@@ -24,26 +24,10 @@ mod clock;
 mod stats;
 use clock::checked_add;
 pub use clock::{Clock, ManualClock, MonotonicClock};
-use stats::Failures;
-pub use stats::StoreStats;
+use stats::{Failures, Maintenance};
+pub use stats::{MaintenanceFailures, StoreStats};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Maintenance failures since the store opened. The crate has no logger: the runtime reads
-/// these counters and the first unread error (`Store::take_reclaim_error`) and logs them.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MaintenanceFailures {
-    /// Ticks whose expiry or decay returned an I/O error.
-    pub errors: u64,
-    /// Ticks that panicked. The maintenance thread contains each panic and keeps running.
-    pub panics: u64,
-}
-
-#[derive(Default)]
-struct Maintenance {
-    failures: MaintenanceFailures,
-    first_error: Option<io::Error>,
-}
 
 /// Hashes stream ids by one multiplication. The store assigns ids sequentially, so no client
 /// chooses the keys in the table, and a lookup skips SipHash's cost.
@@ -213,14 +197,16 @@ impl Inner {
     /// Invalidate the least recently read streams whose `gain` (what invalidation returns now)
     /// together covers `wanted`. Streams that would return nothing stay cached; if every
     /// candidate together cannot cover the request, nothing is invalidated and this returns false.
-    /// A held request returns nothing alone: evicting its last dependent frees it too.
+    /// A request stream and its dependents are one unit: it is chosen when the walk has reached
+    /// every member, for what invalidating all of them returns, so dependents that return
+    /// nothing themselves do not keep their request.
     fn evict(&self, exclude: Option<u64>, wanted: usize, gain: fn(&Stream, &State) -> usize) -> bool {
         let _retention = self.retention.retain();
         let mut cache = self.cache.lock();
         let mut victims = Vec::new();
         let mut chosen = HashSet::new();
-        // Dependents chosen per request stream.
-        let mut released = HashMap::<u64, usize>::new();
+        // The dependents reached so far per request stream, and what they return.
+        let mut units = HashMap::<u64, (Vec<u64>, usize)>::new();
         let mut found = 0;
         let mut refreshed = HashSet::new();
         let mut cursor = None;
@@ -247,29 +233,30 @@ impl Inner {
                 cache.requeue(key, last_read);
                 continue;
             }
-            let mut returned = if stream.is_held() { 0 } else { gain(&stream, &state) };
+            let own = if stream.is_held() { 0 } else { gain(&stream, &state) };
             let invalidated = stream.is_invalidated();
             drop(state);
             let request = stream.request().filter(|request| {
                 !invalidated && Some(request.id) != exclude && cache.streams.contains_key(&request.id)
             });
-            let mut freed = None;
-            if let Some(request) = request
-                && released.get(&request.id).map_or(0, |count| *count) + 1 == request.holders()
-            {
-                let request_gain = gain(request, &request.state.lock());
-                if request_gain > 0 {
-                    returned += request_gain;
-                    freed = Some(request.id);
+            let (returned, members) = match request {
+                Some(request) => {
+                    let unit = units.entry(request.id).or_default();
+                    unit.0.push(key.1);
+                    unit.1 += own;
+                    if unit.0.len() < request.holders() {
+                        continue;
+                    }
+                    let (mut members, returned) = units.remove(&request.id).unwrap();
+                    members.push(request.id);
+                    (returned + gain(request, &request.state.lock()), members)
                 }
-            }
+                None => (own, vec![key.1]),
+            };
             if returned > 0 {
                 found += returned;
-                if let Some(request) = request {
-                    *released.entry(request.id).or_default() += 1;
-                }
-                victims.extend(std::iter::once(key.1).chain(freed));
-                chosen.extend(std::iter::once(key.1).chain(freed));
+                chosen.extend(members.iter().copied());
+                victims.extend(members);
             }
         }
         if found < wanted {
@@ -495,9 +482,21 @@ impl Store {
     /// Admit a response stream that depends on `request`, the request stream of its exchange
     /// (INTERNAL-STREAM.md §6.4): the response charges the request's frame and metadata quota,
     /// and the request neither expires nor is evicted on its own while a dependent is cached.
-    /// `Gone` if the request left the cache; `InvalidRecord` if `request` is itself dependent.
+    /// `Gone` if the request left the cache; `InvalidRecord` if `request` is itself dependent
+    /// or belongs to another store.
     pub fn create_dependent(&self, request: &Writer) -> Result<Writer, Error> {
-        self.admit(Some(request.stream()))
+        // Another store's request has another cache lock and other limits.
+        if !Arc::ptr_eq(request.store(), &self.inner) {
+            return Err(Error::InvalidRecord);
+        }
+        let request = request.stream();
+        // Charged before admission may evict another stream for a header slot.
+        request.charge_dependency()?;
+        let admitted = self.admit(Some(request));
+        if admitted.is_err() {
+            request.release_dependency();
+        }
+        admitted
     }
 
     fn admit(&self, request: Option<&Arc<Stream>>) -> Result<Writer, Error> {

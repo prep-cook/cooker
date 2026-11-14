@@ -3,7 +3,23 @@ use std::{
     time::Duration,
 };
 
-use crate::{FRAME_BYTES, MaintenanceFailures, Store};
+use crate::{FRAME_BYTES, Store};
+
+/// Maintenance failures since the store opened. The crate has no logger: the runtime reads
+/// these counters and the first unread error (`Store::take_reclaim_error`) and logs them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaintenanceFailures {
+    /// Ticks whose expiry or decay returned an I/O error.
+    pub errors: u64,
+    /// Ticks that panicked. The maintenance thread contains each panic and keeps running.
+    pub panics: u64,
+}
+
+#[derive(Default)]
+pub(super) struct Maintenance {
+    pub(super) failures: MaintenanceFailures,
+    pub(super) first_error: Option<std::io::Error>,
+}
 
 /// Flow metrics of one store (INTERNAL-STREAM.md §9.2). Counters are monotonic since the
 /// store opened and are not persisted.
