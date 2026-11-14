@@ -11,22 +11,10 @@ fn pointer(doc: &Document, path: &[Option<Component>], e: &mut Encoder<'_, '_>) 
         e.bytes(b"/")?;
         match component {
             Component::Index(i) => e.unsigned(*i)?,
-            Component::Name(name) => {
-                let mut decoded = doc.name_chars(*name)?;
-                while let Some(c) = decoded.next_scalar()? {
-                    pointer_scalar(c, e)?;
-                }
-            }
+            Component::Name(name) => crate::codec::provenance::write_pointer_segment(doc, *name, e)?,
         }
     }
     e.bytes(b"\"")
-}
-fn pointer_scalar(c: char, e: &mut Encoder<'_, '_>) -> Result<()> {
-    match c {
-        '~' => e.bytes(b"~0"),
-        '/' => e.bytes(b"~1"),
-        c => e.escaped(c.encode_utf8(&mut [0; 4])),
-    }
 }
 pub(super) fn field(
     doc: &mut Document,
@@ -57,34 +45,19 @@ pub(super) fn field(
             }
         }
     }
-    emitter.emit(
+    let (record, spans) = emitter.emit_field(
         owner,
-        Kind::RequestField,
-        Scope::default(),
         |e| {
-            e.bytes(b",\"pointer\":")?;
             if path.is_empty() || super::super::request_provenance::preserved(doc, node)? {
-                crate::codec::provenance::pointer(doc, node, e)?;
+                crate::codec::provenance::pointer(doc, node, e)
             } else {
-                pointer(doc, path, e)?;
-            }
-            e.bytes(b",\"value\":")?;
-            if let Some(m) = registered {
-                return media::write_reference(m, e);
-            }
-            match doc.node(node)?.value {
-                Value::Object => e.bytes(b"{}"),
-                Value::Array => e.bytes(b"[]"),
-                _ => doc.write(node, e),
+                pointer(doc, path, e)
             }
         },
-        |_| Ok(()),
+        |e| crate::codec::event::write_field_value(doc, node, registered, e),
     )?;
-    let (kind, event) = codec::internal::next(owner, reader)?;
-    if kind != Kind::RequestField {
-        return Err(Error::Schema);
-    }
-    doc.bind_field(node, event)?;
+    let lease = codec::internal::committed(reader, record)?;
+    doc.bind_field(owner, node, lease, spans)?;
     doc.mark_published(node);
     if let Some(parent) = doc.node(node)?.parent
         && matches!(doc.node(parent)?.value, Value::Array)

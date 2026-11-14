@@ -1,5 +1,5 @@
 use super::{Error, Result, document::Document, event::Kind, source::Source};
-use ck_stream::{Lease, Position, Writer};
+use ck_stream::{Lease, Position, Record, Writer};
 
 const KINDS: &[Kind] = &[
     Kind::Chunk,
@@ -187,6 +187,15 @@ pub(crate) fn refuse_uri_media(kind: Kind, doc: &Document) -> Result<()> {
 pub(crate) fn next(owner: &mut Writer, reader: &mut ck_stream::Reader) -> Result<(Kind, Document)> {
     match reader.try_next() {
         std::task::Poll::Ready(Some(ck_stream::Read::Record(lease))) => decode(owner, lease),
+        _ => Err(Error::Position),
+    }
+}
+
+/// Takes the lease of a record this writer just committed, checked against that exact record,
+/// so ingress can bind it from the coordinates it wrote instead of decoding it again.
+pub(crate) fn committed(reader: &mut ck_stream::Reader, record: Record) -> Result<Lease> {
+    match reader.try_next() {
+        std::task::Poll::Ready(Some(ck_stream::Read::Record(lease))) if lease.record() == record => Ok(lease),
         _ => Err(Error::Position),
     }
 }

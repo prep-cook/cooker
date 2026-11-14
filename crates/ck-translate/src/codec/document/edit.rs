@@ -1,7 +1,12 @@
 //! Document mutations: node edits, adopted sources and provenance bindings.
 
 use super::{Document, Name, Node, Text, Value};
-use crate::codec::{Error, Result, source::Span};
+use crate::codec::{
+    Error, Result,
+    event::FieldSpans,
+    source::{Source, Span},
+};
+use ck_stream::{Lease, Writer};
 
 /// Where an adopted record's texts now live.
 #[derive(Clone, Copy)]
@@ -27,25 +32,65 @@ impl Adopted {
 }
 
 impl Document {
-    pub(crate) fn bind_field(&mut self, node: usize, mut event: Document) -> Result<()> {
-        let pointer = event.required(event.root(), "pointer")?;
-        let value = event.required(event.root(), "value")?;
-        let Value::String(pointer) = event.node(pointer)?.value else {
-            return Err(Error::Schema);
+    /// Binds `node` to the pointer and scalar value that its just-committed `request.field`
+    /// record holds at `field`. Strings and numbers keep their JSON type; containers, booleans,
+    /// nulls and media references keep their value.
+    pub(crate) fn bind_field(
+        &mut self,
+        owner: &mut Writer,
+        node: usize,
+        lease: Lease,
+        field: FieldSpans,
+    ) -> Result<()> {
+        let record = lease.record();
+        if field.pointer.end > record.len() || field.value.is_some_and(|value| value.end > record.len()) {
+            return Err(Error::Position);
+        }
+        let scalar = match (field.value, self.node(node)?.value) {
+            (None, _) | (Some(_), Value::Bool(_) | Value::Null) => None,
+            (Some(span), Value::Number(_) | Value::Unsigned(_)) => Some((span, Value::Number as fn(Text) -> Value)),
+            (
+                Some(span),
+                Value::String(_)
+                | Value::Text(_)
+                | Value::Id(_)
+                | Value::Fragments
+                | Value::Base64Fragments
+                | Value::Utf8Media,
+            ) => Some((span, Value::String as fn(Text) -> Value)),
+            (Some(_), Value::Object | Value::Array) => return Err(Error::Schema),
         };
-        let mut value = event.node(value)?.value;
-        let adopted = self.adopt_record(&mut event)?;
-        let pointer = adopted.text(pointer)?;
-        if let Value::String(text) | Value::Number(text) = &mut value {
-            *text = adopted.text(*text)?;
-        }
+        let source = self.records_source(owner)?;
+        let offset = self.sources[source].push(lease, record.start..record.end)?.start;
+        let text = |span: Span| Text {
+            source,
+            span: Span {
+                start: offset + span.start,
+                end: offset + span.end,
+            },
+        };
         if self.nodes[node].name.is_some() {
-            self.nodes[node].name = Some(Name::Pointer(pointer));
+            self.nodes[node].name = Some(Name::Pointer(text(field.pointer)));
         }
-        if !matches!(value, Value::Object | Value::Array) {
-            self.nodes[node].value = value;
+        if let Some((span, value)) = scalar {
+            self.nodes[node].value = value(text(span));
         }
         Ok(())
+    }
+
+    /// The source that holds adopted records, created on first use.
+    fn records_source(&mut self, owner: &mut Writer) -> Result<usize> {
+        if let Some(records) = self.records {
+            return Ok(records);
+        }
+        self.reserve(0, 1, 0)?;
+        let source = Source::new(owner)?;
+        if source.stream_id() != self.stream_id() {
+            return Err(Error::Position);
+        }
+        self.records = Some(self.sources.len());
+        self.sources.push(source);
+        Ok(self.sources.len() - 1)
     }
 
     pub(crate) fn retain_text(&mut self, mut event: Document, text: Text) -> Result<Text> {
