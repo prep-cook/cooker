@@ -11,7 +11,7 @@ This page fixes the interfaces Phase D units build against: stream ownership, th
 | `Protocol`, `Framing`, `Output` | `crates/ck-server/src/http/egress.rs` | D2 |
 | `Exchange`, `Owner`, `StreamHandle`, `StreamId` | `crates/ck-server/src/inference/streams.rs` | D2 (exchange), D3 (registry, resume) |
 | `CanonicalUsage`, `ResponseFacts` (tracker input) | `crates/ck-server/src/observability/usage_snapshot.rs` | D3 |
-| `Writer::allocator`, `Writer::hold`, `Writer::now` | `crates/ck-stream/src/publication/writer.rs` | done in D0 |
+| `Writer::allocator`, `Store::create_dependent`, `Writer::now` | `crates/ck-stream/src/publication/writer.rs` | done in D0 |
 
 Dependency edges `ck-exec -> ck-stream` and `ck-server -> ck-stream` are allowed in `crates/AGENTS.md`. The Anthropic, Responses and Gemini codecs are production modules of `ck-translate` (`ck_translate::{anthropic, responses, gemini}`); the old Gemini pair module is `gemini_gemini` until D9 deletes it.
 
@@ -19,7 +19,7 @@ Two tests prove the contract: `crates/ck-exec/tests/execution_contract.rs` type-
 
 ## 2. Streams and quotas
 
-An exchange uses one request stream and one response stream per attempt. Each stream has its own quota (`max_frames`, `max_metadata_bytes`); the pool cap bounds their sum. There is no shared exchange quota.
+An exchange uses one request stream and one response stream per attempt. Every response stream depends on the request stream (`Store::create_dependent`), and the request stream and its dependents charge one exchange quota (`docs/INTERNAL-STREAM.md` §6.4): their request, response, scratch and replay frames together against `max_frames`, and their metadata together against `max_metadata_bytes`, 8 MiB per exchange by default.
 
 | Stream | Producer (`Writer`) | Holds | Charged with |
 | --- | --- | --- | --- |
@@ -27,8 +27,8 @@ An exchange uses one request stream and one response stream per attempt. Each st
 | Response, one per attempt | the attempt's producer task | that attempt's canonical response | response ingress, response egress output and state, resume re-encoding |
 
 - **Cross-attempt encoding.** Request egress encodes only a document of the stream it allocates on (`Document::check_owner`). Every attempt therefore encodes into the request stream's scratch (`Streams::request`), never into its response stream, and the response ingress publishes into the attempt's fresh response stream (`Streams::response`), whose emitter starts from an empty log.
-- **Allocation handles.** `Writer::allocator` returns a second handle on a stream that never publishes records. It allocates scratch and metadata under that stream's quotas, also after the terminal record, until the stream is invalidated. Codecs that read a stream need a writer of its generation (`internal::decode`, `Document::check_owner`), so response egress decodes and encodes with the response stream's allocator while the producer owns the producer writer, and resume uses the same handle after the producer ended. Dropping an allocator publishes nothing; its `finish` is the control path (§7).
-- **Holds.** At attempt start the response stream holds the request stream (`Writer::hold`): while the response stream is cached, the request stream neither expires nor is evicted, so a committed response always has its request records. Invalidating or dropping the response stream releases the hold.
+- **Allocation handles.** `Writer::allocator` returns a second handle on a stream that never publishes records. It allocates scratch and metadata under the exchange quota, also after the terminal record, until the stream is invalidated; a failure after the terminal fails only that delivery (§9). Codecs that read a stream need a writer of its generation (`internal::decode`, `Document::check_owner`), so response egress decodes and encodes with the response stream's allocator while the producer owns the producer writer, and resume uses the same handle after the producer ended. Dropping an allocator publishes nothing; its `finish` is the control path (§7).
+- **Dependency.** Each attempt creates its response stream with `Store::create_dependent(&exchange.request)`. While a dependent is cached, the request stream neither expires nor is evicted on its own, so a committed response always has its request records; evicting the last dependent frees the request stream with it, and the request expires on the first maintenance tick after its last dependent left. The link is taken under the cache lock and fails with `Gone` once the request stream is invalidated. A dependent cannot be a dependency (`InvalidRecord`), so dependencies form no chain or cycle.
 - **Request view on resume.** The live egress reads the view of the client fence. A resume, served by a later HTTP request, rebuilds the view from the request stream's records with `codec::chat::request::read_request(&mut StreamHandle::request, reader)`, the protocol-neutral canonical rebuild, and allocates it on the request stream.
 
 ## 3. Executor
@@ -83,7 +83,7 @@ Resume looks up the handle, authorizes the caller against `StreamHandle::owner` 
 ## 7. Cancel, discard and producer loss
 
 - **Explicit cancel.** `finish(Terminal::Cancelled)` on the response stream's allocator. The producer's `Writer::cancelled` resolves, it stops reading upstream and its writes fail with `Closed`. Shutdown uses `Terminal::Shutdown` the same way.
-- **Discard.** `finish(Terminal::Gone)` on a failed attempt's response writer or allocator invalidates the stream at once and releases its hold on the request stream. An exchange that ends without commitment discards its request stream the same way.
+- **Discard.** `finish(Terminal::Gone)` on a failed attempt's response writer or allocator invalidates the stream at once and releases its dependency on the request stream. An exchange that ends without commitment discards its request stream the same way.
 - **Producer loss.** Only a dropped producer writer (panic or abort) publishes `stream.producer_lost`. Task abort is never a cancel.
 
 ## 8. Usage
@@ -101,7 +101,8 @@ Commitment is the first deliverable byte the client's `ResponseEgress` emits. Be
 | Client syntax or schema (`Json`, `Utf8`, `DuplicateKey`, `Truncated`, `Schema`) or unsupported semantics (`Unsupported`) at request ingress or the client fence | `codec::Error` | 400 in the client's error shape; no upstream request | not reachable |
 | Client size (`Limit`, `EventTooLarge`) at request ingress | `codec::Error` | 413; no upstream request | not reachable |
 | Re-fence refused for a later attempt | `codec::Error` | attempt failure, scope `Model`; nothing sent | not reachable |
-| `Storage(StorageExhausted)` or `Storage(Io)` | `stream.storage_exhausted`, 503, scope `resource` | resource error to the client; no failover | the stream's terminal, delivered as `error` |
+| `Storage(StorageExhausted)` or `Storage(Io)` while the producer runs | `stream.storage_exhausted`, 503, scope `resource` | resource error to the client; no failover | the stream's terminal, delivered as `error` |
+| `Storage(StorageExhausted)` or `Storage(Io)` in an egress or resume allocation after the producer's terminal | a failure of that one delivery; the stream keeps its terminal | 503 `stream.storage_exhausted`; no failover | that delivery ends its HTTP response with the protocol's error terminal, or with 503 if it has sent nothing yet; other readers and later resumes are unaffected |
 | `Storage(Gone)`: expiry or eviction of a stream the exchange uses | `stream.gone`, 410, scope `resource` | resource error to the client; no failover | attached readers receive `error`; resume answers 410 |
 | `Storage(Closed)` | the stream already has a terminal | follow that terminal's row | follow that terminal's row |
 | `Storage(InvalidPosition, InvalidRecord, IncompleteRecord)` | gateway defect | 500; no failover | delivered as `error` |
