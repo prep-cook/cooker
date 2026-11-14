@@ -98,7 +98,10 @@ impl codec::ResponseIngress for Ingress {
             let source = self.source.as_mut().ok_or(Error::Closed)?;
             source.push_bytes(owner, bytes)?;
             let state = &mut self.state;
-            scanner.advance(source, |event| state.event(owner, source, event))?;
+            let scan = scanner.advance(source, |event| until_error(state, owner, source, event));
+            if stopped(state, scan)? {
+                return Ok(());
+            }
             source.release_before(scanner.consumed())?;
             Ok(())
         })();
@@ -124,6 +127,19 @@ impl codec::ResponseIngress for Ingress {
             Ok(())
         })();
         self.handle(owner, result)
+    }
+}
+/// Maps one event, then stops the scan at an upstream `error` event: the bytes after it in the
+/// same call are dropped unread, as later calls are, whatever their content.
+fn until_error(state: &mut State, owner: &mut Writer, source: &Source, event: &sse::Event) -> Result<()> {
+    state.event(owner, source, event)?;
+    if state.errored { Err(Error::Closed) } else { Ok(()) }
+}
+/// The outcome of a scan that [`until_error`] may have stopped: `Ok(true)` when it stopped.
+fn stopped(state: &State, scan: Result<()>) -> Result<bool> {
+    match scan {
+        Err(Error::Closed) if state.errored => Ok(true),
+        scan => scan.map(|()| false),
     }
 }
 struct Block {

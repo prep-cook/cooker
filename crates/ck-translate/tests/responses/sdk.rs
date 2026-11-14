@@ -298,3 +298,34 @@ fn streamed_audio_reaches_buffered_clients_natively() {
         assert_eq!(out["audio"], expected, "{out}");
     }
 }
+
+/// Input after the upstream `error` event is ignored however the network splits it: in the same
+/// `advance` call as the event or in a later one.
+#[test]
+fn input_after_an_upstream_error_is_ignored_at_every_split() {
+    let mut input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"credit_balance_exhausted\",\"message\":\"billing https://vendor.invalid/private\",\"type\":\"insufficient_quota\"}}\n\n".to_vec();
+    input.push(0xff);
+    for split in 0..=input.len() {
+        let mut m = Mapped::new();
+        let mut ingress = responses::response::Ingress::new(
+            &mut m.writer,
+            identity(Direction::Response),
+            Operation::Generate,
+            BodyMode::Streaming,
+            1024 * 1024,
+        )
+        .unwrap();
+        let (head, tail) = input.split_at(split);
+        let result = ingress
+            .advance(&mut m.writer, head)
+            .and_then(|()| ingress.advance(&mut m.writer, tail))
+            .and_then(|()| ingress.finish(&mut m.writer));
+        assert!(result.is_ok(), "split {split}: {result:?}");
+        let last = events(&m).pop().unwrap();
+        assert_eq!(
+            (&last["code"], &last["scope"]),
+            (&json!("server_error"), &json!("upstream")),
+            "split {split}"
+        );
+    }
+}
