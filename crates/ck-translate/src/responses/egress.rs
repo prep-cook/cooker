@@ -225,6 +225,15 @@ impl<F: FnMut(&'static str, u64)> codec::ResponseEgress for Egress<F> {
         if self.terminal { Ok(()) } else { Err(Error::Truncated) }
     }
 }
+/// Writes `parent`'s `logprobs` member. An event whose schema requires the array (`required`)
+/// gets an empty one when the source reported none.
+fn write_logprobs(doc: &Document, parent: usize, required: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let logprobs = doc.member(parent, "logprobs")?;
+    if required && logprobs.is_none_or(|n| matches!(doc.node(n).map(|n| n.value), Ok(Value::Null))) {
+        return e.bytes(b",\"logprobs\":[]");
+    }
+    super::member(doc, parent, "logprobs", e)
+}
 fn write_lease(lease: &ScratchLease, e: &mut Encoder<'_, '_>) -> Result<()> {
     let mut offset = 0;
     while offset < lease.len() {

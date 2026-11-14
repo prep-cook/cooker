@@ -98,14 +98,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             e.unsigned(block)?;
             e.bytes(b",\"delta\":")?;
             doc.write(value, e)?;
-            let logprobs = doc.member(choice, "logprobs")?;
-            // The text delta event requires a `logprobs` array; the source reported none.
-            if name == "response.output_text.delta"
-                && logprobs.is_none_or(|n| matches!(doc.node(n).map(|n| n.value), Ok(Value::Null)))
-            {
-                return e.bytes(b",\"logprobs\":[]");
-            }
-            super::super::member(doc, choice, "logprobs", e)
+            write_logprobs(doc, choice, name == "response.output_text.delta", e)
         })?;
         doc.detach(delta, value)?;
         append_fragment(doc, part, native, value)?;

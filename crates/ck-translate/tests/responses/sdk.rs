@@ -87,6 +87,11 @@ fn foreign_responses_carry_the_members_the_schema_requires() {
                 .find(|e| e["type"] == "response.output_text.delta")
                 .unwrap();
             assert_eq!(delta["logprobs"], json!([]));
+            let done = events
+                .iter()
+                .find(|e| e["type"] == "response.output_text.done")
+                .unwrap();
+            assert_eq!(done["logprobs"], json!([]));
         }
         for response in responses {
             assert_eq!(response["parallel_tool_calls"], true);
