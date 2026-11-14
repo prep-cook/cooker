@@ -2,9 +2,12 @@
 //! destinations. Gemini request egress writes the native declaration unchanged.
 use crate::codec::{
     Error, Result,
-    document::{Document, Name, Value},
+    document::{Characters, Document, Name, Value},
     encode::Encoder,
+    table::Table,
 };
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 
 /// JSON Schema type names; Gemini's `Type` enum spells them in upper case.
 const TYPES: [&str; 7] = ["string", "number", "integer", "boolean", "array", "object", "null"];
@@ -99,6 +102,15 @@ pub(crate) fn write_function(
 /// does not list each property once, or `properties`, `items`, `anyOf` or `required` of a
 /// shape [`write`] cannot write.
 pub(crate) fn check(doc: &Document, schema: usize) -> Result<()> {
+    doc.with_table(|table| {
+        let mut names = Names {
+            table,
+            hasher: RandomState::new(),
+        };
+        check_with(doc, schema, &mut names)
+    })
+}
+fn check_with(doc: &Document, schema: usize, names: &mut Names) -> Result<()> {
     if !matches!(doc.node(schema)?.value, Value::Object) {
         return Err(Error::Unsupported);
     }
@@ -118,8 +130,7 @@ pub(crate) fn check(doc: &Document, schema: usize) -> Result<()> {
     }
     for key in COUNTS {
         if let Some(count) = doc.member(schema, key)?
-            && doc.unsigned(count).is_err()
-            && count_string(doc, count)?.is_none()
+            && count_value(doc, count)?.is_none()
         {
             return Err(Error::Unsupported);
         }
@@ -129,21 +140,21 @@ pub(crate) fn check(doc: &Document, schema: usize) -> Result<()> {
             return Err(Error::Unsupported);
         }
         for property in doc.children(properties)? {
-            check(doc, property)?;
+            check_with(doc, property, names)?;
         }
     }
     if let Some(ordering) = doc.member(schema, "propertyOrdering")? {
-        check_ordering(doc, doc.member(schema, "properties")?, ordering)?;
+        check_ordering(doc, doc.member(schema, "properties")?, ordering, names)?;
     }
     if let Some(items) = doc.member(schema, "items")? {
-        check(doc, items)?;
+        check_with(doc, items, names)?;
     }
     if let Some(any) = doc.member(schema, "anyOf")? {
         if !matches!(doc.node(any)?.value, Value::Array) {
             return Err(Error::Unsupported);
         }
         for schema in doc.children(any)? {
-            check(doc, schema)?;
+            check_with(doc, schema, names)?;
         }
     }
     if let Some(required) = doc.member(schema, "required")? {
@@ -164,6 +175,15 @@ pub(crate) fn check(doc: &Document, schema: usize) -> Result<()> {
 /// order of `properties`, which JSON Schema keeps; values such as `default` and `enum` stay as
 /// written.
 pub(crate) fn write(doc: &Document, schema: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    doc.with_table(|table| {
+        let mut names = Names {
+            table,
+            hasher: RandomState::new(),
+        };
+        write_with(doc, schema, &mut names, e)
+    })
+}
+fn write_with(doc: &Document, schema: usize, names: &mut Names, e: &mut Encoder<'_, '_>) -> Result<()> {
     let nullable = match doc.member(schema, "nullable")? {
         Some(n) => matches!(doc.node(n)?.value, Value::Bool(true)),
         None => false,
@@ -196,13 +216,19 @@ pub(crate) fn write(doc: &Document, schema: usize, e: &mut Encoder<'_, '_>) -> R
             }
         } else if doc.name_is(name, "properties")? {
             e.bytes(b"{")?;
+            // [`check`] made the ordering name each property once; its index region stays
+            // below the regions nested objects push while their properties are written.
             let ordering = doc.member(schema, "propertyOrdering")?;
-            let mut names = ordering.map(|o| doc.children(o)).transpose()?.into_iter().flatten();
+            let start = ordering.map(|_| names.index(doc, member)).transpose()?;
+            let mut order = ordering.map(|o| doc.children(o)).transpose()?.into_iter().flatten();
             let mut properties = doc.children(member)?;
             let mut first = true;
             loop {
-                let property = match ordering {
-                    Some(_) => names.next().map(|n| named(doc, member, n)).transpose()?.flatten(),
+                let property = match start {
+                    Some(start) => match order.next() {
+                        Some(name) => Some(names.table[names.find(doc, start, name)?.ok_or(Error::Schema)?].2),
+                        None => None,
+                    },
                     None => properties.next(),
                 };
                 let Some(property) = property else {
@@ -212,16 +238,19 @@ pub(crate) fn write(doc: &Document, schema: usize, e: &mut Encoder<'_, '_>) -> R
                 first = false;
                 doc.write_name(doc.node(property)?.name.ok_or(Error::Schema)?, e)?;
                 e.bytes(b":")?;
-                write(doc, property, e)?;
+                write_with(doc, property, names, e)?;
+            }
+            if let Some(start) = start {
+                names.release(start);
             }
             e.bytes(b"}")?;
         } else if doc.name_is(name, "items")? {
-            write(doc, member, e)?;
+            write_with(doc, member, names, e)?;
         } else if doc.name_is(name, "anyOf")? {
             e.bytes(b"[")?;
             for (i, schema) in doc.children(member)?.enumerate() {
                 e.bytes(if i == 0 { b"" } else { b"," })?;
-                write(doc, schema, e)?;
+                write_with(doc, schema, names, e)?;
             }
             e.bytes(b"]")?;
         } else if count(doc, name)? && doc.unsigned(member).is_err() {
@@ -234,9 +263,7 @@ pub(crate) fn write(doc: &Document, schema: usize, e: &mut Encoder<'_, '_>) -> R
 }
 
 /// Refuses a `propertyOrdering` that is not an array naming each of `properties` exactly once.
-// ponytail: matching is quadratic in the property count, which Gemini schemas keep small; a
-// sorted name index, like the call indexes of the request fences, lifts it.
-fn check_ordering(doc: &Document, properties: Option<usize>, ordering: usize) -> Result<()> {
+fn check_ordering(doc: &Document, properties: Option<usize>, ordering: usize, names: &mut Names) -> Result<()> {
     let properties = properties.ok_or(Error::Unsupported)?;
     if !matches!(doc.node(ordering)?.value, Value::Array) {
         return Err(Error::Unsupported);
@@ -244,33 +271,72 @@ fn check_ordering(doc: &Document, properties: Option<usize>, ordering: usize) ->
     if doc.children(ordering)?.count() != doc.children(properties)?.count() {
         return Err(Error::Unsupported);
     }
-    for (i, name) in doc.children(ordering)?.enumerate() {
-        named(doc, properties, name)?.ok_or(Error::Unsupported)?;
-        for earlier in doc.children(ordering)?.take(i) {
-            if doc.equal_strings(earlier, name)? {
-                return Err(Error::Unsupported);
-            }
+    let start = names.index(doc, properties)?;
+    for name in doc.children(ordering)? {
+        let at = names.find(doc, start, name)?.ok_or(Error::Unsupported)?;
+        if std::mem::replace(&mut names.table[at].1, true) {
+            return Err(Error::Unsupported);
         }
     }
+    names.release(start);
     Ok(())
 }
 
-/// The member of `properties` whose name is the string `name`.
-fn named(doc: &Document, properties: usize, name: usize) -> Result<Option<usize>> {
-    for property in doc.children(properties)? {
-        let mut left = doc.name_chars(doc.node(property)?.name.ok_or(Error::Schema)?)?;
-        let mut right = doc.chars(name).map_err(|_| Error::Unsupported)?;
-        loop {
-            let (a, b) = (left.next_scalar()?, right.next_scalar()?);
-            if a != b {
+/// Property lookups for `propertyOrdering`: `(name hash, matched, property)` entries in one
+/// region per object, sorted by hash. Regions form a stack in the document's quota-charged
+/// scratch table: a nested object pushes its region above its parent's and releases it before
+/// the parent continues, so each name is hashed and found once, not compared with every other.
+struct Names<'a> {
+    table: &'a mut Table<(u64, bool, usize)>,
+    hasher: RandomState,
+}
+impl Names<'_> {
+    /// Pushes the region of `properties`; returns its start.
+    fn index(&mut self, doc: &Document, properties: usize) -> Result<usize> {
+        let start = self.table.len();
+        for property in doc.children(properties)? {
+            let hash = self.hash(doc.name_chars(doc.node(property)?.name.ok_or(Error::Schema)?)?)?;
+            self.table.push((hash, false, property))?;
+        }
+        self.table[start..].sort_unstable_by_key(|entry| entry.0);
+        Ok(start)
+    }
+    /// The table position of the property in the region at `start` named by string `name`.
+    fn find(&self, doc: &Document, start: usize, name: usize) -> Result<Option<usize>> {
+        let hash = self.hash(doc.chars(name).map_err(|_| Error::Unsupported)?)?;
+        let region = &self.table[start..];
+        let first = region.partition_point(|entry| entry.0 < hash);
+        for (offset, entry) in region[first..].iter().enumerate() {
+            if entry.0 != hash {
                 break;
             }
-            if a.is_none() {
-                return Ok(Some(property));
+            let mut left = doc.name_chars(doc.node(entry.2)?.name.ok_or(Error::Schema)?)?;
+            let mut right = doc.chars(name)?;
+            loop {
+                let (a, b) = (left.next_scalar()?, right.next_scalar()?);
+                if a != b {
+                    break;
+                }
+                if a.is_none() {
+                    return Ok(Some(start + first + offset));
+                }
             }
         }
+        Ok(None)
     }
-    Ok(None)
+    fn hash(&self, mut chars: Characters<'_>) -> Result<u64> {
+        let mut state = self.hasher.build_hasher();
+        while let Some(c) = chars.next_scalar()? {
+            state.write_u32(c as u32);
+        }
+        Ok(state.finish())
+    }
+    /// Drops the region at `start` and every region above it.
+    fn release(&mut self, start: usize) {
+        while self.table.len() > start {
+            self.table.swap_remove(self.table.len() - 1);
+        }
+    }
 }
 
 /// The JSON Schema name of a Gemini `type`, matched ignoring ASCII case.
@@ -290,6 +356,15 @@ fn type_name(doc: &Document, kind: usize) -> Result<Option<&'static str>> {
         }
     }
     Ok(None)
+}
+
+/// The whole number a Gemini count member holds, as [`write`] writes it: a JSON number or a
+/// protobuf JSON int64 string such as `"01"`; none for any other value.
+pub(crate) fn count_value(doc: &Document, node: usize) -> Result<Option<u64>> {
+    match doc.unsigned(node) {
+        Ok(n) => Ok(Some(n)),
+        Err(_) => count_string(doc, node),
+    }
 }
 
 /// The value of a protobuf JSON int64 string of ASCII digits, such as `"01"`; none for any

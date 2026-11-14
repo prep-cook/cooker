@@ -131,7 +131,9 @@ fn output(doc: &Document, root: usize) -> Result<()> {
             return Err(Error::Unsupported);
         }
         if json_schema::from_gemini(doc)? {
-            structured(doc, gemini::json_mode(doc, format)?.ok_or(Error::Unsupported)?)?;
+            let schema = gemini::json_mode(doc, format)?.ok_or(Error::Unsupported)?;
+            let converted = doc.name_is(doc.node(schema)?.name.ok_or(Error::Schema)?, "responseSchema")?;
+            structured(doc, schema, converted)?;
         } else {
             let schema = doc.member(format, "json_schema")?.ok_or(Error::Unsupported)?;
             if !matches!(doc.node(doc.required(schema, "schema")?)?.value, Value::Object) {
@@ -172,11 +174,12 @@ const FORMATS: [&str; 10] = [
     "ipv6",
     "uuid",
 ];
-/// Refuses a Gemini response schema, before or after conversion to JSON Schema, that uses what
-/// Anthropic structured outputs cannot hold: an [`UNSTRUCTURED`] keyword, `minItems` above 1,
-/// `additionalProperties` other than false, a `format` outside [`FORMATS`], an enum value that
-/// is an object or array, or an external `$ref`. Keywords are refused, never stripped.
-fn structured(doc: &Document, schema: usize) -> Result<()> {
+/// Refuses a Gemini response schema that uses what Anthropic structured outputs cannot hold: an
+/// [`UNSTRUCTURED`] keyword, `minItems` above 1, `additionalProperties` other than false, a
+/// `format` outside [`FORMATS`], an enum value that is an object or array, an external `$ref`,
+/// or `allOf` with `$ref`. A Gemini `Schema` (`converted`) is judged as its JSON Schema form,
+/// whose counts are numbers. Keywords are refused, never stripped.
+fn structured(doc: &Document, schema: usize, converted: bool) -> Result<()> {
     if !matches!(doc.node(schema)?.value, Value::Object) {
         return Ok(());
     }
@@ -194,10 +197,11 @@ fn structured(doc: &Document, schema: usize) -> Result<()> {
         {
             true
         } else if is("minItems")? {
-            match doc.unsigned(member) {
-                Ok(n) => n > 1,
-                Err(_) => !one_of(&["0", "1"])?,
-            }
+            let count = match converted {
+                true => json_schema::count_value(doc, member)?,
+                false => doc.unsigned(member).ok(),
+            };
+            count.is_none_or(|n| n > 1)
         } else if is("additionalProperties")? {
             !matches!(doc.node(member)?.value, Value::Bool(false))
         } else if is("format")? {
@@ -210,6 +214,12 @@ fn structured(doc: &Document, schema: usize) -> Result<()> {
             complex
         } else if is("$ref")? {
             doc.chars(member)?.next_scalar()? != Some('#')
+        } else if is("allOf")? {
+            let mut with_ref = doc.member(schema, "$ref")?.is_some();
+            for part in doc.children(member)? {
+                with_ref |= matches!(doc.node(part)?.value, Value::Object) && doc.member(part, "$ref")?.is_some();
+            }
+            with_ref
         } else {
             false
         };
@@ -220,10 +230,10 @@ fn structured(doc: &Document, schema: usize) -> Result<()> {
         let list = is("anyOf")? || is("allOf")? || is("oneOf")?;
         if map || list || (is("items")? && matches!(doc.node(member)?.value, Value::Array)) {
             for child in doc.children(member)? {
-                structured(doc, child)?;
+                structured(doc, child, converted)?;
             }
         } else if is("items")? || is("not")? {
-            structured(doc, member)?;
+            structured(doc, member, converted)?;
         }
     }
     Ok(())

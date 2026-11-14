@@ -148,3 +148,50 @@ fn property_ordering_orders_properties_or_is_refused() {
     let config = json!({"responseMimeType":"application/json","responseSchema":schema});
     unsupported(translate(P::Gemini, P::Chat, &gm_json(config)));
 }
+
+/// Structured outputs refuse `allOf` with `$ref` even without recursion; `minItems` is judged on
+/// its converted count, so a Gemini `"01"` is 1.
+#[test]
+fn anthropic_judges_all_of_refs_and_converted_counts() {
+    let schema = json!({"type":"object","properties":{"n":{"allOf":[{"$ref":"#/$defs/N"}]}},"additionalProperties":false,"$defs":{"N":{"type":"integer"}}});
+    let config = json!({"responseMimeType":"application/json","responseJsonSchema":schema});
+    unsupported(translate(P::Gemini, P::Anthropic, &gm_json(config)));
+    let schema = json!({"type":"object","properties":{"n":{"$ref":"#/$defs/N","allOf":[{"type":"integer"}]}},"additionalProperties":false,"$defs":{"N":{"type":"integer"}}});
+    let config = json!({"responseMimeType":"application/json","responseJsonSchema":schema});
+    unsupported(translate(P::Gemini, P::Anthropic, &gm_json(config)));
+    let schema = json!({"type":"object","properties":{"n":{"$ref":"#/$defs/N"}},"additionalProperties":false,"$defs":{"N":{"type":"integer"}}});
+    let config = json!({"responseMimeType":"application/json","responseJsonSchema":schema});
+    assert!(translate(P::Gemini, P::Anthropic, &gm_json(config)).is_ok());
+    for (count, ok) in [("01", true), ("1", true), ("02", false)] {
+        let schema = json!({"type":"ARRAY","items":{"type":"STRING"},"minItems":count});
+        let config = json!({"responseMimeType":"application/json","responseSchema":schema});
+        let out = translate(P::Gemini, P::Anthropic, &gm_json(config));
+        assert_eq!(out.is_ok(), ok, "{count}: {out:?}");
+    }
+}
+
+/// A large `propertyOrdering` is matched through an index: thousands of properties translate
+/// well inside a budget the quadratic matching it replaced overran (about 27 s in a debug build).
+#[test]
+fn property_ordering_scales_linearly() {
+    let names: Vec<String> = (0..2048).map(|i| format!("p{i:04}")).collect();
+    let properties: serde_json::Map<String, Value> =
+        names.iter().map(|n| (n.clone(), json!({"type":"STRING"}))).collect();
+    let ordering: Vec<&String> = names.iter().rev().collect();
+    let schema = json!({"type":"OBJECT","properties":properties,"propertyOrdering":ordering});
+    let input = gm_json(json!({"responseMimeType":"application/json","responseSchema":schema}));
+    let raw = serde_json::to_vec(&input).unwrap();
+    let started = std::time::Instant::now();
+    let out = once(P::Gemini, P::Responses, &mut std::iter::once(raw.as_slice())).unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    let written: Vec<&String> = out["text"]["format"]["schema"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect();
+    assert_eq!(written, ordering);
+}
