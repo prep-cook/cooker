@@ -1,0 +1,150 @@
+//! Review findings on PR #108: a translated request keeps every constraint the client set, or
+//! is refused as Unsupported. Inputs are the reviewer's.
+// Test-only inclusion, as in the other codec targets.
+#[path = "../src/anthropic/mod.rs"]
+pub mod anthropic;
+#[allow(dead_code)]
+#[path = "../src/boundary.rs"]
+pub mod boundary;
+#[path = "../src/codec/mod.rs"]
+pub mod codec;
+#[path = "../src/gemini/boundary.rs"]
+pub mod gemini;
+#[allow(dead_code)]
+#[path = "overreach/harness.rs"]
+mod harness;
+#[path = "../src/responses/mod.rs"]
+pub mod responses;
+#[allow(dead_code)]
+#[path = "semantic/mod.rs"]
+mod semantic;
+
+use harness::*;
+use serde_json::{Value, json};
+
+/// Anthropic structured outputs refuse numeric, string and array bounds and an
+/// `additionalProperties` other than false; such a Gemini schema is refused, never stripped.
+#[test]
+fn anthropic_refuses_schema_keywords_structured_outputs_lack() {
+    let input = |schema: Value| gm_json(json!({"responseMimeType":"application/json","responseJsonSchema":schema}));
+    let base =
+        json!({"type":"object","properties":{"n":{"type":"integer"}},"required":["n"],"additionalProperties":false});
+    let out = translate(P::Gemini, P::Anthropic, &input(base.clone())).unwrap();
+    assert_eq!(out["output_config"]["format"]["schema"], base);
+    for (path, value) in [
+        ("/properties/n/minimum", json!(10)),
+        ("/properties/n/maximum", json!(10)),
+        ("/properties/n/multipleOf", json!(2)),
+        ("/properties/s", json!({"type":"string","maxLength":3})),
+        ("/properties/s", json!({"type":"string","format":"regex"})),
+        ("/properties/a", json!({"type":"array","minItems":2})),
+        (
+            "/properties/a",
+            json!({"type":"array","items":{"type":"integer","exclusiveMinimum":0}}),
+        ),
+        ("/properties/e", json!({"enum":[{"a":1}]})),
+        ("/properties/r", json!({"$ref":"https://example.com/s.json"})),
+        ("/additionalProperties", json!(true)),
+    ] {
+        let mut schema = base.clone();
+        let (parent, key) = path.rsplit_once('/').unwrap();
+        schema.pointer_mut(if parent.is_empty() { "" } else { parent }).unwrap()[key] = value;
+        unsupported(translate(P::Gemini, P::Anthropic, &input(schema)));
+    }
+    // A Gemini `Schema` is checked the same way after conversion.
+    let gemini = json!({"responseMimeType":"application/json","responseSchema":{"type":"OBJECT","properties":{"n":{"type":"INTEGER","minimum":10}}}});
+    unsupported(translate(P::Gemini, P::Anthropic, &gm_json(gemini)));
+    let gemini = json!({"responseMimeType":"application/json","responseSchema":{"type":"ARRAY","minItems":"1","items":{"type":"STRING","format":"date-time"}}});
+    assert!(translate(P::Gemini, P::Anthropic, &gm_json(gemini)).is_ok());
+}
+
+/// A plain-text document in a tool result has no Responses file form; a base64 PDF is a data
+/// URL file, and a title, which Responses cannot carry, is refused rather than dropped.
+#[test]
+fn responses_tool_result_documents_map_or_are_refused() {
+    let input = |document: Value| {
+        json!({"model":"m","max_tokens":100,"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"c","name":"f","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":[document]}]}]})
+    };
+    let text =
+        json!({"type":"document","source":{"type":"text","media_type":"text/plain","data":"hello"},"title":"report"});
+    unsupported(translate(P::Anthropic, P::Responses, &input(text)));
+    let text = json!({"type":"document","source":{"type":"text","media_type":"text/plain","data":"hello"}});
+    unsupported(translate(P::Anthropic, P::Responses, &input(text)));
+    let pdf =
+        json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}});
+    let out = translate(P::Anthropic, P::Responses, &input(pdf.clone())).unwrap();
+    assert_eq!(
+        items(&out, "function_call_output")[0]["output"],
+        json!([{"type":"input_file","file_data":"data:application/pdf;base64,JVBERi0xLjQK"}])
+    );
+    let mut titled = pdf;
+    titled["title"] = json!("report");
+    unsupported(translate(P::Anthropic, P::Responses, &input(titled)));
+}
+
+fn gm_tools(function: Value) -> Value {
+    json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[function]}]})
+}
+
+/// A Gemini declaration's result schema is the Responses tool's `output_schema`; Chat and
+/// Anthropic tools have no such member, so they refuse it.
+#[test]
+fn gemini_result_schema_maps_to_responses_output_schema() {
+    let out = translate(
+        P::Gemini,
+        P::Responses,
+        &gm_tools(json!({"name":"f","parameters":{"type":"OBJECT"},"response":{"type":"STRING"}})),
+    )
+    .unwrap();
+    assert_eq!(
+        out["tools"],
+        json!([{"type":"function","name":"f","parameters":{"type":"object"},"output_schema":{"type":"string"}}])
+    );
+    let raw = json!({"type":"object","properties":{"t":{"type":"number"}}});
+    let out = translate(
+        P::Gemini,
+        P::Responses,
+        &gm_tools(json!({"name":"f","responseJsonSchema":raw})),
+    )
+    .unwrap();
+    assert_eq!(out["tools"][0]["output_schema"], raw);
+    let both = json!({"name":"f","response":{"type":"STRING"},"responseJsonSchema":raw});
+    unsupported(translate(P::Gemini, P::Responses, &gm_tools(both)));
+    for function in [
+        json!({"name":"f","response":{"type":"STRING"}}),
+        json!({"name":"f","responseJsonSchema":raw}),
+    ] {
+        for to in [P::Chat, P::Anthropic] {
+            unsupported(translate(P::Gemini, to, &gm_tools(function.clone())));
+        }
+    }
+}
+
+/// `propertyOrdering` orders the written `properties` at every depth; one that does not list
+/// exactly the object's properties is refused.
+#[test]
+fn property_ordering_orders_properties_or_is_refused() {
+    let schema = json!({"type":"OBJECT","properties":{"a":{"type":"STRING"},"b":{"type":"OBJECT","properties":{"x":{"type":"STRING"},"y":{"type":"STRING"}},"propertyOrdering":["y","x"]}},"propertyOrdering":["b","a"]});
+    let config = json!({"responseMimeType":"application/json","responseSchema":schema});
+    let written = |out: &Value, pointer: &str| out.pointer(pointer).unwrap().to_string();
+    let want = r#"{"type":"object","properties":{"b":{"type":"object","properties":{"y":{"type":"string"},"x":{"type":"string"}}},"a":{"type":"string"}}}"#;
+    let out = translate(P::Gemini, P::Chat, &gm_json(config.clone())).unwrap();
+    assert_eq!(written(&out, "/response_format/json_schema/schema"), want);
+    let out = translate(P::Gemini, P::Anthropic, &gm_json(config.clone())).unwrap();
+    assert_eq!(written(&out, "/output_config/format/schema"), want);
+    let out = translate(P::Gemini, P::Responses, &gm_json(config)).unwrap();
+    assert_eq!(written(&out, "/text/format/schema"), want);
+    for ordering in [json!(["a"]), json!(["a", "c"]), json!(["a", "a"]), json!("a")] {
+        let schema = json!({"type":"OBJECT","properties":{"a":{"type":"STRING"},"b":{"type":"STRING"}},"propertyOrdering":ordering});
+        let config = json!({"responseMimeType":"application/json","responseSchema":schema});
+        for to in [P::Chat, P::Anthropic, P::Responses] {
+            unsupported(translate(P::Gemini, to, &gm_json(config.clone())));
+        }
+    }
+    // An ordering that is not a list is refused even beside no properties.
+    let schema = json!({"type":"OBJECT","properties":{},"propertyOrdering":""});
+    let config = json!({"responseMimeType":"application/json","responseSchema":schema});
+    unsupported(translate(P::Gemini, P::Chat, &gm_json(config)));
+}

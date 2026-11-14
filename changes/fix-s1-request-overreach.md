@@ -10,3 +10,7 @@ Fixed
 - An Anthropic upstream takes `store: false`.
 - Anthropic `top_k` and other parameters of another protocol sent to a Responses upstream are refused as unsupported instead of being dropped.
 - A Gemini native tool group, such as `googleSearch`, sent to a Responses upstream is refused as unsupported instead of failing as a malformed request, and an Anthropic upstream refuses it instead of dropping it.
+- A Gemini response schema bound for Anthropic that uses a keyword Anthropic structured outputs do not support, such as `minimum` or `maxLength`, is refused as unsupported instead of reaching the upstream.
+- A Gemini `propertyOrdering` orders the translated schema's `properties` for Chat, Anthropic and Responses; one that does not list each property once is refused.
+- A Gemini function's result schema reaches a Responses upstream as the tool's `output_schema` and is refused by Chat and Anthropic, which have no such field, instead of being dropped.
+- An Anthropic plain-text document, or a document with a `title`, `context` or `citations`, sent to a Responses upstream is refused as unsupported instead of being sent as malformed file data or losing those members.

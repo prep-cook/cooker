@@ -106,7 +106,7 @@ fn write_gemini_tools(doc: &Document, tools: usize, e: &mut Encoder<'_, '_>) -> 
                 continue;
             }
             e.bytes(b"{")?;
-            super::json_schema::write_function(doc, field, "parameters", e)?;
+            super::json_schema::write_function(doc, field, ("parameters", None), e)?;
             e.bytes(b"}")?;
         }
         e.bytes(b"}")?;

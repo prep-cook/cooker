@@ -99,7 +99,7 @@ fn gemini_controls(doc: &Document) -> Result<()> {
     }
     if let Some(tools) = doc.member(root, "tools")? {
         for tool in doc.children(tools)? {
-            json_schema::check_function(doc, doc.required(tool, "function")?)?;
+            json_schema::check_function(doc, doc.required(tool, "function")?, true)?;
         }
     }
     Ok(())
@@ -281,6 +281,25 @@ fn validate_part(view: RequestView<'_>, part: usize) -> Result<()> {
     }
     if !supported {
         return Err(Error::Unsupported);
+    }
+    if doc.string_is(kind, "document")? {
+        document(doc, part)?;
+    }
+    Ok(())
+}
+/// A Responses `input_file` holds a file's bytes, URL or ID and a filename. An Anthropic
+/// plain-text source is not file bytes, and its `title`, `context` and `citations` have no
+/// Responses field, so such a document is refused rather than sent malformed or cut down.
+fn document(doc: &Document, part: usize) -> Result<()> {
+    if doc.member(doc.required(part, "source")?, "anthropic_text")?.is_some() {
+        return Err(Error::Unsupported);
+    }
+    let x = doc.member(doc.root(), "x_ck")?;
+    let original = x.map(|x| doc.member(x, "original")).transpose()?.flatten();
+    for entry in doc.origins(part)? {
+        if original.is_some() && doc.node(entry)?.parent == original && !is(doc, entry, "protocol", "responses")? {
+            return Err(Error::Unsupported);
+        }
     }
     Ok(())
 }

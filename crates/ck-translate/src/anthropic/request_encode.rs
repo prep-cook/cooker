@@ -184,7 +184,7 @@ fn tools(doc: &Document, root: usize, x: usize, e: &mut Encoder<'_, '_>) -> Resu
             let function = doc.required(tool, "function")?;
             e.bytes(b"{")?;
             if json_schema::from_gemini(doc)? {
-                json_schema::write_function(doc, function, "input_schema", e)?;
+                json_schema::write_function(doc, function, ("input_schema", None), e)?;
                 originals(doc, tool, e)?;
                 e.bytes(b"}")?;
                 continue;

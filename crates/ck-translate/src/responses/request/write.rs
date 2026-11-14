@@ -214,9 +214,9 @@ fn write_tools(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<
             e.bytes(b"{\"type\":\"function\"")?;
             let function = doc.required(tool, "function")?;
             if gemini {
-                // A Gemini declaration's schema becomes JSON Schema `parameters`.
+                // A Gemini declaration's schemas become JSON Schema `parameters` and `output_schema`.
                 e.bytes(b",")?;
-                json_schema::write_function(doc, function, "parameters", e)?;
+                json_schema::write_function(doc, function, ("parameters", Some("output_schema")), e)?;
             } else {
                 for f in doc.children(function)? {
                     e.bytes(b",")?;

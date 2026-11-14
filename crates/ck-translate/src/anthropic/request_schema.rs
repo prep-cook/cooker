@@ -131,12 +131,99 @@ fn output(doc: &Document, root: usize) -> Result<()> {
             return Err(Error::Unsupported);
         }
         if json_schema::from_gemini(doc)? {
-            gemini::json_mode(doc, format)?.ok_or(Error::Unsupported)?;
+            structured(doc, gemini::json_mode(doc, format)?.ok_or(Error::Unsupported)?)?;
         } else {
             let schema = doc.member(format, "json_schema")?.ok_or(Error::Unsupported)?;
             if !matches!(doc.node(doc.required(schema, "schema")?)?.value, Value::Object) {
                 return Err(Error::Schema);
             }
+        }
+    }
+    Ok(())
+}
+/// Keywords the structured-outputs JSON Schema limitations list as unsupported: numeric and
+/// string bounds, and array constraints other than `minItems`. Object property counts are not
+/// in the supported list either.
+const UNSTRUCTURED: [&str; 13] = [
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "maxItems",
+    "uniqueItems",
+    "contains",
+    "prefixItems",
+    "minProperties",
+    "maxProperties",
+];
+/// String formats structured outputs support.
+const FORMATS: [&str; 10] = [
+    "date-time",
+    "time",
+    "date",
+    "duration",
+    "email",
+    "hostname",
+    "uri",
+    "ipv4",
+    "ipv6",
+    "uuid",
+];
+/// Refuses a Gemini response schema, before or after conversion to JSON Schema, that uses what
+/// Anthropic structured outputs cannot hold: an [`UNSTRUCTURED`] keyword, `minItems` above 1,
+/// `additionalProperties` other than false, a `format` outside [`FORMATS`], an enum value that
+/// is an object or array, or an external `$ref`. Keywords are refused, never stripped.
+fn structured(doc: &Document, schema: usize) -> Result<()> {
+    if !matches!(doc.node(schema)?.value, Value::Object) {
+        return Ok(());
+    }
+    for member in doc.children(schema)? {
+        let name = doc.node(member)?.name.ok_or(Error::Schema)?;
+        let is = |key: &str| doc.name_is(name, key);
+        let one_of = |values: &[&str]| -> Result<bool> {
+            values
+                .iter()
+                .try_fold(false, |yes, v| Ok(yes || doc.string_is(member, v)?))
+        };
+        let refused = if UNSTRUCTURED
+            .iter()
+            .try_fold(false, |yes, key| Ok::<_, Error>(yes || is(key)?))?
+        {
+            true
+        } else if is("minItems")? {
+            match doc.unsigned(member) {
+                Ok(n) => n > 1,
+                Err(_) => !one_of(&["0", "1"])?,
+            }
+        } else if is("additionalProperties")? {
+            !matches!(doc.node(member)?.value, Value::Bool(false))
+        } else if is("format")? {
+            !one_of(&FORMATS)?
+        } else if is("enum")? {
+            let mut complex = false;
+            for value in doc.children(member)? {
+                complex |= matches!(doc.node(value)?.value, Value::Object | Value::Array);
+            }
+            complex
+        } else if is("$ref")? {
+            doc.chars(member)?.next_scalar()? != Some('#')
+        } else {
+            false
+        };
+        if refused {
+            return Err(Error::Unsupported);
+        }
+        let map = is("properties")? || is("$defs")? || is("definitions")? || is("patternProperties")?;
+        let list = is("anyOf")? || is("allOf")? || is("oneOf")?;
+        if map || list || (is("items")? && matches!(doc.node(member)?.value, Value::Array)) {
+            for child in doc.children(member)? {
+                structured(doc, child)?;
+            }
+        } else if is("items")? || is("not")? {
+            structured(doc, member)?;
         }
     }
     Ok(())
@@ -258,7 +345,7 @@ fn tools(doc: &Document, root: usize, x: usize) -> Result<()> {
             super::string(doc, doc.required(function, "name")?)?;
             let gemini = json_schema::from_gemini(doc)?;
             if gemini {
-                json_schema::check_function(doc, function)?;
+                json_schema::check_function(doc, function, false)?;
             }
             let schema = match doc.member(function, "parameters")? {
                 Some(schema) => schema,
