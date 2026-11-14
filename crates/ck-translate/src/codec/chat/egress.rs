@@ -225,10 +225,11 @@ impl Egress {
             && let Some(name) = doc.member(root, "name")?
             && doc.string_is(name, "chat.media.attributes")?
         {
-            if let (Some(projection), _) = self.reduction.project(owner, Kind::Opaque, doc)? {
+            if let (Some(mut projection), _) = self.reduction.project(owner, Kind::Opaque, doc)? {
                 if self.mode == BodyMode::Buffered {
                     self.reduction.fold(projection)?;
                 } else {
+                    assign_roles(&mut self.roles, &mut projection)?;
                     output(encode::scratch(owner, |e| {
                         e.bytes(b"data: ")?;
                         projection.write(projection.root(), e)?;
@@ -497,8 +498,8 @@ fn track_finishes(finishes: &mut Table<(u64, bool)>, projection: &Document) -> R
     Ok(())
 }
 
-/// Gives each choice's first delivered delta the `role` and removes it from later ones: the
-/// SDK accumulators concatenate a repeated role.
+/// Gives each choice's first delivered delta the assistant `role`, replacing a null one, and
+/// removes it from later ones: the SDK accumulators concatenate a repeated role.
 fn assign_roles(roles: &mut Table<u64>, projection: &mut Document) -> Result<()> {
     let Some(choices) = projection.member(projection.root(), "choices")? else {
         return Ok(());
@@ -514,9 +515,7 @@ fn assign_roles(roles: &mut Table<u64>, projection: &mut Document) -> Result<()>
             projection.remove(delta, "role")?;
         } else {
             roles.push(index)?;
-            if projection.member(delta, "role")?.is_none() {
-                projection.set(delta, "role", Value::Text("assistant"))?;
-            }
+            projection.set(delta, "role", Value::Text("assistant"))?;
         }
     }
     Ok(())

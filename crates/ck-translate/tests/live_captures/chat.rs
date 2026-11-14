@@ -79,3 +79,50 @@ fn chat_stream_from_another_protocol_carries_only_chat_chunks() {
         }
     }
 }
+
+/// The deltas of a Chat stream's first choice, and the positions of those carrying a `role`.
+fn chat_deltas(raw: &[u8]) -> (Vec<Value>, Vec<usize>) {
+    let deltas: Vec<Value> = events(raw)
+        .into_iter()
+        .filter_map(|event| event["choices"].get(0).map(|choice| choice["delta"].clone()))
+        .collect();
+    let roles = (0..deltas.len()).filter(|&i| deltas[i].get("role").is_some()).collect();
+    (deltas, roles)
+}
+
+#[test]
+fn chat_first_delta_with_a_null_role_carries_the_assistant_role() {
+    let input = concat!(
+        "data: {\"id\":\"chatcmpl-review\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":null}}]}\n\n",
+        "data: {\"id\":\"chatcmpl-review\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let streamed = run(
+        Source::Chat,
+        BodyMode::Streaming,
+        input.as_bytes(),
+        Client::Chat,
+        BodyMode::Streaming,
+    );
+    let (deltas, roles) = chat_deltas(&streamed);
+    assert_eq!(roles, [0], "{deltas:?}");
+    assert_eq!(deltas[0]["role"], "assistant", "{deltas:?}");
+}
+
+#[test]
+fn chat_role_from_a_buffered_audio_message_leads_however_the_body_is_split() {
+    let input = br#"{"id":"chatcmpl-review","model":"model","created":1,"object":"chat.completion","choices":[{"index":0,"message":{"audio":{"data":"","id":"audio-review","expires_at":1,"transcript":""},"role":"assistant"},"finish_reason":"stop"}]}"#;
+    for fragment in [1, 37] {
+        let streamed = run_in(
+            fragment,
+            Source::Chat,
+            BodyMode::Buffered,
+            input,
+            Client::Chat,
+            BodyMode::Streaming,
+        );
+        let (deltas, roles) = chat_deltas(&streamed);
+        assert_eq!(roles, [0], "{fragment}: {deltas:?}");
+        assert_eq!(deltas[0]["role"], "assistant", "{fragment}: {deltas:?}");
+    }
+}
