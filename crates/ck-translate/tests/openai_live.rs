@@ -397,14 +397,18 @@ fn gemini_failures_keep_the_parts_queued_behind_an_unfinished_call() {
     }
 }
 
+/// The upstream's own `error` event is a valid end of the stream: every client ends with an
+/// error, and no client sees the upstream's code or message.
 #[test]
 fn responses_error_event_ends_every_client_with_an_upstream_failure() {
     assert!(std::str::from_utf8(OPENAI_ERROR).unwrap().contains("event: error"));
     for client in CLIENTS {
         let (out, failure) = decode(Upstream::Responses, OPENAI_ERROR, BodyMode::Streaming, 61, client);
-        assert!(failure.is_some(), "{client:?}");
+        assert!(failure.is_none(), "{client:?}: {failure:?}");
         let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("error"), "{client:?}: {text}");
         assert!(!text.contains("credit_balance_exhausted"), "{client:?}: {text}");
+        assert!(!text.contains("platform.openai.com"), "{client:?}: {text}");
         if let Client::Responses(downstream) = client {
             assert_eq!(final_response(&out, downstream)["status"], "failed");
         }

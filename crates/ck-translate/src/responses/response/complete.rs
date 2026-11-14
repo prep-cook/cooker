@@ -103,6 +103,25 @@ impl State {
         Err(Error::Schema)
     }
 
+    /// Ends the stream with the upstream's own `error` event as the canonical upstream failure.
+    /// Its code, message and `type` are the gateway's sanitized values; no upstream detail
+    /// passes. The `type` marks a failure the upstream reported itself.
+    pub(super) fn upstream_error(&mut self, owner: &mut Writer) -> Result<()> {
+        self.emitter.emit(
+            owner,
+            Kind::Error,
+            Scope::default(),
+            |e| {
+                e.bytes(b",\"code\":\"server_error\",\"status\":502,\"message\":\"Response failed\",")?;
+                e.bytes(b"\"scope\":\"upstream\",\"type\":\"server_error\"")
+            },
+            |_| Ok(()),
+        )?;
+        self.terminal = true;
+        self.errored = true;
+        Ok(())
+    }
+
     fn complete_audio(&mut self, owner: &mut Writer, doc: &Document, root: usize) -> Result<()> {
         if let Some(native) = doc.member(root, "audio")? {
             if self.audio.is_none() {

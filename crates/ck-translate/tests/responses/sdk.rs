@@ -132,24 +132,62 @@ fn native_tool_settings_and_buffered_text_survive_the_defaults() {
     }
 }
 
-/// A real OpenAI `error` event (nested `error`, no `response`) ends the client with the
-/// canonical upstream failure, as `response.failed` does: a Responses client receives a failed
-/// response and a Chat client the error chunk, never a truncated stream.
+/// A real OpenAI `error` event (nested `error`, no `response`) is the upstream's own failure:
+/// a Responses client receives the official `error` event, which the SDK raises, and a Chat
+/// client an upstream failure. Both carry the gateway's sanitized values, never upstream detail.
 #[test]
-fn openai_error_event_fails_the_client_response() {
+fn openai_error_event_reaches_clients_as_a_sanitized_upstream_failure() {
     let created = json!({"type":"response.created","response":{"id":"resp_1","object":"response","created_at":1,"model":"m","status":"in_progress","output":[]},"sequence_number":0});
-    let error = json!({"type":"error","error":{"type":"insufficient_quota","code":"credit_balance_exhausted","message":"no credits","param":null},"sequence_number":1});
-    let input = format!("event: response.created\ndata: {created}\n\nevent: error\ndata: {error}\n\n");
-    let stream = String::from_utf8(to_client(input.as_bytes(), "responses", BodyMode::Streaming)).unwrap();
-    let last = super::cross::client_events(stream.as_bytes()).pop().unwrap();
-    assert_eq!(last["type"], "response.failed");
-    assert_eq!(last["response"]["status"], "failed");
-    assert_eq!(last["response"]["error"]["code"], "server_error");
-    let body: Value = serde_json::from_slice(&to_client(input.as_bytes(), "responses", BodyMode::Buffered)).unwrap();
-    assert_eq!(body["status"], "failed");
-    assert_eq!(body["id"], "resp_1");
-    let chat: Value = serde_json::from_slice(&to_client(input.as_bytes(), "chat", BodyMode::Buffered)).unwrap();
-    assert_eq!(chat["error"]["status"], 502);
+    let error =
+        json!({"type":"insufficient_quota","code":"credit_balance_exhausted","message":"no credits","param":null});
+    let event = json!({"type":"error","error":error,"sequence_number":1});
+    let failed = json!({"type":"response.failed","response":{"id":"resp_1","object":"response","created_at":1,"model":"m","status":"failed","output":[],"error":error},"sequence_number":2});
+    let input = format!(
+        "event: response.created\ndata: {created}\n\nevent: error\ndata: {event}\n\nevent: response.failed\ndata: {failed}\n\n"
+    );
+    let sanitized = json!({"type":"server_error","code":"server_error","message":"Response failed"});
+    for (client, mode) in [
+        ("responses", BodyMode::Streaming),
+        ("responses", BodyMode::Buffered),
+        ("chat", BodyMode::Streaming),
+        ("chat", BodyMode::Buffered),
+    ] {
+        let text = String::from_utf8(to_client(input.as_bytes(), client, mode)).unwrap();
+        for detail in [
+            "credit_balance_exhausted",
+            "insufficient_quota",
+            "no credits",
+            "invalid_input",
+        ] {
+            assert!(!text.contains(detail), "{client} {mode:?}: {text}");
+        }
+        match (client, mode) {
+            ("responses", BodyMode::Streaming) => {
+                assert!(text.contains("event: error\n"), "{text}");
+                let events = super::cross::client_events(text.as_bytes());
+                let official = events.iter().find(|e| e["type"] == "error").unwrap();
+                assert_eq!(official["error"], sanitized);
+                let last = events.last().unwrap();
+                assert_eq!(last["type"], "response.failed");
+                assert_eq!(last["response"]["error"]["code"], "server_error");
+            }
+            ("responses", _) => {
+                let body: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(
+                    (&body["status"], &body["error"]["code"]),
+                    (&json!("failed"), &json!("server_error"))
+                );
+            }
+            _ => {
+                let line = text.lines().rev().find(|l| l.contains("\"error\"")).unwrap();
+                let chat: Value = serde_json::from_str(line.strip_prefix("data: ").unwrap_or(line)).unwrap();
+                assert_eq!(
+                    chat["error"],
+                    json!({"code":"server_error","message":"Response failed","status":502})
+                );
+            }
+        }
+    }
 }
 
 /// Members under cooker's reserved `x_ck` prefix never reach a client, whatever their origin.

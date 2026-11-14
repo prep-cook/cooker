@@ -62,6 +62,7 @@ impl Ingress {
                 items: Table::new(owner)?,
                 usage: Usage::default(),
                 terminal: false,
+                errored: false,
                 next_media: 0,
                 audio: None,
             },
@@ -84,7 +85,8 @@ impl codec::ResponseIngress for Ingress {
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
         // SSE permits further blank lines after the terminal event.
         let blank = self.scanner.is_some() && bytes.iter().all(|b| matches!(b, b'\r' | b'\n'));
-        crate::boundary::enter(self.owner, owner, self.failed || (self.state.terminal && !blank))?;
+        let ignored = blank || self.state.errored;
+        crate::boundary::enter(self.owner, owner, self.failed || (self.state.terminal && !ignored))?;
         if self.state.terminal {
             return Ok(());
         }
@@ -108,7 +110,10 @@ impl codec::ResponseIngress for Ingress {
             if let Some(scanner) = &mut self.scanner {
                 let source = self.source.as_ref().ok_or(Error::Closed)?;
                 let state = &mut self.state;
-                scanner.finish(source, |event| state.event(owner, source, event))?;
+                // Input after an upstream error is dropped unread, possibly mid-event.
+                if !state.errored {
+                    scanner.finish(source, |event| state.event(owner, source, event))?;
+                }
                 if !state.terminal {
                     return Err(Error::Truncated);
                 }
@@ -157,6 +162,9 @@ struct State {
     items: Table<Item>,
     usage: Usage,
     terminal: bool,
+    /// The upstream's `error` event ended the stream; the `response.failed` that repeats it,
+    /// and anything after, is ignored.
+    errored: bool,
     next_media: u64,
     audio: Option<super::audio::Ingress>,
 }

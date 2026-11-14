@@ -118,7 +118,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         }
         match kind {
             Kind::Heartbeat => return Ok(()),
-            Kind::Error | Kind::Cancelled => return self.failed(owner, output),
+            Kind::Error | Kind::Cancelled => return self.failed(owner, kind, incoming, output),
             Kind::ResponseStart => return self.response_start(incoming),
             Kind::Done => return self.done(owner, output),
             Kind::Opaque => return self.opaque(owner, incoming, output),

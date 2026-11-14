@@ -155,7 +155,7 @@ The registry is closed for core behavior, open for opaque carriage: an unrecogni
 | `opaque` | `{name?: string, format: "json"\|"text", value: JSON}` | Source event/field without a registered semantic mapping. |
 | `heartbeat` | `{}` | Progress/liveness, never token usage or successful completion. |
 | `done` | `{}` | Successful logical stream termination, after final usage and closes. |
-| `error` | `{code: string, status: uint, message: string, scope: "client"\|"upstream"\|"resource"}` | Terminal sanitized failure; source detail remains restricted provenance. |
+| `error` | `{code: string, status: uint, message: string, scope: "client"\|"upstream"\|"resource", type?: string}` | Terminal sanitized failure; source detail remains restricted provenance. `type` marks a failure the upstream reported itself, which a Responses client receives as the `error` event; its value is sanitized too. |
 | `cancelled` | `{reason: "client_cancel"\|"shutdown"}` | Terminal cancellation; no fabricated success. A client disconnect is not a cancellation (§6.6), and expiry or eviction ends a stream with `error` `stream.gone`, not `cancelled`. |
 
 Error codes this specification registers: `stream.gone` (status 410, scope `resource`) means the stream expired, was evicted, never existed or belongs to another identity (§6.2, §6.6); `stream.storage_exhausted` (status 503, scope `resource`) means a stream, pool or metadata limit, or ENOSPC, refused an allocation (§6.4, G7); `stream.producer_lost` (status 502, scope `upstream`) means the stream's producer ended without a terminal record: its writer was dropped without finishing the stream (§6.2).

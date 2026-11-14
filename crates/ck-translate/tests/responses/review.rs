@@ -366,25 +366,34 @@ fn unknown_events_are_preserved_not_failed() {
         Operation::Generate,
     );
     assert!(events.iter().any(|e| e["format"] == "text" && e["value"] == "not-json"));
-    // A known event with broken data and an untyped error object still fail the stream.
-    for input in [
-        format!("event: response.output_text.delta\ndata: not-json\n\ndata: {completed}\n\n"),
-        format!("data: {}\n\ndata: {completed}\n\n", json!({"error":{"message":"m"}})),
-    ] {
-        let mut m = Mapped::new();
-        let mut ingress = responses::response::Ingress::new(
-            &mut m.writer,
-            identity(Direction::Response),
-            Operation::Generate,
-            BodyMode::Streaming,
-            1024 * 1024,
-        )
-        .unwrap();
-        let result = ingress
-            .advance(&mut m.writer, input.as_bytes())
-            .and_then(|()| ingress.finish(&mut m.writer));
-        assert!(result.is_err(), "{input}");
-    }
+    // An untyped error object ends the response failed, not completed.
+    let input = format!("data: {}\n\ndata: {completed}\n\n", json!({"error":{"message":"m"}}));
+    let (out, _) = response(
+        input.as_bytes(),
+        BodyMode::Streaming,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    let body: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        (&body["status"], &body["error"]["message"]),
+        (&json!("failed"), &json!("Response failed"))
+    );
+    // A known event with broken data still fails the stream.
+    let input = format!("event: response.output_text.delta\ndata: not-json\n\ndata: {completed}\n\n");
+    let mut m = Mapped::new();
+    let mut ingress = responses::response::Ingress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        BodyMode::Streaming,
+        1024 * 1024,
+    )
+    .unwrap();
+    let result = ingress
+        .advance(&mut m.writer, input.as_bytes())
+        .and_then(|()| ingress.finish(&mut m.writer));
+    assert!(result.is_err(), "{input}");
 }
 
 /// Runs streamed `records` through Responses ingress alone; returns the outcome.
