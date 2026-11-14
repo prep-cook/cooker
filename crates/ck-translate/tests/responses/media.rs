@@ -93,20 +93,9 @@ fn generated_images_use_media_data_and_preserve_partial_boundaries() {
             };
             assert_eq!(projected["output"][0]["result"], encoded);
             assert_eq!(projected["output"][0]["output_format"], "png");
-            if mode == BodyMode::Streaming && downstream == BodyMode::Buffered {
-                let carrier = projected["x_ck_opaque"].as_array().unwrap();
-                let preview = carrier
-                    .iter()
-                    .find(|entry| entry["type"] == "response.image_generation_call.partial_image")
-                    .unwrap();
-                assert_eq!(preview["partial_image_index"], 3);
-                assert_eq!(preview["partial_image_b64"], "AQID");
-                let native = carrier
-                    .iter()
-                    .find(|entry| entry["name"] == "responses.fields" && entry["value"].get("x_ck_opaque").is_some())
-                    .unwrap();
-                assert_eq!(native["value"]["x_ck_opaque"], json!([]));
-            }
+            // A buffered response has no member for previews, and `x_ck_*` is internal even when
+            // the upstream sent a member of that name.
+            assert!(projected.get("x_ck_opaque").is_none());
         }
     }
 }

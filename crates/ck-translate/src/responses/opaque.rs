@@ -4,18 +4,11 @@ use crate::codec::{
     encode::Encoder,
 };
 
-pub(super) fn write(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
+/// Writes a Responses source's unknown event as that native event. A JSON object event carries
+/// `sequence` as its `sequence_number`, so the client's numbering stays contiguous.
+pub(super) fn write(doc: &Document, sequence: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
     let root = doc.root();
     let x = doc.required(root, "x_ck")?;
-    if super::is(doc, root, "name", "responses.fields")? {
-        e.bytes(b"event: x_ck_opaque\ndata: {\"type\":\"x_ck_opaque\",\"name\":\"responses.fields\",\"value\":")?;
-        doc.write(doc.required(root, "value")?, e)?;
-        if let Some(source) = doc.member(x, "source")? {
-            e.bytes(b",\"source\":")?;
-            doc.write(source, e)?;
-        }
-        return e.bytes(b"}\n\n");
-    }
     if let Some(source) = doc.member(x, "source")?
         && let Some(fields) = doc.member(source, "sse")?
     {
@@ -49,6 +42,20 @@ pub(super) fn write(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
                 c => e.bytes(c.encode_utf8(&mut [0; 4]).as_bytes())?,
             }
         }
+    } else if matches!(doc.node(value)?.value, Value::Object) {
+        e.bytes(b"{\"sequence_number\":")?;
+        e.unsigned(sequence)?;
+        for child in doc.children(value)? {
+            let name = doc.node(child)?.name.ok_or(Error::Schema)?;
+            if doc.name_is(name, "sequence_number")? {
+                continue;
+            }
+            e.bytes(b",")?;
+            doc.write_name(name, e)?;
+            e.bytes(b":")?;
+            doc.write(child, e)?;
+        }
+        e.bytes(b"}")?;
     } else {
         doc.write(value, e)?;
     }
@@ -62,23 +69,6 @@ fn line(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
         }
         e.bytes(c.encode_utf8(&mut [0; 4]).as_bytes())?;
     }
-    Ok(())
-}
-
-/// Buffered Responses has no event sequence; the codec defines a non-control carrier.
-pub(super) fn retain(doc: &mut Document, incoming: Document) -> Result<()> {
-    let event = doc.absorb(incoming)?;
-    let entry = doc.add(None, Value::Object)?;
-    let array = match doc.member(doc.root(), "x_ck_opaque")? {
-        Some(n) => n,
-        None => doc.set(doc.root(), "x_ck_opaque", Value::Array)?,
-    };
-    doc.append(array, entry)?;
-    for name in ["name", "format", "value"] {
-        super::move_field(doc, event, name, entry, name)?;
-    }
-    let x = doc.required(event, "x_ck")?;
-    super::move_field(doc, x, "source", entry, "source")?;
     Ok(())
 }
 

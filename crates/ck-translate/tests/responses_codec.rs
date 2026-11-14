@@ -32,6 +32,8 @@ mod response;
 mod review;
 #[path = "responses/schema.rs"]
 mod schema;
+#[path = "responses/sdk.rs"]
+mod sdk;
 // Test-only inclusion until the framework owner declares the production module.
 // Shared by every boundary codec; this protocol uses a subset.
 #[allow(dead_code)]

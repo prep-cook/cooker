@@ -121,9 +121,8 @@ fn write_details(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result
 }
 
 /// Responses usage for canonical snapshot `usage`: a Responses source's native value, or the
-/// mapped counts. The snapshot itself replaces the one retained in the `usage.snapshot` opaque
-/// carrier, whose value slot `retained` tracks.
-pub(super) fn project(doc: &mut Document, usage: usize, retained: &mut Option<usize>) -> Result<usize> {
+/// mapped counts.
+pub(super) fn project(doc: &mut Document, usage: usize) -> Result<usize> {
     if let Some(native) = doc.member(usage, "native")?
         && super::is(doc, native, "protocol", "responses")?
     {
@@ -169,21 +168,6 @@ pub(super) fn project(doc: &mut Document, usage: usize, retained: &mut Option<us
             }
         }
     }
-    let slot = match *retained {
-        Some(slot) => slot,
-        None => {
-            let carrier = match doc.member(doc.root(), "x_ck_opaque")? {
-                Some(carrier) => carrier,
-                None => doc.set(doc.root(), "x_ck_opaque", Value::Array)?,
-            };
-            let entry = doc.add(None, Value::Object)?;
-            doc.append(carrier, entry)?;
-            doc.set(entry, "name", Value::Text("usage.snapshot"))?;
-            doc.set(entry, "format", Value::Text("json"))?;
-            *retained.insert(doc.set(entry, "value", Value::Null)?)
-        }
-    };
-    doc.transplant(slot, usage)?;
     Ok(result)
 }
 

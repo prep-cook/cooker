@@ -33,8 +33,6 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     diagnostic: F,
     images: Table<super::image::Projection>,
     audio: Table<super::audio::Projection>,
-    /// Value slot of the retained canonical usage snapshot in the opaque carrier.
-    usage_snapshot: Option<usize>,
     /// A message item from a source without native items, appended but not yet announced: it
     /// follows any reasoning item split out of it, and is dropped if it stays empty.
     pending: Option<usize>,
@@ -69,7 +67,6 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             diagnostic,
             images: Table::new(owner)?,
             audio: Table::new(owner)?,
-            usage_snapshot: None,
             pending: None,
             owed: false,
         })
@@ -358,13 +355,19 @@ fn write_item(doc: &Document, item: usize, e: &mut Encoder<'_, '_>) -> Result<()
     }
     e.bytes(b"}")
 }
+/// Writes the response object without the internal `x_ck_opaque` carrier, which no client sees.
 fn write_response(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"{")?;
-    for (i, field) in doc.children(doc.root())?.enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for field in doc.children(doc.root())? {
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        if doc.name_is(name, "x_ck_opaque")? {
+            continue;
+        }
+        if !first {
             e.bytes(b",")?;
         }
-        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        first = false;
         doc.write_name(name, e)?;
         e.bytes(b":")?;
         if doc.name_is(name, "output")? {

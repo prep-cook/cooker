@@ -178,32 +178,29 @@ fn full_reasoning_and_summary_have_independent_block_identity() {
 }
 
 #[test]
-fn native_extension_fields_use_noncontrol_carriers_not_incomplete_native_events() {
-    let input=b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\nid: source-id\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":41,\"output_index\":0,\"item\":{\"id\":\"i\",\"type\":\"message\"},\"vendor\":{\"x_ck\":{\"seq\":900}}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":42,\"vendor\":null,\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"id\":\"i\",\"type\":\"message\",\"content\":[]}]}}\n\n";
+fn native_extension_fields_stay_internal_and_unknown_events_pass_natively() {
+    let input=b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\nid: source-id\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":41,\"output_index\":0,\"item\":{\"id\":\"i\",\"type\":\"message\"},\"vendor\":{\"x_ck\":{\"seq\":900}}}\n\nevent: response.vendor_note\ndata: {\"type\":\"response.vendor_note\",\"sequence_number\":7,\"note\":\"n\"}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":42,\"vendor\":null,\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"id\":\"i\",\"type\":\"message\",\"content\":[]}]}}\n\n";
     let (output, _) = response(input, BodyMode::Streaming, BodyMode::Streaming, Operation::Generate);
-    let events: Vec<Value> = std::str::from_utf8(&output)
-        .unwrap()
+    let text = std::str::from_utf8(&output).unwrap();
+    // Extension members of mapped events have no place in the client's events (§3.7).
+    assert!(!text.contains("x_ck"), "{text}");
+    assert!(!text.contains("vendor\""), "{text}");
+    let names: Vec<_> = text.lines().filter_map(|line| line.strip_prefix("event: ")).collect();
+    let events: Vec<Value> = text
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert!(
-        events
-            .iter()
-            .filter(|event| event["type"] == "response.output_item.added")
-            .all(|event| event["item"].is_object())
-    );
-    let carrier = events
+    assert_eq!(names.len(), events.len());
+    for (at, (name, event)) in names.iter().zip(&events).enumerate() {
+        assert_eq!(event["type"], *name);
+        assert_eq!(event["sequence_number"], at);
+    }
+    let note = events
         .iter()
-        .find(|event| event["type"] == "x_ck_opaque" && event["source"]["sequence"] == 41)
+        .find(|event| event["type"] == "response.vendor_note")
         .unwrap();
-    assert_eq!(carrier["value"]["vendor"]["x_ck"]["seq"], 900);
-    assert_eq!(carrier["source"]["event"], "response.output_item.added");
-    let terminal = events
-        .iter()
-        .find(|event| event["type"] == "x_ck_opaque" && event["source"]["sequence"] == 42)
-        .unwrap();
-    assert!(terminal["value"].get("vendor").unwrap().is_null());
+    assert_eq!(note["note"], "n");
     assert_eq!(events.last().unwrap()["type"], "response.completed");
 }
 

@@ -38,15 +38,9 @@ fn audio_fragments_transcript_and_buffered_extension_preserve_exact_payloads() {
                 if upstream == BodyMode::Buffered {
                     assert_eq!(output["audio"], native["audio"]);
                 } else {
-                    let audio = output["x_ck_opaque"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|entry| entry["type"] == "response.audio")
-                        .unwrap();
-                    assert_eq!(audio["data"], "AAECAwQF");
-                    assert_eq!(audio["transcript"], "hello é");
-                    assert!(audio.get("mime_type").is_none());
+                    // Streamed audio has no member in a buffered response; the internal carrier
+                    // that holds it is never written to the client.
+                    assert!(output.get("x_ck_opaque").is_none());
                 }
             } else {
                 assert_streamed_audio(&output);

@@ -293,7 +293,7 @@ fn lifecycle_status_and_fields_survive_a_terminal_snapshot_without_them() {
 }
 
 #[test]
-fn late_audio_metadata_reaches_the_client() {
+fn late_audio_metadata_stays_out_of_buffered_clients() {
     let audio = json!({"data":"AAEC","mime_type":"audio/wav","expires_at":12,"vendor":7});
     let records = [
         json!({"type":"response.audio.delta","delta":"AAEC"}),
@@ -306,10 +306,9 @@ fn late_audio_metadata_reaches_the_client() {
         BodyMode::Buffered,
         Operation::Generate,
     );
+    // Streamed audio has no member in a buffered response; its internal carrier stays internal.
     let out = String::from_utf8(out).unwrap();
-    for field in ["\"mime_type\":\"audio/wav\"", "\"expires_at\":12", "\"vendor\":7"] {
-        assert!(out.contains(field), "{field}: {out}");
-    }
+    assert!(!out.contains("x_ck") && !out.contains("audio/wav"), "{out}");
     // Audio that the snapshot starts carries its metadata in `media.start`; no second record.
     let body = json!({"id":"r","status":"completed","output":[],"audio":audio});
     let (_, events) = response(
