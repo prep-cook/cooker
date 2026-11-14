@@ -57,6 +57,7 @@ macro_rules! registered {
     };
 }
 
+pub mod anthropic;
 mod antigravity_chat;
 mod antigravity_claude;
 mod antigravity_claude_response;
@@ -65,6 +66,7 @@ mod antigravity_interactions;
 mod antigravity_responses;
 mod apply_patch;
 pub mod apply_patch_responses;
+mod boundary;
 mod claude_chat_request;
 mod claude_chat_response;
 mod claude_gemini;
@@ -81,11 +83,13 @@ mod codex_gemini;
 mod codex_interactions;
 mod codex_responses;
 mod common;
-mod gemini;
+#[path = "gemini/boundary.rs"]
+pub mod gemini;
 mod gemini_chat_request;
 mod gemini_chat_response;
 mod gemini_claude;
 mod gemini_claude_response;
+mod gemini_gemini;
 mod gemini_interactions;
 mod gemini_interactions_response;
 mod gemini_responses;
@@ -102,6 +106,7 @@ mod openai_interactions_response;
 mod openai_responses;
 mod openai_responses_response;
 mod replay_cache;
+pub mod responses;
 mod responses_interactions;
 mod responses_interactions_response;
 mod responses_tools;
@@ -288,7 +293,7 @@ fn registered(client: Format, upstream: Format) -> Option<&'static Registered> {
         (Format::OpenAIResponse, Format::Codex) => Some(&codex_responses::PAIR),
         (Format::OpenAIResponse, Format::Claude) => Some(&claude_responses_response::PAIR),
         (Format::Claude, Format::OpenAI) => Some(&openai_claude::PAIR),
-        (Format::Gemini, Format::Gemini) => Some(&gemini::PAIR),
+        (Format::Gemini, Format::Gemini) => Some(&gemini_gemini::PAIR),
         (Format::OpenAI, Format::Gemini) => Some(&gemini_chat_request::PAIR),
         (Format::Claude, Format::Gemini) => Some(&gemini_claude::PAIR),
         (Format::OpenAI, Format::Codex) => Some(&codex_chat_request::PAIR),

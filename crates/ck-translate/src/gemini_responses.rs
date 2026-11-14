@@ -18,8 +18,8 @@ use crate::claude_responses::{extract_call_id, normalize_tool_call_outputs, qual
 use crate::common::{
     UserTurnDrops, file_ext, go_lower, normalize_openai_file_data, sanitize_function_name, trim_space,
 };
-use crate::gemini::{set_function_response_raw, set_function_response_result};
 use crate::gemini_chat_request::{content_node as content, text_part};
+use crate::gemini_gemini::{set_function_response_raw, set_function_response_result};
 use crate::gemini_web_search as ws;
 use crate::responses_tools::{
     client_tool_search_name, gemini_function_declarations, is_client_tool_search_item, map_tool_name,
@@ -1703,8 +1703,8 @@ pub(crate) fn merge_adjacent_user_contents(contents: Vec<Vec<u8>>) -> Vec<Vec<u8
         if let Some(last) = merged.last_mut()
             && gj::get(last, "role").bytes().as_ref() == b"user"
             && gj::get(&content, "role").bytes().as_ref() == b"user"
-            && !crate::gemini::has_function_response(last)
-            && !crate::gemini::has_function_response(&content)
+            && !crate::gemini_gemini::has_function_response(last)
+            && !crate::gemini_gemini::has_function_response(&content)
         {
             let mut combined: Vec<Vec<u8>> = gj::get(last, "parts").array().iter().map(|p| p.raw.to_vec()).collect();
             combined.extend(parts.array().iter().map(|p| p.raw.to_vec()));
@@ -1910,7 +1910,7 @@ pub(crate) fn convert(model: &str, raw: &[u8]) -> Result<Vec<u8>, crate::Error> 
         }
     }
 
-    let mut result = crate::gemini::attach_default_safety_settings(out, "safetySettings");
+    let mut result = crate::gemini_gemini::attach_default_safety_settings(out, "safetySettings");
     if native {
         result = sig::sanitize_gemini_request_thought_signatures(&result, "contents");
     }

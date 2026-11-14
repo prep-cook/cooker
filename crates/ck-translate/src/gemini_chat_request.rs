@@ -4,8 +4,8 @@
 use crate::{
     Registered,
     common::{self, UserTurnDrops, gemini_part_is_sendable, go_lower, sanitize_function_name, trim_space},
-    gemini::attach_default_safety_settings,
     gemini_chat_response as response,
+    gemini_gemini::attach_default_safety_settings,
 };
 use ck_wire::json::{self as gj, Kind, Res};
 use std::collections::{HashMap, HashSet};

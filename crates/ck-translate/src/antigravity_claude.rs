@@ -16,10 +16,10 @@ use crate::common::{
     UserTurnDrops, align_claude_tool_results, claude_message_system_reminder_text, gemini_part_is_sendable, go_lower,
     is_claude_code_attribution_text, thinking_text, trim_space,
 };
-use crate::gemini::{
+use crate::gemini_chat_request::content_node as content;
+use crate::gemini_gemini::{
     attach_default_safety_settings, merge_adjacent_contents, set_function_response_raw, set_function_response_result,
 };
-use crate::gemini_chat_request::content_node as content;
 use crate::replay_cache;
 use crate::responses_tools::{map_sanitized_function_name, sanitized_function_name_map};
 
@@ -1270,7 +1270,7 @@ fn function_tools(raw: &[u8], names: &HashMap<Vec<u8>, Vec<u8>>) -> Option<Vec<u
 /// common.SplitGeminiFunctionResponseTurns: function responses get their own user turn,
 /// and after a model turn with calls, response turns come before other user turns.
 pub(crate) fn split_function_response_turns(contents: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-    use crate::gemini::has_function_response;
+    use crate::gemini_gemini::has_function_response;
     if contents.is_empty() {
         return contents;
     }

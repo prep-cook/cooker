@@ -20,7 +20,7 @@ pub static PAIR: Registered = registered!(
     request: |ctx, body| convert(ctx.model, body, ctx.stream),
     non_stream: non_stream,
     go_stream: go_stream,
-    token_count: Some(crate::gemini::token_count),
+    token_count: Some(crate::gemini_gemini::token_count),
 );
 
 fn string(res: &Res<'_>) -> Vec<u8> {

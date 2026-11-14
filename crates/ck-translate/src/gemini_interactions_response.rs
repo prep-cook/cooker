@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use ck_wire::json::{self as gj, Kind, Res};
 
 use crate::common::{format_rfc3339_utc, now_nanos, now_unix, sse_event, trim_space};
-use crate::gemini::{set_function_response_raw, set_function_response_result};
+use crate::gemini_gemini::{set_function_response_raw, set_function_response_result};
 use crate::gemini_interactions::{content_part_to_gemini, first_existing, inline_to_interactions_content, text_part};
 use crate::stream::GoStream;
 use crate::{Error, ResponseCtx};

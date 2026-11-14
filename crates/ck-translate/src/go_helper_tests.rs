@@ -97,7 +97,7 @@ fn replay(fun: &str, a: &[Value], r: &[Value]) -> Option<(Vec<u8>, Vec<u8>)> {
         "SystemReminderText" => (crate::common::system_reminder_text(&arg(0)), want()),
         "RequestModelName" => (crate::common::request_model_name(&arg(0), &arg(1)), want()),
         "ContainsJSONRef" => (
-            bool_out(crate::gemini::contains_json_ref(&gj::parse(&arg(0)))),
+            bool_out(crate::gemini_gemini::contains_json_ref(&gj::parse(&arg(0)))),
             flag(&r[0]),
         ),
         "BuildClaudeStructuredOutputInstruction" => (
@@ -226,12 +226,15 @@ fn replay(fun: &str, a: &[Value], r: &[Value]) -> Option<(Vec<u8>, Vec<u8>)> {
             )
         }
         "MergeAdjacentGeminiContents" => (
-            list_out(&crate::gemini::merge_adjacent_contents(list(&a[0]))),
+            list_out(&crate::gemini_gemini::merge_adjacent_contents(list(&a[0]))),
             list_out(&list(&r[0])),
         ),
-        "ContentHasGeminiFunctionResponse" => (bool_out(crate::gemini::has_function_response(&arg(0))), flag(&r[0])),
+        "ContentHasGeminiFunctionResponse" => (
+            bool_out(crate::gemini_gemini::has_function_response(&arg(0))),
+            flag(&r[0]),
+        ),
         "ReorderGeminiUserParts" => (
-            list_out(&crate::gemini::reorder_user_parts(list(&a[0]))),
+            list_out(&crate::gemini_gemini::reorder_user_parts(list(&a[0]))),
             list_out(&list(&r[0])),
         ),
         "MergeAdjacentGeminiUserContents" => (
@@ -247,7 +250,7 @@ fn replay(fun: &str, a: &[Value], r: &[Value]) -> Option<(Vec<u8>, Vec<u8>)> {
             let value = arg(2);
             (
                 edit(arg(0), |part| {
-                    crate::gemini::set_function_response_result(part, &path, &gj::parse(&value))
+                    crate::gemini_gemini::set_function_response_result(part, &path, &gj::parse(&value))
                 }),
                 want(),
             )
