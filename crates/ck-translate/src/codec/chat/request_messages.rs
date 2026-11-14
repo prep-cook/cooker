@@ -276,6 +276,19 @@ fn string_hash(doc: &Document, node: usize, state: &impl std::hash::BuildHasher)
     Ok(hasher.finish())
 }
 
+/// The openai SDK's accumulated assistant message carries `tool_calls` and `function_call` as
+/// null; null is absent.
+fn absent_null_calls(doc: &mut Document, m: usize) -> Result<()> {
+    for key in ["tool_calls", "function_call"] {
+        if let Some(n) = doc.member(m, key)?
+            && matches!(doc.node(n)?.value, Value::Null)
+        {
+            doc.remove(m, key)?;
+        }
+    }
+    Ok(())
+}
+
 fn normalize_message(
     doc: &mut Document,
     m: usize,
@@ -284,6 +297,7 @@ fn normalize_message(
     owner: &mut Writer,
 ) -> Result<()> {
     let x = doc.required(doc.root(), "x_ck")?;
+    absent_null_calls(doc, m)?;
     super::super::request_controls::message(doc, owner, m, current_message)?;
     if let Some(content) = doc.member(m, "content")?
         && matches!(doc.node(content)?.value, Value::Array)

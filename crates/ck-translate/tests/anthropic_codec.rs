@@ -22,6 +22,8 @@ mod policy;
 // Test-only inclusion until the framework owner declares the production module.
 #[path = "../src/anthropic/mod.rs"]
 pub mod anthropic;
+// Shared by every boundary codec; this protocol uses a subset.
+#[allow(dead_code)]
 #[path = "../src/boundary.rs"]
 pub mod boundary;
 #[path = "../src/codec/mod.rs"]

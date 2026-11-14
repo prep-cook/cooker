@@ -187,7 +187,11 @@ fn x_ck(doc: &Document, root: usize) -> Result<()> {
         object(doc, thinking)?;
         optional(doc, thinking, "effort", require_string)?;
         optional(doc, thinking, "enabled", boolean)?;
-        optional(doc, thinking, "include", boolean)?;
+        // Responses `summary` arrives as a string; Chat has no summary setting.
+        optional(doc, thinking, "include", |doc, node| match doc.node(node)?.value {
+            Value::Bool(_) => Ok(()),
+            _ => Err(Error::Unsupported),
+        })?;
         optional(doc, thinking, "budget_tokens", |doc, node| {
             doc.unsigned(node).map(|_| ())
         })?;
@@ -324,6 +328,14 @@ fn tool_result(doc: &Document, part: usize) -> Result<()> {
 
 fn response_format(doc: &Document, node: usize) -> Result<()> {
     object(doc, node)?;
+    // Chat ingress keeps only these members; another protocol's schema members (Gemini's
+    // `responseSchema`) have no Chat form.
+    for member in doc.children(node)? {
+        let name = doc.node(member)?.name.ok_or(Error::Schema)?;
+        if !doc.name_is(name, "type")? && !doc.name_is(name, "json_schema")? {
+            return Err(Error::Unsupported);
+        }
+    }
     let kind = doc.required(node, "type")?;
     enumeration(doc, kind, &["text", "json_object", "json_schema"])?;
     if doc.string_is(kind, "json_schema")? {

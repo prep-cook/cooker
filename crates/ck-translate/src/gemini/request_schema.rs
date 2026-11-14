@@ -185,7 +185,8 @@ fn controls(doc: &Document) -> Result<()> {
     }
     Ok(())
 }
-/// Session, transport, provider parameters, replay, cache directives and native tools.
+/// Session, transport, provider parameters, replay, cache directives, native tools and a Chat
+/// `reasoning` object.
 fn extension(doc: &Document, x: usize) -> Result<()> {
     for key in ["session", "transport"] {
         if doc.member(x, key)?.is_some() {
@@ -219,6 +220,18 @@ fn extension(doc: &Document, x: usize) -> Result<()> {
         && !super::is(doc, x, "original_protocol", "gemini")?
     {
         return Err(Error::Unsupported);
+    }
+    // A Chat `reasoning` object maps only through its `effort`; a summary or token budget has no
+    // Gemini form and is refused rather than dropped.
+    if super::is(doc, x, "original_protocol", "chat")?
+        && let Some(thinking) = doc.member(x, "thinking")?
+        && let Some(object) = doc.member(thinking, "native")?
+    {
+        for f in doc.children(object)? {
+            if !doc.name_is(doc.node(f)?.name.ok_or(Error::Schema)?, "effort")? {
+                return Err(Error::Unsupported);
+            }
+        }
     }
     Ok(())
 }

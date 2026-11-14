@@ -221,6 +221,37 @@ fn fence_refuses(input: &Value) -> bool {
         })
 }
 
+/// Ingress gives the `generationConfig` and `thinkingConfig` members it maps their JSON names
+/// (`thinking_budget` returns as `thinkingBudget`), so the comparison ignores the spelling.
+fn json_names(value: &Value) -> Value {
+    let Value::Object(members) = value else {
+        return value.clone();
+    };
+    let camel = |name: &str| {
+        let mut words = name.split('_');
+        let first = words.next().unwrap_or_default().to_owned();
+        words.fold(first, |out, word| {
+            let mut chars = word.chars();
+            out + &chars
+                .next()
+                .map(|c| c.to_ascii_uppercase())
+                .into_iter()
+                .chain(chars)
+                .collect::<String>()
+        })
+    };
+    let member = |(name, value): (&String, &Value)| {
+        let name = camel(name);
+        let value = if name == "thinkingConfig" {
+            json_names(value)
+        } else {
+            value.clone()
+        };
+        (name, value)
+    };
+    Value::Object(members.iter().map(member).collect())
+}
+
 #[test]
 fn recorded_text_requests_keep_native_controls_and_unknown_fields() {
     let mut checked = 0;
@@ -275,7 +306,11 @@ fn recorded_text_requests_keep_native_controls_and_unknown_fields() {
             "toolConfig",
         ] {
             if let Some(value) = input.get(key) {
-                assert_eq!(&output[key], value, "{id}: {key}");
+                if key == "generationConfig" {
+                    assert_eq!(json_names(&output[key]), json_names(value), "{id}: {key}");
+                } else {
+                    assert_eq!(&output[key], value, "{id}: {key}");
+                }
             }
         }
         checked += 1;

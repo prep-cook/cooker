@@ -1,5 +1,6 @@
 use super::super::{is, member};
 use super::native::{item_type, native, typed};
+use super::reasoning::write_reasoning_options;
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Name, Value},
@@ -231,21 +232,7 @@ fn position_of(doc: &Document, entry: usize) -> Result<Option<u64>> {
 /// Writes the reasoning options, the continuation and the Responses provider parameters.
 fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     if let Some(thinking) = doc.member(x, "thinking")? {
-        e.bytes(b",\"reasoning\":{")?;
-        for (i, f) in doc.children(thinking)?.enumerate() {
-            if i > 0 {
-                e.bytes(b",")?;
-            }
-            let name = doc.node(f)?.name.ok_or(Error::Schema)?;
-            if doc.name_is(name, "include")? {
-                e.string("summary")?;
-            } else {
-                doc.write_name(name, e)?;
-            }
-            e.bytes(b":")?;
-            doc.write(f, e)?;
-        }
-        e.bytes(b"}")?;
+        write_reasoning_options(doc, x, thinking, e)?;
     }
     if let Some(session) = doc.member(x, "session")? {
         member(doc, session, "previous_response_id", e)?;

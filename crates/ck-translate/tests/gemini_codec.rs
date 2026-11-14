@@ -31,6 +31,8 @@ mod rereview;
 pub mod responses;
 #[path = "gemini/roundtrip.rs"]
 mod roundtrip;
+#[path = "gemini/sdk.rs"]
+mod sdk;
 #[path = "semantic/mod.rs"]
 mod semantic;
 #[path = "gemini/streams.rs"]

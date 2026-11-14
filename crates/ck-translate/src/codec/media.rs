@@ -17,6 +17,7 @@ use decode::{write_encoded_chunks, write_payload};
 #[derive(Clone, Copy)]
 pub enum Encoding {
     Base64,
+    Base64AnyAlphabet,
     DataUri { skip: u64 },
     Utf8,
 }
@@ -418,8 +419,8 @@ pub fn write_reference(media: Media, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"{\"type\":\"x_ck_media\",\"media_id\":")?;
     e.string(media.id.as_str())?;
     e.bytes(match media.encoding {
-        Encoding::Base64 | Encoding::DataUri { .. } => b",\"value_kind\":\"bytes\"}",
         Encoding::Utf8 => b",\"value_kind\":\"utf8\"}",
+        _ => b",\"value_kind\":\"bytes\"}",
     })
 }
 
