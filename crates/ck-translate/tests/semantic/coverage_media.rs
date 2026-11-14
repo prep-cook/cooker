@@ -185,3 +185,28 @@ fn only_root_choices_messages_are_published_as_media() {
     assert_eq!(output["choices"][0]["message"]["content"], "short");
     assert!(events.iter().all(|e| e["x_ck"].get("media_id").is_none()));
 }
+
+/// Response media takes only the standard base64 alphabet; the URL-safe one is a Gemini
+/// request opt-in.
+#[test]
+fn response_image_data_uri_refuses_the_url_safe_alphabet() {
+    for quad in ["_-8A".to_owned(), "_-8A".repeat(400)] {
+        let url = format!("data:image/png;base64,{quad}");
+        let body = json!({"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":"x",
+            "images":[{"type":"image_url","image_url":{"url":url}}]},"finish_reason":"stop"}]});
+        let mut mapped = Mapped::new();
+        let mut ingress = codec::chat::response::Ingress::new(
+            &mut mapped.writer,
+            &mapped.store,
+            identity(Direction::Response),
+            Operation::Generate,
+            BodyMode::Buffered,
+            1024 * 1024,
+        )
+        .unwrap();
+        let result = ingress
+            .advance(&mut mapped.writer, body.to_string().as_bytes())
+            .and_then(|()| ingress.finish(&mut mapped.writer));
+        assert!(matches!(result, Err(Error::Schema)), "{result:?}");
+    }
+}

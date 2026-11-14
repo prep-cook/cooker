@@ -238,11 +238,36 @@ fn validate_extensions(doc: &Document, x: usize) -> Result<()> {
             }
         }
     }
+    if let Some(thinking) = doc.member(x, "thinking")?
+        && !is(doc, x, "original_protocol", "responses")?
+    {
+        foreign_thinking(doc, thinking)?;
+    }
     if let Some(session) = doc.member(x, "session")? {
         for field in doc.children(session)? {
             if !doc.name_is(doc.node(field)?.name.ok_or(Error::Schema)?, "previous_response_id")? {
                 return Err(Error::Unsupported);
             }
+        }
+    }
+    Ok(())
+}
+/// Another protocol's thinking reaches Responses only as `effort` (and a string `include` as
+/// `summary`). Thinking turned on without an effort, such as a bare budget, has no Responses
+/// form, so it is refused rather than dropped; a disabled setting needs none.
+fn foreign_thinking(doc: &Document, thinking: usize) -> Result<()> {
+    let set = |key: &str| -> Result<Option<bool>> {
+        Ok(match doc.member(thinking, key)? {
+            Some(n) => Some(!matches!(doc.node(n)?.value, Value::Bool(false))),
+            None => None,
+        })
+    };
+    if doc.member(thinking, "effort")?.is_some() || set("enabled")? == Some(false) {
+        return Ok(());
+    }
+    for key in ["enabled", "budget_tokens", "native", "include"] {
+        if set(key)? == Some(true) {
+            return Err(Error::Unsupported);
         }
     }
     Ok(())

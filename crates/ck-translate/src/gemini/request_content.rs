@@ -449,7 +449,7 @@ pub(super) fn register(doc: &mut Document, media: &mut Registry) -> Result<()> {
                 };
                 let mime = doc.member(part, "mime")?;
                 let kind = mime.map(|n| modality(doc, n)).transpose()?.unwrap_or("document");
-                media.register(doc, node, data, Encoding::Base64, kind, mime)?;
+                media.register(doc, node, data, Encoding::Base64AnyAlphabet, kind, mime)?;
             }
         }
     }

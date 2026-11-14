@@ -197,12 +197,27 @@ fn responses_reasoning_summary_is_unsupported_at_chat() {
 }
 
 /// Responses `reasoning` takes `effort` and `summary` only: another protocol's budget, switch
-/// and native config stay out. A Responses source keeps its own object.
+/// and native config stay out. Thinking turned on without an effort has no Responses form and
+/// is refused, never dropped; an effort or a disabled setting passes. A Responses source keeps
+/// its own object.
 #[test]
 fn foreign_thinking_writes_only_responses_reasoning_members() {
-    let anthropic = json!({"model":"claude-x","max_tokens":2048,"thinking":{"type":"enabled","budget_tokens":1024},"messages":[{"role":"user","content":"2+2?"}]});
-    let out = translate(P::Anthropic, P::Responses, &anthropic).unwrap();
-    assert!(out.get("reasoning").is_none(), "{out}");
+    let anthropic = |thinking: Value| json!({"model":"claude-x","max_tokens":2048,"thinking":thinking,"messages":[{"role":"user","content":"2+2?"}]});
+    let budget = anthropic(json!({"type":"enabled","budget_tokens":1024}));
+    assert!(matches!(
+        translate(P::Anthropic, P::Responses, &budget),
+        Err(codec::Error::Unsupported)
+    ));
+    let disabled = translate(P::Anthropic, P::Responses, &anthropic(json!({"type":"disabled"}))).unwrap();
+    assert!(disabled.get("reasoning").is_none(), "{disabled}");
+    let gemini = json!({"contents":[{"parts":[{"text":"2+2?"}],"role":"user"}],"generationConfig":{"thinkingConfig":{"thinkingBudget":1024}}});
+    assert!(matches!(
+        translate(P::Gemini, P::Responses, &gemini),
+        Err(codec::Error::Unsupported)
+    ));
+    let gemini = json!({"contents":[{"parts":[{"text":"2+2?"}],"role":"user"}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}});
+    let out = translate(P::Gemini, P::Responses, &gemini).unwrap();
+    assert_eq!(out["reasoning"], json!({"effort":"low"}));
     let chat = json!({"model":"gpt-x","messages":[{"role":"user","content":"2+2?"}],"reasoning_effort":"low"});
     let out = translate(P::Chat, P::Responses, &chat).unwrap();
     assert_eq!(out["reasoning"], json!({"effort":"low"}));

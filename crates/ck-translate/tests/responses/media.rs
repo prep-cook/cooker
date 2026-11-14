@@ -221,3 +221,26 @@ fn buffered_image_results_publish_chunks_before_the_body_ends() {
         .and_then(|()| ingress.finish(&mut m.writer));
     assert!(result.is_err());
 }
+
+/// Response media takes only the standard base64 alphabet; the URL-safe one is a Gemini
+/// request opt-in.
+#[test]
+fn response_image_result_refuses_the_url_safe_alphabet() {
+    for result in ["_-8A", &"_-8A".repeat(4096)] {
+        let body = json!({"id":"r","model":"m","status":"completed","output":[
+            {"type":"image_generation_call","id":"img1","status":"completed","result":result}]});
+        let mut m = Mapped::new();
+        let mut ingress = responses::response::Ingress::new(
+            &mut m.writer,
+            identity(Direction::Response),
+            Operation::Generate,
+            BodyMode::Buffered,
+            1024 * 1024,
+        )
+        .unwrap();
+        let outcome = ingress
+            .advance(&mut m.writer, &serde_json::to_vec(&body).unwrap())
+            .and_then(|()| ingress.finish(&mut m.writer));
+        assert!(matches!(outcome, Err(codec::Error::Schema)), "{outcome:?}");
+    }
+}

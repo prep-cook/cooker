@@ -97,7 +97,7 @@ impl Ingress {
             return Ok(());
         }
         let (encoding, kind, mime) = match native {
-            Some((kind, mime)) => (Encoding::Base64, kind, Some(mime)),
+            Some((kind, mime)) => (Encoding::Base64AnyAlphabet, kind, Some(mime)),
             None => (
                 Encoding::Utf8,
                 "text",
