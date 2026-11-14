@@ -410,3 +410,34 @@ fn responses_reasoning_summary_becomes_a_thinking_block() {
         );
     }
 }
+
+#[test]
+fn chat_usage_counts_an_omitted_anthropic_cache_component_as_zero() {
+    for (cache, prompt) in [
+        (json!({"cache_read_input_tokens":7}), 17),
+        (json!({"cache_creation_input_tokens":4}), 14),
+        (json!({}), 10),
+    ] {
+        let mut usage = json!({"input_tokens":10,"output_tokens":5});
+        usage
+            .as_object_mut()
+            .unwrap()
+            .extend(cache.as_object().unwrap().clone());
+        let body = json!({"id":"m","model":"c","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":usage});
+        let output = run(
+            Source::Anthropic,
+            BodyMode::Buffered,
+            &serde_json::to_vec(&body).unwrap(),
+            Client::Chat,
+            BodyMode::Buffered,
+        );
+        let usage = &serde_json::from_slice::<Value>(&output).unwrap()["usage"];
+        assert_eq!(usage["prompt_tokens"], prompt, "{usage}");
+        assert_eq!(usage["completion_tokens"], 5, "{usage}");
+        assert_eq!(usage["total_tokens"], prompt + 5, "{usage}");
+        assert_eq!(
+            usage["prompt_tokens_details"]["cached_tokens"], cache["cache_read_input_tokens"],
+            "{usage}"
+        );
+    }
+}

@@ -57,9 +57,14 @@ impl Usage {
         let write = count(doc, root, "cache_creation_input_tokens")?;
         let output = count(doc, root, "output_tokens")?;
         let reasoning = reasoning(doc, root)?;
-        let input = match (uncached, read, write) {
-            (Some(a), Some(b), Some(c)) => Some(a.checked_add(b).and_then(|v| v.checked_add(c)).ok_or(Error::Schema)?),
-            _ => None,
+        // An omitted cache component counts as 0 (owner ruling, 2026-11-15).
+        let input = match uncached {
+            Some(a) => Some(
+                a.checked_add(read.unwrap_or(0))
+                    .and_then(|v| v.checked_add(write.unwrap_or(0)))
+                    .ok_or(Error::Schema)?,
+            ),
+            None => None,
         };
         let total = match (input, output) {
             (Some(a), Some(b)) => Some(a.checked_add(b).ok_or(Error::Schema)?),
