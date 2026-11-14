@@ -29,16 +29,14 @@ impl MetadataPermit {
         self.bytes
     }
 
-    /// Resize the charge. Growth requires a live, nonterminal stream; shrinking is always allowed.
+    /// Resize the charge. Growth requires a live stream; shrinking is always allowed. A terminal
+    /// does not refuse growth: only taking a new permit through the producer writer stops then.
     /// Quota failure terminates the stream with `StorageExhausted`.
     pub fn resize(&mut self, bytes: usize) -> Result<(), Error> {
         let mut state = self.stream.state.lock();
         if bytes > self.bytes {
             if self.stream.invalidated.load(Ordering::Acquire) {
                 return Err(Error::Gone);
-            }
-            if state.terminal.is_some() {
-                return Err(Error::Closed);
             }
             let extra = bytes - self.bytes;
             if extra
@@ -76,7 +74,7 @@ impl Writer {
             if self.stream.invalidated.load(Ordering::Acquire) {
                 return Err(Error::Gone);
             }
-            if state.terminal.is_some() {
+            if state.terminal.is_some() && self.producer {
                 return Err(Error::Closed);
             }
         }
@@ -111,7 +109,7 @@ impl Writer {
         if self.stream.invalidated.load(Ordering::Acquire) {
             return Err(Error::Gone);
         }
-        if state.terminal.is_some() {
+        if state.terminal.is_some() && self.producer {
             return Err(Error::Closed);
         }
         let shared = state
@@ -155,7 +153,7 @@ impl Writer {
             if self.stream.invalidated.load(Ordering::Acquire) {
                 return Err(Error::Gone);
             }
-            if state.terminal.is_some() {
+            if state.terminal.is_some() && self.producer {
                 return Err(Error::Closed);
             }
             if len < FRAME_BYTES {
@@ -225,12 +223,9 @@ impl ScratchReservation {
     /// Append bytes within the declared length. Overrun leaves the reservation unchanged.
     pub fn write(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
         let stream = &self.lease.metadata.stream;
-        let state = stream.state.lock();
+        let _state = stream.state.lock();
         if stream.invalidated.load(Ordering::Acquire) {
             return Err(Error::Gone);
-        }
-        if state.terminal.is_some() {
-            return Err(Error::Closed);
         }
         if bytes.len() > self.lease.len - self.written {
             return Err(Error::InvalidPosition);
@@ -252,12 +247,9 @@ impl ScratchReservation {
     pub fn complete(self) -> Result<ScratchLease, Error> {
         {
             let stream = &self.lease.metadata.stream;
-            let state = stream.state.lock();
+            let _state = stream.state.lock();
             if stream.invalidated.load(Ordering::Acquire) {
                 return Err(Error::Gone);
-            }
-            if state.terminal.is_some() {
-                return Err(Error::Closed);
             }
             if self.written != self.lease.len {
                 return Err(Error::IncompleteRecord);

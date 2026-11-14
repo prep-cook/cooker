@@ -598,6 +598,8 @@ A separate event index stores only start/end positions and type/correlation inde
 | Actor/step | Required operation |
 | --- | --- |
 | Writer admission | One writer per stream; reserve every needed frame/table entry under allocator ownership before writing it. |
+| Allocation handle | `Writer::allocator` gives consumers a handle of the stream's generation that never publishes: it allocates scratch and metadata under the stream's quotas, also after the terminal, until invalidation. Its `finish` publishes a cancel, shutdown or discard terminal; its drop publishes nothing. |
+| Hold | `Writer::hold` keeps another stream from expiry and eviction until the holding stream is invalidated or dropped; a response stream holds its request stream (`docs/EXECUTION-CONTRACT.md` §2). |
 | Append | Write only unpublished mapped bytes; published event bytes are immutable. Finish JSON and SSE delimiter before publishing the event. |
 | Publish | Under the stream metadata lock, install frame-table extents/event boundaries and advance the stream's committed end position (header slot, Release store). |
 | Wake | Notify readers after unlocking. Publication uses the lock's release/acquire ordering; mmap visibility alone is not synchronization. |

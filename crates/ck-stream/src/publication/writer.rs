@@ -7,14 +7,53 @@ use crate::{Error, FRAME_BYTES, Position, Record, Terminal, cache::Inner};
 
 /// Exclusive stream producer. A disconnect must drop a reader, not this producer.
 /// Dropping it before a terminal publishes `ProducerLost`.
+///
+/// [`Writer::allocator`] returns a second kind of handle on the same stream that never
+/// publishes records: it allocates scratch and metadata under this stream's quotas, also after
+/// the terminal record, and its drop publishes nothing.
 pub struct Writer {
     pub(super) inner: Arc<Inner>,
     pub(super) stream: Arc<Stream>,
+    /// False for an allocation handle.
+    pub(super) producer: bool,
 }
 
 impl Writer {
     pub(crate) fn new(inner: Arc<Inner>, stream: Arc<Stream>) -> Self {
-        Self { inner, stream }
+        Self {
+            inner,
+            stream,
+            producer: true,
+        }
+    }
+
+    /// An allocation handle on this stream, for consumers that decode its records and encode
+    /// output while the producer runs and after it ends: reading codecs need a writer of the
+    /// stream's generation. It cannot begin records, append or release a prefix (`Closed`).
+    /// Its `finish` publishes a terminal as the producer's would: `Cancelled` or `Shutdown`
+    /// stops the producer, `Gone` discards the stream. Invalidation still ends its allocations.
+    pub fn allocator(&self) -> Writer {
+        Self {
+            inner: self.inner.clone(),
+            stream: self.stream.clone(),
+            producer: false,
+        }
+    }
+
+    /// Keep `other`'s stream from expiry and eviction until this stream is invalidated or
+    /// dropped, so a response stream retains the request stream it was encoded from.
+    pub fn hold(&self, other: &Writer) -> Result<(), Error> {
+        let mut state = self.stream.state.lock();
+        if self.stream.is_invalidated() {
+            return Err(Error::Gone);
+        }
+        other.stream.held.fetch_add(1, Ordering::AcqRel);
+        state.holds.push(other.stream.held.clone());
+        Ok(())
+    }
+
+    fn publishes(&self) -> Result<(), Error> {
+        if self.producer { Ok(()) } else { Err(Error::Closed) }
     }
     pub fn id(&self) -> u64 {
         self.stream.id
@@ -71,6 +110,7 @@ impl Writer {
         kind: u32,
         correlation: u32,
     ) -> Result<Reservation<'_>, Error> {
+        self.publishes()?;
         let (record, index, old_count, state) = self.reserve(len, aligned, kind, correlation)?;
         drop(state);
         Ok(Reservation {
@@ -227,6 +267,7 @@ impl Writer {
     }
 
     pub fn append(&mut self, bytes: &[u8]) -> Result<Record, Error> {
+        self.publishes()?;
         let mut state = self.stream.state.lock();
         if let Some(record) = self.append_in_frame(&mut state, bytes) {
             drop(state);
@@ -304,6 +345,7 @@ impl Writer {
     /// Release a non-resumable canonical prefix. Response records must never use this API.
     /// Independent scratch leases release on drop. Frame and record numbers are never recycled.
     pub fn release_before(&mut self, position: Position) -> Result<(), Error> {
+        self.publishes()?;
         let end = position.byte(self.id())?;
         let (mut state, _fence) = self.stream.retention.lock_stable(&self.stream);
         if end > state.end {
@@ -344,7 +386,9 @@ impl Writer {
 impl Drop for Writer {
     fn drop(&mut self) {
         // A producer that ends without a terminal is lost, never a client cancel.
-        self.stream.finish(Terminal::ProducerLost);
+        if self.producer {
+            self.stream.finish(Terminal::ProducerLost);
+        }
     }
 }
 

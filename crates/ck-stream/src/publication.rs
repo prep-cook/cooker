@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -110,6 +110,9 @@ pub(crate) struct State {
     slot: Option<u32>,
     /// Frames charged when the stream ended with `StorageExhausted`.
     failure_frames: Option<u32>,
+    /// Hold counters of the streams this one keeps alive (`Writer::hold`), released when this
+    /// stream is invalidated or dropped.
+    holds: Vec<Arc<AtomicUsize>>,
 }
 
 impl State {
@@ -133,6 +136,8 @@ pub(crate) struct Stream {
     detached: AtomicU64,
     notify: Wakeup,
     stopped: Wakeup,
+    /// Streams holding this one: while nonzero it neither expires nor is evicted.
+    held: Arc<AtomicUsize>,
 }
 
 impl Stream {
@@ -154,6 +159,7 @@ impl Stream {
             invalidated: AtomicBool::new(false),
             last_read: AtomicU64::new(millis(now)),
             detached: AtomicU64::new(0),
+            held: Arc::new(AtomicUsize::new(0)),
             state: Mutex::new(State {
                 frames: VecDeque::new(),
                 base_frame: 0,
@@ -168,12 +174,18 @@ impl Stream {
                 external_metadata: 0,
                 slot: Some(slot),
                 failure_frames: None,
+                holds: Vec::new(),
             }),
         }
     }
 
     pub(crate) fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
+    }
+
+    /// Whether another cached stream holds this one (`Writer::hold`).
+    pub(crate) fn is_held(&self) -> bool {
+        self.held.load(Ordering::Acquire) > 0
     }
 
     /// Frames reader leases keep pinned: owned ones with another reference, and detached ones
@@ -341,14 +353,22 @@ impl Stream {
         if let Some(slot) = state.slot.take() {
             self.pool.release_slot(slot);
         }
+        release_holds(state);
         self.notify.wake();
         self.stopped.wake();
+    }
+}
+
+fn release_holds(state: &mut State) {
+    for held in state.holds.drain(..) {
+        held.fetch_sub(1, Ordering::Release);
     }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
         let state = self.state.get_mut();
+        release_holds(state);
         for frame in &mut state.frames {
             if let Some(index) = frame.pool.take() {
                 self.pool.release(index);

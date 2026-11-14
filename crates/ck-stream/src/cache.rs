@@ -285,7 +285,7 @@ impl Inner {
                 cache.requeue(key, last_read);
                 continue;
             }
-            let returned = gain(&stream, &state);
+            let returned = if stream.is_held() { 0 } else { gain(&stream, &state) };
             if returned > 0 {
                 found += returned;
                 victims.push(key);
@@ -318,8 +318,9 @@ impl Inner {
                 }
                 let stream = cache.streams[&id].stream.clone();
                 let mut state = stream.state.lock();
-                // An outstanding wait is a read even without publication or another poll.
-                if state.readers > 0 {
+                // An outstanding wait is a read even without publication or another poll, and a
+                // held stream lives as long as its holder.
+                if state.readers > 0 || stream.is_held() {
                     stream.touch(now);
                 }
                 let last_read = stream.last_read();
