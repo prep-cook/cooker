@@ -1,0 +1,62 @@
+use super::super::{chat_effort, is};
+use crate::codec::{
+    Error, Result,
+    document::{Document, Value},
+    encode::Encoder,
+};
+
+/// Writes `,"reasoning":{...}` from the thinking options. Another protocol's budget, switch and
+/// native config are not Responses members, and its `include` is a summary setting only as a
+/// string; a Chat `reasoning` object, which the fence limits to these two, gives its `effort`
+/// and `summary`.
+pub(super) fn write_reasoning_options(
+    doc: &Document,
+    x: usize,
+    thinking: usize,
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
+    let native = is(doc, x, "original_protocol", "responses")?;
+    let mut open = false;
+    for f in doc.children(thinking)? {
+        let name = doc.node(f)?.name.ok_or(Error::Schema)?;
+        let include = doc.name_is(name, "include")?;
+        let summary = include && matches!(doc.node(f)?.value, Value::String(_) | Value::Text(_));
+        if !native && !summary && !doc.name_is(name, "effort")? {
+            continue;
+        }
+        key(&mut open, e)?;
+        if include {
+            e.string("summary")?;
+        } else {
+            doc.write_name(name, e)?;
+        }
+        e.bytes(b":")?;
+        doc.write(f, e)?;
+    }
+    if let Some(effort) = chat_effort(doc, x, thinking)? {
+        key(&mut open, e)?;
+        e.bytes(b"\"effort\":")?;
+        doc.write(effort, e)?;
+    }
+    if is(doc, x, "original_protocol", "chat")?
+        && let Some(object) = doc.member(thinking, "native")?
+        && let Some(summary) = doc.member(object, "summary")?
+    {
+        key(&mut open, e)?;
+        e.bytes(b"\"summary\":")?;
+        doc.write(summary, e)?;
+    }
+    if native && !open {
+        e.bytes(b",\"reasoning\":{}")
+    } else if open {
+        e.bytes(b"}")
+    } else {
+        Ok(())
+    }
+}
+/// Opens the `reasoning` object before its first member, else separates the next one.
+fn key(open: &mut bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(if *open { b"," } else { b",\"reasoning\":{" })?;
+    *open = true;
+    Ok(())
+}

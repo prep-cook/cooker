@@ -5,6 +5,6 @@ Fixed
 - A Gemini function response bound for an Anthropic upstream is refused as unsupported instead of being sent without its result.
 - Gemini requests that spell fields in snake_case, such as `thinking_budget` or `parameters_json_schema`, translate like their camelCase spelling.
 - A Gemini response schema bound for a Chat or Anthropic upstream, or a Responses reasoning summary bound for a Chat upstream, is refused as unsupported rather than as a malformed request.
-- Requests sent to a Responses upstream carry only `effort` and `summary` in `reasoning`; the effort of a Chat `reasoning` object counts as `effort`. Thinking enabled without an effort, such as an Anthropic token budget, is refused as unsupported instead of reaching the upstream as invalid members.
+- Requests sent to a Responses upstream carry only `effort` and `summary` in `reasoning`; a Chat `reasoning` object passes its `effort` and `summary`, and any other member of it is refused as unsupported. Thinking enabled without an effort, such as an Anthropic token budget, is refused as unsupported instead of reaching the upstream as invalid members.
 - Chat requests whose assistant history has `tool_calls: null` or `function_call: null`, as the openai SDK writes them, are accepted.
 - Thinking blocks with an empty signature are left out of requests to an Anthropic upstream, which refuses them.

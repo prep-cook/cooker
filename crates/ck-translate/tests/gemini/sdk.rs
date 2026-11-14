@@ -229,10 +229,14 @@ fn foreign_thinking_writes_only_responses_reasoning_members() {
     both["reasoning_effort"] = json!("low");
     let out = translate(P::Chat, P::Responses, &both).unwrap();
     assert_eq!(out["reasoning"], json!({"effort":"low"}));
-    assert!(matches!(
-        translate(P::Chat, P::Responses, &chat(json!({"max_tokens":1024}))),
-        Err(codec::Error::Unsupported)
-    ));
+    let out = translate(P::Chat, P::Responses, &chat(json!({"effort":"low","summary":"auto"}))).unwrap();
+    assert_eq!(out["reasoning"], json!({"effort":"low","summary":"auto"}));
+    for reasoning in [json!({"max_tokens":1024}), json!({"effort":"low","max_tokens":1024})] {
+        assert!(matches!(
+            translate(P::Chat, P::Responses, &chat(reasoning)),
+            Err(codec::Error::Unsupported)
+        ));
+    }
     let responses = json!({"model":"gpt-x","input":"2+2?","reasoning":{"effort":"low","summary":"auto"}});
     let out = translate(P::Responses, P::Responses, &responses).unwrap();
     assert_eq!(out["reasoning"], json!({"effort":"low","summary":"auto"}));

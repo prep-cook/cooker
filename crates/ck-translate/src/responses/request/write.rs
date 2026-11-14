@@ -1,5 +1,6 @@
-use super::super::{chat_effort, is, member};
+use super::super::{is, member};
 use super::native::{item_type, native, typed};
+use super::reasoning::write_reasoning_options;
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Name, Value},
@@ -231,38 +232,7 @@ fn position_of(doc: &Document, entry: usize) -> Result<Option<u64>> {
 /// Writes the reasoning options, the continuation and the Responses provider parameters.
 fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     if let Some(thinking) = doc.member(x, "thinking")? {
-        // Another protocol's budget, switch and native config are not Responses members, except a
-        // Chat `reasoning` object's effort; its `include` is a summary setting only as a string.
-        let native = is(doc, x, "original_protocol", "responses")?;
-        let mut open = false;
-        for f in doc.children(thinking)? {
-            let name = doc.node(f)?.name.ok_or(Error::Schema)?;
-            let include = doc.name_is(name, "include")?;
-            let summary = include && matches!(doc.node(f)?.value, Value::String(_) | Value::Text(_));
-            if !native && !summary && !doc.name_is(name, "effort")? {
-                continue;
-            }
-            e.bytes(if open { b"," } else { b",\"reasoning\":{" })?;
-            open = true;
-            if include {
-                e.string("summary")?;
-            } else {
-                doc.write_name(name, e)?;
-            }
-            e.bytes(b":")?;
-            doc.write(f, e)?;
-        }
-        if let Some(effort) = chat_effort(doc, x, thinking)? {
-            e.bytes(if open { b"," } else { b",\"reasoning\":{" })?;
-            open = true;
-            e.bytes(b"\"effort\":")?;
-            doc.write(effort, e)?;
-        }
-        if native && !open {
-            e.bytes(b",\"reasoning\":{}")?;
-        } else if open {
-            e.bytes(b"}")?;
-        }
+        write_reasoning_options(doc, x, thinking, e)?;
     }
     if let Some(session) = doc.member(x, "session")? {
         member(doc, session, "previous_response_id", e)?;

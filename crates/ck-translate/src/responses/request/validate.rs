@@ -257,6 +257,18 @@ fn validate_extensions(doc: &Document, x: usize) -> Result<()> {
 /// bare budget, has no Responses form, so it is refused rather than dropped; a disabled setting
 /// needs none.
 fn foreign_thinking(doc: &Document, x: usize, thinking: usize) -> Result<()> {
+    // A Chat `reasoning` object maps only through its `effort` and `summary`; any other member,
+    // such as a token budget, has no Responses form even beside an effort.
+    if is(doc, x, "original_protocol", "chat")?
+        && let Some(object) = doc.member(thinking, "native")?
+    {
+        for f in doc.children(object)? {
+            let name = doc.node(f)?.name.ok_or(Error::Schema)?;
+            if !doc.name_is(name, "effort")? && !doc.name_is(name, "summary")? {
+                return Err(Error::Unsupported);
+            }
+        }
+    }
     let set = |key: &str| -> Result<Option<bool>> {
         Ok(match doc.member(thinking, key)? {
             Some(n) => Some(!matches!(doc.node(n)?.value, Value::Bool(false))),
