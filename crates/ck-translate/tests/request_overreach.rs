@@ -421,7 +421,7 @@ fn gemini_function_response_reaches_anthropic_as_text() {
     let out = translate(P::Gemini, P::Anthropic, &gm_tool_result(json!({"error":"down"}))).unwrap();
     assert_eq!(
         out["messages"][2]["content"],
-        json!([{"type":"tool_result","tool_use_id":"fc_1","content":"\"down\"","is_error":true}])
+        json!([{"type":"tool_result","tool_use_id":"fc_1","content":"down","is_error":true}])
     );
     unsupported(translate(
         P::Gemini,
@@ -569,4 +569,24 @@ fn gemini_tools_reach_responses_as_function_tools() {
         P::Responses,
         &tools(json!({"name":"f","behavior":"NON_BLOCKING"})),
     ));
+}
+
+/// A string `error` is the error text as is, like a string `result`; other values are JSON.
+#[test]
+fn gemini_string_error_is_raw_text() {
+    let out = translate(P::Gemini, P::Anthropic, &gm_tool_result(json!({"error":{"code":5}}))).unwrap();
+    assert_eq!(out["messages"][2]["content"][0]["content"], "{\"code\":5}");
+}
+
+/// A Gemini native tool group has no Responses, Chat or Anthropic form: the fence refuses it as
+/// unsupported, not as malformed and not at egress.
+#[test]
+fn gemini_native_tool_groups_are_unsupported_elsewhere() {
+    for group in [json!({"googleSearch":{}}), json!({"codeExecution":{}})] {
+        let input = json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[group]});
+        for to in [P::Responses, P::Chat, P::Anthropic] {
+            unsupported(translate(P::Gemini, to, &input));
+        }
+        assert!(translate(P::Gemini, P::Gemini, &input).is_ok());
+    }
 }

@@ -85,9 +85,15 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     }
     Ok(())
 }
-/// Gemini JSON mode and function declarations, which egress writes in JSON Schema.
+/// Gemini JSON mode and function declarations, which egress writes in JSON Schema. A native
+/// tool group, such as `googleSearch`, has no Responses form.
 fn gemini_controls(doc: &Document) -> Result<()> {
     let root = doc.root();
+    if let Some(native) = doc.member(doc.required(root, "x_ck")?, "tools")?
+        && doc.node(native)?.first.is_some()
+    {
+        return Err(Error::Unsupported);
+    }
     if let Some(format) = doc.member(root, "response_format")? {
         json_mode(doc, format)?;
     }

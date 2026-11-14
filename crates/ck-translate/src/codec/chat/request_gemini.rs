@@ -51,8 +51,8 @@ pub(crate) fn outcome(doc: &Document, part: usize) -> Result<Option<Outcome>> {
     }
 }
 
-/// Writes `,"<key>":` and a Gemini outcome as tool text: a string `result` as it is, any other
-/// value as its compact JSON serialization, then `,"is_error":true` for an error; returns false,
+/// Writes `,"<key>":` and a Gemini outcome as tool text: a string as it is, any other value as
+/// its compact JSON serialization, then `,"is_error":true` for an error; returns false,
 /// writing nothing, for any other tool result. Only the Anthropic fence admits an error.
 pub(crate) fn write_outcome(doc: &Document, part: usize, key: &str, e: &mut Encoder<'_, '_>) -> Result<bool> {
     let Some(outcome) = outcome(doc, part)? else {
@@ -66,7 +66,7 @@ pub(crate) fn write_outcome(doc: &Document, part: usize, key: &str, e: &mut Enco
         doc.node(value)?.value,
         Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media
     );
-    if text && matches!(outcome, Outcome::Result(_)) {
+    if text {
         doc.write(value, e)?;
     } else {
         e.quoted_json(|e| doc.write(value, e))?;

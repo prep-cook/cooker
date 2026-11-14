@@ -231,6 +231,13 @@ fn extensions(doc: &Document, x: usize) -> Result<()> {
     Ok(())
 }
 fn tools(doc: &Document, root: usize, x: usize) -> Result<()> {
+    // A Gemini native tool group, such as `googleSearch`, has no Anthropic form.
+    if json_schema::from_gemini(doc)?
+        && let Some(native) = doc.member(x, "tools")?
+        && doc.node(native)?.first.is_some()
+    {
+        return Err(Error::Unsupported);
+    }
     let Some(tools) = doc.member(root, "tools")? else {
         return Ok(());
     };
