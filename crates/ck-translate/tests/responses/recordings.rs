@@ -49,7 +49,7 @@ fn recorded_buffered_responses_preserve_items_usage_and_terminal_status() {
                 assert_eq!(projected["id"], body["id"], "{} id", fixture["name"]);
                 assert_eq!(
                     projected.get("usage"),
-                    body.get("usage"),
+                    body.get("usage").map(super::sdk::official_usage).as_ref(),
                     "{} usage presence",
                     fixture["name"]
                 );

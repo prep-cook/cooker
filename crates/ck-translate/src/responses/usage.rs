@@ -121,14 +121,16 @@ fn write_details(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result
 }
 
 /// Responses usage for canonical snapshot `usage`: a Responses source's native value, or the
-/// mapped counts. The snapshot itself replaces the one retained in the `usage.snapshot` opaque
-/// carrier, whose value slot `retained` tracks.
-pub(super) fn project(doc: &mut Document, usage: usize, retained: &mut Option<usize>) -> Result<usize> {
+/// mapped counts.
+pub(super) fn project(doc: &mut Document, usage: usize) -> Result<usize> {
     if let Some(native) = doc.member(usage, "native")?
         && super::is(doc, native, "protocol", "responses")?
     {
         let value = doc.required(native, "value")?;
         overlay(doc, usage, value)?;
+        if matches!(doc.node(value)?.value, Value::Object) {
+            cache_details(doc, value)?;
+        }
         return Ok(value);
     }
     let result = doc.add(None, Value::Object)?;
@@ -137,7 +139,6 @@ pub(super) fn project(doc: &mut Document, usage: usize, retained: &mut Option<us
         "output_tokens",
         "total_tokens",
         "input_uncached_tokens",
-        "cache_write_tokens",
         "cache_write_by_ttl",
     ] {
         super::move_field(doc, usage, name, result, name)?;
@@ -148,6 +149,7 @@ pub(super) fn project(doc: &mut Document, usage: usize, retained: &mut Option<us
             &[
                 ("cache_read_tokens", "cached_tokens"),
                 ("input_audio_tokens", "audio_tokens"),
+                ("cache_write_tokens", "cache_write_tokens"),
             ][..],
         ),
         (
@@ -169,22 +171,36 @@ pub(super) fn project(doc: &mut Document, usage: usize, retained: &mut Option<us
             }
         }
     }
-    let slot = match *retained {
-        Some(slot) => slot,
-        None => {
-            let carrier = match doc.member(doc.root(), "x_ck_opaque")? {
-                Some(carrier) => carrier,
-                None => doc.set(doc.root(), "x_ck_opaque", Value::Array)?,
-            };
-            let entry = doc.add(None, Value::Object)?;
-            doc.append(carrier, entry)?;
-            doc.set(entry, "name", Value::Text("usage.snapshot"))?;
-            doc.set(entry, "format", Value::Text("json"))?;
-            *retained.insert(doc.set(entry, "value", Value::Null)?)
-        }
-    };
-    doc.transplant(slot, usage)?;
+    cache_details(doc, result)?;
     Ok(result)
+}
+
+/// Puts both cache counts of Responses `usage` where the API does, in `input_tokens_details`. A
+/// top-level `cache_write_tokens` moves there and wins over a nested one, as in `write_details`;
+/// the schema requires both counts, so an unreported one is 0.
+fn cache_details(doc: &mut Document, usage: usize) -> Result<()> {
+    let details = match doc
+        .member(usage, "input_tokens_details")?
+        .filter(|&d| matches!(doc.node(d).map(|n| n.value), Ok(Value::Object)))
+    {
+        Some(details) => details,
+        None => doc.set(usage, "input_tokens_details", Value::Object)?,
+    };
+    if let Some(write) = doc.remove(usage, "cache_write_tokens")?
+        && !matches!(doc.node(write)?.value, Value::Null)
+    {
+        doc.remove(details, "cache_write_tokens")?;
+        doc.append(details, write)?;
+    }
+    for name in ["cached_tokens", "cache_write_tokens"] {
+        if doc
+            .member(details, name)?
+            .is_none_or(|n| matches!(doc.node(n).map(|n| n.value), Ok(Value::Null)))
+        {
+            doc.set(details, name, Value::Unsigned(0))?;
+        }
+    }
+    Ok(())
 }
 
 /// Canonical counts and the native Responses member each one maps to: `(canonical, details

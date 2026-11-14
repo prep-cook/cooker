@@ -205,7 +205,7 @@ impl State {
     /// accepted.
     pub(super) fn event(&mut self, owner: &mut Writer, source: &Source, event: &sse::Event) -> Result<()> {
         if self.terminal && !event.fields().is_empty() {
-            return Err(Error::Closed);
+            return if self.errored { Ok(()) } else { Err(Error::Closed) };
         }
         if !event.has_data(source)? {
             if !event.fields().is_empty() {
@@ -245,7 +245,7 @@ impl State {
         match class {
             Class::Failure => match doc.member(root, "response")? {
                 Some(response) => self.fail(owner, &doc, response),
-                None => Err(Error::Schema),
+                None => self.upstream_error(owner),
             },
             Class::Terminal => {
                 let response = doc.required(root, "response")?;

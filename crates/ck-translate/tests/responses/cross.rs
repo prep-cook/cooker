@@ -119,7 +119,7 @@ fn chat_logprobs_without_a_block_join_the_open_text_part() {
     let events = client_events(&output);
     let delta = events
         .iter()
-        .find(|e| e["type"] == "response.output_text.delta" && e.get("logprobs").is_some())
+        .find(|e| e["type"] == "response.output_text.delta" && e["logprobs"].as_array().is_some_and(|l| !l.is_empty()))
         .unwrap();
     assert_eq!(
         (delta["content_index"].clone(), delta["delta"].clone()),
@@ -193,7 +193,7 @@ fn chat_text_and_multiple_calls_remain_separate_output_items() {
 }
 
 /// The final Responses object of a buffered body or a streamed `response.completed`.
-fn final_response(output: &[u8], downstream: BodyMode) -> Value {
+pub(super) fn final_response(output: &[u8], downstream: BodyMode) -> Value {
     if downstream == BodyMode::Buffered {
         return serde_json::from_slice(output).unwrap();
     }
@@ -213,21 +213,15 @@ fn chat_usage_projects_native_token_details_without_control_fields() {
         let out = final_response(&output, downstream);
         assert_eq!(
             out["usage"],
-            json!({"input_tokens":0,"output_tokens":3,"total_tokens":3,"input_tokens_details":{"cached_tokens":0,"audio_tokens":2},"output_tokens_details":{"reasoning_tokens":1,"audio_tokens":2}})
+            json!({"input_tokens":0,"output_tokens":3,"total_tokens":3,"input_tokens_details":{"cached_tokens":0,"audio_tokens":2,"cache_write_tokens":0},"output_tokens_details":{"reasoning_tokens":1,"audio_tokens":2}})
         );
-        let provenance = out["x_ck_opaque"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["name"] == "usage.snapshot")
-            .unwrap();
-        assert_eq!(provenance["value"]["native"]["value"], usage);
-        assert!(provenance["value"]["final"].is_boolean());
+        // The Chat usage snapshot is internal and never reaches a Responses client.
+        assert!(!String::from_utf8(output).unwrap().contains("x_ck"));
     }
 }
 
 #[test]
-fn corrected_usage_replaces_counts_and_preserves_native_null() {
+fn corrected_usage_replaces_counts_and_keeps_its_snapshot_internal() {
     let input = sse(&[
         json!({"id":"r","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}),
         json!({"id":"r","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
@@ -236,16 +230,11 @@ fn corrected_usage_replaces_counts_and_preserves_native_null() {
     ]);
     let output = chat_to_responses(input.as_bytes(), BodyMode::Streaming, BodyMode::Buffered);
     let out = final_response(&output, BodyMode::Buffered);
-    assert_eq!(out["usage"], json!({"output_tokens":3}));
-    let snapshots: Vec<_> = out["x_ck_opaque"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|entry| entry["name"] == "usage.snapshot")
-        .collect();
-    assert_eq!(snapshots.len(), 1);
-    assert_eq!(snapshots[0]["value"]["native"]["value"]["prompt_tokens"], Value::Null);
-    assert_eq!(snapshots[0]["value"]["native"]["value"]["completion_tokens"], 3);
+    assert_eq!(
+        out["usage"],
+        json!({"output_tokens":3,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}})
+    );
+    assert!(out.get("x_ck_opaque").is_none());
     let absent = json!({"choices":[{"index":0,"message":{"content":"x"},"finish_reason":"stop"}]});
     let output = chat_to_responses(
         &serde_json::to_vec(&absent).unwrap(),

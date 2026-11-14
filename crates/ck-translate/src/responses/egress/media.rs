@@ -4,7 +4,23 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     /// Opens the audio projection for a media start.
     pub(super) fn audio_start(&mut self, node: usize) -> Result<()> {
         let doc = &mut self.document;
-        self.audio.push(super::super::audio::Projection::start(doc, node)?)?;
+        let native = match doc.member(node, "attributes")? {
+            Some(attributes) => is(doc, attributes, "protocol", "responses")?,
+            None => false,
+        };
+        let projection = super::super::audio::Projection::start(doc, node)?;
+        // A buffered body has no audio events: a Responses source's streamed audio, its
+        // transcript and late metadata go to the native `audio` member, not the internal carrier.
+        let root = doc.root();
+        if native && self.mode == BodyMode::Buffered && doc.member(root, "audio")?.is_none() {
+            doc.detach(doc.required(root, "x_ck_opaque")?, projection.audio)?;
+            for name in ["type", "attributes"] {
+                doc.remove(projection.audio, name)?;
+            }
+            doc.rename(projection.audio, "audio")?;
+            doc.append(root, projection.audio)?;
+        }
+        self.audio.push(projection)?;
         Ok(())
     }
 

@@ -98,7 +98,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             e.unsigned(block)?;
             e.bytes(b",\"delta\":")?;
             doc.write(value, e)?;
-            super::super::member(doc, choice, "logprobs", e)
+            write_logprobs(doc, choice, name == "response.output_text.delta", e)
         })?;
         doc.detach(delta, value)?;
         append_fragment(doc, part, native, value)?;

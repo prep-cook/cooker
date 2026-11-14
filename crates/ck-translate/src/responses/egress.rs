@@ -33,8 +33,6 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     diagnostic: F,
     images: Table<super::image::Projection>,
     audio: Table<super::audio::Projection>,
-    /// Value slot of the retained canonical usage snapshot in the opaque carrier.
-    usage_snapshot: Option<usize>,
     /// A message item from a source without native items, appended but not yet announced: it
     /// follows any reasoning item split out of it, and is dropped if it stays empty.
     pending: Option<usize>,
@@ -57,7 +55,13 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             } else {
                 "response"
             })?;
-            e.bytes(b",\"created_at\":0,\"model\":\"\",\"status\":\"in_progress\",\"output\":[]}")
+            e.bytes(b",\"created_at\":0,\"model\":\"\",\"status\":\"in_progress\",\"output\":[]")?;
+            // Members the `Response` schema always carries, at their API defaults; a Responses
+            // source's own values replace them by merge.
+            if operation != Operation::Compact {
+                e.bytes(b",\"parallel_tool_calls\":true,\"tool_choice\":\"auto\",\"tools\":[]")?;
+            }
+            e.bytes(b"}")
         })?;
         Ok(Self {
             owner: owner.id(),
@@ -69,7 +73,6 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             diagnostic,
             images: Table::new(owner)?,
             audio: Table::new(owner)?,
-            usage_snapshot: None,
             pending: None,
             owed: false,
         })
@@ -115,7 +118,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         }
         match kind {
             Kind::Heartbeat => return Ok(()),
-            Kind::Error | Kind::Cancelled => return self.failed(owner, output),
+            Kind::Error | Kind::Cancelled => return self.failed(owner, kind, incoming, output),
             Kind::ResponseStart => return self.response_start(incoming),
             Kind::Done => return self.done(owner, output),
             Kind::Opaque => return self.opaque(owner, incoming, output),
@@ -221,6 +224,15 @@ impl<F: FnMut(&'static str, u64)> codec::ResponseEgress for Egress<F> {
     fn finish(&mut self) -> Result<()> {
         if self.terminal { Ok(()) } else { Err(Error::Truncated) }
     }
+}
+/// Writes `parent`'s `logprobs` member. An event whose schema requires the array (`required`)
+/// gets an empty one when the source reported none.
+fn write_logprobs(doc: &Document, parent: usize, required: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let logprobs = doc.member(parent, "logprobs")?;
+    if required && logprobs.is_none_or(|n| matches!(doc.node(n).map(|n| n.value), Ok(Value::Null))) {
+        return e.bytes(b",\"logprobs\":[]");
+    }
+    super::member(doc, parent, "logprobs", e)
 }
 fn write_lease(lease: &ScratchLease, e: &mut Encoder<'_, '_>) -> Result<()> {
     let mut offset = 0;
@@ -358,13 +370,20 @@ fn write_item(doc: &Document, item: usize, e: &mut Encoder<'_, '_>) -> Result<()
     }
     e.bytes(b"}")
 }
+/// Writes the response object without members under the reserved `x_ck` prefix, which no
+/// client sees.
 fn write_response(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"{")?;
-    for (i, field) in doc.children(doc.root())?.enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for field in doc.children(doc.root())? {
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        if super::opaque::reserved(doc, name)? {
+            continue;
+        }
+        if !first {
             e.bytes(b",")?;
         }
-        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        first = false;
         doc.write_name(name, e)?;
         e.bytes(b":")?;
         if doc.name_is(name, "output")? {

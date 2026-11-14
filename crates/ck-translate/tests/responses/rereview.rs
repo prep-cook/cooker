@@ -169,9 +169,10 @@ fn failed_responses_keep_their_identity_and_usage() {
             let (out, canonical) = failing(input.as_bytes(), mode, downstream);
             assert!(!format!("{canonical:?}").contains("SENSITIVE"));
             let response = failed_response(&out, downstream);
-            for name in ["id", "model", "created_at", "usage"] {
+            for name in ["id", "model", "created_at"] {
                 assert_eq!(response[name], failed[name], "{name} {input}");
             }
+            assert_eq!(response["usage"], super::sdk::official_usage(&failed["usage"]));
             assert_eq!(response["status"], "failed");
         }
     }
@@ -200,9 +201,10 @@ fn failed_responses_publish_only_their_identity_and_usage() {
             let (out, canonical) = failing(input.as_bytes(), mode, downstream);
             assert!(!format!("{canonical:?}").contains("SENSITIVE"), "{canonical:?}");
             let response = failed_response(&out, downstream);
-            for name in ["id", "object", "created_at", "model", "usage"] {
+            for name in ["id", "object", "created_at", "model"] {
                 assert_eq!(response[name], failed[name], "{name} {input}");
             }
+            assert_eq!(response["usage"], super::sdk::official_usage(&failed["usage"]));
             assert!(response.get("message").is_none() && response.get("metadata").is_none());
         }
     }

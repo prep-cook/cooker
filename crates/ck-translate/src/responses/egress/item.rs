@@ -347,7 +347,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                             Some(value) => doc.write(value, e)?,
                             None => e.bytes(b"\"\"")?,
                         }
-                        super::super::member(doc, part, "logprobs", e)
+                        write_logprobs(doc, part, name == "response.output_text.done", e)
                     })?,
                 )),
                 None => None,

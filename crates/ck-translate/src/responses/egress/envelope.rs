@@ -1,17 +1,26 @@
 use super::*;
 
 impl<F: FnMut(&'static str, u64)> Egress<F> {
-    /// Ends the response as failed: the response with a sanitized error, as the body in buffered
-    /// mode and in a `response.failed` event when streaming.
+    /// Ends the response as failed with a sanitized error, as the body in buffered mode and in
+    /// a `response.failed` event when streaming. A failure the upstream reported itself (an
+    /// `error` record with a `type`) first gets the official `error` event, which the client SDK
+    /// raises, with the same sanitized values.
     pub(super) fn failed(
         &mut self,
         owner: &mut Writer,
+        kind: Kind,
+        record: Document,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         // A stream that fails before its start still opens with `response.created`.
         self.owed |= self.sequence == 0;
         self.created(owner, output)?;
         self.terminal = true;
+        if kind == Kind::Error && record.member(record.root(), "type")?.is_some() {
+            let payload =
+                b",\"error\":{\"type\":\"server_error\",\"code\":\"server_error\",\"message\":\"Response failed\"}";
+            self.emit(owner, "error", |e| e.bytes(payload), output)?;
+        }
         let doc = &mut self.document;
         let root = doc.root();
         doc.set(root, "status", Value::Text("failed"))?;
@@ -92,7 +101,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             return Ok(());
         }
         self.owed = false;
-        let response = encode::scratch(owner, |e| self.document.write(self.document.root(), e))?;
+        let response = encode::scratch(owner, |e| write_response(&self.document, e))?;
         self.emit(
             owner,
             "response.created",
@@ -141,7 +150,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         )
     }
 
-    /// Restores native response fields, or writes or retains an unknown event.
+    /// Restores native response fields, or writes or drops an unknown event.
     pub(super) fn opaque(
         &mut self,
         owner: &mut Writer,
@@ -193,18 +202,32 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             let value = doc.required(node, "value")?;
             return super::super::merge(doc, self.audio[at].audio, value);
         }
-        if self.mode == BodyMode::Streaming {
-            return output(encode::scratch(owner, |e| super::super::opaque::write(&incoming, e))?);
+        // Only a Responses source's own unknown event reaches the client, as that native event; a
+        // buffered body has no place for events, and extension fields of mapped events have none
+        // in the events this egress writes (§3.7).
+        let native = match incoming.member(incoming.required(root, "x_ck")?, "source")? {
+            Some(source) => is(&incoming, source, "protocol", "responses")?,
+            None => false,
+        };
+        if self.mode == BodyMode::Buffered || !native || is(&incoming, root, "name", "responses.fields")? {
+            (self.diagnostic)("opaque", 0);
+            return Ok(());
         }
-        super::super::opaque::retain(&mut self.document, incoming)
+        let sequence = self.sequence;
+        if matches!(incoming.node(incoming.required(root, "value")?)?.value, Value::Object) {
+            self.sequence = sequence.checked_add(1).ok_or(Error::Limit)?;
+        }
+        output(encode::scratch(owner, |e| {
+            super::super::opaque::write(&incoming, sequence, e)
+        })?)
     }
 
     /// Stores the usage object: the native value when the source was Responses, otherwise the
-    /// Responses projection of the canonical snapshot, which itself stays in the opaque carrier.
+    /// Responses projection of the canonical snapshot.
     pub(super) fn usage(&mut self, node: usize) -> Result<()> {
         let doc = &mut self.document;
         let usage = doc.required(node, "usage")?;
-        let value = super::super::usage::project(doc, usage, &mut self.usage_snapshot)?;
+        let value = super::super::usage::project(doc, usage)?;
         let target = doc.set(doc.root(), "usage", Value::Null)?;
         doc.transplant(target, value)
     }

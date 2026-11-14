@@ -38,15 +38,12 @@ fn audio_fragments_transcript_and_buffered_extension_preserve_exact_payloads() {
                 if upstream == BodyMode::Buffered {
                     assert_eq!(output["audio"], native["audio"]);
                 } else {
-                    let audio = output["x_ck_opaque"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|entry| entry["type"] == "response.audio")
-                        .unwrap();
+                    // Streamed audio reaches a buffered client at the native `audio` member.
+                    let audio = &output["audio"];
                     assert_eq!(audio["data"], "AAECAwQF");
                     assert_eq!(audio["transcript"], "hello é");
                     assert!(audio.get("mime_type").is_none());
+                    assert!(output.get("x_ck_opaque").is_none());
                 }
             } else {
                 assert_streamed_audio(&output);

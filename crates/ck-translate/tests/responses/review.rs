@@ -306,10 +306,10 @@ fn late_audio_metadata_reaches_the_client() {
         BodyMode::Buffered,
         Operation::Generate,
     );
-    let out = String::from_utf8(out).unwrap();
-    for field in ["\"mime_type\":\"audio/wav\"", "\"expires_at\":12", "\"vendor\":7"] {
-        assert!(out.contains(field), "{field}: {out}");
-    }
+    // Streamed audio and its late metadata reach a buffered client at the native `audio` member.
+    let out: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(out["audio"], audio, "{out}");
+    assert!(out.get("x_ck_opaque").is_none());
     // Audio that the snapshot starts carries its metadata in `media.start`; no second record.
     let body = json!({"id":"r","status":"completed","output":[],"audio":audio});
     let (_, events) = response(
@@ -366,25 +366,34 @@ fn unknown_events_are_preserved_not_failed() {
         Operation::Generate,
     );
     assert!(events.iter().any(|e| e["format"] == "text" && e["value"] == "not-json"));
-    // A known event with broken data and an untyped error object still fail the stream.
-    for input in [
-        format!("event: response.output_text.delta\ndata: not-json\n\ndata: {completed}\n\n"),
-        format!("data: {}\n\ndata: {completed}\n\n", json!({"error":{"message":"m"}})),
-    ] {
-        let mut m = Mapped::new();
-        let mut ingress = responses::response::Ingress::new(
-            &mut m.writer,
-            identity(Direction::Response),
-            Operation::Generate,
-            BodyMode::Streaming,
-            1024 * 1024,
-        )
-        .unwrap();
-        let result = ingress
-            .advance(&mut m.writer, input.as_bytes())
-            .and_then(|()| ingress.finish(&mut m.writer));
-        assert!(result.is_err(), "{input}");
-    }
+    // An untyped error object ends the response failed, not completed.
+    let input = format!("data: {}\n\ndata: {completed}\n\n", json!({"error":{"message":"m"}}));
+    let (out, _) = response(
+        input.as_bytes(),
+        BodyMode::Streaming,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    let body: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        (&body["status"], &body["error"]["message"]),
+        (&json!("failed"), &json!("Response failed"))
+    );
+    // A known event with broken data still fails the stream.
+    let input = format!("event: response.output_text.delta\ndata: not-json\n\ndata: {completed}\n\n");
+    let mut m = Mapped::new();
+    let mut ingress = responses::response::Ingress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        BodyMode::Streaming,
+        1024 * 1024,
+    )
+    .unwrap();
+    let result = ingress
+        .advance(&mut m.writer, input.as_bytes())
+        .and_then(|()| ingress.finish(&mut m.writer));
+    assert!(result.is_err(), "{input}");
 }
 
 /// Runs streamed `records` through Responses ingress alone; returns the outcome.
@@ -455,11 +464,13 @@ fn canonical_usage_counts_win_over_the_native_value() {
     }
     egress.finish().unwrap();
     let out: Value = serde_json::from_slice(&out).unwrap();
-    // The cached count was removed from the canonical snapshot; the native null stays.
+    // The cached count was removed from the canonical snapshot, so it is reported as 0; the
+    // native null stays.
     assert_eq!(
         out["usage"],
         json!({"input_tokens":9,"output_tokens":2,"total_tokens":11,
-            "input_tokens_details":{"vendor":null},"output_tokens_details":{"reasoning_tokens":1}}),
+            "input_tokens_details":{"vendor":null,"cached_tokens":0,"cache_write_tokens":0},
+            "output_tokens_details":{"reasoning_tokens":1}}),
     );
     // Unchanged counts round-trip: no derived total, and a nested cache write stays nested.
     let usage = json!({"input_tokens":3,"output_tokens":2,"input_tokens_details":{"cache_write_tokens":4}});
@@ -470,7 +481,10 @@ fn canonical_usage_counts_win_over_the_native_value() {
         BodyMode::Buffered,
         Operation::Generate,
     );
-    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["usage"], usage);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap()["usage"],
+        super::sdk::official_usage(&usage)
+    );
 }
 
 #[test]

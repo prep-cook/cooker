@@ -46,10 +46,21 @@ fn unknown_sse_data_stays_opaque() {
     let (_, canonical) = before_completion("data: ordinary text\n\n").unwrap();
     assert_eq!(opaque(&canonical)[0]["value"], "ordinary text");
     assert_eq!(opaque(&canonical)[0]["format"], "text");
-    // Failures and invalid JSON still end the stream.
+    // An upstream error ends the response failed with the sanitized code; the completed response
+    // after it is ignored.
     for failing in [
         "data: {\"error\":{\"code\":\"x\"}}\n\n",
         "event: error\ndata: {\"code\":\"x\"}\n\n",
+    ] {
+        let (body, canonical) = before_completion(failing).unwrap();
+        assert_eq!(
+            (&body["status"], &body["error"]["code"]),
+            (&json!("failed"), &json!("server_error"))
+        );
+        assert_eq!(canonical.last().unwrap()["scope"], "upstream", "{failing}");
+    }
+    // Invalid JSON still ends the stream.
+    for failing in [
         "event: response.output_text.delta\ndata: not json\n\n",
         "event: response.completed\ndata: {\"type\":\"response.completed\"\n\n",
     ] {
