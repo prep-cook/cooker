@@ -32,7 +32,11 @@ pub struct Egress {
     top: Option<Document>,
     choices: Table<Choice>,
     /// Open parts only; a part leaves the table when its block ends.
-    blocks: Table<Block>,
+    blocks: Table<part::Block>,
+    /// Streamed parts queued behind a call outside any block until that call ends.
+    parked: Table<part::Parked>,
+    /// Counts streamed content as it arrives, so a failure writes held parts in that order.
+    arrival: u64,
     terminal: bool,
     failed: bool,
     array_started: bool,
@@ -48,19 +52,9 @@ struct Choice {
     /// Streamed output holds the last completed part and the candidate members that follow it,
     /// so every record carries content and the last one also carries the finish.
     part: Option<Document>,
+    /// When the held part's content arrived.
+    arrival: u64,
     fields: Option<Document>,
-}
-struct Block {
-    item: LocalId,
-    index: u64,
-    choice: u64,
-    /// The native part under construction, at the document root.
-    document: Document,
-    arguments: Option<usize>,
-    media: Option<usize>,
-    thought: bool,
-    /// A streamed part holds its latest text until more text, its signature or its end arrives.
-    held: bool,
 }
 impl Egress {
     pub fn new(
@@ -102,6 +96,8 @@ impl Egress {
             top: None,
             choices: Table::new(owner)?,
             blocks: Table::new(owner)?,
+            parked: Table::new(owner)?,
+            arrival: 0,
             terminal: false,
             failed: false,
             array_started: false,
@@ -125,8 +121,8 @@ impl Egress {
             Kind::BlockStart => self.block_start(owner, event)?,
             Kind::Chunk => self.chunk(owner, event, output)?,
             Kind::ReasoningSignature => self.signature(event)?,
-            Kind::ToolStart => self.tool_start(event)?,
-            Kind::ToolEnd => self.tool_end(owner, &event)?,
+            Kind::ToolStart => self.tool_start(owner, event, output)?,
+            Kind::ToolEnd => self.tool_end(owner, &event, output)?,
             Kind::ToolResult | Kind::CodeExecution | Kind::MediaTranscript => self.part_value(kind, event)?,
             Kind::MediaStart => self.media_start(event)?,
             Kind::Data => self.data(event)?,
@@ -302,6 +298,7 @@ impl Egress {
             node,
             finished: false,
             part: None,
+            arrival: 0,
             fields: None,
         })
     }
@@ -390,6 +387,7 @@ impl Egress {
     }
     fn error(&mut self, owner: &mut Writer, output: &mut impl FnMut(ScratchLease) -> Result<()>) -> Result<()> {
         if self.body.is_none() {
+            self.release_parked(owner, output)?;
             self.last(owner, output)?;
         }
         self.emit(owner, output, |e| {
