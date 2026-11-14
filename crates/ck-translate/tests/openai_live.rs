@@ -38,6 +38,8 @@ const OPENAI_ERROR: &[u8] = include_bytes!("fixtures/openai-live/oai-resp-func1.
 const TEXT_THEN_TOOL: &[u8] = include_bytes!("fixtures/openai-live/order-input.sse");
 const TOOL_THEN_TEXT: &[u8] = include_bytes!("fixtures/openai-live/late-text.sse");
 const ALTERNATING: &[u8] = include_bytes!("fixtures/openai-live/alternating.sse");
+const UNFINISHED_CALL: &[u8] = include_bytes!("fixtures/openai-live/unfinished-eof.sse");
+const UNFINISHED_FIRST_CALL: &[u8] = include_bytes!("fixtures/openai-live/reverse-tool-failure.sse");
 
 #[derive(Clone, Copy)]
 enum Upstream {
@@ -303,6 +305,30 @@ fn gemini_function_calls_carry_the_upstream_call_id() {
     );
 }
 
+/// The text and call parts of a Gemini client body in order. Adjacent text parts join: a
+/// stream may split one text across records.
+fn part_order(out: &[u8], framing: Framing) -> Vec<String> {
+    let records = match framing {
+        Framing::Sse => events(out),
+        _ => vec![serde_json::from_slice(out).unwrap()],
+    };
+    let mut order: Vec<String> = Vec::new();
+    for record in &records {
+        for part in record["candidates"][0]["content"]["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            match (part["text"].as_str(), order.last_mut()) {
+                (Some(text), Some(last)) if last.starts_with("text ") => last.push_str(text),
+                (Some(text), _) => order.push(format!("text {text}")),
+                (None, _) => order.push(format!("call {}", part["functionCall"]["name"].as_str().unwrap())),
+            }
+        }
+    }
+    order
+}
+
 #[test]
 fn gemini_tool_parts_keep_their_arrival_order() {
     for (input, expected) in [
@@ -313,27 +339,30 @@ fn gemini_tool_parts_keep_their_arrival_order() {
         for framing in [Framing::Json, Framing::Sse] {
             let (out, failure) = decode(Upstream::Chat, input, BodyMode::Streaming, 61, Client::Gemini(framing));
             assert_eq!(failure, None);
-            let records = match framing {
-                Framing::Sse => events(&out),
-                _ => vec![serde_json::from_slice(&out).unwrap()],
-            };
-            // Adjacent text parts join: a stream may split one text across records.
-            let mut order: Vec<String> = Vec::new();
-            for record in &records {
-                for part in record["candidates"][0]["content"]["parts"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                {
-                    match (part["text"].as_str(), order.last_mut()) {
-                        (Some(text), Some(last)) if last.starts_with("text ") => last.push_str(text),
-                        (Some(text), _) => order.push(format!("text {text}")),
-                        (None, _) => order.push(format!("call {}", part["functionCall"]["name"].as_str().unwrap())),
-                    }
-                }
-            }
-            assert_eq!(order, expected);
+            assert_eq!(part_order(&out, framing), expected);
         }
+    }
+}
+
+#[test]
+fn gemini_failures_keep_the_parts_queued_behind_an_unfinished_call() {
+    for (upstream, input, expected) in [
+        (Upstream::Chat, UNFINISHED_CALL, &["text after-Aafter-B"][..]),
+        (
+            Upstream::Responses,
+            UNFINISHED_FIRST_CALL,
+            &["text after0", "call f1", "text after1", "call f2", "text after2"],
+        ),
+    ] {
+        let (out, failure) = decode(upstream, input, BodyMode::Streaming, 61, Client::Gemini(Framing::Sse));
+        assert!(failure.is_some());
+        assert_eq!(part_order(&out, Framing::Sse), expected);
+        assert_eq!(events(&out).last().unwrap()["error"]["code"], 502);
+        // A buffered body is replaced by the error: no placeholder or partial call escapes.
+        let (out, _) = decode(upstream, input, BodyMode::Streaming, 61, Client::Gemini(Framing::Json));
+        let body: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(body["error"]["code"], 502, "{body}");
+        assert!(body.get("candidates").is_none(), "{body}");
     }
 }
 

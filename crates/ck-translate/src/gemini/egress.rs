@@ -397,6 +397,7 @@ impl Egress {
     }
     fn error(&mut self, owner: &mut Writer, output: &mut impl FnMut(ScratchLease) -> Result<()>) -> Result<()> {
         if self.body.is_none() {
+            self.release_parked(owner, output)?;
             self.last(owner, output)?;
         }
         self.emit(owner, output, |e| {

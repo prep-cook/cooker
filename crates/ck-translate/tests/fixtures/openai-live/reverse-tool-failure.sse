@@ -1,0 +1,57 @@
+event: response.created
+data: {"type": "response.created", "response": {"id": "r", "model": "m", "created_at": 1, "status": "in_progress", "output": []}}
+
+event: response.output_item.added
+data: {"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "fc0", "call_id": "call0", "name": "f0", "arguments": "", "status": "in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "fc0", "delta": "{\"x\":1}"}
+
+event: response.output_item.added
+data: {"type": "response.output_item.added", "output_index": 1, "item": {"type": "message", "id": "msg0", "status": "in_progress", "role": "assistant", "content": []}}
+
+event: response.output_text.delta
+data: {"type": "response.output_text.delta", "output_index": 1, "item_id": "msg0", "content_index": 0, "delta": "after0"}
+
+event: response.output_item.done
+data: {"type": "response.output_item.done", "output_index": 1, "item": {"type": "message", "id": "msg0", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "after0"}]}}
+
+event: response.output_item.added
+data: {"type": "response.output_item.added", "output_index": 2, "item": {"type": "function_call", "id": "fc1", "call_id": "call1", "name": "f1", "arguments": "", "status": "in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type": "response.function_call_arguments.delta", "output_index": 2, "item_id": "fc1", "delta": "{\"x\":1}"}
+
+event: response.output_item.added
+data: {"type": "response.output_item.added", "output_index": 3, "item": {"type": "message", "id": "msg1", "status": "in_progress", "role": "assistant", "content": []}}
+
+event: response.output_text.delta
+data: {"type": "response.output_text.delta", "output_index": 3, "item_id": "msg1", "content_index": 0, "delta": "after1"}
+
+event: response.output_item.done
+data: {"type": "response.output_item.done", "output_index": 3, "item": {"type": "message", "id": "msg1", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "after1"}]}}
+
+event: response.output_item.added
+data: {"type": "response.output_item.added", "output_index": 4, "item": {"type": "function_call", "id": "fc2", "call_id": "call2", "name": "f2", "arguments": "", "status": "in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type": "response.function_call_arguments.delta", "output_index": 4, "item_id": "fc2", "delta": "{\"x\":1}"}
+
+event: response.output_item.added
+data: {"type": "response.output_item.added", "output_index": 5, "item": {"type": "message", "id": "msg2", "status": "in_progress", "role": "assistant", "content": []}}
+
+event: response.output_text.delta
+data: {"type": "response.output_text.delta", "output_index": 5, "item_id": "msg2", "content_index": 0, "delta": "after2"}
+
+event: response.output_item.done
+data: {"type": "response.output_item.done", "output_index": 5, "item": {"type": "message", "id": "msg2", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "after2"}]}}
+
+event: response.output_item.done
+data: {"type": "response.output_item.done", "output_index": 4, "item": {"type": "function_call", "id": "fc2", "call_id": "call2", "name": "f2", "arguments": "{\"x\":1}", "status": "completed"}}
+
+event: response.output_item.done
+data: {"type": "response.output_item.done", "output_index": 2, "item": {"type": "function_call", "id": "fc1", "call_id": "call1", "name": "f1", "arguments": "{\"x\":1}", "status": "completed"}}
+
+event: response.failed
+data: {"type": "response.failed", "response": {"id": "r", "model": "m", "created_at": 1, "status": "failed", "error": {"code": "server_error", "message": "failed"}, "output": []}}
+

@@ -384,6 +384,20 @@ impl Egress {
         }
         self.hold(owner, choice, document, output)
     }
+    /// Writes every parked part in order when the stream fails. A call that never ended leaves
+    /// nothing: neither a partial call nor an empty part.
+    pub(super) fn release_parked(
+        &mut self,
+        owner: &mut Writer,
+        output: &mut impl FnMut(ScratchLease) -> Result<()>,
+    ) -> Result<()> {
+        for at in 0..self.parked.len() {
+            if let Some(part) = self.parked[at].part.take() {
+                self.hold(owner, self.parked[at].choice, part, output)?;
+            }
+        }
+        Ok(())
+    }
     /// Holds `document` as the next record of `choice`, first writing the part held before it.
     /// A finished choice keeps its members for the last record.
     fn hold(
