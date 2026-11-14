@@ -230,3 +230,33 @@ fn native_usage_carries_both_cache_counts_in_the_details() {
         }
     }
 }
+
+/// Streamed audio reaches a buffered client at the native `audio` member; a final response that
+/// carries the audio keeps it as sent.
+#[test]
+fn streamed_audio_reaches_buffered_clients_natively() {
+    let audio = json!({"data":"AAEC","transcript":"hello","mime_type":"audio/wav"});
+    for final_audio in [None, Some(audio.clone())] {
+        let mut completed = json!({"id":"r","status":"completed","output":[]});
+        if let Some(audio) = &final_audio {
+            completed["audio"] = audio.clone();
+        }
+        let input = wire(&[
+            json!({"type":"response.created","response":{"id":"r"}}),
+            json!({"type":"response.audio.delta","delta":"AAEC"}),
+            json!({"type":"response.audio.done"}),
+            json!({"type":"response.audio.transcript.delta","delta":"hello"}),
+            json!({"type":"response.audio.transcript.done"}),
+            json!({"type":"response.completed","response":completed}),
+        ]);
+        let (output, _) = response(
+            input.as_bytes(),
+            BodyMode::Streaming,
+            BodyMode::Buffered,
+            Operation::Generate,
+        );
+        let out: Value = serde_json::from_slice(&output).unwrap();
+        let expected = final_audio.unwrap_or_else(|| json!({"data":"AAEC","transcript":"hello"}));
+        assert_eq!(out["audio"], expected, "{out}");
+    }
+}
