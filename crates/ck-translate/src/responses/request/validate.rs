@@ -1,4 +1,6 @@
 use super::super::{is, string};
+use crate::codec::chat::request::gemini::{Outcome, json_mode, outcome};
+use crate::codec::chat::request::json_schema;
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
@@ -53,6 +55,9 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     {
         return Err(Error::Unsupported);
     }
+    if json_schema::from_gemini(doc)? {
+        gemini_controls(doc)?;
+    }
     let messages = doc.required(root, "messages")?;
     if !matches!(doc.node(messages)?.value, Value::Array) {
         return Err(Error::Schema);
@@ -77,6 +82,25 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     })?;
     if let Some(x) = x {
         validate_extensions(doc, x)?;
+    }
+    Ok(())
+}
+/// Gemini JSON mode and function declarations, which egress writes in JSON Schema. A native
+/// tool group, such as `googleSearch`, has no Responses form.
+fn gemini_controls(doc: &Document) -> Result<()> {
+    let root = doc.root();
+    if let Some(native) = doc.member(doc.required(root, "x_ck")?, "tools")?
+        && doc.node(native)?.first.is_some()
+    {
+        return Err(Error::Unsupported);
+    }
+    if let Some(format) = doc.member(root, "response_format")? {
+        json_mode(doc, format)?;
+    }
+    if let Some(tools) = doc.member(root, "tools")? {
+        for tool in doc.children(tools)? {
+            json_schema::check_function(doc, doc.required(tool, "function")?, true)?;
+        }
     }
     Ok(())
 }
@@ -176,13 +200,49 @@ fn validate_message(view: RequestView<'_>, message: usize, calls: Calls<'_>, con
             Value::Null | Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
             Value::Array => {
                 for part in doc.children(content)? {
-                    validate_part(view, part)?;
+                    if is(doc, part, "type", "tool_result")? {
+                        tool_result(view, part, calls, continued)?;
+                    } else {
+                        validate_part(view, part)?;
+                    }
                 }
             }
             _ => return Err(Error::Schema),
         }
     }
     Ok(())
+}
+/// A tool result part, which egress writes as a `function_call_output` item: its content, or a
+/// Gemini `result` as JSON text. Responses has no field for `is_error: true` or a Gemini `error`.
+fn tool_result(view: RequestView<'_>, part: usize, calls: Calls<'_>, continued: bool) -> Result<()> {
+    let doc = view.document;
+    let id = doc.required(part, "tool_call_id")?;
+    string(doc, id)?;
+    if !continued && !prior_call(doc, calls, id)? {
+        return Err(Error::Schema);
+    }
+    if let Some(error) = doc.member(part, "is_error")? {
+        match doc.node(error)?.value {
+            Value::Bool(false) | Value::Null => (),
+            Value::Bool(true) => return Err(Error::Unsupported),
+            _ => return Err(Error::Schema),
+        }
+    }
+    match outcome(doc, part)? {
+        Some(Outcome::Error(_)) => Err(Error::Unsupported),
+        Some(Outcome::Result(_)) => Ok(()),
+        None => {
+            if let Some(content) = doc.member(part, "content")? {
+                if !matches!(doc.node(content)?.value, Value::Array) {
+                    return Err(Error::Schema);
+                }
+                for item in doc.children(content)? {
+                    validate_part(view, item)?;
+                }
+            }
+            Ok(())
+        }
+    }
 }
 fn validate_part(view: RequestView<'_>, part: usize) -> Result<()> {
     let doc = view.document;
@@ -222,6 +282,25 @@ fn validate_part(view: RequestView<'_>, part: usize) -> Result<()> {
     if !supported {
         return Err(Error::Unsupported);
     }
+    if doc.string_is(kind, "document")? {
+        document(doc, part)?;
+    }
+    Ok(())
+}
+/// A Responses `input_file` holds a file's bytes, URL or ID and a filename. An Anthropic
+/// plain-text source is not file bytes, and its `title`, `context` and `citations` have no
+/// Responses field, so such a document is refused rather than sent malformed or cut down.
+fn document(doc: &Document, part: usize) -> Result<()> {
+    if doc.member(doc.required(part, "source")?, "anthropic_text")?.is_some() {
+        return Err(Error::Unsupported);
+    }
+    let x = doc.member(doc.root(), "x_ck")?;
+    let original = x.map(|x| doc.member(x, "original")).transpose()?.flatten();
+    for entry in doc.origins(part)? {
+        if original.is_some() && doc.node(entry)?.parent == original && !is(doc, entry, "protocol", "responses")? {
+            return Err(Error::Unsupported);
+        }
+    }
     Ok(())
 }
 /// Refuses gateway extensions a Responses upstream cannot carry.
@@ -230,6 +309,16 @@ fn validate_extensions(doc: &Document, x: usize) -> Result<()> {
         && doc.node(cache)?.first.is_some()
     {
         return Err(Error::Unsupported);
+    }
+    // Another protocol's parameters, such as Anthropic `top_k`, have no Responses form.
+    if let Some(providers) = doc.member(x, "provider_parameters")? {
+        for group in doc.children(providers)? {
+            if !doc.name_is(doc.node(group)?.name.ok_or(Error::Schema)?, "responses")?
+                && doc.node(group)?.first.is_some()
+            {
+                return Err(Error::Unsupported);
+            }
+        }
     }
     if let Some(replay) = doc.member(x, "replay")? {
         for entry in doc.children(replay)? {
@@ -252,9 +341,10 @@ fn validate_extensions(doc: &Document, x: usize) -> Result<()> {
     }
     Ok(())
 }
-/// Another protocol's thinking reaches Responses only as `effort` (and a string `include` as
-/// `summary`). Thinking turned on without an effort, such as a bare budget, has no Responses form,
-/// so it is refused rather than dropped; a disabled setting needs none.
+/// Another protocol's thinking reaches Responses only as `effort` and `summary`: a string
+/// `include` is the summary, and Gemini's `includeThoughts: true` asks for `auto`. Thinking
+/// turned on without an effort, such as a bare budget, has no Responses form, so it is refused
+/// rather than dropped; a disabled setting needs none.
 fn foreign_thinking(doc: &Document, x: usize, thinking: usize) -> Result<()> {
     // A Chat `reasoning` object maps only through its `effort` and `summary`; any other member,
     // such as a token budget, has no Responses form even beside an effort.
@@ -277,10 +367,18 @@ fn foreign_thinking(doc: &Document, x: usize, thinking: usize) -> Result<()> {
             None => None,
         })
     };
+    if let Some(include) = doc.member(thinking, "include")?
+        && !matches!(
+            doc.node(include)?.value,
+            Value::Bool(_) | Value::Null | Value::String(_) | Value::Text(_)
+        )
+    {
+        return Err(Error::Unsupported);
+    }
     if doc.member(thinking, "effort")?.is_some() || set("enabled")? == Some(false) {
         return Ok(());
     }
-    for key in ["enabled", "budget_tokens", "native", "include"] {
+    for key in ["enabled", "budget_tokens", "native"] {
         if set(key)? == Some(true) {
             return Err(Error::Unsupported);
         }

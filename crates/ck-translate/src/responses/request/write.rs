@@ -1,11 +1,15 @@
 use super::super::{is, member};
 use super::native::{item_type, native, typed};
 use super::reasoning::write_reasoning_options;
+use crate::codec::chat::request::{gemini, json_schema};
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Name, Value},
     encode::Encoder,
 };
+use results::write_results;
+#[path = "results.rs"]
+mod results;
 
 /// Writes the Responses fields of `target` that normalization kept in `x_ck.original`; fields
 /// another protocol kept there mean nothing to a Responses upstream.
@@ -150,8 +154,17 @@ fn provider_text(doc: &Document) -> Result<Option<usize>> {
         None => Ok(None),
     }
 }
-/// Writes a canonical response format; Responses spells `json_schema` members flat.
+/// Writes a canonical response format; Responses spells `json_schema` members flat. Gemini JSON
+/// mode is a `json_schema` format with a fixed name, or `json_object` without a schema.
 fn write_format(doc: &Document, format: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    if json_schema::from_gemini(doc)? {
+        let Some(schema) = gemini::json_mode(doc, format)? else {
+            return e.bytes(b"{\"type\":\"json_object\"}");
+        };
+        e.bytes(b"{\"type\":\"json_schema\",\"name\":\"response\",\"schema\":")?;
+        gemini::write_schema(doc, schema, e)?;
+        return e.bytes(b"}");
+    }
     let schema = match doc.node(format)?.value {
         Value::Object => doc.member(format, "json_schema")?,
         _ => None,
@@ -185,6 +198,7 @@ fn write_tools(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<
         .flatten()
         .peekable();
     let mut functions = doc.children(field)?.peekable();
+    let gemini = json_schema::from_gemini(doc)?;
     e.bytes(b"[")?;
     for position in 0u64.. {
         let at = match natives.peek() {
@@ -199,11 +213,17 @@ fn write_tools(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<
         } else if let Some(tool) = functions.next() {
             e.bytes(b"{\"type\":\"function\"")?;
             let function = doc.required(tool, "function")?;
-            for f in doc.children(function)? {
+            if gemini {
+                // A Gemini declaration's schemas become JSON Schema `parameters` and `output_schema`.
                 e.bytes(b",")?;
-                doc.write_name(doc.node(f)?.name.ok_or(Error::Schema)?, e)?;
-                e.bytes(b":")?;
-                doc.write(f, e)?;
+                json_schema::write_function(doc, function, ("parameters", Some("output_schema")), e)?;
+            } else {
+                for f in doc.children(function)? {
+                    e.bytes(b",")?;
+                    doc.write_name(doc.node(f)?.name.ok_or(Error::Schema)?, e)?;
+                    e.bytes(b":")?;
+                    doc.write(f, e)?;
+                }
             }
             originals(doc, tool, e, &["type", "function"])?;
             e.bytes(b"}")?;
@@ -293,13 +313,14 @@ fn write_message(
             separate(first, e)?;
             return doc.write(doc.required(part, "value")?, e);
         }
+        let results = write_results(view, content, first, e)?;
         let reasoning = native || any_part(doc, content, true)?;
         if reasoning {
             separate(first, e)?;
             write_reasoning(doc, message, content, replay, e)?;
         }
         let text = match doc.node(content)?.value {
-            Value::Array => any_part(doc, content, false)? || (!reasoning && calls.is_none()),
+            Value::Array => any_part(doc, content, false)? || (!reasoning && !results && calls.is_none()),
             Value::Null => calls.is_none(),
             _ => calls.is_none() || doc.chars(content)?.next_scalar()?.is_some(),
         };
@@ -316,13 +337,16 @@ fn write_message(
     }
     Ok(())
 }
-/// True when array `content` has a reasoning part (`reasoning`) or a part of any other kind.
+/// True when array `content` has a reasoning part (`reasoning`) or a message part.
 fn any_part(doc: &Document, content: usize, reasoning: bool) -> Result<bool> {
     if !matches!(doc.node(content)?.value, Value::Array) {
         return Ok(false);
     }
     for part in doc.children(content)? {
         let kind = doc.required(part, "type")?;
+        if doc.string_is(kind, "tool_result")? {
+            continue;
+        }
         let found = doc.string_is(kind, "reasoning")?
             || doc.string_is(kind, "reasoning_summary")?
             || doc.string_is(kind, "encrypted")?;
@@ -399,6 +423,7 @@ fn write_message_item(view: RequestView<'_>, message: usize, content: usize, e: 
             if doc.string_is(kind, "reasoning")?
                 || doc.string_is(kind, "reasoning_summary")?
                 || doc.string_is(kind, "encrypted")?
+                || doc.string_is(kind, "tool_result")?
             {
                 continue;
             }

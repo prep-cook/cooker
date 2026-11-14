@@ -202,7 +202,7 @@ pub(super) fn destination(doc: &Document) -> Result<()> {
                 return Err(Error::Unsupported);
             }
             if gemini {
-                super::request::json_schema::check_function(doc, doc.required(tool, "function")?)?;
+                super::request::json_schema::check_function(doc, doc.required(tool, "function")?, false)?;
             }
         }
     }
