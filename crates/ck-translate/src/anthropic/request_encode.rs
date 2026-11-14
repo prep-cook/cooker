@@ -52,6 +52,7 @@ fn fields(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<bool> 
             "tool_choice",
             "parallel_tool_calls",
             "response_format",
+            "max_completion_tokens",
         ]
         .iter()
         .try_fold(false, |yes, key| Ok::<_, Error>(yes || doc.name_is(name, key)?))?
@@ -93,7 +94,7 @@ fn messages(view: RequestView<'_>, root: usize, e: &mut Encoder<'_, '_>) -> Resu
     let mut first_message = true;
     let mut system = None;
     for (message_index, message) in doc.children(messages)?.enumerate() {
-        if super::is(doc, message, "role", "system")? {
+        if super::is(doc, message, "role", "system")? || super::is(doc, message, "role", "developer")? {
             if system.is_some() {
                 return Err(Error::Unsupported);
             }
@@ -133,23 +134,8 @@ fn thinking(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     }
     e.bytes(b",\"thinking\":")?;
     e.bytes(b"{\"type\":")?;
-    let enabled = doc
-        .member(thinking, "enabled")?
-        .map(|n| doc.node(n))
-        .transpose()?
-        .is_some_and(|n| matches!(n.value, Value::Bool(true)));
+    e.string(super::request_schema::thinking_type(doc, thinking)?)?;
     let native = doc.member(thinking, "native")?;
-    let adaptive = native
-        .map(|n| super::is(doc, n, "type", "adaptive"))
-        .transpose()?
-        .unwrap_or(false);
-    e.string(if !enabled {
-        "disabled"
-    } else if adaptive {
-        "adaptive"
-    } else {
-        "enabled"
-    })?;
     super::member(doc, thinking, "budget_tokens", e)?;
     if let Some(native) = native {
         for field in doc.children(native)? {
@@ -193,6 +179,12 @@ fn tools(doc: &Document, root: usize, x: usize, e: &mut Encoder<'_, '_>) -> Resu
         } else {
             let function = doc.required(tool, "function")?;
             e.bytes(b"{")?;
+            if crate::codec::chat::request::json_schema::from_gemini(doc)? {
+                crate::codec::chat::request::json_schema::write_function(doc, function, "input_schema", e)?;
+                originals(doc, tool, e)?;
+                e.bytes(b"}")?;
+                continue;
+            }
             for (i, field) in doc.children(function)?.enumerate() {
                 if i != 0 {
                     e.bytes(b",")?;
@@ -232,7 +224,7 @@ fn tool_choice(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<(
     if let Some(choice) = choice {
         if matches!(doc.node(choice)?.value, Value::Object) {
             e.string("tool")?;
-            let function = doc.required(choice, "function")?;
+            let function = super::request_schema::forced_function(doc, choice)?;
             super::member(doc, function, "name", e)?;
             originals(doc, choice, e)?;
         } else {

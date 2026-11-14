@@ -165,11 +165,11 @@ fn controls(doc: &Document) -> Result<()> {
     {
         return Err(Error::Unsupported);
     }
-    // ponytail: Chat's nested `allowed_tools` choice is refused; mapping it to Gemini's
-    // `allowedFunctionNames` lifts this.
+    // `allowedFunctionNames` holds only with mode ANY, Chat's `required`.
     if let Some(choice) = doc.member(root, "tool_choice")?
         && matches!(doc.node(choice)?.value, Value::Object)
-        && doc.member(choice, "allowed_tools")?.is_some()
+        && let Some(allowed) = doc.member(choice, "allowed_tools")?
+        && !super::is(doc, allowed, "mode", "required")?
     {
         return Err(Error::Unsupported);
     }

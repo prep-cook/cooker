@@ -227,7 +227,8 @@ fn response_file_data_fails_where_it_cannot_be_written() {
     }
 }
 
-/// Chat's `allowed_tools` choice has no Gemini mapping yet and is refused at the fence.
+/// An optional (`auto`) `allowed_tools` choice has no Gemini form: `allowedFunctionNames`
+/// holds only with mode ANY.
 #[test]
 fn chat_allowed_tools_choice_is_refused_at_the_gemini_fence() {
     let input = json!({"model":"m","messages":[{"role":"user","content":"q"}],

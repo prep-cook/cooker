@@ -195,10 +195,14 @@ pub(super) fn destination(doc: &Document) -> Result<()> {
     if let Some(tools) = doc.member(doc.root(), "tools")?
         && matches!(doc.node(tools)?.value, Value::Array)
     {
+        let gemini = super::request::json_schema::from_gemini(doc)?;
         for tool in doc.children(tools)? {
             let kind = doc.required(tool, "type")?;
             if !doc.string_is(kind, "custom")? && !doc.string_is(kind, "function")? {
                 return Err(Error::Unsupported);
+            }
+            if gemini {
+                super::request::json_schema::check_function(doc, doc.required(tool, "function")?)?;
             }
         }
     }
@@ -227,9 +231,18 @@ pub(super) fn destination(doc: &Document) -> Result<()> {
 /// Whether the request came from Anthropic ingress, whose thinking history Chat egress strips:
 /// visible thinking becomes `reasoning_content`; signatures and redacted blocks are dropped.
 pub(super) fn from_claude(doc: &Document) -> Result<bool> {
+    original_protocol_is(doc, "anthropic")
+}
+
+/// Whether the request came from Chat ingress.
+pub(super) fn from_chat(doc: &Document) -> Result<bool> {
+    original_protocol_is(doc, "chat")
+}
+
+fn original_protocol_is(doc: &Document, protocol: &str) -> Result<bool> {
     let x = doc.required(doc.root(), "x_ck")?;
     match doc.member(x, "original_protocol")? {
-        Some(protocol) => doc.string_is(protocol, "anthropic"),
+        Some(original) => doc.string_is(original, protocol),
         None => Ok(false),
     }
 }

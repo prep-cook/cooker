@@ -1,3 +1,4 @@
+use crate::codec::chat::request::json_schema;
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
@@ -29,7 +30,8 @@ fn roles(view: RequestView<'_>, messages: usize, (index, hasher): (&CallIndex, &
     let mut system = false;
     for (ordinal, message) in doc.children(messages)?.enumerate() {
         let role = doc.required(message, "role")?;
-        if doc.string_is(role, "system")? {
+        // Encoding writes a leading `developer` message, such as Responses `instructions`, as `system`.
+        if doc.string_is(role, "system")? || doc.string_is(role, "developer")? {
             if conversation || system {
                 return Err(Error::Unsupported);
             }
@@ -58,10 +60,15 @@ fn parameters(doc: &Document, root: usize, operation: Operation, default_max_tok
     if !matches!(doc.node(messages)?.value, Value::Array) {
         return Err(Error::Schema);
     }
+    let completion = doc
+        .member(root, "max_completion_tokens")?
+        .map(|n| doc.unsigned(n))
+        .transpose()?;
     if operation == Operation::Generate {
+        // Encoding writes `max_completion_tokens` as `max_tokens` unless `max_tokens` is present.
         let max_tokens = match doc.member(root, "max_tokens")? {
             Some(max_tokens) => doc.unsigned(max_tokens)?,
-            None => default_max_tokens.ok_or(Error::Schema)?,
+            None => completion.or(default_max_tokens).ok_or(Error::Schema)?,
         };
         if max_tokens == 0 {
             return Err(Error::Schema);
@@ -94,7 +101,6 @@ fn parameters(doc: &Document, root: usize, operation: Operation, default_max_tok
     for key in [
         "n",
         "seed",
-        "max_completion_tokens",
         "logprobs",
         "top_logprobs",
         "modalities",
@@ -228,22 +234,47 @@ fn tools(doc: &Document, root: usize, x: usize) -> Result<()> {
             }
             let function = doc.required(tool, "function")?;
             super::string(doc, doc.required(function, "name")?)?;
-            if !matches!(doc.node(doc.required(function, "parameters")?)?.value, Value::Object) {
+            let gemini = json_schema::from_gemini(doc)?;
+            if gemini {
+                json_schema::check_function(doc, function)?;
+            }
+            let schema = match doc.member(function, "parameters")? {
+                Some(schema) => schema,
+                None if gemini => doc.required(function, "parametersJsonSchema")?,
+                None => return Err(Error::Schema),
+            };
+            if !matches!(doc.node(schema)?.value, Value::Object) {
                 return Err(Error::Schema);
             }
         }
     }
     Ok(())
 }
+/// The function a tool choice object forces: Chat's `function` choice, or an `allowed_tools`
+/// choice that requires its only tool. Anthropic can force one tool, not choose among several.
+pub(super) fn forced_function(doc: &Document, choice: usize) -> Result<usize> {
+    if super::is(doc, choice, "type", "function")? {
+        return doc.required(choice, "function");
+    }
+    if !super::is(doc, choice, "type", "allowed_tools")? {
+        return Err(Error::Unsupported);
+    }
+    let allowed = doc.required(choice, "allowed_tools")?;
+    if !super::is(doc, allowed, "mode", "required")? {
+        return Err(Error::Unsupported);
+    }
+    let mut tools = doc.children(doc.required(allowed, "tools")?)?;
+    match (tools.next(), tools.next()) {
+        (Some(tool), None) => doc.required(tool, "function"),
+        _ => Err(Error::Unsupported),
+    }
+}
 fn tool_choice(doc: &Document, root: usize, x: usize) -> Result<()> {
     let Some(choice) = doc.member(root, "tool_choice")? else {
         return Ok(());
     };
     if matches!(doc.node(choice)?.value, Value::Object) {
-        if !super::is(doc, choice, "type", "function")? {
-            return Err(Error::Unsupported);
-        }
-        let function = doc.required(choice, "function")?;
+        let function = forced_function(doc, choice)?;
         let name = doc.required(function, "name")?;
         if doc.chars(name)?.next_scalar()?.is_none() {
             return Err(Error::Schema);
@@ -278,7 +309,35 @@ fn tool_choice(doc: &Document, root: usize, x: usize) -> Result<()> {
     {
         return Err(Error::Unsupported);
     }
+    // Manual thinking allows only `auto` and `none`; adaptive thinking allows a forced tool.
+    let forced = matches!(doc.node(choice)?.value, Value::Object) || doc.string_is(choice, "required")?;
+    if forced
+        && let Some(thinking) = doc.member(x, "thinking")?
+        && thinking_type(doc, thinking)? == "enabled"
+    {
+        return Err(Error::Unsupported);
+    }
     Ok(())
+}
+/// The Anthropic `thinking.type` that canonical thinking stands for.
+pub(super) fn thinking_type(doc: &Document, thinking: usize) -> Result<&'static str> {
+    let enabled = match doc.member(thinking, "enabled")? {
+        Some(n) => matches!(doc.node(n)?.value, Value::Bool(true)),
+        None => false,
+    };
+    // ponytail: foreign thinking is adaptive without a budget and manual with one; some models
+    // (claude-haiku-5-5) refuse budgets. Phase D model capability picks the form per model.
+    let adaptive = match doc.member(thinking, "native")? {
+        Some(native) => super::is(doc, native, "type", "adaptive")?,
+        None => doc.member(thinking, "budget_tokens")?.is_none(),
+    };
+    Ok(if !enabled {
+        "disabled"
+    } else if adaptive {
+        "adaptive"
+    } else {
+        "enabled"
+    })
 }
 fn validate_part(view: RequestView<'_>, calls: Calls<'_>, part: usize) -> Result<()> {
     let doc = view.document;

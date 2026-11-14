@@ -37,13 +37,20 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
             e.bytes(b":")?;
             if doc.name_is(name, "messages")? {
                 e.bytes(b"[")?;
+                let mut first = true;
                 for (i, message) in doc.children(child)?.enumerate() {
-                    if i != 0 {
+                    if !write_tool_results(doc, message, &mut first, e)? {
+                        continue;
+                    }
+                    if !first {
                         e.bytes(b",")?;
                     }
+                    first = false;
                     write_message(view, message, i as u64, e)?;
                 }
                 e.bytes(b"]")?;
+            } else if doc.name_is(name, "tools")? && super::json_schema::from_gemini(doc)? {
+                write_gemini_tools(doc, child, e)?;
             } else {
                 super::super::request_controls::write(doc, child, e)?;
             }
@@ -55,7 +62,13 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
     e.bytes(b"\"stream\":")?;
     e.bytes(if streaming { b"true" } else { b"false" })?;
     if let Some(thinking) = doc.member(x, "thinking")? {
+        // Another protocol's native thinking config has no Chat field (orchestrator ruling
+        // 2026-11-15); only its effort maps.
+        let native = super::super::request_controls::from_chat(doc)?;
         for (from, to) in [("effort", "reasoning_effort"), ("native", "reasoning")] {
+            if from == "native" && !native {
+                continue;
+            }
             if let Some(value) = doc.member(thinking, from)? {
                 e.bytes(b",")?;
                 e.string(to)?;
@@ -68,6 +81,58 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
     e.bytes(b"}")
 }
 
+/// Writes a Gemini source's tools with each declaration as a JSON Schema tool definition.
+fn write_gemini_tools(doc: &Document, tools: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"[")?;
+    for (i, tool) in doc.children(tools)?.enumerate() {
+        e.bytes(if i == 0 { b"{" } else { b",{" })?;
+        for (j, field) in doc.children(tool)?.enumerate() {
+            e.bytes(if j == 0 { b"" } else { b"," })?;
+            let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+            doc.write_name(name, e)?;
+            e.bytes(b":")?;
+            if !doc.name_is(name, "function")? {
+                doc.write(field, e)?;
+                continue;
+            }
+            e.bytes(b"{")?;
+            super::json_schema::write_function(doc, field, "parameters", e)?;
+            e.bytes(b"}")?;
+        }
+        e.bytes(b"}")?;
+    }
+    e.bytes(b"]")
+}
+/// Writes each tool result of `message` as a `tool` message with its text parts joined, ahead of
+/// the rest of the turn; returns whether parts other than tool results remain. Chat has no field
+/// for `is_error`.
+fn write_tool_results(doc: &Document, message: usize, first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<bool> {
+    let Some(content) = doc.member(message, "content")? else {
+        return Ok(true);
+    };
+    if !matches!(doc.node(content)?.value, Value::Array) {
+        return Ok(true);
+    }
+    let mut rest = doc.node(content)?.first.is_none();
+    for part in doc.children(content)? {
+        if !doc.string_is(doc.required(part, "type")?, "tool_result")? {
+            rest = true;
+            continue;
+        }
+        e.bytes(if *first { b"" } else { b"," })?;
+        *first = false;
+        e.bytes(b"{\"role\":\"tool\",\"tool_call_id\":")?;
+        doc.write(doc.required(part, "tool_call_id")?, e)?;
+        e.bytes(b",\"content\":\"")?;
+        if let Some(texts) = doc.member(part, "content")? {
+            for text in doc.children(texts)? {
+                doc.write_contents(doc.required(text, "text")?, e)?;
+            }
+        }
+        e.bytes(b"\"}")?;
+    }
+    Ok(rest)
+}
 fn write_message(view: RequestView<'_>, message: usize, _message_index: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
     let claude = super::super::request_controls::from_claude(doc)?;
@@ -154,7 +219,9 @@ fn write_content(view: RequestView<'_>, content: usize, claude: bool, e: &mut En
     let mut first = true;
     for part in doc.children(content)? {
         let kind = doc.required(part, "type")?;
-        if claude && (doc.string_is(kind, "reasoning")? || doc.string_is(kind, "redacted")?) {
+        if (claude && (doc.string_is(kind, "reasoning")? || doc.string_is(kind, "redacted")?))
+            || doc.string_is(kind, "tool_result")?
+        {
             continue;
         }
         e.bytes(if first { b"[" } else { b"," })?;
