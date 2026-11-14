@@ -231,6 +231,8 @@ fn foreign_thinking_writes_only_responses_reasoning_members() {
     assert_eq!(out["reasoning"], json!({"effort":"low"}));
     let out = translate(P::Chat, P::Responses, &chat(json!({"effort":"low","summary":"auto"}))).unwrap();
     assert_eq!(out["reasoning"], json!({"effort":"low","summary":"auto"}));
+    let out = translate(P::Chat, P::Responses, &chat(json!({"summary":"auto"}))).unwrap();
+    assert_eq!(out["reasoning"], json!({"summary":"auto"}));
     for reasoning in [json!({"max_tokens":1024}), json!({"effort":"low","max_tokens":1024})] {
         assert!(matches!(
             translate(P::Chat, P::Responses, &chat(reasoning)),
@@ -240,6 +242,33 @@ fn foreign_thinking_writes_only_responses_reasoning_members() {
     let responses = json!({"model":"gpt-x","input":"2+2?","reasoning":{"effort":"low","summary":"auto"}});
     let out = translate(P::Responses, P::Responses, &responses).unwrap();
     assert_eq!(out["reasoning"], json!({"effort":"low","summary":"auto"}));
+}
+
+/// A Chat `reasoning` object reaches Gemini only through its `effort`; any other member is refused
+/// rather than dropped.
+#[test]
+fn chat_reasoning_object_reaches_gemini_only_as_effort() {
+    let chat =
+        |reasoning: Value| json!({"model":"gpt-x","messages":[{"role":"user","content":"2+2?"}],"reasoning":reasoning});
+    let out = translate(P::Chat, P::Gemini, &chat(json!({"effort":"low"}))).unwrap();
+    assert_eq!(
+        out["generationConfig"]["thinkingConfig"],
+        json!({"thinkingLevel":"low"})
+    );
+    for reasoning in [
+        json!({"effort":"low","summary":"auto"}),
+        json!({"effort":"low","max_tokens":1024}),
+        json!({"max_tokens":1024}),
+        json!({"summary":"auto"}),
+    ] {
+        assert!(
+            matches!(
+                translate(P::Chat, P::Gemini, &chat(reasoning.clone())),
+                Err(codec::Error::Unsupported)
+            ),
+            "{reasoning}"
+        );
+    }
 }
 
 /// The openai SDK's accumulated assistant message carries `tool_calls: null` and

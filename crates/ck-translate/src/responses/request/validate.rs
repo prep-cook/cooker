@@ -1,4 +1,4 @@
-use super::super::{chat_effort, is, string};
+use super::super::{is, string};
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
@@ -252,10 +252,9 @@ fn validate_extensions(doc: &Document, x: usize) -> Result<()> {
     }
     Ok(())
 }
-/// Another protocol's thinking reaches Responses only as `effort`, including a Chat `reasoning`
-/// object's (and a string `include` as `summary`). Thinking turned on without an effort, such as a
-/// bare budget, has no Responses form, so it is refused rather than dropped; a disabled setting
-/// needs none.
+/// Another protocol's thinking reaches Responses only as `effort` (and a string `include` as
+/// `summary`). Thinking turned on without an effort, such as a bare budget, has no Responses form,
+/// so it is refused rather than dropped; a disabled setting needs none.
 fn foreign_thinking(doc: &Document, x: usize, thinking: usize) -> Result<()> {
     // A Chat `reasoning` object maps only through its `effort` and `summary`; any other member,
     // such as a token budget, has no Responses form even beside an effort.
@@ -268,6 +267,9 @@ fn foreign_thinking(doc: &Document, x: usize, thinking: usize) -> Result<()> {
                 return Err(Error::Unsupported);
             }
         }
+        if doc.node(object)?.first.is_some() {
+            return Ok(());
+        }
     }
     let set = |key: &str| -> Result<Option<bool>> {
         Ok(match doc.member(thinking, key)? {
@@ -275,10 +277,7 @@ fn foreign_thinking(doc: &Document, x: usize, thinking: usize) -> Result<()> {
             None => None,
         })
     };
-    if doc.member(thinking, "effort")?.is_some()
-        || chat_effort(doc, x, thinking)?.is_some()
-        || set("enabled")? == Some(false)
-    {
+    if doc.member(thinking, "effort")?.is_some() || set("enabled")? == Some(false) {
         return Ok(());
     }
     for key in ["enabled", "budget_tokens", "native", "include"] {
