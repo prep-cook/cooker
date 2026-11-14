@@ -231,7 +231,7 @@ fn late_escaped_duplicate_names_fail_on_every_protocol_and_split() {
 /// name is checked as RFC 6901 decoding checks it.
 #[test]
 fn copied_pointer_segments_match_decoded_names() {
-    use codec::document::{Document, Name, Value};
+    use codec::document::{Document, Value};
     let mut mapped = Mapped::new();
     let mut source = codec::source::Source::new(&mut mapped.writer).unwrap();
     let body = br#"{"valid":"/x/a~1b~0","invalid":"/x/a~2","escaped":"e\u0066~/"}"#;
@@ -243,9 +243,9 @@ fn copied_pointer_segments_match_decoded_names() {
             panic!("{member} is not a string");
         };
         let name = if pointer {
-            Name::Pointer(text)
+            doc.pointer_name(text)?
         } else {
-            Name::Mapped(text)
+            doc.mapped_name(text)?
         };
         let lease = codec::encode::scratch(&mut mapped.writer, |e| {
             codec::provenance::write_pointer_segment(&doc, name, e)

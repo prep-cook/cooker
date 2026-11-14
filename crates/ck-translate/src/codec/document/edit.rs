@@ -70,7 +70,7 @@ impl Document {
             },
         };
         if self.nodes[node].name.is_some() {
-            self.nodes[node].name = Some(Name::Pointer(text(field.pointer)));
+            self.nodes[node].name = Some(self.pointer_name(text(field.pointer))?);
         }
         if let Some((span, value)) = scalar {
             self.nodes[node].value = value(text(span));
@@ -141,8 +141,8 @@ impl Document {
             let node = event.node(index)?;
             child = node.next;
             let name = match node.name {
-                Some(Name::Mapped(text)) => Some(Name::Mapped(adopted.text(text)?)),
-                Some(Name::Pointer(text)) => Some(Name::Pointer(adopted.text(text)?)),
+                Some(Name::Mapped(text, digest)) => Some(Name::Mapped(adopted.text(text)?, digest)),
+                Some(Name::Pointer(text, digest)) => Some(Name::Pointer(adopted.text(text)?, digest)),
                 name => name,
             };
             let copy = self.copy_adopted(event, index, adopted, name)?;
@@ -227,7 +227,7 @@ impl Document {
             published: false,
             published_through: 0,
             input_key: match name {
-                Some(Name::Mapped(Text { source: 0, span })) => Some(span),
+                Some(Name::Mapped(Text { source: 0, span }, _)) => Some(span),
                 _ => None,
             },
         });

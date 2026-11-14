@@ -188,7 +188,8 @@ impl Ingress {
                 .map(|s| self.document.node(s.node).map(|n| n.name))
                 .transpose()?
                 .flatten()
-                .unwrap_or(Name::Mapped(codec::document::Text { source: 0, span: key }));
+                .or(wire.name(0))
+                .ok_or(Error::Schema)?;
             let path = [Some(Component::Name(name))];
             return Ok(Some(
                 self.stream_string(owner, index, self.document.root(), &path, true)?.1,
@@ -200,7 +201,7 @@ impl Ingress {
             let name = if let Some(state) = self.trees.get(index).and_then(|s| *s) {
                 self.document.node(state.node)?.name.ok_or(Error::Schema)?
             } else {
-                Name::Mapped(codec::document::Text { source: 0, span: key })
+                wire.name(0).ok_or(Error::Schema)?
             };
             let mut path = [None; 128];
             path[0] = Some(Component::Name(name));

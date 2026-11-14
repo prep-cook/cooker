@@ -79,6 +79,11 @@ impl<'a> Decoded<'a> {
         })
     }
 
+    /// The source offset of the next undecoded byte.
+    pub(crate) fn offset(&self) -> u64 {
+        self.cursor.offset()
+    }
+
     fn hex(&mut self) -> Result<u32> {
         let mut value = 0;
         for _ in 0..4 {
