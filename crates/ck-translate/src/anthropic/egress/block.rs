@@ -390,13 +390,13 @@ impl Egress {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         self.begin(owner, output)?;
-        let block = &mut self.blocks[index];
-        if block.started {
+        if self.blocks[index].started {
             return Ok(());
         }
         // Client indexes count started blocks; a skipped empty text block takes none.
-        block.index = self.started_blocks;
-        self.started_blocks += 1;
+        self.order.push(index)?;
+        let block = &mut self.blocks[index];
+        block.index = self.order.len() as u64 - 1;
         let origin = block.start_origin.take();
         if self.mode == BodyMode::Streaming {
             output(native_event(owner, "content_block_start", origin.as_ref(), |e| {

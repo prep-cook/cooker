@@ -534,3 +534,36 @@ fn responses_function_call_keeps_its_call_id() {
         assert_eq!(content[0]["id"], "call_1", "{content}");
     }
 }
+
+#[test]
+fn buffered_content_follows_the_streamed_block_order() {
+    let mut input = Vec::new();
+    for (delta, finish) in [
+        (json!({"role":"assistant","content":""}), Value::Null),
+        (json!({"reasoning_content":"reason"}), Value::Null),
+        (json!({"content":"answer"}), Value::Null),
+        (json!({}), json!("stop")),
+    ] {
+        let chunk = json!({"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+        input.extend_from_slice(format!("data: {chunk}\n\n").as_bytes());
+    }
+    input.extend_from_slice(b"data: [DONE]\n\n");
+    let buffered = run(
+        Source::Chat,
+        BodyMode::Streaming,
+        &input,
+        Client::Anthropic,
+        BodyMode::Buffered,
+    );
+    let buffered: Value = serde_json::from_slice(&buffered).unwrap();
+    let streamed = run(
+        Source::Chat,
+        BodyMode::Streaming,
+        &input,
+        Client::Anthropic,
+        BodyMode::Streaming,
+    );
+    let expected = json!([{"type":"thinking","thinking":"reason","signature":""},{"type":"text","text":"answer"}]);
+    assert_eq!(buffered["content"], expected);
+    assert_eq!(accumulate(&streamed)["content"], expected);
+}

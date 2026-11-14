@@ -251,11 +251,12 @@ impl Egress {
             original_members_with_separator(origin, x, "/message", true, Some(finish), e)?;
         }
         e.bytes(b",\"content\":[")?;
-        // Only an empty text block is never started.
-        for (index, block) in self.blocks.iter().filter(|b| b.started).enumerate() {
+        // Blocks in start order, as a stream numbers them; an empty text block never starts.
+        for (index, &position) in self.order.iter().enumerate() {
             if index != 0 {
                 e.bytes(b",")?;
             }
+            let block = &self.blocks[position];
             object(&block.document, block.document.root(), &["partial_json"], e)?;
         }
         e.bytes(b"]")?;

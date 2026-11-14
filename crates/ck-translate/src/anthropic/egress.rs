@@ -51,8 +51,8 @@ pub struct Egress {
     base: Option<Document>,
     id: ResponseId,
     blocks: Table<Block>,
-    /// Blocks started so far; the next started block takes this client index.
-    started_blocks: u64,
+    /// `blocks` positions in start order; a block's client index is its place here.
+    order: Table<usize>,
     /// `blocks` positions by (item, block index) and by tool index, and `text_lists` positions
     /// by (item, kind).
     named: Index,
@@ -90,7 +90,7 @@ impl Egress {
             base: None,
             id: ResponseId::new("msg_", owner.id())?,
             blocks: Table::new(owner)?,
-            started_blocks: 0,
+            order: Table::new(owner)?,
             named: Index::new(owner)?,
             tools: Index::new(owner)?,
             texts: Index::new(owner)?,
