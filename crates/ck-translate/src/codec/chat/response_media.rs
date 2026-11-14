@@ -52,7 +52,7 @@ impl Audio {
         let held = &mut self.held;
         fragments.push(input, data, |bytes| held.push_bytes(owner, bytes).map(drop))?;
         if self.held.len() > self.complete {
-            self.since.get_or_insert_with(Instant::now);
+            self.since.get_or_insert_with(|| owner.now());
         }
         self.complete = self.held.len();
         if self.complete - self.published >= HELD_BYTES {
@@ -457,12 +457,13 @@ impl State {
     /// Publishes every choice's held audio when `force`, otherwise the audio whose collection
     /// delay has passed.
     pub(super) fn flush_audio(&mut self, owner: &mut Writer, force: bool) -> Result<()> {
+        let now = owner.now();
         for position in 0..self.choices.len() {
             let since = self.choices[position]
                 .audio_output
                 .as_ref()
                 .and_then(|audio| audio.since);
-            if since.is_some_and(|since| force || since.elapsed() >= FLUSH_DELAY) {
+            if since.is_some_and(|since| force || now.saturating_duration_since(since) >= FLUSH_DELAY) {
                 self.publish_audio(owner, position)?;
             }
         }

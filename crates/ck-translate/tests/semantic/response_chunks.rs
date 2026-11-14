@@ -85,12 +85,12 @@ fn held_media_input_has_a_deadline_and_flushes_split_quartets() {
     // Stop two characters into a quartet, then one more character, so a quartet stays split.
     let (first, rest) = body.split_at(start + 2002);
     let (second, rest) = rest.split_at(1);
-    let mut mapped = Mapped::new();
+    let clock = std::sync::Arc::new(ck_stream::ManualClock::default());
+    let mut mapped = Mapped::with_clock(clock.clone());
     let mut ingress = buffered(&mut mapped);
-    let began = std::time::Instant::now();
     ingress.advance(&mut mapped.writer, first.as_bytes()).unwrap();
     let deadline = ingress.flush_deadline().unwrap();
-    assert!(deadline > began && deadline <= std::time::Instant::now() + std::time::Duration::from_millis(100));
+    assert_eq!(deadline, mapped.writer.now() + std::time::Duration::from_millis(100));
     ingress.advance(&mut mapped.writer, second.as_bytes()).unwrap();
     assert_eq!(ingress.flush_deadline(), Some(deadline));
     assert_eq!(data_records(&mapped).0, 0);
@@ -100,7 +100,7 @@ fn held_media_input_has_a_deadline_and_flushes_split_quartets() {
     // A read after the deadline publishes without an explicit flush.
     let (third, rest) = rest.split_at(5);
     ingress.advance(&mut mapped.writer, third.as_bytes()).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(101));
+    clock.advance(std::time::Duration::from_millis(100));
     let (fourth, rest) = rest.split_at(1);
     ingress.advance(&mut mapped.writer, fourth.as_bytes()).unwrap();
     assert_eq!(data_records(&mapped), (2, raw[..1506].to_vec()));

@@ -62,7 +62,8 @@ fn unfinished_text_publishes_decoded_data_and_flushes_without_request_end() {
 /// Input that arrives after the deadline publishes the held bytes even when no flush came.
 #[test]
 fn input_after_the_deadline_publishes_held_bytes() {
-    let mut mapped = Mapped::new();
+    let clock = std::sync::Arc::new(ck_stream::ManualClock::default());
+    let mut mapped = Mapped::with_clock(clock.clone());
     let mut ingress = ingress(&mut mapped);
     let open = br#"{"contents":[{"parts":[{"text":""#;
     ingress.advance(&mut mapped.writer, open).unwrap();
@@ -71,7 +72,7 @@ fn input_after_the_deadline_publishes_held_bytes() {
         .unwrap();
     ingress.advance(&mut mapped.writer, b"bb").unwrap();
     let deadline = ingress.flush_deadline().unwrap();
-    std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+    clock.advance(deadline - mapped.writer.now());
     ingress.advance(&mut mapped.writer, b"c").unwrap();
     assert!(ingress.flush_deadline().is_none());
     let published = decoded(&events(&mapped.output(&mapped.writer)));

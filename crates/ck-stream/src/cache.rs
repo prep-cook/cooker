@@ -187,6 +187,8 @@ pub(crate) struct Inner {
 
 pub(crate) struct Retention {
     clock: Arc<dyn Clock>,
+    /// The instant at which `clock` reads zero.
+    epoch: Instant,
     fence: RwLock<()>,
     active: AtomicBool,
     pub(crate) failures: Failures,
@@ -231,6 +233,10 @@ impl Retention {
 
     pub(crate) fn now(&self) -> Duration {
         self.clock.now()
+    }
+
+    pub(crate) fn instant(&self) -> Instant {
+        self.epoch + self.clock.now()
     }
 }
 
@@ -407,10 +413,16 @@ pub struct Store {
 
 impl Store {
     pub fn open(config: Config) -> io::Result<Self> {
-        Self::with_clock(config, Arc::new(MonotonicClock::default()))
+        let epoch = Instant::now();
+        Self::start(config, Arc::new(MonotonicClock(epoch)), epoch)
     }
 
+    /// [`Writer::now`] then reads `clock` from the time of this call.
     pub fn with_clock(config: Config, clock: Arc<dyn Clock>) -> io::Result<Self> {
+        Self::start(config, clock, Instant::now())
+    }
+
+    fn start(config: Config, clock: Arc<dyn Clock>, epoch: Instant) -> io::Result<Self> {
         let limits = config.resolve()?;
         let pool = Arc::new(Pool::open(
             &config.directory,
@@ -425,6 +437,7 @@ impl Store {
             cache: parking_lot::Mutex::new(Cache::default()),
             retention: Arc::new(Retention {
                 clock,
+                epoch,
                 fence: RwLock::new(()),
                 active: AtomicBool::new(false),
                 failures: Failures::default(),

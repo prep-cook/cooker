@@ -19,6 +19,12 @@ impl Writer {
     pub fn id(&self) -> u64 {
         self.stream.id
     }
+    /// The store clock as an `Instant`, for codec flush deadlines: the monotonic time under
+    /// [`Store::open`](crate::Store::open), and the injected clock's time since the store was
+    /// created under [`Store::with_clock`](crate::Store::with_clock).
+    pub fn now(&self) -> std::time::Instant {
+        self.stream.retention.instant()
+    }
     /// The published end. It stays valid after invalidation, when the header slot may be reused.
     pub fn committed(&self) -> Position {
         Position::at(self.id(), self.stream.state.lock().end)

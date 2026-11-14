@@ -198,7 +198,10 @@ impl Ingress {
             sink.registry
                 .retain_record(sink.doc, pending.media, sink.owner, sink.reader)?;
             self.active = None;
-        } else if pending.since.is_some_and(|since| since.elapsed() >= FLUSH_DELAY) {
+        } else if pending
+            .since
+            .is_some_and(|since| sink.owner.now().saturating_duration_since(since) >= FLUSH_DELAY)
+        {
             pending.flush(&mut sink)?;
         }
         Ok(())
@@ -250,7 +253,7 @@ impl StringState {
         while !remaining.is_empty() {
             if self.buffer.is_none() {
                 self.buffer = Some(sink.owner.begin_scratch(self.capacity)?);
-                self.since = Some(std::time::Instant::now());
+                self.since = Some(sink.owner.now());
             }
             let count = remaining.len().min(self.capacity - self.buffered);
             self.buffer.as_mut().ok_or(Error::Schema)?.write(&remaining[..count])?;

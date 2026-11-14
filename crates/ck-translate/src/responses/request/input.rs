@@ -241,12 +241,13 @@ impl Input {
             .scanner
             .pending_node(self.pending.document.input(), active.wire)?;
         if wire.validated_end > active.offset {
-            let since = active.pending_since.get_or_insert_with(Instant::now);
+            let now = owner.now();
+            let since = *active.pending_since.get_or_insert(now);
             if !flush
                 && active.offset != active.start
                 && wire.span.end == 0
                 && wire.validated_end - active.offset < 8192
-                && since.elapsed() < FLUSH_DELAY
+                && now.saturating_duration_since(since) < FLUSH_DELAY
             {
                 return Ok(());
             }

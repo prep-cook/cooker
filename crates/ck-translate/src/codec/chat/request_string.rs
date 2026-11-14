@@ -237,8 +237,13 @@ impl Ingress {
         // An incomplete scalar or escape after the validated end decodes with the next step.
         let received = self.document.input().len();
         if wire.validated_end > pending.offset {
-            let since = *pending.held.get_or_insert_with(std::time::Instant::now);
-            if !ended && !force && received - pending.offset < HELD_BYTES && since.elapsed() < FLUSH_DELAY {
+            let now = owner.now();
+            let since = *pending.held.get_or_insert(now);
+            if !ended
+                && !force
+                && received - pending.offset < HELD_BYTES
+                && now.saturating_duration_since(since) < FLUSH_DELAY
+            {
                 return Ok(false);
             }
         }
