@@ -136,7 +136,6 @@ pub(super) fn project(doc: &mut Document, usage: usize) -> Result<usize> {
         "output_tokens",
         "total_tokens",
         "input_uncached_tokens",
-        "cache_write_tokens",
         "cache_write_by_ttl",
     ] {
         super::move_field(doc, usage, name, result, name)?;
@@ -147,6 +146,7 @@ pub(super) fn project(doc: &mut Document, usage: usize) -> Result<usize> {
             &[
                 ("cache_read_tokens", "cached_tokens"),
                 ("input_audio_tokens", "audio_tokens"),
+                ("cache_write_tokens", "cache_write_tokens"),
             ][..],
         ),
         (
@@ -166,6 +166,19 @@ pub(super) fn project(doc: &mut Document, usage: usize) -> Result<usize> {
                 };
                 super::move_field(doc, usage, from, target, to)?;
             }
+        }
+    }
+    // The schema requires both cache counts; an unreported one is 0.
+    let details = match doc.member(result, "input_tokens_details")? {
+        Some(details) => details,
+        None => doc.set(result, "input_tokens_details", Value::Object)?,
+    };
+    for name in ["cached_tokens", "cache_write_tokens"] {
+        if doc
+            .member(details, name)?
+            .is_none_or(|n| matches!(doc.node(n).map(|n| n.value), Ok(Value::Null)))
+        {
+            doc.set(details, name, Value::Unsigned(0))?;
         }
     }
     Ok(result)

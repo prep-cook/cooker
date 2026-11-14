@@ -55,7 +55,13 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             } else {
                 "response"
             })?;
-            e.bytes(b",\"created_at\":0,\"model\":\"\",\"status\":\"in_progress\",\"output\":[]}")
+            e.bytes(b",\"created_at\":0,\"model\":\"\",\"status\":\"in_progress\",\"output\":[]")?;
+            // Members the `Response` schema always carries, at their API defaults; a Responses
+            // source's own values replace them by merge.
+            if operation != Operation::Compact {
+                e.bytes(b",\"parallel_tool_calls\":true,\"tool_choice\":\"auto\",\"tools\":[]")?;
+            }
+            e.bytes(b"}")
         })?;
         Ok(Self {
             owner: owner.id(),

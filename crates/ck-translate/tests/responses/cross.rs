@@ -119,7 +119,7 @@ fn chat_logprobs_without_a_block_join_the_open_text_part() {
     let events = client_events(&output);
     let delta = events
         .iter()
-        .find(|e| e["type"] == "response.output_text.delta" && e.get("logprobs").is_some())
+        .find(|e| e["type"] == "response.output_text.delta" && e["logprobs"].as_array().is_some_and(|l| !l.is_empty()))
         .unwrap();
     assert_eq!(
         (delta["content_index"].clone(), delta["delta"].clone()),
@@ -193,7 +193,7 @@ fn chat_text_and_multiple_calls_remain_separate_output_items() {
 }
 
 /// The final Responses object of a buffered body or a streamed `response.completed`.
-fn final_response(output: &[u8], downstream: BodyMode) -> Value {
+pub(super) fn final_response(output: &[u8], downstream: BodyMode) -> Value {
     if downstream == BodyMode::Buffered {
         return serde_json::from_slice(output).unwrap();
     }
@@ -213,7 +213,7 @@ fn chat_usage_projects_native_token_details_without_control_fields() {
         let out = final_response(&output, downstream);
         assert_eq!(
             out["usage"],
-            json!({"input_tokens":0,"output_tokens":3,"total_tokens":3,"input_tokens_details":{"cached_tokens":0,"audio_tokens":2},"output_tokens_details":{"reasoning_tokens":1,"audio_tokens":2}})
+            json!({"input_tokens":0,"output_tokens":3,"total_tokens":3,"input_tokens_details":{"cached_tokens":0,"audio_tokens":2,"cache_write_tokens":0},"output_tokens_details":{"reasoning_tokens":1,"audio_tokens":2}})
         );
         // The Chat usage snapshot is internal and never reaches a Responses client.
         assert!(!String::from_utf8(output).unwrap().contains("x_ck"));
@@ -230,7 +230,10 @@ fn corrected_usage_replaces_counts_and_keeps_its_snapshot_internal() {
     ]);
     let output = chat_to_responses(input.as_bytes(), BodyMode::Streaming, BodyMode::Buffered);
     let out = final_response(&output, BodyMode::Buffered);
-    assert_eq!(out["usage"], json!({"output_tokens":3}));
+    assert_eq!(
+        out["usage"],
+        json!({"output_tokens":3,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}})
+    );
     assert!(out.get("x_ck_opaque").is_none());
     let absent = json!({"choices":[{"index":0,"message":{"content":"x"},"finish_reason":"stop"}]});
     let output = chat_to_responses(
