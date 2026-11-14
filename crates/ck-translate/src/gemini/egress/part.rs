@@ -32,6 +32,8 @@ impl Egress {
             super::super::is(&event, root, "kind", "thinking")? || super::super::is(&event, root, "kind", "reasoning")?;
         let mut document = empty_part(owner, thought)?;
         restore_originals(&mut document, event)?;
+        // A native part's content arrives with its block; text restamps each held delta.
+        self.arrival += 1;
         self.blocks.push(Block {
             item,
             index,
@@ -43,7 +45,7 @@ impl Egress {
             held: false,
             split: false,
             slot: None,
-            arrival: 0,
+            arrival: self.arrival,
         })?;
         Ok(())
     }

@@ -46,11 +46,16 @@ const HELD_CHOICES: &[u8] = include_bytes!("fixtures/openai-live/held-multiple-c
 // The two above with the thought first: the held record and a parked part are newer than it.
 const HELD_RECORD_ORDER: &[u8] = include_bytes!("fixtures/openai-live/held-record-order.sse");
 const HELD_PARKED_ORDER: &[u8] = include_bytes!("fixtures/openai-live/held-parked-order.sse");
+// Gemini sources: text for candidate 0, then a call, media or signature-only part for 1.
+const NATIVE_CALL: &[u8] = include_bytes!("fixtures/openai-live/native-call-failure.sse");
+const NATIVE_MEDIA: &[u8] = include_bytes!("fixtures/openai-live/native-media-failure.sse");
+const NATIVE_SIGNATURE: &[u8] = include_bytes!("fixtures/openai-live/native-signature-failure.sse");
 
 #[derive(Clone, Copy)]
 enum Upstream {
     Chat,
     Responses,
+    Gemini,
 }
 
 #[derive(Clone, Copy)]
@@ -144,6 +149,9 @@ fn run<E: ResponseEgress>(
         ),
         Upstream::Responses => Box::new(
             responses::response::Ingress::new(&mut m.writer, identity(), Operation::Generate, mode, 1 << 22).unwrap(),
+        ),
+        Upstream::Gemini => Box::new(
+            gemini::response::Ingress::new(&mut m.writer, identity(), Operation::Generate, mode, 1 << 22).unwrap(),
         ),
     };
     let mut egress = make(&mut m.writer).unwrap();
@@ -333,10 +341,11 @@ fn part_order(out: &[u8], framing: Framing) -> Vec<String> {
             match (part["text"].as_str(), order.last_mut()) {
                 (Some(text), Some(last)) if last.starts_with(&kind) => last.push_str(text),
                 (Some(text), _) => order.push(format!("{kind}{text}")),
-                (None, _) => order.push(format!(
-                    "{index}call {}",
-                    part["functionCall"]["name"].as_str().unwrap()
-                )),
+                (None, _) => order.push(match part["functionCall"]["name"].as_str() {
+                    Some(name) => format!("{index}call {name}"),
+                    None if part["inlineData"].is_object() => format!("{index}media"),
+                    None => format!("{index}signature"),
+                }),
             }
         }
     }
@@ -372,6 +381,9 @@ fn gemini_failures_keep_the_parts_queued_behind_an_unfinished_call() {
         (Upstream::Chat, HELD_CHOICES, &["1 text one-first", "text zero-second"]),
         (Upstream::Chat, HELD_RECORD_ORDER, &["thought B", "text AC"]),
         (Upstream::Chat, HELD_PARKED_ORDER, &["thought B", "text AC"]),
+        (Upstream::Gemini, NATIVE_CALL, &["text first", "1 call f"]),
+        (Upstream::Gemini, NATIVE_MEDIA, &["text first", "1 media"]),
+        (Upstream::Gemini, NATIVE_SIGNATURE, &["text first", "1 signature"]),
     ] {
         let (out, failure) = decode(upstream, input, BodyMode::Streaming, 61, Client::Gemini(Framing::Sse));
         assert!(failure.is_some());
