@@ -240,15 +240,31 @@ fn tools(doc: &Document, root: usize, x: usize) -> Result<()> {
     }
     Ok(())
 }
+/// The function a tool choice object forces: Chat's `function` choice, or an `allowed_tools`
+/// choice that requires its only tool. Anthropic can force one tool, not choose among several.
+pub(super) fn forced_function(doc: &Document, choice: usize) -> Result<usize> {
+    if super::is(doc, choice, "type", "function")? {
+        return doc.required(choice, "function");
+    }
+    if !super::is(doc, choice, "type", "allowed_tools")? {
+        return Err(Error::Unsupported);
+    }
+    let allowed = doc.required(choice, "allowed_tools")?;
+    if !super::is(doc, allowed, "mode", "required")? {
+        return Err(Error::Unsupported);
+    }
+    let mut tools = doc.children(doc.required(allowed, "tools")?)?;
+    match (tools.next(), tools.next()) {
+        (Some(tool), None) => doc.required(tool, "function"),
+        _ => Err(Error::Unsupported),
+    }
+}
 fn tool_choice(doc: &Document, root: usize, x: usize) -> Result<()> {
     let Some(choice) = doc.member(root, "tool_choice")? else {
         return Ok(());
     };
     if matches!(doc.node(choice)?.value, Value::Object) {
-        if !super::is(doc, choice, "type", "function")? {
-            return Err(Error::Unsupported);
-        }
-        let function = doc.required(choice, "function")?;
+        let function = forced_function(doc, choice)?;
         let name = doc.required(function, "name")?;
         if doc.chars(name)?.next_scalar()?.is_none() {
             return Err(Error::Schema);

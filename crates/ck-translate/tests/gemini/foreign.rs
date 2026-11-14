@@ -112,3 +112,106 @@ fn chat_reasoning_effort_object_reaches_gemini_thinking_level() {
         json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}})
     );
 }
+
+/// `thinkingBudget` maps through canonical fields only: a positive budget enables thinking with
+/// it, 0 disables it and -1 (dynamic) enables it without one. Gemini gets the budget back.
+#[test]
+fn gemini_thinking_budget_reaches_anthropic_through_canonical_fields() {
+    let input = |budget: i64| json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":4096,"thinkingConfig":{"thinkingBudget":budget}}});
+    for (budget, thinking) in [
+        (2048, json!({"type":"enabled","budget_tokens":2048})),
+        (0, json!({"type":"disabled"})),
+        (-1, json!({"type":"adaptive"})),
+    ] {
+        assert_eq!(
+            from_gemini(&input(budget), To::Anthropic).unwrap()["thinking"],
+            thinking
+        );
+        let chat = from_gemini(&input(budget), To::Chat).unwrap();
+        assert!(chat.get("reasoning").is_none(), "{chat}");
+        assert_eq!(request(&input(budget), Operation::Generate).0, input(budget));
+    }
+}
+
+/// `functionCallingConfig` modes map to `tool_choice`; ANY with names maps to Chat's
+/// `allowed_tools`, and to Anthropic only with one name. Gemini gets the config back.
+#[test]
+fn gemini_function_calling_config_reaches_chat_and_anthropic() {
+    let input = |config: Value| json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[{"name":"f","parameters":{"type":"object"}},{"name":"g","parameters":{"type":"object"}}]}],"toolConfig":config});
+    let calling = |mode: &str| json!({"functionCallingConfig":{"mode":mode}});
+    let allowed = |names: Value| json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":names}});
+    let function = |name: &str| json!({"type":"function","function":{"name":name}});
+    for (config, chat, anthropic) in [
+        (calling("AUTO"), json!("auto"), json!({"type":"auto"})),
+        (calling("ANY"), json!("required"), json!({"type":"any"})),
+        (calling("NONE"), json!("none"), json!({"type":"none"})),
+        (
+            allowed(json!(["f"])),
+            json!({"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[function("f")]}}),
+            json!({"type":"tool","name":"f"}),
+        ),
+    ] {
+        assert_eq!(
+            from_gemini(&input(config.clone()), To::Chat).unwrap()["tool_choice"],
+            chat
+        );
+        assert_eq!(
+            from_gemini(&input(config.clone()), To::Anthropic).unwrap()["tool_choice"],
+            anthropic
+        );
+        assert_eq!(request(&input(config.clone()), Operation::Generate).0, input(config));
+    }
+    let two = input(allowed(json!(["f", "g"])));
+    assert_eq!(
+        from_gemini(&two, To::Chat).unwrap()["tool_choice"]["allowed_tools"]["tools"],
+        json!([function("f"), function("g")])
+    );
+    assert!(matches!(
+        from_gemini(&two, To::Anthropic),
+        Err(codec::Error::Unsupported)
+    ));
+    assert_eq!(request(&two, Operation::Generate).0, two);
+    // Members without a canonical field stay native and keep foreign fences closed.
+    for config in [
+        calling("VALIDATED"),
+        json!({"functionCallingConfig":{"mode":"AUTO","allowedFunctionNames":["f"]}}),
+        json!({"functionCallingConfig":{"mode":"AUTO"},"retrievalConfig":{"languageCode":"en"}}),
+    ] {
+        assert!(matches!(
+            from_gemini(&input(config.clone()), To::Chat),
+            Err(codec::Error::Unsupported)
+        ));
+        assert_eq!(
+            request(&input(config.clone()), Operation::Generate).0,
+            input(config.clone())
+        );
+        assert_eq!(gemini_raw(&input(config)).matches("\"toolConfig\"").count(), 1);
+    }
+}
+
+/// Encodes a Gemini request for Gemini as raw text, so a repeated member shows.
+fn gemini_raw(input: &Value) -> String {
+    let mut mapped = Mapped::new();
+    let mut ingress = gemini::request::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        "gemini-test",
+        1024 * 1024,
+    )
+    .unwrap();
+    ingress
+        .advance(&mut mapped.writer, &serde_json::to_vec(input).unwrap())
+        .unwrap();
+    let ready = ingress
+        .finish(&mut mapped.writer, &gemini::request::GeminiCapability)
+        .unwrap();
+    let output = gemini::request::Egress {
+        destination: "gemini",
+        upstream_stream: true,
+    }
+    .encode(&ready, &mut mapped.writer)
+    .unwrap();
+    String::from_utf8(bytes(&output)).unwrap()
+}

@@ -140,10 +140,11 @@ fn thinking(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
         .transpose()?
         .is_some_and(|n| matches!(n.value, Value::Bool(true)));
     let native = doc.member(thinking, "native")?;
-    let adaptive = native
-        .map(|n| super::is(doc, n, "type", "adaptive"))
-        .transpose()?
-        .unwrap_or(false);
+    // ponytail: foreign thinking is adaptive without a budget; Phase D picks per model (haiku-5-5 refuses budgets).
+    let adaptive = match native {
+        Some(native) => super::is(doc, native, "type", "adaptive")?,
+        None => doc.member(thinking, "budget_tokens")?.is_none(),
+    };
     e.string(if !enabled {
         "disabled"
     } else if adaptive {
@@ -233,7 +234,7 @@ fn tool_choice(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<(
     if let Some(choice) = choice {
         if matches!(doc.node(choice)?.value, Value::Object) {
             e.string("tool")?;
-            let function = doc.required(choice, "function")?;
+            let function = super::request_schema::forced_function(doc, choice)?;
             super::member(doc, function, "name", e)?;
             originals(doc, choice, e)?;
         } else {

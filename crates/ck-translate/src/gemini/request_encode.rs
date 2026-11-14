@@ -58,12 +58,7 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
     let native = super::request_schema::native(doc)?;
     config(doc, x, native, e)?;
     tool_declarations(doc, x, e)?;
-    if let Some(native) = native {
-        super::members(doc, native, &["generationConfig"], e)?;
-    }
-    if let Some(choice) = doc.member(root, "tool_choice")? {
-        tool_config(doc, choice, e)?;
-    }
+    tool_config(doc, native, e)?;
     if !wrapper {
         originals(doc, root, None, e)?;
     }
@@ -216,9 +211,21 @@ fn thinking_config(doc: &Document, thinking: usize, e: &mut Encoder<'_, '_>) -> 
         Some(n) => matches!(doc.node(n)?.value, Value::Bool(false)),
         None => false,
     };
-    if disabled && doc.member(thinking, "budget_tokens")?.is_none() {
-        comma(&mut first, e)?;
-        e.bytes(b"\"thinkingBudget\":0")?;
+    let enabled = match doc.member(thinking, "enabled")? {
+        Some(n) => matches!(doc.node(n)?.value, Value::Bool(true)),
+        None => false,
+    };
+    if (disabled || enabled) && doc.member(thinking, "budget_tokens")?.is_none() {
+        // Thinking on without a budget is the dynamic budget, -1; Gemini refuses a budget
+        // beside `thinkingLevel`.
+        if disabled || doc.member(thinking, "effort")?.is_none() {
+            comma(&mut first, e)?;
+            e.bytes(if disabled {
+                b"\"thinkingBudget\":0"
+            } else {
+                b"\"thinkingBudget\":-1"
+            })?;
+        }
     }
     let x = doc.required(doc.root(), "x_ck")?;
     // A Chat `reasoning` object's effort means what `reasoning_effort` means.
@@ -268,13 +275,55 @@ fn tool_declarations(doc: &Document, x: Option<usize>, e: &mut Encoder<'_, '_>) 
     }
     e.bytes(b"]")
 }
-/// Writes `,"toolConfig":...` for a Chat `tool_choice`.
-fn tool_config(doc: &Document, choice: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
-    e.bytes(b",\"toolConfig\":{\"functionCallingConfig\":{")?;
+/// Writes the native members other than `generationConfig`, then `,"toolConfig":...` for a
+/// canonical `tool_choice`, sharing the object with a native `toolConfig` object's members.
+fn tool_config(doc: &Document, provider: Option<usize>, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let native = match provider.map(|n| doc.member(n, "toolConfig")).transpose()?.flatten() {
+        Some(n) if matches!(doc.node(n)?.value, Value::Object) => Some(n),
+        _ => None,
+    };
+    if let Some(provider) = provider {
+        let skip: &[&str] = if native.is_some() {
+            &["generationConfig", "toolConfig"]
+        } else {
+            &["generationConfig"]
+        };
+        super::members(doc, provider, skip, e)?;
+    }
+    let choice = doc.member(doc.root(), "tool_choice")?;
+    if choice.is_none() && native.is_none() {
+        return Ok(());
+    }
+    e.bytes(b",\"toolConfig\":{")?;
+    let mut first = true;
+    if let Some(choice) = choice {
+        first = false;
+        function_calling(doc, choice, e)?;
+    }
+    if let Some(native) = native {
+        for n in doc.children(native)? {
+            comma(&mut first, e)?;
+            doc.write_name(doc.node(n)?.name.ok_or(Error::Schema)?, e)?;
+            e.bytes(b":")?;
+            doc.write(n, e)?;
+        }
+    }
+    e.bytes(b"}")
+}
+/// Writes `"functionCallingConfig":{...}` for a canonical `tool_choice`.
+fn function_calling(doc: &Document, choice: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"\"functionCallingConfig\":{")?;
     if matches!(doc.node(choice)?.value, Value::Object) {
-        let function = doc.required(choice, "function")?;
         e.bytes(b"\"mode\":\"ANY\",\"allowedFunctionNames\":[")?;
-        doc.write(doc.required(function, "name")?, e)?;
+        match doc.member(choice, "allowed_tools")? {
+            Some(allowed) => {
+                for (i, tool) in doc.children(doc.required(allowed, "tools")?)?.enumerate() {
+                    e.bytes(if i == 0 { b"" } else { b"," })?;
+                    doc.write(doc.required(doc.required(tool, "function")?, "name")?, e)?;
+                }
+            }
+            None => doc.write(doc.required(doc.required(choice, "function")?, "name")?, e)?,
+        }
         e.bytes(b"]")?;
     } else {
         e.bytes(b"\"mode\":")?;
@@ -288,8 +337,7 @@ fn tool_config(doc: &Document, choice: usize, e: &mut Encoder<'_, '_>) -> Result
             return Err(Error::Unsupported);
         })?;
     }
-    e.bytes(b"}}")?;
-    Ok(())
+    e.bytes(b"}")
 }
 fn comma(first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<()> {
     if !*first {

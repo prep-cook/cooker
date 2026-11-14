@@ -170,6 +170,7 @@ fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation, model
             doc.append(native, n)?;
         }
     }
+    function_calling(doc, native)?;
     if let Some(config) = doc.remove(root, "generationConfig")? {
         // A null config is unset in protobuf JSON: it maps nothing and returns as it came.
         let members = doc.node(config)?.first.is_some();
@@ -260,18 +261,18 @@ fn generation_config(doc: &mut Document, config: usize, x: usize) -> Result<()> 
     if let Some(thinking) = doc.remove(config, "thinkingConfig")? {
         super::object(doc, thinking)?;
         let normalized = doc.set(x, "thinking", Value::Object)?;
-        for (wire, canonical) in [
-            ("thinkingBudget", "budget_tokens"),
-            ("includeThoughts", "include"),
-            ("thinkingLevel", "effort"),
-        ] {
+        thinking_budget(doc, thinking, normalized)?;
+        for (wire, canonical) in [("includeThoughts", "include"), ("thinkingLevel", "effort")] {
             if let Some(n) = doc.remove(thinking, wire)? {
                 doc.rename(n, canonical)?;
                 doc.append(normalized, n)?;
             }
         }
-        doc.rename(thinking, "native")?;
-        doc.append(normalized, thinking)?;
+        // Another protocol's fence refuses any native thinking config, even an empty one.
+        if doc.node(thinking)?.first.is_some() {
+            doc.rename(thinking, "native")?;
+            doc.append(normalized, thinking)?;
+        }
     }
     const SCHEMA: [&str; 3] = ["responseMimeType", "responseSchema", "responseJsonSchema"];
     if SCHEMA.iter().try_fold(false, |found, key| {
@@ -284,6 +285,92 @@ fn generation_config(doc: &mut Document, config: usize, x: usize) -> Result<()> 
                 doc.append(format, n)?;
             }
         }
+    }
+    Ok(())
+}
+/// Maps `toolConfig.functionCallingConfig` to `tool_choice`: AUTO, ANY and NONE, and ANY with
+/// `allowedFunctionNames` as Chat's `allowed_tools`. Any other config stays native.
+fn function_calling(doc: &mut Document, native: usize) -> Result<()> {
+    let object = |doc: &Document, n: Option<usize>| match n {
+        Some(n) if matches!(doc.node(n)?.value, Value::Object) => Ok(Some(n)),
+        _ => Ok::<_, Error>(None),
+    };
+    let Some(config) = object(doc, doc.member(native, "toolConfig")?)? else {
+        return Ok(());
+    };
+    let Some(calling) = object(doc, doc.member(config, "functionCallingConfig")?)? else {
+        return Ok(());
+    };
+    let Some(mode) = doc.member(calling, "mode")? else {
+        return Ok(());
+    };
+    let names = doc.member(calling, "allowedFunctionNames")?;
+    let choice = match super::string(doc, mode) {
+        Err(_) => return Ok(()),
+        Ok(()) if doc.string_is(mode, "AUTO")? => "auto",
+        Ok(()) if doc.string_is(mode, "NONE")? => "none",
+        Ok(()) if doc.string_is(mode, "ANY")? => "required",
+        Ok(()) => return Ok(()),
+    };
+    // Only ANY takes names, and only a nonempty list of strings maps.
+    let unmapped = match names {
+        Some(names) => {
+            choice != "required"
+                || !matches!(doc.node(names)?.value, Value::Array)
+                || doc.node(names)?.first.is_none()
+                || doc.children(names)?.any(|name| super::string(doc, name).is_err())
+        }
+        None => false,
+    };
+    if unmapped || doc.children(calling)?.count() != 1 + usize::from(names.is_some()) {
+        return Ok(());
+    }
+    doc.remove(config, "functionCallingConfig")?;
+    if doc.node(config)?.first.is_none() {
+        doc.remove(native, "toolConfig")?;
+    }
+    let root = doc.root();
+    let Some(names) = names else {
+        doc.set(root, "tool_choice", Value::Text(choice))?;
+        return Ok(());
+    };
+    let choice = doc.set(root, "tool_choice", Value::Object)?;
+    doc.set(choice, "type", Value::Text("allowed_tools"))?;
+    let allowed = doc.set(choice, "allowed_tools", Value::Object)?;
+    doc.set(allowed, "mode", Value::Text("required"))?;
+    let tools = doc.set(allowed, "tools", Value::Array)?;
+    while let Some(name) = doc.node(names)?.first {
+        doc.detach(names, name)?;
+        let tool = doc.add(None, Value::Object)?;
+        doc.append(tools, tool)?;
+        doc.set(tool, "type", Value::Text("function"))?;
+        let function = doc.set(tool, "function", Value::Object)?;
+        doc.rename(name, "name")?;
+        doc.append(function, name)?;
+    }
+    Ok(())
+}
+/// Maps `thinkingBudget`: a positive budget enables thinking with it, 0 disables it and -1
+/// (dynamic) enables it without one. Any other value stays native.
+fn thinking_budget(doc: &mut Document, thinking: usize, normalized: usize) -> Result<()> {
+    let Some(budget) = doc.member(thinking, "thinkingBudget")? else {
+        return Ok(());
+    };
+    let dynamic = match doc.node(budget)?.value {
+        Value::Number(t) => {
+            let mut cursor = doc.source(t)?.cursor(t.span)?;
+            let (minus, one) = (cursor.next_byte()?, cursor.next_byte()?);
+            (minus, one, cursor.next_byte()?) == (Some(b'-'), Some(b'1'), None)
+        }
+        _ => false,
+    };
+    let Some(tokens) = doc.unsigned(budget).ok().or(dynamic.then_some(0)) else {
+        return Ok(());
+    };
+    doc.remove(thinking, "thinkingBudget")?;
+    doc.set(normalized, "enabled", Value::Bool(dynamic || tokens > 0))?;
+    if tokens > 0 {
+        doc.set(normalized, "budget_tokens", Value::Unsigned(tokens))?;
     }
     Ok(())
 }

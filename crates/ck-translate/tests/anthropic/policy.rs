@@ -77,14 +77,27 @@ fn allowed_tools(name: &str) -> Value {
 }
 
 #[test]
-fn allowed_tools_choice_reaches_chat_and_is_refused_where_inexpressible() {
+fn allowed_tools_choice_reaches_chat_and_anthropic_only_when_it_forces_one_tool() {
     let input = allowed_tools("f");
     let output = from_chat(&input, None).unwrap();
     assert_eq!(output["tool_choice"], input["tool_choice"]);
-    assert!(matches!(
-        from_chat(&input, Some(AnthropicCapability::default())),
-        Err(codec::Error::Unsupported)
-    ));
+    // Requiring the only allowed tool forces it; Anthropic cannot choose among several or
+    // leave the choice optional.
+    assert_eq!(
+        from_chat(&input, Some(AnthropicCapability::default())).unwrap()["tool_choice"],
+        json!({"type":"tool","name":"f"})
+    );
+    let mut several = input.clone();
+    several["tool_choice"]["allowed_tools"]["tools"] =
+        json!([{"type":"function","function":{"name":"f"}},{"type":"function","function":{"name":"g"}}]);
+    let mut optional = input.clone();
+    optional["tool_choice"]["allowed_tools"]["mode"] = json!("auto");
+    for refused in [several, optional] {
+        assert!(matches!(
+            from_chat(&refused, Some(AnthropicCapability::default())),
+            Err(codec::Error::Unsupported)
+        ));
+    }
     assert!(matches!(
         from_chat(&allowed_tools("undeclared"), None),
         Err(codec::Error::Schema)
