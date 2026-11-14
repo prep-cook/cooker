@@ -32,6 +32,8 @@ pub struct Egress {
     finishes: Table<(u64, bool)>,
     /// Choice and tool indexes of every started tool call without its end.
     open_tools: Table<(u64, u64)>,
+    /// Streamed choice indexes whose first delta, the only one with a `role`, was delivered.
+    roles: Table<u64>,
     include_usage: bool,
     diagnostic: fn(Diagnostic),
 }
@@ -59,6 +61,7 @@ impl Egress {
             shown: false,
             finishes: Table::new(owner)?,
             open_tools: Table::new(owner)?,
+            roles: Table::new(owner)?,
             include_usage,
             diagnostic,
         })
@@ -152,13 +155,14 @@ impl Egress {
                 reason: "source field has no surviving native parent",
             });
         }
-        if let Some(projection) = projection {
+        if let Some(mut projection) = projection {
             if self.mode == BodyMode::Buffered {
                 self.reduction.fold(projection)?;
                 return Ok(());
             }
             track_finishes(&mut self.finishes, &projection)?;
             if deliverable {
+                assign_roles(&mut self.roles, &mut projection)?;
                 output(encode::scratch(owner, |e| {
                     if kind == Kind::Chunk {
                         source_fields(&projection, x, e)?;
@@ -232,7 +236,7 @@ impl Egress {
                     })?)?;
                 }
             }
-        } else if self.mode == BodyMode::Streaming {
+        } else if self.mode == BodyMode::Streaming && chat_source(&doc, x)?.is_some() {
             output(encode::scratch(owner, |e| {
                 source_fields(&doc, x, e)?;
                 e.bytes(b"data: ")?;
@@ -255,7 +259,11 @@ impl Egress {
             (self.diagnostic)(Diagnostic {
                 identity: self.identity,
                 kind: Kind::Opaque,
-                destination: "chat.buffered",
+                destination: if self.mode == BodyMode::Streaming {
+                    "chat"
+                } else {
+                    "chat.buffered"
+                },
                 reason: "no native event carrier",
             });
         }
@@ -302,9 +310,11 @@ impl Egress {
                 ) {
                     return Err(Error::Truncated);
                 }
-                if let Some(message) = aggregate.member(c, "message")?
-                    && let Some(calls) = aggregate.member(message, "tool_calls")?
-                {
+                let message = aggregate.required(c, "message")?;
+                if aggregate.member(message, "role")?.is_none() {
+                    aggregate.set(message, "role", Value::Text("assistant"))?;
+                }
+                if let Some(calls) = aggregate.member(message, "tool_calls")? {
                     let mut call = aggregate.node(calls)?.first;
                     while let Some(t) = call {
                         call = aggregate.node(t)?.next;
@@ -385,8 +395,16 @@ fn raw_string(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result<()
     }
     Ok(())
 }
+/// The source of a record that came from a Chat upstream. Native events and SSE fields of
+/// another protocol have no place in a Chat stream (docs/INTERNAL-STREAM.md, §3.7).
+fn chat_source(doc: &Document, x: usize) -> Result<Option<usize>> {
+    match doc.member(x, "source")? {
+        Some(source) if doc.string_is(doc.required(source, "protocol")?, "chat")? => Ok(Some(source)),
+        _ => Ok(None),
+    }
+}
 fn source_fields(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
-    if let Some(source) = doc.member(x, "source")?
+    if let Some(source) = chat_source(doc, x)?
         && let Some(fields) = doc.member(source, "sse")?
     {
         for field in doc.children(fields)? {
@@ -473,6 +491,31 @@ fn track_finishes(finishes: &mut Table<(u64, bool)>, projection: &Document) -> R
             Some((_, done)) => *done |= finished,
             None => {
                 finishes.push((index, finished))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Gives each choice's first delivered delta the `role` and removes it from later ones: the
+/// SDK accumulators concatenate a repeated role.
+fn assign_roles(roles: &mut Table<u64>, projection: &mut Document) -> Result<()> {
+    let Some(choices) = projection.member(projection.root(), "choices")? else {
+        return Ok(());
+    };
+    let mut choice = projection.node(choices)?.first;
+    while let Some(c) = choice {
+        choice = projection.node(c)?.next;
+        let Some(delta) = projection.member(c, "delta")? else {
+            continue;
+        };
+        let index = projection.unsigned(projection.required(c, "index")?)?;
+        if roles.contains(&index) {
+            projection.remove(delta, "role")?;
+        } else {
+            roles.push(index)?;
+            if projection.member(delta, "role")?.is_none() {
+                projection.set(delta, "role", Value::Text("assistant"))?;
             }
         }
     }

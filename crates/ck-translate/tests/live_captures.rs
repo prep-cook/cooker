@@ -7,6 +7,8 @@ pub mod anthropic;
 #[allow(dead_code)]
 #[path = "../src/boundary.rs"]
 pub mod boundary;
+#[path = "live_captures/chat.rs"]
+mod chat;
 #[path = "../src/codec/mod.rs"]
 pub mod codec;
 #[allow(dead_code)]
