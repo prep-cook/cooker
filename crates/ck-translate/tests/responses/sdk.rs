@@ -177,3 +177,56 @@ fn reserved_members_never_reach_responses_clients() {
         }
     }
 }
+
+/// `usage` as a Responses client receives it: a top-level `cache_write_tokens` moves into
+/// `input_tokens_details`, and an unreported cache count is 0.
+pub(super) fn official_usage(usage: &Value) -> Value {
+    let mut usage = usage.clone();
+    let Some(object) = usage.as_object_mut() else {
+        return usage;
+    };
+    let write = object.remove("cache_write_tokens").filter(|v| !v.is_null());
+    let details = object.entry("input_tokens_details").or_insert_with(|| json!({}));
+    if !details.is_object() {
+        *details = json!({});
+    }
+    if let Some(write) = write {
+        details["cache_write_tokens"] = write;
+    }
+    for name in ["cached_tokens", "cache_write_tokens"] {
+        if details[name].is_null() {
+            details[name] = json!(0);
+        }
+    }
+    usage
+}
+
+/// Native usage keeps its counts and takes the official placement and missing-value rule.
+#[test]
+fn native_usage_carries_both_cache_counts_in_the_details() {
+    for (usage, details) in [
+        (
+            json!({"input_tokens":4,"output_tokens":1,"total_tokens":5,"input_tokens_details":{"cached_tokens":2}}),
+            json!({"cached_tokens":2,"cache_write_tokens":0}),
+        ),
+        (
+            json!({"input_tokens":4,"output_tokens":1,"total_tokens":5,"cache_write_tokens":3,"input_tokens_details":{"cached_tokens":2}}),
+            json!({"cached_tokens":2,"cache_write_tokens":3}),
+        ),
+    ] {
+        let body = json!({"id":"r","object":"response","status":"completed","output":[],"usage":usage});
+        let stream = format!("data: {}\n\n", json!({"type":"response.completed","response":body}));
+        for (input, mode) in [
+            (serde_json::to_vec(&body).unwrap(), BodyMode::Buffered),
+            (stream.into_bytes(), BodyMode::Streaming),
+        ] {
+            for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+                let (output, _) = response(&input, mode, downstream, Operation::Generate);
+                let out = super::cross::final_response(&output, downstream);
+                assert_eq!(out["usage"]["input_tokens_details"], details, "{out}");
+                assert!(out["usage"].get("cache_write_tokens").is_none(), "{out}");
+                assert_eq!(out["usage"]["input_tokens"], 4);
+            }
+        }
+    }
+}

@@ -454,11 +454,13 @@ fn canonical_usage_counts_win_over_the_native_value() {
     }
     egress.finish().unwrap();
     let out: Value = serde_json::from_slice(&out).unwrap();
-    // The cached count was removed from the canonical snapshot; the native null stays.
+    // The cached count was removed from the canonical snapshot, so it is reported as 0; the
+    // native null stays.
     assert_eq!(
         out["usage"],
         json!({"input_tokens":9,"output_tokens":2,"total_tokens":11,
-            "input_tokens_details":{"vendor":null},"output_tokens_details":{"reasoning_tokens":1}}),
+            "input_tokens_details":{"vendor":null,"cached_tokens":0,"cache_write_tokens":0},
+            "output_tokens_details":{"reasoning_tokens":1}}),
     );
     // Unchanged counts round-trip: no derived total, and a nested cache write stays nested.
     let usage = json!({"input_tokens":3,"output_tokens":2,"input_tokens_details":{"cache_write_tokens":4}});
@@ -469,7 +471,10 @@ fn canonical_usage_counts_win_over_the_native_value() {
         BodyMode::Buffered,
         Operation::Generate,
     );
-    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["usage"], usage);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap()["usage"],
+        super::sdk::official_usage(&usage)
+    );
 }
 
 #[test]

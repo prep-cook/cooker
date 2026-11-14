@@ -11,7 +11,7 @@ fn compact_preserves_opaque_items_and_usage_presence() {
     );
     let out: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(out["output"], input["output"]);
-    assert_eq!(out["usage"], input["usage"]);
+    assert_eq!(out["usage"], super::sdk::official_usage(&input["usage"]));
     let usage = events.iter().find(|e| e.get("usage").is_some()).unwrap();
     assert_eq!(usage["usage"]["input_tokens"], 0);
     assert!(usage["usage"].get("output_tokens").is_none());

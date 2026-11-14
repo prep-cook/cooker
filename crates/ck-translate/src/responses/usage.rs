@@ -128,6 +128,9 @@ pub(super) fn project(doc: &mut Document, usage: usize) -> Result<usize> {
     {
         let value = doc.required(native, "value")?;
         overlay(doc, usage, value)?;
+        if matches!(doc.node(value)?.value, Value::Object) {
+            cache_details(doc, value)?;
+        }
         return Ok(value);
     }
     let result = doc.add(None, Value::Object)?;
@@ -168,11 +171,27 @@ pub(super) fn project(doc: &mut Document, usage: usize) -> Result<usize> {
             }
         }
     }
-    // The schema requires both cache counts; an unreported one is 0.
-    let details = match doc.member(result, "input_tokens_details")? {
+    cache_details(doc, result)?;
+    Ok(result)
+}
+
+/// Puts both cache counts of Responses `usage` where the API does, in `input_tokens_details`. A
+/// top-level `cache_write_tokens` moves there and wins over a nested one, as in `write_details`;
+/// the schema requires both counts, so an unreported one is 0.
+fn cache_details(doc: &mut Document, usage: usize) -> Result<()> {
+    let details = match doc
+        .member(usage, "input_tokens_details")?
+        .filter(|&d| matches!(doc.node(d).map(|n| n.value), Ok(Value::Object)))
+    {
         Some(details) => details,
-        None => doc.set(result, "input_tokens_details", Value::Object)?,
+        None => doc.set(usage, "input_tokens_details", Value::Object)?,
     };
+    if let Some(write) = doc.remove(usage, "cache_write_tokens")?
+        && !matches!(doc.node(write)?.value, Value::Null)
+    {
+        doc.remove(details, "cache_write_tokens")?;
+        doc.append(details, write)?;
+    }
     for name in ["cached_tokens", "cache_write_tokens"] {
         if doc
             .member(details, name)?
@@ -181,7 +200,7 @@ pub(super) fn project(doc: &mut Document, usage: usize) -> Result<usize> {
             doc.set(details, name, Value::Unsigned(0))?;
         }
     }
-    Ok(result)
+    Ok(())
 }
 
 /// Canonical counts and the native Responses member each one maps to: `(canonical, details
