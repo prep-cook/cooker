@@ -244,7 +244,7 @@ impl Fixture {
 
 /// The live exchange: two attempts, egress during production, commitment.
 /// Runs attempts until one starts: each re-fences the client view for its own destination,
-/// encodes into the request stream and gets a fresh response stream that holds it.
+/// encodes into the request stream and gets a fresh response stream that depends on it.
 async fn start(fixture: &Fixture, probe: &Probe, exchange: &mut Exchange, fenced: RequestView<'_>) -> Started {
     let store = &fixture.store;
     let attempt = fixture.attempt();
@@ -255,8 +255,7 @@ async fn start(fixture: &Fixture, probe: &Probe, exchange: &mut Exchange, fenced
                 .unwrap(),
             client: fixture.client(),
         };
-        let mut response = store.create().unwrap();
-        response.hold(&exchange.request).unwrap();
+        let mut response = store.create_dependent(&exchange.request).unwrap();
         let streams = Streams {
             request: &mut exchange.request,
             response: &mut response,
@@ -373,8 +372,8 @@ async fn two_attempts_egress_while_producing_and_resume_after_finish() {
     let (mut handle, delivered) = live(&fixture, &probe, sender).await;
     assert!(String::from_utf8_lossy(&delivered).contains("lo"));
 
-    // A client stays attached to the response for two hours; the response stream holds the
-    // request stream, so neither expires.
+    // A client stays attached to the response for two hours; the response stream depends on
+    // the request stream, so neither expires.
     let attached = fixture.store.reader(handle.response.id(), 0).unwrap();
     fixture.clock.advance(Duration::from_secs(7200));
     fixture.store.tick().unwrap();

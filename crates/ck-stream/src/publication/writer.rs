@@ -2,14 +2,14 @@ use std::sync::{Arc, atomic::Ordering};
 
 use parking_lot::MutexGuard;
 
-use super::{Frame, Index, READER_BYTES, State, Stream, reserve_metadata};
+use super::{Frame, Index, State, Stream, reserve_metadata};
 use crate::{Error, FRAME_BYTES, Position, Record, Terminal, cache::Inner};
 
 /// Exclusive stream producer. A disconnect must drop a reader, not this producer.
 /// Dropping it before a terminal publishes `ProducerLost`.
 ///
 /// [`Writer::allocator`] returns a second kind of handle on the same stream that never
-/// publishes records: it allocates scratch and metadata under this stream's quotas, also after
+/// publishes records: it allocates scratch and metadata under the exchange quota, also after
 /// the terminal record, and its drop publishes nothing.
 pub struct Writer {
     pub(super) inner: Arc<Inner>,
@@ -40,21 +40,13 @@ impl Writer {
         }
     }
 
-    /// Keep `other`'s stream from expiry and eviction until this stream is invalidated or
-    /// dropped, so a response stream retains the request stream it was encoded from.
-    pub fn hold(&self, other: &Writer) -> Result<(), Error> {
-        let mut state = self.stream.state.lock();
-        if self.stream.is_invalidated() {
-            return Err(Error::Gone);
-        }
-        other.stream.held.fetch_add(1, Ordering::AcqRel);
-        state.holds.push(other.stream.held.clone());
-        Ok(())
-    }
-
     fn publishes(&self) -> Result<(), Error> {
         if self.producer { Ok(()) } else { Err(Error::Closed) }
     }
+    pub(crate) fn stream(&self) -> &Arc<Stream> {
+        &self.stream
+    }
+
     pub fn id(&self) -> u64 {
         self.stream.id
     }
@@ -78,7 +70,7 @@ impl Writer {
     /// Metadata bytes charged against `max_metadata_bytes`, for the codec benchmark harness only.
     #[cfg(feature = "bench-hooks")]
     pub fn metadata_bytes(&self) -> usize {
-        Stream::metadata(&self.stream.state.lock())
+        self.stream.metadata(&self.stream.state.lock())
     }
 
     /// Wait for the producer to stop, including expiry, eviction, cancellation and shutdown.
@@ -168,9 +160,6 @@ impl Writer {
             .map_err(|_| Error::StorageExhausted)?;
         let old_count = state.frames.len();
         let extra = needed.saturating_sub(old_count);
-        if extra > 0 && self.stream.live_frames(&state) + extra > self.inner.limits.max_frames as usize {
-            return Err(Error::StorageExhausted);
-        }
         let record = Record {
             sequence: state.next_sequence,
             start: Position::at(self.id(), start),
@@ -189,31 +178,28 @@ impl Writer {
         };
         let extends = state.records.back().is_some_and(|last| last.extends(&index));
         let records = state.records.len() + usize::from(!extends);
-        self.grow_tables(&mut state, needed, records)?;
+        // Charge every new frame before the lock is released to allocate them, so another
+        // handle on the exchange cannot pass the quota meanwhile.
+        self.stream.charge_frames(extra)?;
+        if let Err(error) = self.grow_tables(&mut state, needed, records) {
+            self.stream.release_frames(extra);
+            return Err(error);
+        }
         let state = self.take_frames(state, old_count, extra, start, end)?;
         Ok((record, index, old_count, state))
     }
 
     /// Grow the frame table and run index to `frames` and `records` entries within the
-    /// stream's metadata ceiling.
+    /// exchange's metadata ceiling.
     fn grow_tables(&self, state: &mut State, frames: usize, records: usize) -> Result<(), Error> {
-        let reader_bytes = state.readers * READER_BYTES + state.external_metadata;
-        let frame_budget = self
-            .inner
-            .limits
-            .max_metadata_bytes
-            .saturating_sub(state.records.capacity().max(records) * std::mem::size_of::<Index>() + reader_bytes);
+        let before = Stream::tables(state);
+        // What the tables may hold: what the exchange has left, plus what they hold now.
+        let budget = self.stream.metadata_available() + before;
+        let frame_budget = budget.saturating_sub(state.records.capacity().max(records) * std::mem::size_of::<Index>());
         reserve_metadata(&mut state.frames, frames, frame_budget)?;
-        let record_budget = self
-            .inner
-            .limits
-            .max_metadata_bytes
-            .saturating_sub(state.frames.capacity() * std::mem::size_of::<Frame>() + reader_bytes);
+        let record_budget = budget.saturating_sub(state.frames.capacity() * std::mem::size_of::<Frame>());
         reserve_metadata(&mut state.records, records, record_budget)?;
-        if Stream::metadata(state) > self.inner.limits.max_metadata_bytes {
-            return Err(Error::StorageExhausted);
-        }
-        Ok(())
+        self.stream.add_metadata(Stream::tables(state) - before)
     }
 
     /// Back the bytes `start..end` of a reservation: prefault the pages it reaches in the
@@ -230,9 +216,19 @@ impl Writer {
         // The locked owner prefaults them; eviction cannot help, as it punches nothing.
         let first_new = (state.base_frame + old_count as u64) * FRAME_BYTES as u64;
         if start < first_new {
-            let frame = state.frames.back().and_then(|frame| frame.pool).ok_or(Error::Gone)?;
-            let needed = end.min(first_new) - (first_new - FRAME_BYTES as u64);
-            self.inner.pool.prefault(frame, needed as usize).map_err(Error::Io)?;
+            let prefaulted = state
+                .frames
+                .back()
+                .and_then(|frame| frame.pool)
+                .ok_or(Error::Gone)
+                .and_then(|frame| {
+                    let needed = end.min(first_new) - (first_new - FRAME_BYTES as u64);
+                    self.inner.pool.prefault(frame, needed as usize).map_err(Error::Io)
+                });
+            if let Err(error) = prefaulted {
+                self.stream.release_frames(extra);
+                return Err(error);
+            }
         }
         for taken in 0..extra {
             let needed = (end - first_new - taken as u64 * FRAME_BYTES as u64).min(FRAME_BYTES as u64) as usize;
@@ -241,6 +237,7 @@ impl Writer {
             let frame = match self.inner.allocate(self.id(), extra - taken, needed) {
                 Ok(frame) => frame,
                 Err(error) => {
+                    self.stream.release_frames(extra - taken);
                     self.rollback(old_count);
                     return Err(error);
                 }
@@ -249,6 +246,7 @@ impl Writer {
             if self.stream.invalidated.load(Ordering::Acquire) || state.terminal.is_some() {
                 self.inner.pool.release(frame);
                 drop(state);
+                self.stream.release_frames(extra - taken);
                 self.rollback(old_count);
                 return Err(Error::Gone);
             }
@@ -257,11 +255,14 @@ impl Writer {
         Ok(state)
     }
 
+    /// Return the frames a reservation added after `old_count`. Frames invalidation detached
+    /// meanwhile left the quota through the detach.
     fn rollback(&self, old_count: usize) {
         let (mut state, _fence) = self.stream.retention.lock_stable(&self.stream);
         while state.frames.len() > old_count {
             if let Some(frame) = state.frames.pop_back().unwrap().pool {
                 self.inner.pool.release(frame);
+                self.stream.release_frames(1);
             }
         }
     }

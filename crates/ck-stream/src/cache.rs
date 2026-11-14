@@ -20,54 +20,12 @@ use crate::{
     publication::{State, Stream},
 };
 
+mod clock;
 mod stats;
+use clock::checked_add;
+pub use clock::{Clock, ManualClock, MonotonicClock};
 use stats::Failures;
 pub use stats::StoreStats;
-
-/// Monotonic elapsed time. Implementations must never move backwards.
-pub trait Clock: Send + Sync + 'static {
-    /// Must not panic: reads and lease drops call it after taking frame references and
-    /// metadata charges, and an unwind there strands both.
-    fn now(&self) -> Duration;
-}
-
-pub struct MonotonicClock(Instant);
-impl Default for MonotonicClock {
-    fn default() -> Self {
-        Self(Instant::now())
-    }
-}
-impl Clock for MonotonicClock {
-    fn now(&self) -> Duration {
-        self.0.elapsed()
-    }
-}
-
-/// Injectable clock for retention tests and storage measurements, not wall-clock time.
-#[derive(Default)]
-pub struct ManualClock(AtomicU64);
-impl ManualClock {
-    pub fn advance(&self, duration: Duration) {
-        let nanos = u64::try_from(duration.as_nanos()).expect("clock duration fits u64");
-        checked_add(&self.0, nanos).expect("clock does not overflow");
-    }
-}
-impl Clock for ManualClock {
-    fn now(&self) -> Duration {
-        Duration::from_nanos(self.0.load(Ordering::Acquire))
-    }
-}
-
-fn checked_add(counter: &AtomicU64, increment: u64) -> Option<u64> {
-    let mut old = counter.load(Ordering::Acquire);
-    loop {
-        let new = old.checked_add(increment)?;
-        match counter.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(old),
-            Err(current) => old = current,
-        }
-    }
-}
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -255,10 +213,14 @@ impl Inner {
     /// Invalidate the least recently read streams whose `gain` (what invalidation returns now)
     /// together covers `wanted`. Streams that would return nothing stay cached; if every
     /// candidate together cannot cover the request, nothing is invalidated and this returns false.
+    /// A held request returns nothing alone: evicting its last dependent frees it too.
     fn evict(&self, exclude: Option<u64>, wanted: usize, gain: fn(&Stream, &State) -> usize) -> bool {
         let _retention = self.retention.retain();
         let mut cache = self.cache.lock();
         let mut victims = Vec::new();
+        let mut chosen = HashSet::new();
+        // Dependents chosen per request stream.
+        let mut released = HashMap::<u64, usize>::new();
         let mut found = 0;
         let mut refreshed = HashSet::new();
         let mut cursor = None;
@@ -271,7 +233,7 @@ impl Inner {
                 break;
             };
             cursor = Some(key);
-            if Some(key.1) == exclude {
+            if Some(key.1) == exclude || chosen.contains(&key.1) {
                 continue;
             }
             let stream = cache.streams[&key.1].stream.clone();
@@ -285,10 +247,29 @@ impl Inner {
                 cache.requeue(key, last_read);
                 continue;
             }
-            let returned = if stream.is_held() { 0 } else { gain(&stream, &state) };
+            let mut returned = if stream.is_held() { 0 } else { gain(&stream, &state) };
+            let invalidated = stream.is_invalidated();
+            drop(state);
+            let request = stream.request().filter(|request| {
+                !invalidated && Some(request.id) != exclude && cache.streams.contains_key(&request.id)
+            });
+            let mut freed = None;
+            if let Some(request) = request
+                && released.get(&request.id).map_or(0, |count| *count) + 1 == request.holders()
+            {
+                let request_gain = gain(request, &request.state.lock());
+                if request_gain > 0 {
+                    returned += request_gain;
+                    freed = Some(request.id);
+                }
+            }
             if returned > 0 {
                 found += returned;
-                victims.push(key);
+                if let Some(request) = request {
+                    *released.entry(request.id).or_default() += 1;
+                }
+                victims.extend(std::iter::once(key.1).chain(freed));
+                chosen.extend(std::iter::once(key.1).chain(freed));
             }
         }
         if found < wanted {
@@ -299,8 +280,8 @@ impl Inner {
             hook();
         }
         cache.evictions += victims.len() as u64;
-        for key in victims {
-            let stream = cache.remove(key.1).unwrap();
+        for id in victims {
+            let stream = cache.remove(id).unwrap();
             stream.invalidate_locked(&mut stream.state.lock());
             cache.retire(&stream);
         }
@@ -312,20 +293,33 @@ impl Inner {
         {
             let _retention = self.retention.retain();
             let mut cache = self.cache.lock();
-            while let Some(&(read, id)) = cache.order.first() {
+            let mut cursor = None;
+            loop {
+                let next = match cursor {
+                    None => cache.order.first(),
+                    Some(key) => cache.order.range((Excluded(key), Unbounded)).next(),
+                };
+                let Some(&(read, id)) = next else {
+                    break;
+                };
                 if now.saturating_sub(read) <= self.limits.cache_ttl {
                     break;
                 }
                 let stream = cache.streams[&id].stream.clone();
                 let mut state = stream.state.lock();
-                // An outstanding wait is a read even without publication or another poll, and a
-                // held stream lives as long as its holder.
-                if state.readers > 0 || stream.is_held() {
+                // An outstanding wait is a read even without publication or another poll.
+                if state.readers > 0 {
                     stream.touch(now);
                 }
                 let last_read = stream.last_read();
                 if last_read != read {
                     cache.requeue((read, id), last_read);
+                    continue;
+                }
+                // A held request stays while a dependent is cached, and expires on the first
+                // tick after the last one leaves.
+                if stream.is_held() {
+                    cursor = Some((read, id));
                     continue;
                 }
                 cache.remove(id);
@@ -495,6 +489,18 @@ impl Store {
 
     /// Admit one exclusive producer. The returned id is an internal generation, not an auth token.
     pub fn create(&self) -> Result<Writer, Error> {
+        self.admit(None)
+    }
+
+    /// Admit a response stream that depends on `request`, the request stream of its exchange
+    /// (INTERNAL-STREAM.md §6.4): the response charges the request's frame and metadata quota,
+    /// and the request neither expires nor is evicted on its own while a dependent is cached.
+    /// `Gone` if the request left the cache; `InvalidRecord` if `request` is itself dependent.
+    pub fn create_dependent(&self, request: &Writer) -> Result<Writer, Error> {
+        self.admit(Some(request.stream()))
+    }
+
+    fn admit(&self, request: Option<&Arc<Stream>>) -> Result<Writer, Error> {
         // Header slots bound the mapping, not the cache: when none is free, evict the least
         // recently read stream exactly as under frame pressure. Invalidation frees its slot.
         let slot = loop {
@@ -504,7 +510,10 @@ impl Store {
             if let Some(slot) = self.inner.pool.claim_slot() {
                 break slot;
             }
-            if !self.inner.evict(None, 1, State::slot_count) {
+            if !self
+                .inner
+                .evict(request.map(|request| request.id), 1, State::slot_count)
+            {
                 self.inner.retention.failures.record(None);
                 return Err(Error::StorageExhausted);
             }
@@ -515,6 +524,8 @@ impl Store {
         } else {
             checked_add(&NEXT_ID, 1).ok_or(Error::StorageExhausted)
         }
+        // Linked under the cache lock, which eviction and expiry hold until they invalidate.
+        .and_then(|id| request.map_or(Ok(id), |request| request.depend(&request.state.lock()).map(|()| id)))
         .inspect_err(|_| self.inner.pool.release_slot(slot))?;
         let now = self.inner.retention.clock.now();
         let stream = Arc::new(Stream::new(
@@ -524,6 +535,7 @@ impl Store {
             self.inner.retention.clone(),
             self.inner.limits,
             now,
+            request.cloned(),
         ));
         cache.insert(stream.clone());
         Ok(Writer::new(self.inner.clone(), stream))

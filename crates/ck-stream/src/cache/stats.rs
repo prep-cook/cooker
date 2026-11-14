@@ -17,7 +17,8 @@ pub struct StoreStats {
     pub cache_bytes: u64,
     pub cached_streams: usize,
     /// Time since the least recent read of a cached, valid stream; a stream with an attached
-    /// reader counts as read now, as expiry treats it. `None` when no such stream is cached.
+    /// reader or a dependent counts as read now, as expiry treats it. `None` when no such
+    /// stream is cached.
     pub oldest_read_age: Option<Duration>,
     /// Streams invalidated to free frames, tmpfs space or header slots.
     pub evictions: u64,
@@ -87,7 +88,11 @@ impl Store {
             if stream.is_invalidated() {
                 continue;
             }
-            let read = if state.readers > 0 { now } else { stream.last_read() };
+            let read = if state.readers > 0 || stream.is_held() {
+                now
+            } else {
+                stream.last_read()
+            };
             oldest = Some(oldest.map_or(read, |oldest| oldest.min(read)));
         }
         orphans.retain(|orphan| {

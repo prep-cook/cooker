@@ -1,4 +1,4 @@
-use super::{Error, FRAME_BYTES, Ordering, State, Stream, Terminal, Writer};
+use super::{Error, FRAME_BYTES, Ordering, Stream, Terminal, Writer};
 use std::sync::Arc;
 
 /// Owns a reservation for external metadata capacity, not payload storage.
@@ -30,8 +30,8 @@ impl MetadataPermit {
     }
 
     /// Resize the charge. Growth requires a live stream; shrinking is always allowed. A terminal
-    /// does not refuse growth: only taking a new permit through the producer writer stops then.
-    /// Quota failure terminates the stream with `StorageExhausted`.
+    /// does not refuse growth (INTERNAL-STREAM.md §6.4). Quota failure terminates a running
+    /// stream with `StorageExhausted`; after the terminal it fails only this call.
     pub fn resize(&mut self, bytes: usize) -> Result<(), Error> {
         let mut state = self.stream.state.lock();
         if bytes > self.bytes {
@@ -39,20 +39,15 @@ impl MetadataPermit {
                 return Err(Error::Gone);
             }
             let extra = bytes - self.bytes;
-            if extra
-                > self
-                    .stream
-                    .limits
-                    .max_metadata_bytes
-                    .saturating_sub(Stream::metadata(&state))
-            {
+            if let Err(error) = self.stream.charge_metadata(extra) {
                 drop(state);
                 self.stream.finish(Terminal::StorageExhausted);
-                return Err(Error::StorageExhausted);
+                return Err(error);
             }
             state.external_metadata += extra;
         } else {
             state.external_metadata -= self.bytes - bytes;
+            self.stream.release_metadata(self.bytes - bytes);
         }
         self.bytes = bytes;
         Ok(())
@@ -62,6 +57,7 @@ impl MetadataPermit {
 impl Drop for MetadataPermit {
     fn drop(&mut self) {
         self.stream.state.lock().external_metadata -= self.bytes;
+        self.stream.release_metadata(self.bytes);
     }
 }
 
@@ -87,12 +83,13 @@ impl Writer {
     }
 
     /// Reserve unpublished source bytes without borrowing the writer for the lease lifetime.
-    /// Scratch shares this stream's frame and metadata quotas but has no canonical positions,
+    /// Scratch shares the exchange's frame and metadata quotas but has no canonical positions,
     /// records, sequence numbers or committed end. A lease shorter than a frame packs into the
     /// stream's open scratch frame; a frame is charged once and returns to the pool when the
     /// last lease in it drops. Longer leases take whole frames of their own.
     /// Zero length is invalid; `max_event_bytes` applies to canonical records, not scratch.
-    /// Pool/quota failures terminate the stream with `StorageExhausted` and roll back frames.
+    /// Pool/quota failures roll back frames and terminate a running stream with
+    /// `StorageExhausted`; after the terminal they fail only this call.
     pub fn begin_scratch(&mut self, len: usize) -> Result<ScratchReservation, Error> {
         let result = self.reserve_scratch(len);
         if matches!(result, Err(Error::StorageExhausted | Error::Io(_))) {
@@ -116,11 +113,13 @@ impl Writer {
             .scratch_open
             .filter(|&(_, used)| len < FRAME_BYTES && len <= FRAME_BYTES - used);
         let count = if shared.is_some() { 0 } else { len.div_ceil(FRAME_BYTES) };
-        let (mut frames, bytes) = self.scratch_quota(&state, count)?;
         if let Some((frame, used)) = shared {
             // The locked owner prefaults the pages this lease reaches; eviction cannot help,
             // as it punches nothing.
             self.inner.pool.prefault(frame, used + len).map_err(Error::Io)?;
+        }
+        let (mut frames, bytes) = self.scratch_quota(count)?;
+        if let Some((frame, used)) = shared {
             // The leases already in this frame release it only under this lock, and the
             // release that frees it clears `scratch_open`, so it is still allocated. Each
             // lease spans at least one byte, so its references never saturate.
@@ -164,18 +163,19 @@ impl Writer {
         Ok(ScratchReservation { lease, written: 0 })
     }
 
-    /// Check that `count` more frames and one lease's bookkeeping fit the stream's quotas, and
-    /// allocate the lease's frame list. Charges nothing.
-    fn scratch_quota(&self, state: &State, count: usize) -> Result<(Vec<u32>, usize), Error> {
-        let live = self.stream.live_frames(state);
-        if count > (self.stream.limits.max_frames as usize).saturating_sub(live) {
-            return Err(Error::StorageExhausted);
+    /// Charge `count` more frames and one lease's bookkeeping to the exchange quotas, and
+    /// allocate the lease's frame list. On failure nothing stays charged.
+    fn scratch_quota(&self, count: usize) -> Result<(Vec<u32>, usize), Error> {
+        self.stream.charge_frames(count)?;
+        let charged = self.lease_bookkeeping(count);
+        if charged.is_err() {
+            self.stream.release_frames(count);
         }
-        let available = self
-            .stream
-            .limits
-            .max_metadata_bytes
-            .saturating_sub(Stream::metadata(state));
+        charged
+    }
+
+    fn lease_bookkeeping(&self, count: usize) -> Result<(Vec<u32>, usize), Error> {
+        let available = self.stream.metadata_available();
         let overhead = std::mem::size_of::<ScratchReservation>();
         // A shared lease takes no new frame but still lists the one it packs into.
         let listed = count.max(1);
@@ -189,9 +189,7 @@ impl Writer {
         let mut frames = Vec::new();
         frames.try_reserve_exact(listed).map_err(|_| Error::StorageExhausted)?;
         let bytes = frames.capacity() * std::mem::size_of::<u32>() + overhead;
-        if bytes > available {
-            return Err(Error::StorageExhausted);
-        }
+        self.stream.charge_metadata(bytes)?;
         Ok((frames, bytes))
     }
 }
@@ -323,11 +321,13 @@ impl Drop for ScratchLease {
             // A shared frame is charged once, until its last lease releases it.
             if stream.pool.release(frame) {
                 state.scratch_frames -= 1;
+                stream.release_frames(1);
                 if state.scratch_open.is_some_and(|(open, _)| open == frame) {
                     state.scratch_open = None;
                 }
             }
         }
         state.scratch_frames -= self.pending as usize;
+        stream.release_frames(self.pending as usize);
     }
 }
