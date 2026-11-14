@@ -32,7 +32,8 @@ fn messages(view: RequestView<'_>) -> Result<()> {
             tool_message(doc, message, calls)?;
             continue;
         }
-        if doc.string_is(role, "system")? {
+        // Gemini has one system instruction; `developer` (Responses `instructions`) is one too.
+        if doc.string_is(role, "system")? || doc.string_is(role, "developer")? {
             if system {
                 return Err(Error::Unsupported);
             }
@@ -143,16 +144,26 @@ fn controls(doc: &Document) -> Result<()> {
         }
     }
     for key in [
-        "parallel_tool_calls",
         "audio",
         "prediction",
         "logit_bias",
         "presence_penalty",
         "frequency_penalty",
-        "store",
         "service_tier",
     ] {
         if doc.member(root, key)?.is_some() {
+            return Err(Error::Unsupported);
+        }
+    }
+    // Gemini runs parallel calls and stores nothing, so only the opposite settings are refused.
+    for (key, default) in [("parallel_tool_calls", true), ("store", false)] {
+        if let Some(n) = doc.member(root, key)?
+            && !match doc.node(n)?.value {
+                Value::Null => true,
+                Value::Bool(value) => value == default,
+                _ => false,
+            }
+        {
             return Err(Error::Unsupported);
         }
     }
@@ -195,15 +206,22 @@ fn extension(doc: &Document, x: usize) -> Result<()> {
     }
     if let Some(provider) = doc.member(x, "provider_parameters")? {
         for native in doc.children(provider)? {
-            if !doc.name_is(doc.node(native)?.name.ok_or(Error::Schema)?, "gemini")?
-                && doc.node(native)?.first.is_some()
-            {
+            let name = doc.node(native)?.name.ok_or(Error::Schema)?;
+            if doc.name_is(name, "anthropic")? {
+                anthropic_parameters(doc, native)?;
+            } else if !doc.name_is(name, "gemini")? && doc.node(native)?.first.is_some() {
                 return Err(Error::Unsupported);
             }
         }
     }
+    let claude = super::is(doc, x, "original_protocol", "anthropic")?;
     if let Some(replay) = doc.member(x, "replay")? {
         for entry in doc.children(replay)? {
+            // Request egress strips Claude thinking history, as at a Chat upstream (owner
+            // ruling 2026-11-15).
+            if claude && super::is(doc, entry, "kind", "anthropic")? {
+                continue;
+            }
             if !super::is(doc, entry, "kind", "gemini")? {
                 return Err(Error::Unsupported);
             }
@@ -235,11 +253,28 @@ fn extension(doc: &Document, x: usize) -> Result<()> {
     }
     Ok(())
 }
+/// Anthropic's `top_k` is Gemini's `topK`; its other parameters have no Gemini form.
+fn anthropic_parameters(doc: &Document, native: usize) -> Result<()> {
+    for f in doc.children(native)? {
+        if !doc.name_is(doc.node(f)?.name.ok_or(Error::Schema)?, "top_k")? {
+            return Err(Error::Unsupported);
+        }
+        if !matches!(doc.node(f)?.value, Value::Null) {
+            doc.unsigned(f)?;
+        }
+    }
+    Ok(())
+}
 fn validate_part(view: RequestView<'_>, part: usize, calls: Option<usize>) -> Result<()> {
     let doc = view.document;
     let kind = doc.required(part, "type")?;
     if doc.string_is(kind, "text")? || doc.string_is(kind, "reasoning")? {
         return super::string(doc, doc.required(part, "text")?);
+    }
+    if doc.string_is(kind, "redacted")?
+        && super::is(doc, doc.required(doc.root(), "x_ck")?, "original_protocol", "anthropic")?
+    {
+        return Ok(());
     }
     if doc.string_is(kind, "tool_result")? {
         if doc.member(part, "result")?.is_none() {
@@ -281,4 +316,21 @@ pub(super) fn native(doc: &Document) -> Result<Option<usize>> {
         return Ok(None);
     };
     doc.member(provider, "gemini")
+}
+/// Whether `message` is the system instruction; the fence admits one `system` or `developer`.
+pub(super) fn system(doc: &Document, message: usize) -> Result<bool> {
+    Ok(super::is(doc, message, "role", "system")? || super::is(doc, message, "role", "developer")?)
+}
+/// Anthropic's `top_k`, which Gemini spells `topK`; null is unset.
+pub(super) fn top_k(doc: &Document, x: Option<usize>) -> Result<Option<usize>> {
+    let Some(provider) = x.map(|x| doc.member(x, "provider_parameters")).transpose()?.flatten() else {
+        return Ok(None);
+    };
+    let top_k = doc
+        .member(provider, "anthropic")?
+        .map(|n| doc.member(n, "top_k"))
+        .transpose()?;
+    Ok(top_k
+        .flatten()
+        .filter(|&n| !matches!(doc.node(n).map(|n| n.value), Ok(Value::Null))))
 }

@@ -1,4 +1,4 @@
-use crate::codec::chat::request::json_schema;
+use crate::codec::chat::request::{gemini, json_schema};
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
@@ -109,23 +109,37 @@ fn parameters(doc: &Document, root: usize, operation: Operation, default_max_tok
         "presence_penalty",
         "logit_bias",
         "prediction",
-        "store",
     ] {
         if doc.member(root, key)?.is_some() {
             return Err(Error::Unsupported);
         }
     }
+    output(doc, root)?;
+    Ok(messages)
+}
+/// Checks storage and the response format: Messages stores nothing, so only `store: true` asks
+/// for what it cannot do, and Gemini JSON mode needs a schema, as Anthropic has no schemaless
+/// JSON output.
+fn output(doc: &Document, root: usize) -> Result<()> {
+    if let Some(store) = doc.member(root, "store")?
+        && !matches!(doc.node(store)?.value, Value::Bool(false) | Value::Null)
+    {
+        return Err(Error::Unsupported);
+    }
     if let Some(format) = doc.member(root, "response_format")? {
         if !super::is(doc, format, "type", "json_schema")? {
             return Err(Error::Unsupported);
         }
-        // Gemini's schema members come without a Chat `json_schema`; Anthropic has no form for them.
-        let schema = doc.member(format, "json_schema")?.ok_or(Error::Unsupported)?;
-        if !matches!(doc.node(doc.required(schema, "schema")?)?.value, Value::Object) {
-            return Err(Error::Schema);
+        if json_schema::from_gemini(doc)? {
+            gemini::json_mode(doc, format)?.ok_or(Error::Unsupported)?;
+        } else {
+            let schema = doc.member(format, "json_schema")?.ok_or(Error::Unsupported)?;
+            if !matches!(doc.node(doc.required(schema, "schema")?)?.value, Value::Object) {
+                return Err(Error::Schema);
+            }
         }
     }
-    Ok(messages)
+    Ok(())
 }
 /// Checks one message's content parts, tool result link and tool calls.
 fn message(view: RequestView<'_>, calls: Calls<'_>, message: usize, role: usize) -> Result<()> {
@@ -362,9 +376,9 @@ fn validate_part(view: RequestView<'_>, calls: Calls<'_>, part: usize) -> Result
         }
     } else if doc.string_is(kind, "tool_result")? {
         linked(doc, calls, Some(part), doc.required(part, "tool_call_id")?)?;
-        // A Gemini function response has no Anthropic content form, as at the Chat fence.
-        if doc.member(part, "result")?.is_some() {
-            return Err(Error::Unsupported);
+        // A Gemini function response is written as the JSON text of its result or error.
+        if gemini::outcome(doc, part)?.is_some() {
+            return Ok(());
         }
         if let Some(content) = doc.member(part, "content")? {
             if !matches!(doc.node(content)?.value, Value::Array) {

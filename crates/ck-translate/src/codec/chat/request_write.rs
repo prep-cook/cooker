@@ -51,14 +51,14 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
                 e.bytes(b"]")?;
             } else if doc.name_is(name, "tools")? && super::json_schema::from_gemini(doc)? {
                 write_gemini_tools(doc, child, e)?;
+            } else if doc.name_is(name, "response_format")? && super::json_schema::from_gemini(doc)? {
+                write_gemini_format(doc, child, e)?;
             } else {
                 super::super::request_controls::write(doc, child, e)?;
             }
         }
     }
-    if !first {
-        e.bytes(b",")?;
-    }
+    e.bytes(if first { b"" } else { b"," })?;
     e.bytes(b"\"stream\":")?;
     e.bytes(if streaming { b"true" } else { b"false" })?;
     if let Some(thinking) = doc.member(x, "thinking")? {
@@ -81,6 +81,16 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
     e.bytes(b"}")
 }
 
+/// Writes Gemini JSON mode as a `json_schema` format with a fixed name, or `json_object` when it
+/// has no schema.
+fn write_gemini_format(doc: &Document, format: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let Some(schema) = gemini::json_mode(doc, format)? else {
+        return e.bytes(b"{\"type\":\"json_object\"}");
+    };
+    e.bytes(b"{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"response\",\"schema\":")?;
+    gemini::write_schema(doc, schema, e)?;
+    e.bytes(b"}}")
+}
 /// Writes a Gemini source's tools with each declaration as a JSON Schema tool definition.
 fn write_gemini_tools(doc: &Document, tools: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"[")?;
@@ -103,9 +113,9 @@ fn write_gemini_tools(doc: &Document, tools: usize, e: &mut Encoder<'_, '_>) -> 
     }
     e.bytes(b"]")
 }
-/// Writes each tool result of `message` as a `tool` message with its text parts joined, ahead of
-/// the rest of the turn; returns whether parts other than tool results remain. Chat has no field
-/// for `is_error`.
+/// Writes each tool result of `message` as a `tool` message with its text parts joined, or a
+/// Gemini `result` as its JSON text, ahead of the rest of the turn; returns whether parts other
+/// than tool results remain. Chat has no field for `is_error`.
 fn write_tool_results(doc: &Document, message: usize, first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<bool> {
     let Some(content) = doc.member(message, "content")? else {
         return Ok(true);
@@ -123,13 +133,16 @@ fn write_tool_results(doc: &Document, message: usize, first: &mut bool, e: &mut 
         *first = false;
         e.bytes(b"{\"role\":\"tool\",\"tool_call_id\":")?;
         doc.write(doc.required(part, "tool_call_id")?, e)?;
-        e.bytes(b",\"content\":\"")?;
-        if let Some(texts) = doc.member(part, "content")? {
-            for text in doc.children(texts)? {
-                doc.write_contents(doc.required(text, "text")?, e)?;
+        if !gemini::write_outcome(doc, part, "content", e)? {
+            e.bytes(b",\"content\":\"")?;
+            if let Some(texts) = doc.member(part, "content")? {
+                for text in doc.children(texts)? {
+                    doc.write_contents(doc.required(text, "text")?, e)?;
+                }
             }
+            e.bytes(b"\"")?;
         }
-        e.bytes(b"\"}")?;
+        e.bytes(b"}")?;
     }
     Ok(rest)
 }

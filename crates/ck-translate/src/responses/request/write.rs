@@ -6,6 +6,9 @@ use crate::codec::{
     document::{Document, Name, Value},
     encode::Encoder,
 };
+use results::write_results;
+#[path = "results.rs"]
+mod results;
 
 /// Writes the Responses fields of `target` that normalization kept in `x_ck.original`; fields
 /// another protocol kept there mean nothing to a Responses upstream.
@@ -293,13 +296,14 @@ fn write_message(
             separate(first, e)?;
             return doc.write(doc.required(part, "value")?, e);
         }
+        let results = write_results(view, content, first, e)?;
         let reasoning = native || any_part(doc, content, true)?;
         if reasoning {
             separate(first, e)?;
             write_reasoning(doc, message, content, replay, e)?;
         }
         let text = match doc.node(content)?.value {
-            Value::Array => any_part(doc, content, false)? || (!reasoning && calls.is_none()),
+            Value::Array => any_part(doc, content, false)? || (!reasoning && !results && calls.is_none()),
             Value::Null => calls.is_none(),
             _ => calls.is_none() || doc.chars(content)?.next_scalar()?.is_some(),
         };
@@ -316,13 +320,16 @@ fn write_message(
     }
     Ok(())
 }
-/// True when array `content` has a reasoning part (`reasoning`) or a part of any other kind.
+/// True when array `content` has a reasoning part (`reasoning`) or a message part.
 fn any_part(doc: &Document, content: usize, reasoning: bool) -> Result<bool> {
     if !matches!(doc.node(content)?.value, Value::Array) {
         return Ok(false);
     }
     for part in doc.children(content)? {
         let kind = doc.required(part, "type")?;
+        if doc.string_is(kind, "tool_result")? {
+            continue;
+        }
         let found = doc.string_is(kind, "reasoning")?
             || doc.string_is(kind, "reasoning_summary")?
             || doc.string_is(kind, "encrypted")?;
@@ -399,6 +406,7 @@ fn write_message_item(view: RequestView<'_>, message: usize, content: usize, e: 
             if doc.string_is(kind, "reasoning")?
                 || doc.string_is(kind, "reasoning_summary")?
                 || doc.string_is(kind, "encrypted")?
+                || doc.string_is(kind, "tool_result")?
             {
                 continue;
             }

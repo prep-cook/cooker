@@ -1,3 +1,4 @@
+use crate::codec::chat::request::{gemini, json_schema};
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
@@ -55,6 +56,7 @@ fn fields(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<bool> 
             "parallel_tool_calls",
             "response_format",
             "max_completion_tokens",
+            "store",
         ]
         .iter()
         .try_fold(false, |yes, key| Ok::<_, Error>(yes || doc.name_is(name, key)?))?
@@ -181,8 +183,8 @@ fn tools(doc: &Document, root: usize, x: usize, e: &mut Encoder<'_, '_>) -> Resu
         } else {
             let function = doc.required(tool, "function")?;
             e.bytes(b"{")?;
-            if crate::codec::chat::request::json_schema::from_gemini(doc)? {
-                crate::codec::chat::request::json_schema::write_function(doc, function, "input_schema", e)?;
+            if json_schema::from_gemini(doc)? {
+                json_schema::write_function(doc, function, "input_schema", e)?;
                 originals(doc, tool, e)?;
                 e.bytes(b"}")?;
                 continue;
@@ -423,6 +425,7 @@ fn part_value(view: RequestView<'_>, part: usize, at: At, block_index: u64, e: &
                 content(view, value, at, e)?;
             }
         }
+        gemini::write_outcome(doc, part, "content", e)?;
         super::member(doc, part, "is_error", e)?;
     } else {
         doc.write(kind, e)?;
@@ -573,12 +576,19 @@ fn output_config(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()
         }
         e.bytes(b"\"format\":{\"type\":")?;
         doc.write(doc.required(format, "type")?, e)?;
-        let schema = doc.required(format, "json_schema")?;
-        for field in doc.children(schema)? {
-            e.bytes(b",")?;
-            doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
-            e.bytes(b":")?;
-            doc.write(field, e)?;
+        // The fence admits Gemini JSON mode only with a schema.
+        if json_schema::from_gemini(doc)? {
+            let schema = gemini::json_mode(doc, format)?.ok_or(Error::Unsupported)?;
+            e.bytes(b",\"schema\":")?;
+            gemini::write_schema(doc, schema, e)?;
+        } else {
+            let schema = doc.required(format, "json_schema")?;
+            for field in doc.children(schema)? {
+                e.bytes(b",")?;
+                doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
+                e.bytes(b":")?;
+                doc.write(field, e)?;
+            }
         }
         e.bytes(b"}")?;
     }
