@@ -1,6 +1,6 @@
 //! Native parts: one open document per canonical block, written out when the block ends.
 
-use super::{Block, Diagnostic, Egress, local, mapped, native};
+use super::{Diagnostic, Egress, Table, local, mapped, native};
 use crate::codec::{
     Error, Result,
     document::{Document, Name, Value},
@@ -43,6 +43,7 @@ impl Egress {
             held: false,
             split: false,
             slot: None,
+            arrival: 0,
         })?;
         Ok(())
     }
@@ -62,7 +63,9 @@ impl Egress {
             let thought = self.blocks[block].thought;
             self.blocks[block].document = empty_part(owner, thought)?;
         }
+        self.arrival += 1;
         let entry = &mut self.blocks[block];
+        entry.arrival = self.arrival;
         entry.thought |= reasoning;
         entry.held = self.body.is_none();
         let doc = &mut entry.document;
@@ -161,14 +164,17 @@ impl Egress {
             held: false,
             split: false,
             slot: None,
+            arrival: 0,
         })?;
         self.write_earlier(owner, block, output)?;
         if self.body.is_none() {
-            let call = Some(item);
+            self.arrival += 1;
+            let (call, arrival) = (Some(item), self.arrival);
             self.parked.push(Parked {
                 choice,
                 call,
                 part: None,
+                arrival,
             })?;
             return Ok(());
         }
@@ -207,20 +213,16 @@ impl Egress {
             return body.transplant(slot, part);
         }
         let parked = self.parked.iter().position(|p| p.call == Some(item));
-        let part = Some(document);
-        self.parked[parked.ok_or(Error::Schema)?] = Parked {
-            choice,
-            call: None,
-            part,
-        };
+        let parked = &mut self.parked[parked.ok_or(Error::Schema)?];
+        (parked.call, parked.part) = (None, Some(document));
         while let Some(next) = self.parked.iter().position(|p| p.choice == choice) {
             if self.parked[next].part.is_none() {
                 break;
             }
             self.parked[next..].rotate_left(1);
             let last = self.parked.len() - 1;
-            let part = self.parked.swap_remove(last).part.ok_or(Error::Schema)?;
-            self.hold(owner, choice, part, output)?;
+            let Parked { part, arrival, .. } = self.parked.swap_remove(last);
+            self.hold(owner, choice, (part.ok_or(Error::Schema)?, arrival), output)?;
         }
         Ok(())
     }
@@ -370,7 +372,7 @@ impl Egress {
         block: usize,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
-        let choice = self.blocks[block].choice;
+        let (choice, arrival) = (self.blocks[block].choice, self.blocks[block].arrival);
         let document = std::mem::replace(&mut self.blocks[block].document, empty_part(owner, false)?);
         self.blocks[block].held = false;
         if self.parked.iter().any(|p| p.choice == choice) {
@@ -379,39 +381,55 @@ impl Egress {
                 choice,
                 call: None,
                 part,
+                arrival,
             })?;
             return Ok(());
         }
-        self.hold(owner, choice, document, output)
+        self.hold(owner, choice, (document, arrival), output)
     }
-    /// Writes every parked part in order when the stream fails, then the text open blocks
-    /// hold. A call that never ended leaves nothing: neither a partial call nor an empty part.
+    /// Writes every completed part a failing stream still holds, each as its own record in
+    /// arrival order: held records, parked parts and held text. A call that never ended leaves
+    /// nothing: neither a partial call nor an empty part.
     pub(super) fn release_parked(
         &mut self,
         owner: &mut Writer,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
-        for at in 0..self.parked.len() {
-            if let Some(part) = self.parked[at].part.take() {
-                self.hold(owner, self.parked[at].choice, part, output)?;
+        let mut parts: Table<(u64, u64, Document)> = Table::new(owner)?;
+        for choice in self.choices.iter_mut() {
+            if let Some(part) = choice.part.take() {
+                parts.push((choice.arrival, choice.index, part))?;
+            }
+        }
+        for parked in self.parked.iter_mut() {
+            if let Some(part) = parked.part.take() {
+                parts.push((parked.arrival, parked.choice, part))?;
             }
         }
         for block in 0..self.blocks.len() {
             if self.blocks[block].held {
                 self.blocks[block].held = false;
                 let document = std::mem::replace(&mut self.blocks[block].document, empty_part(owner, false)?);
-                self.hold(owner, self.blocks[block].choice, document, output)?;
+                parts.push((self.blocks[block].arrival, self.blocks[block].choice, document))?;
             }
+        }
+        // Latest first, so each next part comes off the end.
+        parts.sort_unstable_by_key(|&(arrival, ..)| std::cmp::Reverse(arrival));
+        while !parts.is_empty() {
+            let (_, choice, part) = parts.swap_remove(parts.len() - 1);
+            let slot = self.choice(choice)?;
+            self.choices[slot].part = Some(part);
+            self.flush(owner, slot, false, output)?;
         }
         Ok(())
     }
-    /// Holds `document` as the next record of `choice`, first writing the part held before it.
-    /// A finished choice keeps its members for the last record.
+    /// Holds a part, with the arrival of its content, as the next record of `choice`, first
+    /// writing the part held before it. A finished choice keeps its members for the last record.
     fn hold(
         &mut self,
         owner: &mut Writer,
         choice: u64,
-        document: Document,
+        (document, arrival): (Document, u64),
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         let slot = self.choice(choice)?;
@@ -420,6 +438,7 @@ impl Egress {
             self.flush(owner, slot, fields, output)?;
         }
         self.choices[slot].part = Some(document);
+        self.choices[slot].arrival = arrival;
         Ok(())
     }
 }
@@ -429,6 +448,26 @@ pub(super) struct Parked {
     choice: u64,
     call: Option<LocalId>,
     part: Option<Document>,
+    /// When the part's content, or the call, arrived.
+    arrival: u64,
+}
+pub(super) struct Block {
+    pub(super) item: LocalId,
+    pub(super) index: u64,
+    pub(super) choice: u64,
+    /// The native part under construction, at the document root.
+    pub(super) document: Document,
+    pub(super) arguments: Option<usize>,
+    pub(super) media: Option<usize>,
+    pub(super) thought: bool,
+    /// A streamed part holds its latest text until more text, its signature or its end arrives.
+    pub(super) held: bool,
+    /// A buffered part whose content so far was written ahead of a tool call outside any block.
+    pub(super) split: bool,
+    /// The buffered placeholder a call outside any block fills when it ends.
+    pub(super) slot: Option<usize>,
+    /// When the held text arrived.
+    pub(super) arrival: u64,
 }
 /// A record's block: its `item_id` and `block_index`, or for a call outside any block (Chat
 /// and Responses sources) its `tool_call_id` with an index no block uses.

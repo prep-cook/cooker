@@ -40,6 +40,12 @@ const TOOL_THEN_TEXT: &[u8] = include_bytes!("fixtures/openai-live/late-text.sse
 const ALTERNATING: &[u8] = include_bytes!("fixtures/openai-live/alternating.sse");
 const UNFINISHED_CALL: &[u8] = include_bytes!("fixtures/openai-live/unfinished-eof.sse");
 const UNFINISHED_FIRST_CALL: &[u8] = include_bytes!("fixtures/openai-live/reverse-tool-failure.sse");
+const HELD_THOUGHT: &[u8] = include_bytes!("fixtures/openai-live/held-thought-order.sse");
+const HELD_THOUGHT_NO_CALL: &[u8] = include_bytes!("fixtures/openai-live/held-thought-order-no-call.sse");
+const HELD_CHOICES: &[u8] = include_bytes!("fixtures/openai-live/held-multiple-choices.sse");
+// The two above with the thought first: the held record and a parked part are newer than it.
+const HELD_RECORD_ORDER: &[u8] = include_bytes!("fixtures/openai-live/held-record-order.sse");
+const HELD_PARKED_ORDER: &[u8] = include_bytes!("fixtures/openai-live/held-parked-order.sse");
 
 #[derive(Clone, Copy)]
 enum Upstream {
@@ -305,24 +311,32 @@ fn gemini_function_calls_carry_the_upstream_call_id() {
     );
 }
 
-/// The text and call parts of a Gemini client body in order. Adjacent text parts join: a
-/// stream may split one text across records.
+/// The text, thought and call parts of a Gemini client body in order, prefixed with the
+/// candidate index when it is not 0. Adjacent parts of one kind join: a stream may split one
+/// text across records.
 fn part_order(out: &[u8], framing: Framing) -> Vec<String> {
     let records = match framing {
         Framing::Sse => events(out),
         _ => vec![serde_json::from_slice(out).unwrap()],
     };
     let mut order: Vec<String> = Vec::new();
-    for record in &records {
-        for part in record["candidates"][0]["content"]["parts"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
+    for candidate in records
+        .iter()
+        .flat_map(|r| r["candidates"].as_array().into_iter().flatten())
+    {
+        let index = match candidate["index"].as_u64() {
+            Some(0) | None => String::new(),
+            Some(index) => format!("{index} "),
+        };
+        for part in candidate["content"]["parts"].as_array().into_iter().flatten() {
+            let kind = format!("{index}{} ", if part["thought"] == true { "thought" } else { "text" });
             match (part["text"].as_str(), order.last_mut()) {
-                (Some(text), Some(last)) if last.starts_with("text ") => last.push_str(text),
-                (Some(text), _) => order.push(format!("text {text}")),
-                (None, _) => order.push(format!("call {}", part["functionCall"]["name"].as_str().unwrap())),
+                (Some(text), Some(last)) if last.starts_with(&kind) => last.push_str(text),
+                (Some(text), _) => order.push(format!("{kind}{text}")),
+                (None, _) => order.push(format!(
+                    "{index}call {}",
+                    part["functionCall"]["name"].as_str().unwrap()
+                )),
             }
         }
     }
@@ -353,6 +367,11 @@ fn gemini_failures_keep_the_parts_queued_behind_an_unfinished_call() {
             UNFINISHED_FIRST_CALL,
             &["text after0", "call f1", "text after1", "call f2", "text after2"],
         ),
+        (Upstream::Chat, HELD_THOUGHT, &["text A", "thought B", "text C"]),
+        (Upstream::Chat, HELD_THOUGHT_NO_CALL, &["text A", "thought B", "text C"]),
+        (Upstream::Chat, HELD_CHOICES, &["1 text one-first", "text zero-second"]),
+        (Upstream::Chat, HELD_RECORD_ORDER, &["thought B", "text AC"]),
+        (Upstream::Chat, HELD_PARKED_ORDER, &["thought B", "text AC"]),
     ] {
         let (out, failure) = decode(upstream, input, BodyMode::Streaming, 61, Client::Gemini(Framing::Sse));
         assert!(failure.is_some());
