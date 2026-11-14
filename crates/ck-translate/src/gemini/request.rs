@@ -8,8 +8,13 @@ use crate::codec::{
 };
 use ck_stream::{ScratchLease, Writer};
 
+#[path = "request_config.rs"]
+mod config;
+#[path = "request_names.rs"]
+pub(super) mod names;
 #[path = "request_stream.rs"]
 mod stream;
+use names::{field, json_names, take};
 
 pub struct Ingress {
     owner: u64,
@@ -175,11 +180,14 @@ fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation, model
         // A null config is unset in protobuf JSON: it maps nothing and returns as it came.
         let members = doc.node(config)?.first.is_some();
         if !matches!(doc.node(config)?.value, Value::Null) {
-            generation_config(doc, config, x)?;
+            config::generation_config(doc, config, x)?;
         }
         // Members without a canonical field stay native, and foreign fences refuse them; a
-        // config that mapping emptied is not native. A null or `{}` config returns as it came.
-        if !members || doc.node(config)?.first.is_some() {
+        // config that mapping emptied is not native. A null or `{}` config returns as it came;
+        // `{}` carries nothing, so only a flag that other fences ignore records it.
+        if !members && matches!(doc.node(config)?.value, Value::Object) {
+            doc.set(x, "gemini_empty_config", Value::Bool(true))?;
+        } else if !members || doc.node(config)?.first.is_some() {
             doc.append(native, config)?;
         }
     }
@@ -212,7 +220,7 @@ fn envelope(owner: &mut Writer, doc: &mut Document, operation: Operation, model:
     if let Some(n) = collision {
         preserve(owner, doc, root, n, None)?;
     }
-    if let Some(wrapper) = doc.remove(root, "generateContentRequest")? {
+    if let Some(wrapper) = take(doc, root, "generateContentRequest")? {
         if operation != Operation::CountTokens || doc.member(root, "contents")?.is_some() {
             return Err(Error::Schema);
         }
@@ -224,6 +232,7 @@ fn envelope(owner: &mut Writer, doc: &mut Document, operation: Operation, model:
             doc.append(root, n)?;
         }
     }
+    json_names(doc, root, ROOT_KNOWN)?;
     capture(owner, doc, root, ROOT_KNOWN, None)?;
     if let Some(n) = doc.remove(root, "model")? {
         preserve(owner, doc, root, n, Some("body_model"))?;
@@ -247,47 +256,6 @@ const ROOT_KNOWN: &[&str] = &[
     "safetySettings",
     "labels",
 ];
-/// Moves the mapped `generationConfig` members to the root, thinking to `x_ck.thinking` and
-/// the response schema to `response_format`; the rest stays in the native config.
-fn generation_config(doc: &mut Document, config: usize, x: usize) -> Result<()> {
-    let root = doc.root();
-    super::object(doc, config)?;
-    for &(wire, canonical) in CONFIG {
-        if let Some(n) = doc.remove(config, wire)? {
-            doc.rename(n, canonical)?;
-            doc.append(root, n)?;
-        }
-    }
-    if let Some(thinking) = doc.remove(config, "thinkingConfig")? {
-        super::object(doc, thinking)?;
-        let normalized = doc.set(x, "thinking", Value::Object)?;
-        thinking_budget(doc, thinking, normalized)?;
-        for (wire, canonical) in [("includeThoughts", "include"), ("thinkingLevel", "effort")] {
-            if let Some(n) = doc.remove(thinking, wire)? {
-                doc.rename(n, canonical)?;
-                doc.append(normalized, n)?;
-            }
-        }
-        // Another protocol's fence refuses any native thinking config, even an empty one.
-        if doc.node(thinking)?.first.is_some() {
-            doc.rename(thinking, "native")?;
-            doc.append(normalized, thinking)?;
-        }
-    }
-    const SCHEMA: [&str; 3] = ["responseMimeType", "responseSchema", "responseJsonSchema"];
-    if SCHEMA.iter().try_fold(false, |found, key| {
-        Ok::<_, Error>(found || doc.member(config, key)?.is_some())
-    })? {
-        let format = doc.set(root, "response_format", Value::Object)?;
-        doc.set(format, "type", Value::Text("json_schema"))?;
-        for key in SCHEMA {
-            if let Some(n) = doc.remove(config, key)? {
-                doc.append(format, n)?;
-            }
-        }
-    }
-    Ok(())
-}
 /// Maps `toolConfig.functionCallingConfig` to `tool_choice`: AUTO, ANY and NONE, and ANY with
 /// `allowedFunctionNames` as Chat's `allowed_tools`. Any other config stays native.
 fn function_calling(doc: &mut Document, native: usize) -> Result<()> {
@@ -298,13 +266,14 @@ fn function_calling(doc: &mut Document, native: usize) -> Result<()> {
     let Some(config) = object(doc, doc.member(native, "toolConfig")?)? else {
         return Ok(());
     };
-    let Some(calling) = object(doc, doc.member(config, "functionCallingConfig")?)? else {
+    let calling = field(doc, config, "functionCallingConfig")?;
+    let Some(calling) = object(doc, calling)? else {
         return Ok(());
     };
     let Some(mode) = doc.member(calling, "mode")? else {
         return Ok(());
     };
-    let names = doc.member(calling, "allowedFunctionNames")?;
+    let names = field(doc, calling, "allowedFunctionNames")?;
     let choice = match super::string(doc, mode) {
         Err(_) => return Ok(()),
         Ok(()) if doc.string_is(mode, "AUTO")? => "auto",
@@ -350,30 +319,6 @@ fn function_calling(doc: &mut Document, native: usize) -> Result<()> {
     }
     Ok(())
 }
-/// Maps `thinkingBudget`: a positive budget enables thinking with it, 0 disables it and -1
-/// (dynamic) enables it without one. Any other value stays native.
-fn thinking_budget(doc: &mut Document, thinking: usize, normalized: usize) -> Result<()> {
-    let Some(budget) = doc.member(thinking, "thinkingBudget")? else {
-        return Ok(());
-    };
-    let dynamic = match doc.node(budget)?.value {
-        Value::Number(t) => {
-            let mut cursor = doc.source(t)?.cursor(t.span)?;
-            let (minus, one) = (cursor.next_byte()?, cursor.next_byte()?);
-            (minus, one, cursor.next_byte()?) == (Some(b'-'), Some(b'1'), None)
-        }
-        _ => false,
-    };
-    let Some(tokens) = doc.unsigned(budget).ok().or(dynamic.then_some(0)) else {
-        return Ok(());
-    };
-    doc.remove(thinking, "thinkingBudget")?;
-    doc.set(normalized, "enabled", Value::Bool(dynamic || tokens > 0))?;
-    if tokens > 0 {
-        doc.set(normalized, "budget_tokens", Value::Unsigned(tokens))?;
-    }
-    Ok(())
-}
 /// Turns `systemInstruction` and `contents` into canonical messages, system first.
 fn messages(owner: &mut Writer, doc: &mut Document) -> Result<()> {
     let root = doc.root();
@@ -416,10 +361,11 @@ fn normalize_tools(doc: &mut Document, tools: usize, x: usize) -> Result<()> {
     let native_tools = doc.set(x, "tools", Value::Array)?;
     while let Some(group) = doc.node(tools)?.first {
         doc.detach(tools, group)?;
-        if let Some(functions) = doc.remove(group, "functionDeclarations")? {
+        if let Some(functions) = take(doc, group, "functionDeclarations")? {
             super::array(doc, functions)?;
             while let Some(function) = doc.node(functions)?.first {
                 doc.detach(functions, function)?;
+                json_names(doc, function, &["parametersJsonSchema", "responseJsonSchema"])?;
                 let tool = doc.add(None, Value::Object)?;
                 doc.append(normalized, tool)?;
                 doc.set(tool, "type", Value::Text("function"))?;

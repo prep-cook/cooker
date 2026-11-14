@@ -240,9 +240,11 @@ impl Capability for ChatCapability {
         if view.operation != Operation::Generate {
             return Err(Error::Unsupported);
         }
+        // Capability first: another protocol's valid request that Chat cannot carry, such as
+        // Responses encrypted reasoning, is unsupported rather than malformed Chat.
+        super::request_controls::destination(view.document)?;
         messages::validate(view.document)?;
-        super::request_schema::validate(view.document, view.media)?;
-        super::request_controls::destination(view.document)
+        super::request_schema::validate(view.document, view.media)
     }
 }
 

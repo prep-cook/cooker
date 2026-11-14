@@ -231,13 +231,20 @@ fn position_of(doc: &Document, entry: usize) -> Result<Option<u64>> {
 /// Writes the reasoning options, the continuation and the Responses provider parameters.
 fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     if let Some(thinking) = doc.member(x, "thinking")? {
-        e.bytes(b",\"reasoning\":{")?;
-        for (i, f) in doc.children(thinking)?.enumerate() {
-            if i > 0 {
-                e.bytes(b",")?;
-            }
+        // Another protocol's budget, switch and native config are not Responses members; its
+        // `include` is a summary setting only as a string.
+        let native = is(doc, x, "original_protocol", "responses")?;
+        let mut open = false;
+        for f in doc.children(thinking)? {
             let name = doc.node(f)?.name.ok_or(Error::Schema)?;
-            if doc.name_is(name, "include")? {
+            let include = doc.name_is(name, "include")?;
+            let summary = include && matches!(doc.node(f)?.value, Value::String(_) | Value::Text(_));
+            if !native && !summary && !doc.name_is(name, "effort")? {
+                continue;
+            }
+            e.bytes(if open { b"," } else { b",\"reasoning\":{" })?;
+            open = true;
+            if include {
                 e.string("summary")?;
             } else {
                 doc.write_name(name, e)?;
@@ -245,7 +252,12 @@ fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result
             e.bytes(b":")?;
             doc.write(f, e)?;
         }
-        e.bytes(b"}")?;
+        if native && !open {
+            e.bytes(b",\"reasoning\":{")?;
+        }
+        if native || open {
+            e.bytes(b"}")?;
+        }
     }
     if let Some(session) = doc.member(x, "session")? {
         member(doc, session, "previous_response_id", e)?;

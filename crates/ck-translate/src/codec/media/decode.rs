@@ -31,11 +31,8 @@ pub fn bytes(doc: &Document, media: Media, mut emit: impl FnMut(&[u8]) -> Result
                 quartet[count] = c as u8;
                 count += 1;
                 if count == 4 {
-                    use base64::Engine;
                     let mut out = [0; 3];
-                    let len = base64::engine::general_purpose::STANDARD
-                        .decode_slice(quartet, &mut out)
-                        .map_err(|_| Error::Schema)?;
+                    let len = decode_quartet(quartet, &mut out)?;
                     padded = quartet.contains(&b'=');
                     emit(&out[..len])?;
                     count = 0;
@@ -49,8 +46,21 @@ pub fn bytes(doc: &Document, media: Media, mut emit: impl FnMut(&[u8]) -> Result
     Ok(())
 }
 
-pub(crate) fn decode_base64(doc: &Document, text: Text, mut emit: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+/// Decodes one base64 quartet. Gemini's protobuf JSON reads the URL-safe alphabet as well as the
+/// standard one; decoded bytes are canonical, and egress writes the standard alphabet.
+fn decode_quartet(quartet: [u8; 4], out: &mut [u8; 3]) -> Result<usize> {
     use base64::Engine;
+    let quartet = quartet.map(|c| match c {
+        b'-' => b'+',
+        b'_' => b'/',
+        c => c,
+    });
+    base64::engine::general_purpose::STANDARD
+        .decode_slice(quartet, out)
+        .map_err(|_| Error::Schema)
+}
+
+pub(crate) fn decode_base64(doc: &Document, text: Text, mut emit: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
     let mut decoded = Decoded::new(doc.source(text)?, text.span)?;
     let mut quartet = [0; 4];
     let mut count = 0;
@@ -63,9 +73,7 @@ pub(crate) fn decode_base64(doc: &Document, text: Text, mut emit: impl FnMut(&[u
         count += 1;
         if count == 4 {
             let mut bytes = [0; 3];
-            let len = base64::engine::general_purpose::STANDARD
-                .decode_slice(quartet, &mut bytes)
-                .map_err(|_| Error::Schema)?;
+            let len = decode_quartet(quartet, &mut bytes)?;
             padded = quartet.contains(&b'=');
             emit(&bytes[..len])?;
             count = 0;
@@ -172,7 +180,6 @@ impl InputDecoder {
         self.skip == 0 && self.count == 0
     }
     pub(crate) fn push(&mut self, c: char, mut emit: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
-        use base64::Engine;
         if self.skip != 0 {
             self.skip -= 1;
             return Ok(());
@@ -187,9 +194,7 @@ impl InputDecoder {
         self.count += 1;
         if self.count == 4 {
             let mut bytes = [0; 3];
-            let len = base64::engine::general_purpose::STANDARD
-                .decode_slice(self.quartet, &mut bytes)
-                .map_err(|_| Error::Schema)?;
+            let len = decode_quartet(self.quartet, &mut bytes)?;
             self.padded = self.quartet.contains(&b'=');
             self.count = 0;
             emit(&bytes[..len])?;

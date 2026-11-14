@@ -278,7 +278,7 @@ fn native_media(doc: &Document, node: usize) -> Result<Carrier> {
     let parent = |node: usize| -> Result<Option<usize>> { Ok(doc.node(node)?.parent) };
     let named = |node: usize, name: &str| -> Result<bool> {
         match doc.node(node)?.name {
-            Some(key) => doc.name_is(key, name),
+            Some(key) => super::names::field_is(doc, key, name),
             None => Ok(false),
         }
     };
@@ -312,7 +312,11 @@ fn native_media(doc: &Document, node: usize) -> Result<Carrier> {
     if body != root && !(parent(body)? == Some(root) && named(body, "generateContentRequest")?) {
         return Ok(Carrier::Other);
     }
-    let Some(mime) = doc.member(inline, "mimeType")? else {
+    let mut mime = None;
+    for n in doc.children(inline)? {
+        mime = mime.or(named(n, "mimeType")?.then_some(n));
+    }
+    let Some(mime) = mime else {
         return Ok(Carrier::Unresolved);
     };
     if !matches!(

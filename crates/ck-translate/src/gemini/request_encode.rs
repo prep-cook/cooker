@@ -104,6 +104,13 @@ fn config(doc: &Document, x: Option<usize>, native: Option<usize>, e: &mut Encod
         e.bytes(b"}")?;
     } else if null_config {
         e.bytes(b",\"generationConfig\":null")?;
+    } else if x
+        .map(|x| doc.member(x, "gemini_empty_config"))
+        .transpose()?
+        .flatten()
+        .is_some()
+    {
+        e.bytes(b",\"generationConfig\":{}")?;
     }
     Ok(())
 }

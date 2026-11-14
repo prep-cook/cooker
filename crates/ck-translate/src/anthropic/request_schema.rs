@@ -119,7 +119,8 @@ fn parameters(doc: &Document, root: usize, operation: Operation, default_max_tok
         if !super::is(doc, format, "type", "json_schema")? {
             return Err(Error::Unsupported);
         }
-        let schema = doc.required(format, "json_schema")?;
+        // Gemini's schema members come without a Chat `json_schema`; Anthropic has no form for them.
+        let schema = doc.member(format, "json_schema")?.ok_or(Error::Unsupported)?;
         if !matches!(doc.node(doc.required(schema, "schema")?)?.value, Value::Object) {
             return Err(Error::Schema);
         }
@@ -361,6 +362,10 @@ fn validate_part(view: RequestView<'_>, calls: Calls<'_>, part: usize) -> Result
         }
     } else if doc.string_is(kind, "tool_result")? {
         linked(doc, calls, Some(part), doc.required(part, "tool_call_id")?)?;
+        // A Gemini function response has no Anthropic content form, as at the Chat fence.
+        if doc.member(part, "result")?.is_some() {
+            return Err(Error::Unsupported);
+        }
         if let Some(content) = doc.member(part, "content")? {
             if !matches!(doc.node(content)?.value, Value::Array) {
                 return Err(Error::Schema);

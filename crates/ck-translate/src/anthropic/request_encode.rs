@@ -3,6 +3,8 @@ use crate::codec::{
     document::{Document, Value},
     encode::Encoder,
 };
+#[path = "request_replay.rs"]
+mod replay;
 
 pub(super) fn write(view: RequestView<'_>, egress: &super::request::Egress, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
@@ -300,18 +302,22 @@ fn message_value(view: RequestView<'_>, message: usize, at: At, e: &mut Encoder<
             } else {
                 false
             };
-            if !first {
-                e.bytes(b",")?;
-            }
-            first = false;
+            let node = if use_call { call } else { part }.ok_or(Error::Schema)?;
             if use_call {
-                let node = call.ok_or(Error::Schema)?;
                 call = doc.node(node)?.next;
-                tool_call(doc, node, e)?;
             } else {
-                let node = part.ok_or(Error::Schema)?;
                 part = doc.node(node)?.next;
-                part_value(view, node, at, block_index, e)?;
+            }
+            if use_call || !replay::unsigned(doc, node, at, block_index)? {
+                if !first {
+                    e.bytes(b",")?;
+                }
+                first = false;
+                if use_call {
+                    tool_call(doc, node, e)?;
+                } else {
+                    part_value(view, node, at, block_index, e)?;
+                }
             }
             block_index += 1;
         }
@@ -362,10 +368,15 @@ fn content(view: RequestView<'_>, node: usize, at: At, e: &mut Encoder<'_, '_>) 
         return doc.write(node, e);
     }
     e.bytes(b"[")?;
+    let mut first = true;
     for (index, part) in doc.children(node)?.enumerate() {
-        if index != 0 {
+        if replay::unsigned(doc, part, at, index as u64)? {
+            continue;
+        }
+        if !first {
             e.bytes(b",")?;
         }
+        first = false;
         part_value(view, part, at, index as u64, e)?;
     }
     e.bytes(b"]")
@@ -381,24 +392,9 @@ fn part_value(view: RequestView<'_>, part: usize, at: At, block_index: u64, e: &
         e.string("thinking")?;
         e.bytes(b",\"thinking\":")?;
         doc.write(doc.required(part, "text")?, e)?;
-        let x = doc.required(doc.root(), "x_ck")?;
-        if let Some(replay) = doc.member(x, "replay")? {
-            for entry in doc.origins(part)? {
-                if doc.node(entry)?.parent == Some(replay) {
-                    super::member(doc, entry, "signature", e)?;
-                }
-            }
-            // Imported documents carry no bindings; their entries match by position.
-            if at.unbound_replay {
-                for entry in doc.children(replay)? {
-                    if doc.origin(entry)?.is_none()
-                        && doc.unsigned(doc.required(entry, "message_index")?)? == at.message
-                        && doc.unsigned(doc.required(entry, "block_index")?)? == block_index
-                    {
-                        super::member(doc, entry, "signature", e)?;
-                    }
-                }
-            }
+        if let Some(signature) = replay::signature(doc, part, at, block_index)? {
+            e.bytes(b",\"signature\":")?;
+            doc.write(signature, e)?;
         }
     } else if doc.string_is(kind, "redacted")? {
         e.string("redacted_thinking")?;

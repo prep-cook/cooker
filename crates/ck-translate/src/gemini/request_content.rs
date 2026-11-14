@@ -1,4 +1,5 @@
 use super::Table;
+use super::request::names::json_names;
 use super::request::{capture, preserve};
 use crate::codec::{
     Error, Result,
@@ -89,8 +90,7 @@ const CANONICAL_PART: &[&str] = &[
 ];
 /// Moves one native part to its canonical home: a tool call, a tool result or a content part.
 fn normalize_part(owner: &mut Writer, doc: &mut Document, part: usize, place: Place, calls: &mut Calls) -> Result<()> {
-    let mut payloads = 0;
-    for key in [
+    const PAYLOADS: [&str; 7] = [
         "text",
         "inlineData",
         "fileData",
@@ -98,7 +98,11 @@ fn normalize_part(owner: &mut Writer, doc: &mut Document, part: usize, place: Pl
         "functionResponse",
         "executableCode",
         "codeExecutionResult",
-    ] {
+    ];
+    json_names(doc, part, &PAYLOADS)?;
+    json_names(doc, part, &["thoughtSignature", "videoMetadata"])?;
+    let mut payloads = 0;
+    for key in PAYLOADS {
         payloads += usize::from(doc.member(part, key)?.is_some());
     }
     if payloads > 1 {
@@ -309,6 +313,7 @@ impl Calls {
     }
 }
 fn media_part(owner: &mut Writer, doc: &mut Document, part: usize, data: usize, inline: bool) -> Result<()> {
+    json_names(doc, data, &["mimeType", "fileUri"])?;
     let mime = doc.member(data, "mimeType")?;
     let kind = if let Some(mime) = mime {
         modality(doc, mime)?
@@ -340,7 +345,7 @@ fn media_part(owner: &mut Writer, doc: &mut Document, part: usize, data: usize, 
     capture(owner, doc, part, &["type", "source", "mime", "timing"], None)
 }
 /// Adds the canonical `timing` for `videoMetadata` offsets. The native object stays an
-/// original, so a Gemini destination gets its exact spelling and `fps` back.
+/// original, so a Gemini destination gets its offsets, under their JSON names, and `fps` back.
 fn timing(doc: &mut Document, part: usize) -> Result<()> {
     let Some(metadata) = doc.member(part, "videoMetadata")? else {
         return Ok(());
@@ -348,6 +353,7 @@ fn timing(doc: &mut Document, part: usize) -> Result<()> {
     if !matches!(doc.node(metadata)?.value, Value::Object) {
         return Ok(());
     }
+    json_names(doc, metadata, &["startOffset", "endOffset"])?;
     let start = match doc.member(metadata, "startOffset")? {
         Some(n) => seconds(doc, n)?,
         None => None,
