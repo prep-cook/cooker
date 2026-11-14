@@ -155,6 +155,8 @@ fn egress_blocks_need_a_unique_open_block() {
     let mut edited = records.clone();
     let mut delta = records[text].clone();
     delta.2["x_ck"].as_object_mut().unwrap().remove("block_index");
+    // The copied record is the block's empty first chunk; an empty text block never starts.
+    delta.2["choices"][0]["delta"]["content"] = json!("b");
     edited.insert(end + 1, delta);
     let (native, _) = egress(&edited);
     let starts = native.iter().filter(|e| e["type"] == "content_block_start").count();
@@ -209,5 +211,72 @@ fn unindexed_text_goes_to_the_earliest_open_block() {
         .map(|e| e["index"].as_u64().unwrap())
         .collect();
     // The earliest of four, past a closed later block, past closed earlier ones, then a new one.
-    assert_eq!(deltas, [0, 0, 2, 3, 4, 4], "native={native:?}");
+    // Block 1 closes without text, so it is never written and takes no client index.
+    assert_eq!(deltas, [0, 0, 1, 2, 3, 3], "native={native:?}");
+}
+
+/// A thinking delta without a block index starts a thinking block with the empty signature the
+/// API sends for an unsigned block.
+#[test]
+fn unindexed_thinking_starts_with_an_empty_signature() {
+    let records = canonical();
+    let start = position(&records, "x_ck.block.start", 0);
+    let end = position(&records, "x_ck.block.end", 0);
+    let text = (start..end).find(|&i| records[i].1.is_none()).unwrap();
+    let mut edited = records.clone();
+    let mut delta = records[text].clone();
+    delta.2["x_ck"].as_object_mut().unwrap().remove("block_index");
+    delta.2["choices"][0]["delta"] = json!({"reasoning_content":"r"});
+    edited.insert(end + 1, delta);
+    let (native, _) = egress(&edited);
+    let start = native
+        .iter()
+        .find(|e| e["content_block"]["type"] == "thinking")
+        .unwrap();
+    assert_eq!(
+        start["content_block"],
+        json!({"type":"thinking","thinking":"","signature":""})
+    );
+}
+
+/// A text block starts with its first content of any kind, so a citation or an unknown delta
+/// before its text still follows its content_block_start.
+#[test]
+fn text_block_starts_before_a_leading_citation_or_unknown_delta() {
+    let citation =
+        json!({"type":"char_location","cited_text":"x","document_index":0,"start_char_index":0,"end_char_index":1});
+    let citation =
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":citation}});
+    let unknown = json!({"type":"content_block_delta","index":0,"delta":{"type":"future_delta","value":1}});
+    let [start, text, stop] = text(0);
+    for (first, second) in [(&citation, &unknown), (&unknown, &citation)] {
+        let rows = [
+            json!({"type":"message_start","message":{"id":"r","model":"m"}}),
+            start.clone(),
+            first.clone(),
+            second.clone(),
+            text.clone(),
+            stop.clone(),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            json!({"type":"message_stop"}),
+        ];
+        let (native, rejected) = egress(&records(&rows));
+        assert_eq!(rejected, None, "native={native:?}");
+        let blocks: Vec<_> = native
+            .iter()
+            .filter(|e| e["index"] == 0)
+            .map(|e| e["delta"]["type"].as_str().unwrap_or(e["type"].as_str().unwrap()))
+            .collect();
+        let delta = |row: &Value| row["delta"]["type"].as_str().unwrap().to_owned();
+        assert_eq!(
+            blocks,
+            [
+                "content_block_start",
+                &delta(first),
+                &delta(second),
+                "text_delta",
+                "content_block_stop"
+            ]
+        );
+    }
 }

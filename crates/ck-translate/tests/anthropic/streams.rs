@@ -31,7 +31,11 @@ fn expected(rows: &[Value]) -> Option<(Vec<Value>, Value)> {
                 if indices.insert(index, blocks.len()).is_some() {
                     return None;
                 }
-                let block = row["content_block"].clone();
+                let mut block = row["content_block"].clone();
+                // Egress gives an unsigned thinking block the empty signature the API sends.
+                if block["type"] == "thinking" && block.get("signature").is_none() {
+                    block["signature"] = json!("");
+                }
                 if matches!(block["type"].as_str(), Some("tool_use" | "server_tool_use")) {
                     block["id"].as_str()?;
                     block["name"].as_str()?;

@@ -51,6 +51,8 @@ pub struct Egress {
     base: Option<Document>,
     id: ResponseId,
     blocks: Table<Block>,
+    /// Blocks started so far; the next started block takes this client index.
+    started_blocks: u64,
     /// `blocks` positions by (item, block index) and by tool index, and `text_lists` positions
     /// by (item, kind).
     named: Index,
@@ -88,6 +90,7 @@ impl Egress {
             base: None,
             id: ResponseId::new("msg_", owner.id())?,
             blocks: Table::new(owner)?,
+            started_blocks: 0,
             named: Index::new(owner)?,
             tools: Index::new(owner)?,
             texts: Index::new(owner)?,
@@ -125,7 +128,7 @@ impl Egress {
             finish.write(finish.root(), e)?;
             if let Some(usage) = &self.usage {
                 e.bytes(b",\"usage\":")?;
-                write_usage(usage, e)?;
+                write_usage(usage, false, e)?;
             }
             if let Some(doc) = &origin {
                 original_members(doc, doc.required(doc.root(), "x_ck")?, e)?;
@@ -148,9 +151,11 @@ impl Egress {
                 original_members_at(doc, doc.required(doc.root(), "x_ck")?, "/message", e)?;
             }
             e.bytes(b",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null")?;
-            if let Some(usage) = &self.usage {
-                e.bytes(b",\"usage\":")?;
-                write_usage(usage, e)?;
+            // The SDKs require both counts here; message_delta carries the real ones.
+            e.bytes(b",\"usage\":")?;
+            match &self.usage {
+                Some(usage) => write_usage(usage, true, e)?,
+                None => e.bytes(b"{\"input_tokens\":0,\"output_tokens\":0}")?,
             }
             e.bytes(b"}")?;
             if let Some(doc) = &origin {
@@ -378,7 +383,8 @@ fn write_base(doc: &Document, later: Option<&Document>, e: &mut Encoder<'_, '_>)
     }
     Ok(())
 }
-fn write_usage(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
+/// Writes `usage` in Anthropic names; `complete` writes an unknown input or output count as 0.
+fn write_usage(doc: &Document, complete: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
     let root = doc.root();
     if let Some(native) = doc.member(root, "native")?
         && is(doc, native, "protocol", "anthropic")?
@@ -387,12 +393,13 @@ fn write_usage(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     }
     e.bytes(b"{")?;
     let mut first = true;
-    if doc.member(root, "input_uncached_tokens")?.is_none()
-        && let Some(uncached) = derived_uncached(doc, root)?
-    {
-        e.bytes(b"\"input_tokens\":")?;
-        e.unsigned(uncached)?;
-        first = false;
+    if doc.member(root, "input_uncached_tokens")?.is_none() {
+        let uncached = derived_uncached(doc, root)?;
+        if uncached.is_some() || complete {
+            e.bytes(b"\"input_tokens\":")?;
+            e.unsigned(uncached.unwrap_or(0))?;
+            first = false;
+        }
     }
     for (from, to) in [
         ("input_uncached_tokens", "input_tokens"),
@@ -409,6 +416,10 @@ fn write_usage(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
             e.bytes(b":")?;
             doc.write(value, e)?;
         }
+    }
+    // A complete usage always wrote input_tokens first.
+    if complete && doc.member(root, "output_tokens")?.is_none() {
+        e.bytes(b",\"output_tokens\":0")?;
     }
     e.bytes(b"}")
 }
