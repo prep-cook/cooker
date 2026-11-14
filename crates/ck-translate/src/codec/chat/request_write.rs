@@ -226,7 +226,7 @@ fn write_message(view: RequestView<'_>, message: usize, _message_index: u64, e: 
 }
 /// Writes a content array; for Claude history it leaves out thinking, which
 /// [`write_reasoning`] carries, and redacted blocks, which Chat cannot replay. Chat requires at
-/// least one part in a content array, so Claude history left with none becomes `""`.
+/// least one part in a content array.
 fn write_content(view: RequestView<'_>, content: usize, claude: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
     let mut first = true;
@@ -241,10 +241,13 @@ fn write_content(view: RequestView<'_>, content: usize, claude: bool, e: &mut En
         first = false;
         write_part(view, part, e)?;
     }
-    e.bytes(match (first, claude) {
+    // Another protocol's turn left with no part, such as a Gemini model turn holding only calls,
+    // is empty text, as Claude history is; a Chat client's own `[]` returns as it came.
+    let native = super::super::request_controls::from_chat(doc)?;
+    e.bytes(match (first, native) {
         (false, _) => b"]".as_slice(),
-        (true, true) => b"\"\"",
-        (true, false) => b"[]",
+        (true, false) => b"\"\"",
+        (true, true) => b"[]",
     })
 }
 /// Writes the visible thinking of Claude history as `reasoning_content`, blocks joined by a

@@ -1,5 +1,6 @@
 use super::super::{is, string};
-use crate::codec::chat::request::gemini::{Outcome, outcome};
+use crate::codec::chat::request::gemini::{Outcome, json_mode, outcome};
+use crate::codec::chat::request::json_schema;
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
@@ -54,6 +55,9 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     {
         return Err(Error::Unsupported);
     }
+    if json_schema::from_gemini(doc)? {
+        gemini_controls(doc)?;
+    }
     let messages = doc.required(root, "messages")?;
     if !matches!(doc.node(messages)?.value, Value::Array) {
         return Err(Error::Schema);
@@ -78,6 +82,19 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     })?;
     if let Some(x) = x {
         validate_extensions(doc, x)?;
+    }
+    Ok(())
+}
+/// Gemini JSON mode and function declarations, which egress writes in JSON Schema.
+fn gemini_controls(doc: &Document) -> Result<()> {
+    let root = doc.root();
+    if let Some(format) = doc.member(root, "response_format")? {
+        json_mode(doc, format)?;
+    }
+    if let Some(tools) = doc.member(root, "tools")? {
+        for tool in doc.children(tools)? {
+            json_schema::check_function(doc, doc.required(tool, "function")?)?;
+        }
     }
     Ok(())
 }

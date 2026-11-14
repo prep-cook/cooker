@@ -48,7 +48,8 @@ fn bytes(lease: &ck_stream::ScratchLease) -> Vec<u8> {
     out
 }
 
-/// The upstream body, or the fence refusal, of `input` fed in `chunks`.
+/// The upstream body, or the ingress or fence refusal, of `input` fed in `chunks`; egress must
+/// encode whatever the fence passed.
 fn drive(
     m: &mut Mapped,
     mut ingress: impl RequestIngress,
@@ -69,7 +70,8 @@ fn drive(
                 upstream_stream: false,
                 default_max_tokens: Some(4096),
             }
-            .encode(&ready, &mut m.writer)?
+            .encode(&ready, &mut m.writer)
+            .expect("a request the fence passed encodes")
         }
         P::Chat => {
             let ready = ingress.finish(&mut m.writer, &codec::chat::request::ChatCapability)?;
@@ -77,7 +79,8 @@ fn drive(
                 destination: "chat",
                 upstream_stream: false,
             }
-            .encode(&ready, &mut m.writer)?
+            .encode(&ready, &mut m.writer)
+            .expect("a request the fence passed encodes")
         }
         P::Responses => {
             let ready = ingress.finish(&mut m.writer, &responses::request::ResponsesCapability)?;
@@ -85,7 +88,8 @@ fn drive(
                 destination: "responses",
                 upstream_stream: false,
             }
-            .encode(&ready, &mut m.writer)?
+            .encode(&ready, &mut m.writer)
+            .expect("a request the fence passed encodes")
         }
         P::Gemini => {
             let ready = ingress.finish(&mut m.writer, &gemini::request::GeminiCapability)?;
@@ -93,7 +97,8 @@ fn drive(
                 destination: "gemini",
                 upstream_stream: false,
             }
-            .encode(&ready, &mut m.writer)?
+            .encode(&ready, &mut m.writer)
+            .expect("a request the fence passed encodes")
         }
     };
     Ok(serde_json::from_slice(&bytes(&output)).unwrap())
@@ -213,7 +218,7 @@ fn gemini_function_result_reaches_responses_as_json_text() {
     let out = translate(P::Gemini, P::Responses, &gm_tool_result(json!({"result":"19C clear"}))).unwrap();
     assert_eq!(
         items(&out, "function_call_output"),
-        [json!({"type":"function_call_output","call_id":"fc_1","output":"\"19C clear\""})]
+        [json!({"type":"function_call_output","call_id":"fc_1","output":"19C clear"})]
     );
     // The turn holds only the result, so no empty message item follows it.
     assert_eq!(items(&out, "message").len(), 1, "{out}");
@@ -428,10 +433,7 @@ fn gemini_function_response_reaches_anthropic_as_text() {
     unsupported(translate(P::Gemini, P::Anthropic, &more));
     let long = "y".repeat(5000);
     let out = translate(P::Gemini, P::Anthropic, &gm_tool_result(json!({"result":long}))).unwrap();
-    assert_eq!(
-        out["messages"][2]["content"][0]["content"],
-        json!(format!("\"{long}\""))
-    );
+    assert_eq!(out["messages"][2]["content"][0]["content"], json!(long));
 }
 
 /// Audit #23: a Gemini `result` is the tool message's JSON text; Chat has no error flag.
@@ -440,7 +442,7 @@ fn gemini_function_result_reaches_chat_as_text() {
     let out = translate(P::Gemini, P::Chat, &gm_tool_result(json!({"result":"19C clear"}))).unwrap();
     assert_eq!(
         out["messages"][2],
-        json!({"role":"tool","tool_call_id":"fc_1","content":"\"19C clear\""})
+        json!({"role":"tool","tool_call_id":"fc_1","content":"19C clear"})
     );
     unsupported(translate(P::Gemini, P::Chat, &gm_tool_result(json!({"error":"down"}))));
 }
@@ -495,4 +497,76 @@ fn every_split_gives_the_same_body() {
             assert!(same(&whole, &fed), "split {split}");
         }
     }
+}
+
+/// A string `result` is the tool text as is; any other value is its compact JSON text.
+#[test]
+fn gemini_string_result_is_raw_text_and_other_values_are_json() {
+    let out = translate(P::Gemini, P::Responses, &gm_tool_result(json!({"result":25}))).unwrap();
+    assert_eq!(items(&out, "function_call_output")[0]["output"], "25");
+    let out = translate(P::Gemini, P::Chat, &gm_tool_result(json!({"result":[1,true,null]}))).unwrap();
+    assert_eq!(out["messages"][2]["content"], "[1,true,null]");
+    let out = translate(
+        P::Gemini,
+        P::Anthropic,
+        &gm_tool_result(json!({"result":"19C \"clear\""})),
+    )
+    .unwrap();
+    assert_eq!(out["messages"][2]["content"][0]["content"], "19C \"clear\"");
+}
+
+/// A Gemini model turn with only calls has no text: Chat gets `""`, as for Claude history,
+/// never an empty content array. A Chat client's own `[]` is unchanged.
+#[test]
+fn gemini_call_only_turn_reaches_chat_with_empty_text() {
+    let out = translate(P::Gemini, P::Chat, &gm_tool_result(json!({"result":"ok"}))).unwrap();
+    assert_eq!(out["messages"][1]["content"], "", "{out}");
+    let input = json!({"model":"gpt-x","messages":[{"role":"user","content":"hi"},
+        {"role":"assistant","content":[],"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"c1","content":"x"}]});
+    assert_eq!(
+        translate(P::Chat, P::Chat, &input).unwrap()["messages"][1]["content"],
+        json!([])
+    );
+}
+
+/// Gemini JSON mode is a Responses `text.format`: a named `json_schema` with the converted
+/// schema, else `json_object`; no Gemini member is copied.
+#[test]
+fn gemini_json_mode_reaches_responses() {
+    let schema = json!({"properties":{"a":{"type":"INTEGER"}},"type":"OBJECT"});
+    let config = json!({"responseMimeType":"application/json","responseSchema":schema});
+    let out = translate(P::Gemini, P::Responses, &gm_json(config)).unwrap();
+    assert_eq!(
+        out["text"],
+        json!({"format":{"type":"json_schema","name":"response","schema":{"properties":{"a":{"type":"integer"}},"type":"object"}}})
+    );
+    let out = translate(
+        P::Gemini,
+        P::Responses,
+        &gm_json(json!({"responseMimeType":"application/json"})),
+    )
+    .unwrap();
+    assert_eq!(out["text"], json!({"format":{"type":"json_object"}}));
+    let enumeration = json!({"responseMimeType":"text/x.enum","responseSchema":{"type":"STRING","enum":["a"]}});
+    unsupported(translate(P::Gemini, P::Responses, &gm_json(enumeration)));
+}
+
+/// Gemini function declarations are Responses function tools with a JSON Schema `parameters`.
+#[test]
+fn gemini_tools_reach_responses_as_function_tools() {
+    let tools = |function: Value| json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[function]}]});
+    let want = json!([{"type":"function","name":"f","description":"d","parameters":{"type":"object","properties":{"a":{"type":"integer"}}}}]);
+    for function in [
+        json!({"name":"f","description":"d","parametersJsonSchema":{"type":"object","properties":{"a":{"type":"integer"}}}}),
+        json!({"name":"f","description":"d","parameters":{"type":"OBJECT","properties":{"a":{"type":"INTEGER"}}},"behavior":"BLOCKING","response":{"type":"STRING"}}),
+    ] {
+        let out = translate(P::Gemini, P::Responses, &tools(function)).unwrap();
+        assert_eq!(out["tools"], want);
+    }
+    unsupported(translate(
+        P::Gemini,
+        P::Responses,
+        &tools(json!({"name":"f","behavior":"NON_BLOCKING"})),
+    ));
 }
