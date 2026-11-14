@@ -384,8 +384,8 @@ impl Egress {
         }
         self.hold(owner, choice, document, output)
     }
-    /// Writes every parked part in order when the stream fails. A call that never ended leaves
-    /// nothing: neither a partial call nor an empty part.
+    /// Writes every parked part in order when the stream fails, then the text open blocks
+    /// hold. A call that never ended leaves nothing: neither a partial call nor an empty part.
     pub(super) fn release_parked(
         &mut self,
         owner: &mut Writer,
@@ -394,6 +394,13 @@ impl Egress {
         for at in 0..self.parked.len() {
             if let Some(part) = self.parked[at].part.take() {
                 self.hold(owner, self.parked[at].choice, part, output)?;
+            }
+        }
+        for block in 0..self.blocks.len() {
+            if self.blocks[block].held {
+                self.blocks[block].held = false;
+                let document = std::mem::replace(&mut self.blocks[block].document, empty_part(owner, false)?);
+                self.hold(owner, self.blocks[block].choice, document, output)?;
             }
         }
         Ok(())

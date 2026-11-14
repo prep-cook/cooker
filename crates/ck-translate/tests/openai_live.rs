@@ -347,7 +347,7 @@ fn gemini_tool_parts_keep_their_arrival_order() {
 #[test]
 fn gemini_failures_keep_the_parts_queued_behind_an_unfinished_call() {
     for (upstream, input, expected) in [
-        (Upstream::Chat, UNFINISHED_CALL, &["text after-Aafter-B"][..]),
+        (Upstream::Chat, UNFINISHED_CALL, &["text after-Aafter-Bafter-C"][..]),
         (
             Upstream::Responses,
             UNFINISHED_FIRST_CALL,
