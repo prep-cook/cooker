@@ -1,3 +1,4 @@
+use crate::codec::chat::request::json_schema;
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
@@ -233,8 +234,12 @@ fn tools(doc: &Document, root: usize, x: usize) -> Result<()> {
             }
             let function = doc.required(tool, "function")?;
             super::string(doc, doc.required(function, "name")?)?;
-            if !matches!(doc.node(doc.required(function, "parameters")?)?.value, Value::Object) {
+            let parameters = doc.required(function, "parameters")?;
+            if !matches!(doc.node(parameters)?.value, Value::Object) {
                 return Err(Error::Schema);
+            }
+            if json_schema::from_gemini(doc)? {
+                json_schema::check(doc, parameters)?;
             }
         }
     }
@@ -299,7 +304,35 @@ fn tool_choice(doc: &Document, root: usize, x: usize) -> Result<()> {
     {
         return Err(Error::Unsupported);
     }
+    // Manual thinking allows only `auto` and `none`; adaptive thinking allows a forced tool.
+    let forced = matches!(doc.node(choice)?.value, Value::Object) || doc.string_is(choice, "required")?;
+    if forced
+        && let Some(thinking) = doc.member(x, "thinking")?
+        && thinking_type(doc, thinking)? == "enabled"
+    {
+        return Err(Error::Unsupported);
+    }
     Ok(())
+}
+/// The Anthropic `thinking.type` that canonical thinking stands for.
+pub(super) fn thinking_type(doc: &Document, thinking: usize) -> Result<&'static str> {
+    let enabled = match doc.member(thinking, "enabled")? {
+        Some(n) => matches!(doc.node(n)?.value, Value::Bool(true)),
+        None => false,
+    };
+    // ponytail: foreign thinking is adaptive without a budget and manual with one; some models
+    // (claude-haiku-5-5) refuse budgets. Phase D model capability picks the form per model.
+    let adaptive = match doc.member(thinking, "native")? {
+        Some(native) => super::is(doc, native, "type", "adaptive")?,
+        None => doc.member(thinking, "budget_tokens")?.is_none(),
+    };
+    Ok(if !enabled {
+        "disabled"
+    } else if adaptive {
+        "adaptive"
+    } else {
+        "enabled"
+    })
 }
 fn validate_part(view: RequestView<'_>, calls: Calls<'_>, part: usize) -> Result<()> {
     let doc = view.document;

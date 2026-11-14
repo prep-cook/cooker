@@ -195,10 +195,14 @@ pub(super) fn destination(doc: &Document) -> Result<()> {
     if let Some(tools) = doc.member(doc.root(), "tools")?
         && matches!(doc.node(tools)?.value, Value::Array)
     {
+        let gemini = super::request::json_schema::from_gemini(doc)?;
         for tool in doc.children(tools)? {
             let kind = doc.required(tool, "type")?;
             if !doc.string_is(kind, "custom")? && !doc.string_is(kind, "function")? {
                 return Err(Error::Unsupported);
+            }
+            if gemini && let Some(parameters) = doc.member(doc.required(tool, "function")?, "parameters")? {
+                super::request::json_schema::check(doc, parameters)?;
             }
         }
     }

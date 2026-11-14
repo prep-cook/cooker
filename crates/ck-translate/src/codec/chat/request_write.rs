@@ -49,6 +49,8 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
                     write_message(view, message, i as u64, e)?;
                 }
                 e.bytes(b"]")?;
+            } else if doc.name_is(name, "tools")? && super::json_schema::from_gemini(doc)? {
+                write_gemini_tools(doc, child, e)?;
             } else {
                 super::super::request_controls::write(doc, child, e)?;
             }
@@ -79,6 +81,38 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
     e.bytes(b"}")
 }
 
+/// Writes a Gemini source's tools with each `parameters` schema as JSON Schema.
+fn write_gemini_tools(doc: &Document, tools: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"[")?;
+    for (i, tool) in doc.children(tools)?.enumerate() {
+        e.bytes(if i == 0 { b"{" } else { b",{" })?;
+        for (j, field) in doc.children(tool)?.enumerate() {
+            e.bytes(if j == 0 { b"" } else { b"," })?;
+            let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+            doc.write_name(name, e)?;
+            e.bytes(b":")?;
+            if !doc.name_is(name, "function")? {
+                doc.write(field, e)?;
+                continue;
+            }
+            e.bytes(b"{")?;
+            for (k, member) in doc.children(field)?.enumerate() {
+                e.bytes(if k == 0 { b"" } else { b"," })?;
+                let name = doc.node(member)?.name.ok_or(Error::Schema)?;
+                doc.write_name(name, e)?;
+                e.bytes(b":")?;
+                if doc.name_is(name, "parameters")? {
+                    super::json_schema::write(doc, member, e)?;
+                } else {
+                    doc.write(member, e)?;
+                }
+            }
+            e.bytes(b"}")?;
+        }
+        e.bytes(b"}")?;
+    }
+    e.bytes(b"]")
+}
 /// Writes each tool result of `message` as a `tool` message with its text parts joined, ahead of
 /// the rest of the turn; returns whether parts other than tool results remain. Chat has no field
 /// for `is_error`.

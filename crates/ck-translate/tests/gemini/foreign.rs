@@ -215,3 +215,68 @@ fn gemini_raw(input: &Value) -> String {
     .unwrap();
     String::from_utf8(bytes(&output)).unwrap()
 }
+
+/// Gemini schemas reach Chat and Anthropic as JSON Schema: lowercase types, `nullable` as a
+/// `"null"` type, int64 strings as numbers, `example` as `examples`, no `propertyOrdering`.
+/// Values such as `default` stay as written; Gemini gets the schema back unchanged.
+#[test]
+fn gemini_schema_reaches_chat_and_anthropic_as_json_schema() {
+    let input = |parameters: Value| json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[{"name":"f","parameters":parameters}]}]});
+    let gemini = json!({"type":"OBJECT","properties":{
+        "x":{"type":"STRING","nullable":true,"maxLength":"8","example":"hi"},
+        "type":{"type":"ARRAY","items":{"type":"INTEGER"},"minItems":1},
+        "either":{"anyOf":[{"type":"NUMBER"},{"type":"BOOLEAN","nullable":false}]},
+        "d":{"type":"OBJECT","default":{"type":"OBJECT"}}
+    },"required":["x"],"propertyOrdering":["x","type","either","d"]});
+    let schema = json!({"type":"object","properties":{
+        "x":{"type":["string","null"],"maxLength":8,"examples":["hi"]},
+        "type":{"type":"array","items":{"type":"integer"},"minItems":1},
+        "either":{"anyOf":[{"type":"number"},{"type":"boolean"}]},
+        "d":{"type":"object","default":{"type":"OBJECT"}}
+    },"required":["x"]});
+    let chat = from_gemini(&input(gemini.clone()), To::Chat).unwrap();
+    assert_eq!(chat["tools"][0]["function"]["parameters"], schema);
+    let anthropic = from_gemini(&input(gemini.clone()), To::Anthropic).unwrap();
+    assert_eq!(anthropic["tools"][0]["input_schema"], schema);
+    assert_eq!(request(&input(gemini.clone()), Operation::Generate).0, input(gemini));
+    for refused in [
+        json!({"type":"TYPE_UNSPECIFIED"}),
+        json!({"type":"OBJECT","properties":{"x":{"nullable":true}}}),
+        json!({"type":"STRING","maxLength":"eight"}),
+    ] {
+        assert!(matches!(
+            from_gemini(&input(refused.clone()), To::Chat),
+            Err(codec::Error::Unsupported)
+        ));
+        assert!(matches!(
+            from_gemini(&input(refused.clone()), To::Anthropic),
+            Err(codec::Error::Unsupported)
+        ));
+        assert_eq!(request(&input(refused.clone()), Operation::Generate).0, input(refused));
+    }
+}
+
+/// Anthropic forbids a forced tool choice with manual (budgeted) thinking; adaptive thinking
+/// and an optional choice pass.
+#[test]
+fn forced_tool_choice_with_budgeted_thinking_is_refused_at_anthropic() {
+    let input = |budget: i64, mode: Value| {
+        json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],
+            "tools":[{"functionDeclarations":[{"name":"f","parameters":{"type":"object"}}]}],
+            "toolConfig":{"functionCallingConfig":mode},
+            "generationConfig":{"maxOutputTokens":4096,"thinkingConfig":{"thinkingBudget":budget}}})
+    };
+    let any = json!({"mode":"ANY"});
+    let one = json!({"mode":"ANY","allowedFunctionNames":["f"]});
+    for mode in [any.clone(), one.clone()] {
+        assert!(matches!(
+            from_gemini(&input(2048, mode), To::Anthropic),
+            Err(codec::Error::Unsupported)
+        ));
+    }
+    let adaptive = from_gemini(&input(-1, one), To::Anthropic).unwrap();
+    assert_eq!(adaptive["tool_choice"], json!({"type":"tool","name":"f"}));
+    assert_eq!(adaptive["thinking"], json!({"type":"adaptive"}));
+    assert!(from_gemini(&input(2048, json!({"mode":"AUTO"})), To::Anthropic).is_ok());
+    assert!(from_gemini(&input(0, any), To::Anthropic).is_ok());
+}

@@ -134,24 +134,8 @@ fn thinking(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     }
     e.bytes(b",\"thinking\":")?;
     e.bytes(b"{\"type\":")?;
-    let enabled = doc
-        .member(thinking, "enabled")?
-        .map(|n| doc.node(n))
-        .transpose()?
-        .is_some_and(|n| matches!(n.value, Value::Bool(true)));
+    e.string(super::request_schema::thinking_type(doc, thinking)?)?;
     let native = doc.member(thinking, "native")?;
-    // ponytail: foreign thinking is adaptive without a budget; Phase D picks per model (haiku-5-5 refuses budgets).
-    let adaptive = match native {
-        Some(native) => super::is(doc, native, "type", "adaptive")?,
-        None => doc.member(thinking, "budget_tokens")?.is_none(),
-    };
-    e.string(if !enabled {
-        "disabled"
-    } else if adaptive {
-        "adaptive"
-    } else {
-        "enabled"
-    })?;
     super::member(doc, thinking, "budget_tokens", e)?;
     if let Some(native) = native {
         for field in doc.children(native)? {
@@ -200,13 +184,18 @@ fn tools(doc: &Document, root: usize, x: usize, e: &mut Encoder<'_, '_>) -> Resu
                     e.bytes(b",")?;
                 }
                 let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-                if doc.name_is(name, "parameters")? {
+                let schema = doc.name_is(name, "parameters")?;
+                if schema {
                     e.string("input_schema")?;
                 } else {
                     doc.write_name(name, e)?;
                 }
                 e.bytes(b":")?;
-                doc.write(field, e)?;
+                if schema && crate::codec::chat::request::json_schema::from_gemini(doc)? {
+                    crate::codec::chat::request::json_schema::write(doc, field, e)?;
+                } else {
+                    doc.write(field, e)?;
+                }
             }
             originals(doc, tool, e)?;
             e.bytes(b"}")?;

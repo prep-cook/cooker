@@ -18,6 +18,8 @@ mod index;
 mod records;
 pub use records::read_request;
 
+#[path = "request_json_schema.rs"]
+pub(crate) mod json_schema;
 #[path = "request_write.rs"]
 mod write;
 use write::write_request;

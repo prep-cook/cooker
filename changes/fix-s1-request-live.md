@@ -8,3 +8,5 @@ Fixed
 - Gemini requests with `thinkingConfig.thinkingBudget` reach Anthropic and Chat upstreams. A positive budget enables thinking with that budget, 0 disables it, and -1 (dynamic) becomes adaptive thinking on Anthropic.
 - Gemini requests with `toolConfig.functionCallingConfig` reach Chat and Anthropic upstreams. Modes AUTO, ANY and NONE become `auto`, `required` and `none`; ANY with `allowedFunctionNames` becomes Chat's `allowed_tools`, and on Anthropic a single name forces that tool. More than one name is refused on Anthropic.
 - Chat `allowed_tools` choices in `required` mode reach Gemini as mode ANY with `allowedFunctionNames`, and reach Anthropic when they list one tool.
+- Gemini function schemas reach Chat and Anthropic upstreams as valid JSON Schema: types are lowercase, `nullable` becomes a `"null"` type, and `propertyOrdering` is left out. A schema JSON Schema cannot express, such as `TYPE_UNSPECIFIED`, is refused.
+- A request that forces a tool while asking for budgeted thinking is refused before it reaches Anthropic, which does not allow the combination. Adaptive thinking with a forced tool is still sent.
