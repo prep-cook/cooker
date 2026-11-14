@@ -156,9 +156,10 @@ fn snapshots_preserve_absence_null_empty_and_unknown_metadata() {
     ]);
     let (output, _) = response_fragmented(&wire, BodyMode::Streaming, BodyMode::Buffered, wire.len());
     let output: Value = serde_json::from_slice(&output).unwrap();
+    // A message always carries its role, even when the source never sent one.
     assert_eq!(
         output["choices"][0]["message"],
-        json!({"content":"","refusal":"","tool_calls":[],"vendor":{"x":1,"nested":[true,null]}})
+        json!({"content":"","refusal":"","tool_calls":[],"vendor":{"x":1,"nested":[true,null]},"role":"assistant"})
     );
 }
 

@@ -145,14 +145,18 @@ impl Reduction {
         let custom = doc.string_is(doc.required(root, "arguments_format")?, "text")?;
         let legacy = doc.member(x, "chat_legacy")?.is_some();
         let source = doc.required(x, "source")?;
-        // A provider call without its own id (Gemini) takes the canonical call id.
-        let (id, canonical) = match doc
-            .member(source, "ids")?
-            .map(|ids| doc.member(ids, "id"))
-            .transpose()?
-        {
-            Some(Some(id)) => (id, false),
-            _ => (doc.required(x, "tool_call_id")?, true),
+        // A Responses source names the call by `call_id`; its `id` is the output item's. A provider
+        // call without its own id (Gemini) takes the canonical call id.
+        let provider = match doc.member(source, "ids")? {
+            Some(ids) => match doc.member(ids, "call_id")? {
+                Some(id) => Some(id),
+                None => doc.member(ids, "id")?,
+            },
+            None => None,
+        };
+        let (id, canonical) = match provider {
+            Some(id) => (id, false),
+            None => (doc.required(x, "tool_call_id")?, true),
         };
         // A provider id equal to another call's canonical id would make both calls ambiguous.
         let local = local_id(doc, id)?;

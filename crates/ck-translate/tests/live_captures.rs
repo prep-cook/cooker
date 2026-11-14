@@ -7,6 +7,8 @@ pub mod anthropic;
 #[allow(dead_code)]
 #[path = "../src/boundary.rs"]
 pub mod boundary;
+#[path = "live_captures/chat.rs"]
+mod chat;
 #[path = "../src/codec/mod.rs"]
 pub mod codec;
 #[allow(dead_code)]
@@ -60,6 +62,18 @@ type Feed = Box<dyn FnMut(&mut ck_stream::Writer, Option<&[u8]>)>;
 
 /// Translates `input` from `source` to `client` in 13-byte fragments and returns the client bytes.
 fn run(source: Source, upstream: BodyMode, input: &[u8], client: Client, mode: BodyMode) -> Vec<u8> {
+    run_in(13, source, upstream, input, client, mode)
+}
+
+/// [`run`] with `fragment`-byte fragments.
+fn run_in(
+    fragment: usize,
+    source: Source,
+    upstream: BodyMode,
+    input: &[u8],
+    client: Client,
+    mode: BodyMode,
+) -> Vec<u8> {
     let mut m = Mapped::new();
     let (op, limit) = (Operation::Generate, 1 << 20);
     let mut ingress: Feed = match source {
@@ -97,7 +111,7 @@ fn run(source: Source, upstream: BodyMode, input: &[u8], client: Client, mode: B
     };
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
     let mut output = Vec::new();
-    for chunk in input.chunks(13).map(Some).chain([None]) {
+    for chunk in input.chunks(fragment).map(Some).chain([None]) {
         ingress(&mut m.writer, chunk);
         while let Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
             egress.advance(&mut m.writer, lease, &mut output);

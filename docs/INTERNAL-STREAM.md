@@ -231,6 +231,7 @@ Unknown SSE events become `opaque` with source name, payload and SSE fields; val
 A wire field named `x_ck` is untrusted source data: retain it in `original`, never interpret it as gateway control. Only the trusted internal boundary accepts this grammar.
 If replay metadata is explicitly accepted by a client codec, validate its version and correlation; it cannot set trusted request IDs, routing attempts, resource limits or authorization.
 Unknown fields and events always reach the egress encoder intact. That encoder writes them out where the destination grammar has a place for them (original location, native equivalent or defined extension carrier), and otherwise drops them with a content-free debug log naming field/event, destination and reason.
+Native events and SSE fields of one protocol have no place in another protocol's grammar: only a client of the source protocol receives them.
 Known normalized mutations, including deletion, win over stale preserved values; never inject source-specific options into an unrelated provider's request root.
 Mapped request semantics are distinct from unknown data: unsupported semantics in the §4 capability list produce 400 at the `request.end` fence before any upstream request is sent; unknown fields alone do not trigger rejection.
 B7/B9 response projections occur inside the egress encoder after receipt: select choice 0 for single-choice destinations and drop unsupported grounding/code/URL-context events. Debug logs contain request ID, indexes/event kind and destination, never payload/signatures/tool arguments.
