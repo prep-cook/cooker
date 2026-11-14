@@ -115,8 +115,8 @@ Money clauses apply only where billing or a ledger exists.
    | `ck-core` | none |
    | `ck-wire` | `ck-core` |
    | `ck-translate` | `ck-core`, `ck-wire`, `ck-stream` |
-   | `ck-exec` | `ck-core`, `ck-wire`, `ck-translate` |
-   | `ck-server` | `ck-core`, `ck-wire`, `ck-translate`, `ck-exec` |
+   | `ck-exec` | `ck-core`, `ck-wire`, `ck-stream`, `ck-translate` |
+   | `ck-server` | `ck-core`, `ck-wire`, `ck-stream`, `ck-translate`, `ck-exec` |
    | `cooker` | `ck-core`, `ck-wire`, `ck-translate`, `ck-exec`, `ck-server` |
 
 6. Keep unit tests beside modules and crate integration tests in `crates/<name>/tests/`. Keep Go recordings and fixtures excluded from published packages with `exclude = ["tests/"]`.

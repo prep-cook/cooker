@@ -17,6 +17,7 @@ bytes.workspace = true
 ck-wire.workspace = true
 ck-core.workspace = true
 ck-translate.workspace = true
+ck-stream.workspace = true
 futures-util.workspace = true
 http.workspace = true
 wreq = { workspace = true, features = ["socks", "ws"] }

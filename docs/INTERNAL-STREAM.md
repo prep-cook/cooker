@@ -61,6 +61,8 @@ Phase B introduces `ck-stream` and its dependency-table row together, without pr
 
 Use the existing provider selector in `crates/ck-exec/src/lib.rs:164-184`. Executor dispatch stays static; no per-event trait boxing or second provider registry. In the post-W1 layout, stream ownership/resume belongs under `crates/ck-server/src/inference/`; egress belongs beside `http/respond.rs`. Runtime and listener integration belong under `runtime/` and `net/listener.rs`.
 
+The Phase D interfaces between these owners (executor trait, request handle, producer, exchange, stream handle, usage input, errors and commitment) are fixed in `docs/EXECUTION-CONTRACT.md`.
+
 ## 3. Stream grammar
 
 ### 3.1 Framing and base chunk

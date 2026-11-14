@@ -1,5 +1,4 @@
-use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ck_stream::{ByteSpan, FRAME_BYTES, Lease, MetadataPermit, Position, ScratchLease, ScratchReservation, Writer};
 
@@ -63,8 +62,9 @@ pub struct Source {
     len: u64,
     metadata: MetadataPermit,
     base: u64,
-    /// Index of the segment read last. Release moves indexes, so it resets this hint.
-    recent: Cell<usize>,
+    /// Index of the segment read last. Release moves indexes, so it resets this hint. Atomic
+    /// only so shared readers keep `Source` `Sync`; every use is a hint checked against the segment.
+    recent: AtomicUsize,
 }
 
 impl Source {
@@ -75,7 +75,7 @@ impl Source {
             len: 0,
             metadata: owner.reserve_metadata(0)?,
             base: 0,
-            recent: Cell::new(0),
+            recent: AtomicUsize::new(0),
         })
     }
 
@@ -212,7 +212,7 @@ impl Source {
         }
         let count = self.segments.partition_point(|segment| segment.end <= offset);
         self.segments.drain(..count);
-        self.recent.set(0);
+        *self.recent.get_mut() = 0;
         self.base = self.segments.first().map_or(self.len, |segment| segment.start);
         Ok(())
     }
@@ -225,7 +225,7 @@ impl Source {
         }
         self.segments
             .retain(|segment| segment.start < span.start || segment.end > span.end);
-        self.recent.set(0);
+        *self.recent.get_mut() = 0;
         self.base = self.segments.first().map_or(self.len, |segment| segment.start);
         Ok(())
     }
@@ -313,15 +313,16 @@ impl Source {
     }
 
     fn chunk(&self, offset: u64, end: u64) -> Result<&[u8]> {
-        let index = match self.segments.get(self.recent.get()) {
-            Some(segment) if segment.start <= offset && offset < segment.end => self.recent.get(),
+        let recent = self.recent.load(Ordering::Relaxed);
+        let index = match self.segments.get(recent) {
+            Some(segment) if segment.start <= offset && offset < segment.end => recent,
             _ => {
                 let index = self
                     .segments
                     .partition_point(|segment| segment.start <= offset)
                     .checked_sub(1)
                     .ok_or(Error::Position)?;
-                self.recent.set(index);
+                self.recent.store(index, Ordering::Relaxed);
                 index
             }
         };

@@ -126,12 +126,12 @@ fn releasing_segments_resets_the_recent_segment() {
     source.push_bytes(&mut fixture.writer, &bytes).unwrap();
     let last = span(2 * FRAME_BYTES, 2 * FRAME_BYTES + 1);
     assert_eq!(source.slice(last).unwrap(), Some(&[2][..]));
-    assert_eq!(source.recent.get(), 2);
+    assert_eq!(source.recent.load(std::sync::atomic::Ordering::Relaxed), 2);
     source.release_before(FRAME_BYTES as u64).unwrap();
-    assert_eq!(source.recent.get(), 0);
+    assert_eq!(source.recent.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(source.slice(last).unwrap(), Some(&[2][..]));
-    assert_eq!(source.recent.get(), 1);
+    assert_eq!(source.recent.load(std::sync::atomic::Ordering::Relaxed), 1);
     source.release_range(span(FRAME_BYTES, 2 * FRAME_BYTES)).unwrap();
-    assert_eq!(source.recent.get(), 0);
+    assert_eq!(source.recent.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(source.slice(last).unwrap(), Some(&[2][..]));
 }

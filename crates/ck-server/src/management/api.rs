@@ -42,6 +42,7 @@ pub(crate) mod quota;
 mod quota_probe;
 mod session;
 mod siwc;
+mod streams_stats;
 pub use access::cors;
 pub(crate) use access::{Cors, cors_headers};
 
