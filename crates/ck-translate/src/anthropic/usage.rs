@@ -56,9 +56,15 @@ impl Usage {
         let read = count(doc, root, "cache_read_input_tokens")?;
         let write = count(doc, root, "cache_creation_input_tokens")?;
         let output = count(doc, root, "output_tokens")?;
-        let input = match (uncached, read, write) {
-            (Some(a), Some(b), Some(c)) => Some(a.checked_add(b).and_then(|v| v.checked_add(c)).ok_or(Error::Schema)?),
-            _ => None,
+        let reasoning = reasoning(doc, root)?;
+        // An omitted cache component counts as 0 (owner ruling, 2026-11-15).
+        let input = match uncached {
+            Some(a) => Some(
+                a.checked_add(read.unwrap_or(0))
+                    .and_then(|v| v.checked_add(write.unwrap_or(0)))
+                    .ok_or(Error::Schema)?,
+            ),
+            None => None,
         };
         let total = match (input, output) {
             (Some(a), Some(b)) => Some(a.checked_add(b).ok_or(Error::Schema)?),
@@ -71,6 +77,7 @@ impl Usage {
             ("input_tokens", input),
             ("output_tokens", output),
             ("total_tokens", total),
+            ("reasoning_tokens", reasoning),
         ] {
             if let Some(value) = value {
                 e.bytes(b",")?;
@@ -115,6 +122,13 @@ fn object_member(doc: &Document, node: usize, key: &str) -> Result<Option<usize>
         Some(n) if matches!(doc.node(n)?.value, Value::Null) => Ok(None),
         Some(n) if matches!(doc.node(n)?.value, Value::Object) => Ok(Some(n)),
         Some(_) => Err(Error::Schema),
+        None => Ok(None),
+    }
+}
+/// Thinking tokens, a subset of the output tokens.
+fn reasoning(doc: &Document, root: usize) -> Result<Option<u64>> {
+    match object_member(doc, root, "output_tokens_details")? {
+        Some(details) => count(doc, details, "thinking_tokens"),
         None => Ok(None),
     }
 }

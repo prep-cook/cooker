@@ -316,7 +316,8 @@ fn partial_usage_and_null_never_become_zero_or_additive_deltas() {
         11,
     );
     let snapshots: Vec<_> = canonical.iter().filter_map(|v| v.get("usage")).collect();
-    assert!(snapshots[0].get("input_tokens").is_none());
+    // An omitted or null cache count adds 0 to the inclusive input but is never reported as 0.
+    assert_eq!(snapshots[0]["input_tokens"], 4);
     assert!(snapshots[0].get("cache_read_tokens").is_none());
     let last = snapshots.last().unwrap();
     assert_eq!(last["input_tokens"], 6);

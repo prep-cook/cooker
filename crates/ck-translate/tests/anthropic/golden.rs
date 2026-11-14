@@ -146,16 +146,15 @@ fn recorded_complete_native_messages_preserve_blocks_and_usage() {
             assert_eq!(usage["native"]["value"], expected["usage"], "{id}");
             assert_eq!(usage["final"], true, "{id}");
             let native = &expected["usage"];
-            if let (Some(a), Some(b), Some(c)) = (
-                native["input_tokens"].as_u64(),
-                native["cache_read_input_tokens"].as_u64(),
-                native["cache_creation_input_tokens"].as_u64(),
-            ) {
+            // An omitted cache component counts as 0; an omitted uncached input derives nothing.
+            if let Some(a) = native["input_tokens"].as_u64() {
+                let b = native["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                let c = native["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                 assert_eq!(usage["input_tokens"], a + b + c, "{id}");
             } else {
                 assert!(
                     usage.get("input_tokens").is_none(),
-                    "{id}: absent cache counts must not become zero"
+                    "{id}: absent input must not become zero"
                 );
             }
         }
