@@ -78,7 +78,7 @@ impl Egress {
             if let Some(value) = doc.member(delta, field)?
                 && !matches!(doc.node(value)?.value, Value::Null)
             {
-                let index = self.find_or_text(owner, doc, x, native, output)?;
+                let index = self.find_or_text(owner, doc, x, native)?;
                 self.fragment(owner, doc, value, index, (native, delta_kind), output)?;
             }
         }
@@ -135,7 +135,7 @@ impl Egress {
                         e.bytes(b"}")?;
                         if let Some(usage) = &self.usage {
                             e.bytes(b",\"usage\":")?;
-                            write_usage(usage, e)?;
+                            write_usage(usage, false, e)?;
                         }
                         original_members(&doc, x, e)
                     })?)?;
@@ -167,6 +167,7 @@ impl Egress {
             let value = doc.required(root, "value")?;
             if matches!(doc.node(value)?.value, Value::Object) && is(&doc, value, "type", "content_block_delta")? {
                 let index = self.find(&doc, x)?;
+                self.start_block(owner, index, output)?;
                 output(native_event(owner, "content_block_delta", Some(&doc), |e| {
                     e.bytes(b",\"index\":")?;
                     e.unsigned(self.blocks[index].index)?;
@@ -250,10 +251,12 @@ impl Egress {
             original_members_with_separator(origin, x, "/message", true, Some(finish), e)?;
         }
         e.bytes(b",\"content\":[")?;
-        for (index, block) in self.blocks.iter().enumerate() {
+        // Blocks in start order, as a stream numbers them; an empty text block never starts.
+        for (index, &position) in self.order.iter().enumerate() {
             if index != 0 {
                 e.bytes(b",")?;
             }
+            let block = &self.blocks[position];
             object(&block.document, block.document.root(), &["partial_json"], e)?;
         }
         e.bytes(b"]")?;
@@ -265,7 +268,7 @@ impl Egress {
         }
         if let Some(usage) = &self.usage {
             e.bytes(b",\"usage\":")?;
-            write_usage(usage, e)?;
+            write_usage(usage, false, e)?;
         }
         e.bytes(b"}")
     }

@@ -441,3 +441,129 @@ fn chat_usage_counts_an_omitted_anthropic_cache_component_as_zero() {
         );
     }
 }
+
+#[test]
+fn message_start_always_carries_token_counts() {
+    for (source, upstream, name) in [
+        (Source::Chat, BodyMode::Buffered, "ds-chat-text.json"),
+        (Source::Responses, BodyMode::Streaming, "relay-medium-resp-reason1.sse"),
+    ] {
+        let output = run(source, upstream, &fixture(name), Client::Anthropic, BodyMode::Streaming);
+        let events = events(&output);
+        let usage = &events[0]["message"]["usage"];
+        assert!(
+            usage["input_tokens"].is_u64() && usage["output_tokens"].is_u64(),
+            "{name}: {usage}"
+        );
+        let delta = events.iter().rfind(|e| e["type"] == "message_delta").unwrap();
+        assert!(delta["usage"]["output_tokens"].as_u64() > Some(0), "{name}: {delta}");
+    }
+}
+
+#[test]
+fn foreign_thinking_carries_an_empty_signature() {
+    for (source, upstream, name) in [
+        (Source::Chat, BodyMode::Buffered, "ds-chat-text.json"),
+        (Source::Responses, BodyMode::Streaming, "relay-medium-resp-reason1.sse"),
+    ] {
+        let input = fixture(name);
+        let buffered = run(source, upstream, &input, Client::Anthropic, BodyMode::Buffered);
+        let buffered: Value = serde_json::from_slice(&buffered).unwrap();
+        assert_eq!(buffered["content"][0]["signature"], "", "{name}: {buffered}");
+        let streamed = run(source, upstream, &input, Client::Anthropic, BodyMode::Streaming);
+        let start = events(&streamed)
+            .into_iter()
+            .find(|e| e["type"] == "content_block_start")
+            .unwrap();
+        assert_eq!(
+            start["content_block"],
+            json!({"type":"thinking","thinking":"","signature":""}),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn empty_chat_content_beside_tool_calls_writes_no_text_block() {
+    let body = json!({"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}});
+    let input = serde_json::to_vec(&body).unwrap();
+    let buffered = run(
+        Source::Chat,
+        BodyMode::Buffered,
+        &input,
+        Client::Anthropic,
+        BodyMode::Buffered,
+    );
+    let buffered: Value = serde_json::from_slice(&buffered).unwrap();
+    let streamed = run(
+        Source::Chat,
+        BodyMode::Buffered,
+        &input,
+        Client::Anthropic,
+        BodyMode::Streaming,
+    );
+    for content in [&buffered["content"], &accumulate(&streamed)["content"]] {
+        assert_eq!(
+            content,
+            &json!([{"type":"tool_use","id":"call_1","name":"f","input":{"a":1}}]),
+            "{content}"
+        );
+    }
+}
+
+#[test]
+fn responses_function_call_keeps_its_call_id() {
+    let body = json!({"id":"resp_1","object":"response","created_at":1,"model":"m","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"f","arguments":"{}","status":"completed"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}});
+    let input = serde_json::to_vec(&body).unwrap();
+    let buffered = run(
+        Source::Responses,
+        BodyMode::Buffered,
+        &input,
+        Client::Anthropic,
+        BodyMode::Buffered,
+    );
+    let buffered: Value = serde_json::from_slice(&buffered).unwrap();
+    let streamed = run(
+        Source::Responses,
+        BodyMode::Buffered,
+        &input,
+        Client::Anthropic,
+        BodyMode::Streaming,
+    );
+    for content in [&buffered["content"], &accumulate(&streamed)["content"]] {
+        assert_eq!(content[0]["id"], "call_1", "{content}");
+    }
+}
+
+#[test]
+fn buffered_content_follows_the_streamed_block_order() {
+    let mut input = Vec::new();
+    for (delta, finish) in [
+        (json!({"role":"assistant","content":""}), Value::Null),
+        (json!({"reasoning_content":"reason"}), Value::Null),
+        (json!({"content":"answer"}), Value::Null),
+        (json!({}), json!("stop")),
+    ] {
+        let chunk = json!({"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+        input.extend_from_slice(format!("data: {chunk}\n\n").as_bytes());
+    }
+    input.extend_from_slice(b"data: [DONE]\n\n");
+    let buffered = run(
+        Source::Chat,
+        BodyMode::Streaming,
+        &input,
+        Client::Anthropic,
+        BodyMode::Buffered,
+    );
+    let buffered: Value = serde_json::from_slice(&buffered).unwrap();
+    let streamed = run(
+        Source::Chat,
+        BodyMode::Streaming,
+        &input,
+        Client::Anthropic,
+        BodyMode::Streaming,
+    );
+    let expected = json!([{"type":"thinking","thinking":"reason","signature":""},{"type":"text","text":"answer"}]);
+    assert_eq!(buffered["content"], expected);
+    assert_eq!(accumulate(&streamed)["content"], expected);
+}

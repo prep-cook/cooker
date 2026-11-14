@@ -58,13 +58,13 @@ impl Egress {
             body.set(body_root, "type", Value::Text(native))?;
         }
         if matches!(native, "text" | "thinking") {
-            body.set(body_root, native, Value::Fragments)?;
+            text_fields(&mut body, native)?;
         }
-        let index = self.blocks.len() as u64;
+        let index = self.blocks.len();
         self.blocks.push(Block {
             item,
             canonical,
-            index,
+            index: 0,
             document: body,
             open: true,
             started: false,
@@ -74,9 +74,10 @@ impl Egress {
             text: matches!(native, "text" | "thinking").then_some(native),
             next_text: None,
         })?;
-        self.listed(owner, index as usize)?;
-        if matches!(native, "text" | "thinking") {
-            self.start_block(owner, index as usize, output)?;
+        self.listed(owner, index)?;
+        // A text block starts with its first content, so an empty one is never written.
+        if native == "thinking" {
+            self.start_block(owner, index, output)?;
         }
         Ok(())
     }
@@ -102,7 +103,8 @@ impl Egress {
         let x = body.required(from, "x_ck")?;
         let id = if let Some(source) = body.member(x, "source")? {
             if let Some(ids) = body.member(source, "ids")? {
-                body.member(ids, "id")?.or(body.member(ids, "call_id")?)
+                // A Responses call is answered by its `call_id`, not its item id.
+                body.member(ids, "call_id")?.or(body.member(ids, "id")?)
             } else {
                 None
             }
@@ -332,7 +334,7 @@ impl Egress {
         self.blocks.push(Block {
             item: local(doc, doc.required(x, "item_id")?)?,
             canonical: u64::MAX - index as u64,
-            index: index as u64,
+            index: 0,
             document: mapped(owner, |e| e.bytes(b"{\"type\":\"tool_use\"}"))?,
             open: true,
             started: false,
@@ -351,7 +353,6 @@ impl Egress {
         doc: &Document,
         x: usize,
         native: &'static str,
-        output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<usize> {
         if doc.member(x, "block_index")?.is_some() {
             return self.find(doc, x);
@@ -365,11 +366,11 @@ impl Egress {
         let index = self.blocks.len();
         let mut body = mapped(owner, |e| e.bytes(b"{}"))?;
         body.set(body.root(), "type", Value::Text(native))?;
-        body.set(body.root(), native, Value::Fragments)?;
+        text_fields(&mut body, native)?;
         self.blocks.push(Block {
             item,
             canonical: u64::MAX - index as u64,
-            index: index as u64,
+            index: 0,
             document: body,
             open: true,
             started: false,
@@ -380,7 +381,6 @@ impl Egress {
             next_text: None,
         })?;
         self.listed(owner, index)?;
-        self.start_block(owner, index, output)?;
         Ok(index)
     }
     pub(super) fn start_block(
@@ -390,10 +390,13 @@ impl Egress {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         self.begin(owner, output)?;
-        let block = &mut self.blocks[index];
-        if block.started {
+        if self.blocks[index].started {
             return Ok(());
         }
+        // Client indexes count started blocks; a skipped empty text block takes none.
+        self.order.push(index)?;
+        let block = &mut self.blocks[index];
+        block.index = self.order.len() as u64 - 1;
         let origin = block.start_origin.take();
         if self.mode == BodyMode::Streaming {
             output(native_event(owner, "content_block_start", origin.as_ref(), |e| {
@@ -417,14 +420,18 @@ impl Egress {
         origin: Option<&Document>,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
-        self.start_block(owner, index, output)?;
+        let block = &self.blocks[index];
+        let empty = block.text == Some("text") && !block.started;
+        if !empty {
+            self.start_block(owner, index, output)?;
+        }
         let block = &mut self.blocks[index];
         if !block.open {
             return Err(Error::Schema);
         }
         block.open = false;
         let (item, text) = (block.item, block.text);
-        if self.mode == BodyMode::Streaming {
+        if self.mode == BodyMode::Streaming && !empty {
             output(native_event(owner, "content_block_stop", origin, |e| {
                 e.bytes(b",\"index\":")?;
                 e.unsigned(block.index)?;
@@ -455,10 +462,13 @@ impl Egress {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         string(doc, value)?;
-        self.start_block(owner, index, output)?;
+        let empty = doc.string_is(value, "")?;
+        if !(empty && field == "text") {
+            self.start_block(owner, index, output)?;
+        }
         let block = &mut self.blocks[index];
         // An empty `signature_delta` would replace the signature in SDK accumulators.
-        if self.mode == BodyMode::Streaming && !doc.string_is(value, "")? {
+        if self.mode == BodyMode::Streaming && !empty {
             output(native_event(owner, "content_block_delta", Some(doc), |e| {
                 e.bytes(b",\"index\":")?;
                 e.unsigned(block.index)?;
@@ -495,6 +505,7 @@ impl Egress {
         index: usize,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
+        self.start_block(owner, index, output)?;
         if self.mode == BodyMode::Streaming {
             let block = &self.blocks[index];
             output(native_event(owner, "content_block_delta", Some(doc), |e| {
@@ -519,4 +530,14 @@ impl Egress {
         }
         Ok(())
     }
+}
+/// Adds the streamed `native` field of a text or thinking block, and the empty signature the API
+/// gives a thinking block before any `signature_delta`.
+fn text_fields(body: &mut Document, native: &'static str) -> Result<()> {
+    let root = body.root();
+    body.set(root, native, Value::Fragments)?;
+    if native == "thinking" {
+        body.set(root, "signature", Value::Fragments)?;
+    }
+    Ok(())
 }
