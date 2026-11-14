@@ -99,6 +99,18 @@ pub(crate) fn is(doc: &Document, parent: usize, key: &str, value: &str) -> Resul
         .map_or(Ok(false), |node| doc.string_is(node, value))
 }
 
+/// The effort of a Chat `reasoning` object kept in `thinking.native`, which means what
+/// `reasoning_effort` means; `None` when the canonical `effort` is set, since that one wins.
+pub(crate) fn chat_effort(doc: &Document, x: usize, thinking: usize) -> Result<Option<usize>> {
+    if doc.member(thinking, "effort")?.is_some() || !is(doc, x, "original_protocol", "chat")? {
+        return Ok(None);
+    }
+    match doc.member(thinking, "native")? {
+        Some(native) => doc.member(native, "effort"),
+        None => Ok(None),
+    }
+}
+
 /// Writes `,"key":value` when `parent` has member `key`.
 pub(crate) fn member(doc: &Document, parent: usize, key: &str, e: &mut Encoder<'_, '_>) -> Result<()> {
     if let Some(node) = doc.member(parent, key)? {

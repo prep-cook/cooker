@@ -1,4 +1,5 @@
 use super::request::originals;
+use crate::boundary::chat_effort;
 use crate::codec::{
     Error, RequestView, Result,
     document::{Document, Value},
@@ -235,12 +236,7 @@ fn thinking_config(doc: &Document, thinking: usize, e: &mut Encoder<'_, '_>) -> 
         }
     }
     let x = doc.required(doc.root(), "x_ck")?;
-    // A Chat `reasoning` object's effort means what `reasoning_effort` means.
-    if doc.member(thinking, "effort")?.is_none()
-        && super::is(doc, x, "original_protocol", "chat")?
-        && let Some(native) = doc.member(thinking, "native")?
-        && let Some(effort) = doc.member(native, "effort")?
-    {
+    if let Some(effort) = chat_effort(doc, x, thinking)? {
         comma(&mut first, e)?;
         e.bytes(b"\"thinkingLevel\":")?;
         doc.write(effort, e)?;

@@ -1,4 +1,4 @@
-use super::super::{is, member};
+use super::super::{chat_effort, is, member};
 use super::native::{item_type, native, typed};
 use crate::codec::{
     Error, Operation, RequestView, Result,
@@ -231,8 +231,8 @@ fn position_of(doc: &Document, entry: usize) -> Result<Option<u64>> {
 /// Writes the reasoning options, the continuation and the Responses provider parameters.
 fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     if let Some(thinking) = doc.member(x, "thinking")? {
-        // Another protocol's budget, switch and native config are not Responses members; its
-        // `include` is a summary setting only as a string.
+        // Another protocol's budget, switch and native config are not Responses members, except a
+        // Chat `reasoning` object's effort; its `include` is a summary setting only as a string.
         let native = is(doc, x, "original_protocol", "responses")?;
         let mut open = false;
         for f in doc.children(thinking)? {
@@ -252,10 +252,15 @@ fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result
             e.bytes(b":")?;
             doc.write(f, e)?;
         }
-        if native && !open {
-            e.bytes(b",\"reasoning\":{")?;
+        if let Some(effort) = chat_effort(doc, x, thinking)? {
+            e.bytes(if open { b"," } else { b",\"reasoning\":{" })?;
+            open = true;
+            e.bytes(b"\"effort\":")?;
+            doc.write(effort, e)?;
         }
-        if native || open {
+        if native && !open {
+            e.bytes(b",\"reasoning\":{}")?;
+        } else if open {
             e.bytes(b"}")?;
         }
     }
