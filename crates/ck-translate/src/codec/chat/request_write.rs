@@ -81,7 +81,7 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
     e.bytes(b"}")
 }
 
-/// Writes a Gemini source's tools with each `parameters` schema as JSON Schema.
+/// Writes a Gemini source's tools with each declaration as a JSON Schema tool definition.
 fn write_gemini_tools(doc: &Document, tools: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"[")?;
     for (i, tool) in doc.children(tools)?.enumerate() {
@@ -96,17 +96,7 @@ fn write_gemini_tools(doc: &Document, tools: usize, e: &mut Encoder<'_, '_>) -> 
                 continue;
             }
             e.bytes(b"{")?;
-            for (k, member) in doc.children(field)?.enumerate() {
-                e.bytes(if k == 0 { b"" } else { b"," })?;
-                let name = doc.node(member)?.name.ok_or(Error::Schema)?;
-                doc.write_name(name, e)?;
-                e.bytes(b":")?;
-                if doc.name_is(name, "parameters")? {
-                    super::json_schema::write(doc, member, e)?;
-                } else {
-                    doc.write(member, e)?;
-                }
-            }
+            super::json_schema::write_function(doc, field, "parameters", e)?;
             e.bytes(b"}")?;
         }
         e.bytes(b"}")?;

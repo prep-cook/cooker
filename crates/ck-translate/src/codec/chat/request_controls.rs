@@ -201,8 +201,8 @@ pub(super) fn destination(doc: &Document) -> Result<()> {
             if !doc.string_is(kind, "custom")? && !doc.string_is(kind, "function")? {
                 return Err(Error::Unsupported);
             }
-            if gemini && let Some(parameters) = doc.member(doc.required(tool, "function")?, "parameters")? {
-                super::request::json_schema::check(doc, parameters)?;
+            if gemini {
+                super::request::json_schema::check_function(doc, doc.required(tool, "function")?)?;
             }
         }
     }

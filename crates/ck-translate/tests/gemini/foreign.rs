@@ -280,3 +280,42 @@ fn forced_tool_choice_with_budgeted_thinking_is_refused_at_anthropic() {
     assert!(from_gemini(&input(2048, json!({"mode":"AUTO"})), To::Anthropic).is_ok());
     assert!(from_gemini(&input(0, any), To::Anthropic).is_ok());
 }
+
+/// A Gemini declaration reaches Chat and Anthropic as a tool definition: `parametersJsonSchema`
+/// is the schema; `response`, `responseJsonSchema` and the default `behavior` are left out.
+/// Both schema forms, or NON_BLOCKING, are refused; Gemini gets the declaration back.
+#[test]
+fn gemini_declaration_reaches_chat_and_anthropic_as_a_tool_definition() {
+    let input = |function: Value| json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[function]}]});
+    let schema = json!({"type":"object","properties":{"x":{"type":"string"}}});
+    let declaration = json!({"name":"f","description":"d","parametersJsonSchema":schema,
+        "response":{"type":"STRING"},"responseJsonSchema":{"type":"string"},"behavior":"BLOCKING"});
+    let chat = from_gemini(&input(declaration.clone()), To::Chat).unwrap();
+    assert_eq!(
+        chat["tools"][0],
+        json!({"type":"function","function":{"name":"f","description":"d","parameters":schema}})
+    );
+    let anthropic = from_gemini(&input(declaration.clone()), To::Anthropic).unwrap();
+    assert_eq!(
+        anthropic["tools"][0],
+        json!({"name":"f","description":"d","input_schema":schema})
+    );
+    assert_eq!(
+        request(&input(declaration.clone()), Operation::Generate).0,
+        input(declaration)
+    );
+    for refused in [
+        json!({"name":"f","parameters":{"type":"OBJECT"},"parametersJsonSchema":schema}),
+        json!({"name":"f","parametersJsonSchema":schema,"behavior":"NON_BLOCKING"}),
+    ] {
+        assert!(matches!(
+            from_gemini(&input(refused.clone()), To::Chat),
+            Err(codec::Error::Unsupported)
+        ));
+        assert!(matches!(
+            from_gemini(&input(refused.clone()), To::Anthropic),
+            Err(codec::Error::Unsupported)
+        ));
+        assert_eq!(request(&input(refused.clone()), Operation::Generate).0, input(refused));
+    }
+}

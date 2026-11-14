@@ -1,5 +1,5 @@
-//! Gemini function schemas as JSON Schema, for the Chat and Anthropic destinations. Gemini
-//! request egress writes the native schema unchanged.
+//! Gemini function declarations as JSON Schema tool definitions, for the Chat and Anthropic
+//! destinations. Gemini request egress writes the native declaration unchanged.
 use crate::codec::{
     Error, Result,
     document::{Document, Name, Value},
@@ -25,6 +25,59 @@ pub(crate) fn from_gemini(doc: &Document) -> Result<bool> {
         Some(protocol) => doc.string_is(protocol, "gemini"),
         None => Ok(false),
     }
+}
+
+/// Declaration members about the function's return or scheduling, which neither destination has.
+/// [`check_function`] refuses a `behavior` other than the default, BLOCKING.
+const RESULT_MEMBERS: [&str; 3] = ["response", "responseJsonSchema", "behavior"];
+
+/// Refuses a declaration with both `parameters` and `parametersJsonSchema`, a NON_BLOCKING
+/// `behavior`, which changes call semantics, or a `parameters` schema [`check`] refuses.
+pub(crate) fn check_function(doc: &Document, function: usize) -> Result<()> {
+    let parameters = doc.member(function, "parameters")?;
+    if parameters.is_some() && doc.member(function, "parametersJsonSchema")?.is_some() {
+        return Err(Error::Unsupported);
+    }
+    if let Some(behavior) = doc.member(function, "behavior")?
+        && !doc.string_is(behavior, "BLOCKING")?
+    {
+        return Err(Error::Unsupported);
+    }
+    match parameters {
+        Some(parameters) => check(doc, parameters),
+        None => Ok(()),
+    }
+}
+
+/// Writes the members of a declaration that passed [`check_function`], without braces: either
+/// schema under `schema_key`, `parameters` converted by [`write`], and no [`RESULT_MEMBERS`].
+pub(crate) fn write_function(doc: &Document, function: usize, schema_key: &str, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let mut first = true;
+    for member in doc.children(function)? {
+        let name = doc.node(member)?.name.ok_or(Error::Schema)?;
+        if RESULT_MEMBERS
+            .iter()
+            .try_fold(false, |yes, key| Ok::<_, Error>(yes || doc.name_is(name, key)?))?
+        {
+            continue;
+        }
+        e.bytes(if first { b"" } else { b"," })?;
+        first = false;
+        if doc.name_is(name, "parameters")? || doc.name_is(name, "parametersJsonSchema")? {
+            e.string(schema_key)?;
+            e.bytes(b":")?;
+            if doc.name_is(name, "parameters")? {
+                write(doc, member, e)?;
+            } else {
+                doc.write(member, e)?;
+            }
+        } else {
+            doc.write_name(name, e)?;
+            e.bytes(b":")?;
+            doc.write(member, e)?;
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a Gemini schema JSON Schema cannot express: `TYPE_UNSPECIFIED` or an unknown type,

@@ -234,12 +234,17 @@ fn tools(doc: &Document, root: usize, x: usize) -> Result<()> {
             }
             let function = doc.required(tool, "function")?;
             super::string(doc, doc.required(function, "name")?)?;
-            let parameters = doc.required(function, "parameters")?;
-            if !matches!(doc.node(parameters)?.value, Value::Object) {
-                return Err(Error::Schema);
+            let gemini = json_schema::from_gemini(doc)?;
+            if gemini {
+                json_schema::check_function(doc, function)?;
             }
-            if json_schema::from_gemini(doc)? {
-                json_schema::check(doc, parameters)?;
+            let schema = match doc.member(function, "parameters")? {
+                Some(schema) => schema,
+                None if gemini => doc.required(function, "parametersJsonSchema")?,
+                None => return Err(Error::Schema),
+            };
+            if !matches!(doc.node(schema)?.value, Value::Object) {
+                return Err(Error::Schema);
             }
         }
     }

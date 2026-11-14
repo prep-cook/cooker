@@ -179,23 +179,24 @@ fn tools(doc: &Document, root: usize, x: usize, e: &mut Encoder<'_, '_>) -> Resu
         } else {
             let function = doc.required(tool, "function")?;
             e.bytes(b"{")?;
+            if crate::codec::chat::request::json_schema::from_gemini(doc)? {
+                crate::codec::chat::request::json_schema::write_function(doc, function, "input_schema", e)?;
+                originals(doc, tool, e)?;
+                e.bytes(b"}")?;
+                continue;
+            }
             for (i, field) in doc.children(function)?.enumerate() {
                 if i != 0 {
                     e.bytes(b",")?;
                 }
                 let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-                let schema = doc.name_is(name, "parameters")?;
-                if schema {
+                if doc.name_is(name, "parameters")? {
                     e.string("input_schema")?;
                 } else {
                     doc.write_name(name, e)?;
                 }
                 e.bytes(b":")?;
-                if schema && crate::codec::chat::request::json_schema::from_gemini(doc)? {
-                    crate::codec::chat::request::json_schema::write(doc, field, e)?;
-                } else {
-                    doc.write(field, e)?;
-                }
+                doc.write(field, e)?;
             }
             originals(doc, tool, e)?;
             e.bytes(b"}")?;

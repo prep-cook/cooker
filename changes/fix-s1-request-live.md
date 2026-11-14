@@ -10,3 +10,4 @@ Fixed
 - Chat `allowed_tools` choices in `required` mode reach Gemini as mode ANY with `allowedFunctionNames`, and reach Anthropic when they list one tool.
 - Gemini function schemas reach Chat and Anthropic upstreams as valid JSON Schema: types are lowercase, `nullable` becomes a `"null"` type, and `propertyOrdering` is left out. A schema JSON Schema cannot express, such as `TYPE_UNSPECIFIED`, is refused.
 - A request that forces a tool while asking for budgeted thinking is refused before it reaches Anthropic, which does not allow the combination. Adaptive thinking with a forced tool is still sent.
+- Gemini function declarations with `parametersJsonSchema` reach Chat and Anthropic upstreams with that schema as the tool's parameters. `response`, `responseJsonSchema` and the default `behavior` are not sent there. A declaration with both schema forms, or with `behavior: NON_BLOCKING`, is refused.
