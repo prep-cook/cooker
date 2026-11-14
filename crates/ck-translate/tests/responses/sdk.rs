@@ -151,3 +151,29 @@ fn openai_error_event_fails_the_client_response() {
     let chat: Value = serde_json::from_slice(&to_client(input.as_bytes(), "chat", BodyMode::Buffered)).unwrap();
     assert_eq!(chat["error"]["status"], 502);
 }
+
+/// Members under cooker's reserved `x_ck` prefix never reach a client, whatever their origin.
+#[test]
+fn reserved_members_never_reach_responses_clients() {
+    let created = json!({"type":"response.created","response":{"id":"r","output":[],"x_ck_opaque":[{"upstream":"marker"}],"x_ck":{"source":"marker"}}});
+    let note = json!({"type":"response.vendor_note","sequence_number":9,"x_ck":{"source":"marker"},"note":"n"});
+    let completed = json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[]}});
+    let input = format!("data: {created}\n\nevent: response.vendor_note\ndata: {note}\n\ndata: {completed}\n\n");
+    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+        let (output, _) = response(input.as_bytes(), BodyMode::Streaming, downstream, Operation::Generate);
+        let text = String::from_utf8(output).unwrap();
+        assert!(!text.contains("x_ck"), "{text}");
+        if downstream == BodyMode::Streaming {
+            let events = super::cross::client_events(text.as_bytes());
+            let types: Vec<_> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+            assert_eq!(
+                types,
+                ["response.created", "response.vendor_note", "response.completed"]
+            );
+            for (at, event) in events.iter().enumerate() {
+                assert_eq!(event["sequence_number"], at);
+            }
+            assert_eq!(events[1]["note"], "n");
+        }
+    }
+}

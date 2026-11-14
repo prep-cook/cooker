@@ -370,13 +370,14 @@ fn write_item(doc: &Document, item: usize, e: &mut Encoder<'_, '_>) -> Result<()
     }
     e.bytes(b"}")
 }
-/// Writes the response object without the internal `x_ck_opaque` carrier, which no client sees.
+/// Writes the response object without members under the reserved `x_ck` prefix, which no
+/// client sees.
 fn write_response(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"{")?;
     let mut first = true;
     for field in doc.children(doc.root())? {
         let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-        if doc.name_is(name, "x_ck_opaque")? {
+        if super::opaque::reserved(doc, name)? {
             continue;
         }
         if !first {

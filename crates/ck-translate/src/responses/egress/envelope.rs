@@ -92,7 +92,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             return Ok(());
         }
         self.owed = false;
-        let response = encode::scratch(owner, |e| self.document.write(self.document.root(), e))?;
+        let response = encode::scratch(owner, |e| write_response(&self.document, e))?;
         self.emit(
             owner,
             "response.created",
