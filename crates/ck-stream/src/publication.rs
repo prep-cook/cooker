@@ -78,18 +78,40 @@ const MIN_GROWTH: usize = 4;
 /// at least [`MIN_GROWTH`]: each step multiplies the capacity by at least 1.25, so pushes stay
 /// amortized O(1), while the unused tail stays within a quarter of the use rather than the
 /// half of a doubling step, leaving that headroom to the stream's other metadata.
-fn reserve_metadata<T>(entries: &mut VecDeque<T>, needed: usize, budget: usize) -> Result<(), Error> {
+///
+/// With a `stream`, the growth is charged to its exchange quota before it is allocated, and the
+/// charge then follows the capacity actually retained, also when the allocation fails.
+fn reserve_metadata<T>(
+    entries: &mut VecDeque<T>,
+    needed: usize,
+    budget: usize,
+    stream: Option<&Stream>,
+) -> Result<(), Error> {
     if needed <= entries.capacity() {
         return Ok(());
     }
-    let maximum = budget / std::mem::size_of::<T>();
+    let size = std::mem::size_of::<T>();
+    let maximum = budget / size;
     if needed > maximum {
         return Err(Error::StorageExhausted);
     }
+    let before = entries.capacity();
     let capacity = needed.saturating_add((needed / 4).max(MIN_GROWTH)).min(maximum);
-    entries
-        .try_reserve_exact(capacity - entries.len())
-        .map_err(|_| Error::StorageExhausted)
+    let charged = (capacity - before) * size;
+    if let Some(stream) = stream {
+        stream.charge_metadata(charged)?;
+    }
+    let reserved = entries.try_reserve_exact(capacity - entries.len());
+    if let Some(stream) = stream {
+        let retained = (entries.capacity() - before) * size;
+        if retained > charged {
+            // The capacity exists either way; the next charge sees the ceiling exceeded.
+            stream.quota().metadata.fetch_add(retained - charged, Ordering::AcqRel);
+        } else {
+            stream.release_metadata(charged - retained);
+        }
+    }
+    reserved.map_err(|_| Error::StorageExhausted)
 }
 
 pub(crate) struct State {
@@ -240,6 +262,20 @@ impl Stream {
         self.request.as_ref()
     }
 
+    /// Charge the link of a new dependent to this stream's quota.
+    pub(crate) fn charge_dependency(&self) -> Result<(), Error> {
+        if self.request.is_some() {
+            // A request never depends on a stream, so dependencies form no chain or cycle.
+            return Err(Error::InvalidRecord);
+        }
+        self.charge_metadata(DEPENDENCY_BYTES)
+    }
+
+    /// Return the link charge of a dependent whose admission failed.
+    pub(crate) fn release_dependency(&self) {
+        self.release_metadata(DEPENDENCY_BYTES);
+    }
+
     /// Link a new dependent stream: called under the cache lock, which eviction and expiry
     /// hold from planning to invalidation, and under this stream's state lock, which every
     /// invalidation takes, so a stream that is gone or leaving the cache takes no dependent.
@@ -247,11 +283,6 @@ impl Stream {
         if self.is_invalidated() {
             return Err(Error::Gone);
         }
-        if self.request.is_some() {
-            // A request never depends on a stream, so dependencies form no chain or cycle.
-            return Err(Error::InvalidRecord);
-        }
-        self.charge_metadata(DEPENDENCY_BYTES)?;
         self.held.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -271,16 +302,6 @@ impl Stream {
 
     pub(super) fn charge_metadata(&self, bytes: usize) -> Result<(), Error> {
         charge(&self.quota().metadata, bytes, self.limits.max_metadata_bytes)
-    }
-
-    /// Charge capacity a table already grew to, then check the ceiling: the charge stays, as
-    /// the capacity does, until the stream drops.
-    pub(super) fn add_metadata(&self, bytes: usize) -> Result<(), Error> {
-        let total = self.quota().metadata.fetch_add(bytes, Ordering::AcqRel) + bytes;
-        if total > self.limits.max_metadata_bytes {
-            return Err(Error::StorageExhausted);
-        }
-        Ok(())
     }
 
     /// Exchange metadata bytes not yet charged.
@@ -532,7 +553,7 @@ mod tests {
         for value in 0..count as u64 {
             let before = entries.capacity();
             let needed = entries.len() + 1;
-            reserve_metadata(&mut entries, needed, budget).unwrap();
+            reserve_metadata(&mut entries, needed, budget, None).unwrap();
             if entries.capacity() != before {
                 capacities.push(entries.capacity());
             }
@@ -561,7 +582,7 @@ mod tests {
         assert_eq!(*steps(100, budget).last().unwrap(), 100);
         let mut entries = VecDeque::<u64>::new();
         assert!(matches!(
-            reserve_metadata(&mut entries, 101, budget),
+            reserve_metadata(&mut entries, 101, budget, None),
             Err(Error::StorageExhausted)
         ));
         assert_eq!(entries.capacity(), 0);

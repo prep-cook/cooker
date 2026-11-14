@@ -47,6 +47,10 @@ impl Writer {
         &self.stream
     }
 
+    pub(crate) fn store(&self) -> &Arc<Inner> {
+        &self.inner
+    }
+
     pub fn id(&self) -> u64 {
         self.stream.id
     }
@@ -196,10 +200,9 @@ impl Writer {
         // What the tables may hold: what the exchange has left, plus what they hold now.
         let budget = self.stream.metadata_available() + before;
         let frame_budget = budget.saturating_sub(state.records.capacity().max(records) * std::mem::size_of::<Index>());
-        reserve_metadata(&mut state.frames, frames, frame_budget)?;
+        reserve_metadata(&mut state.frames, frames, frame_budget, Some(&self.stream))?;
         let record_budget = budget.saturating_sub(state.frames.capacity() * std::mem::size_of::<Frame>());
-        reserve_metadata(&mut state.records, records, record_budget)?;
-        self.stream.add_metadata(Stream::tables(state) - before)
+        reserve_metadata(&mut state.records, records, record_budget, Some(&self.stream))
     }
 
     /// Back the bytes `start..end` of a reservation: prefault the pages it reaches in the
