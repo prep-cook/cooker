@@ -223,17 +223,17 @@ fn gemini_raw(input: &Value) -> String {
 fn gemini_schema_reaches_chat_and_anthropic_as_json_schema() {
     let input = |parameters: Value| json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[{"name":"f","parameters":parameters}]}]});
     let gemini = json!({"type":"OBJECT","properties":{
-        "x":{"type":"STRING","nullable":true,"maxLength":"8","example":"hi"},
+        "x":{"type":"STRING","nullable":true,"maxLength":"8","minLength":"00","example":"hi"},
         "type":{"type":"ARRAY","items":{"type":"INTEGER"},"minItems":1},
         "either":{"anyOf":[{"type":"NUMBER"},{"type":"BOOLEAN","nullable":false}]},
         "d":{"type":"OBJECT","default":{"type":"OBJECT"}}
-    },"required":["x"],"propertyOrdering":["x","type","either","d"]});
+    },"required":["x"],"minProperties":"01","propertyOrdering":["x","type","either","d"]});
     let schema = json!({"type":"object","properties":{
-        "x":{"type":["string","null"],"maxLength":8,"examples":["hi"]},
+        "x":{"type":["string","null"],"maxLength":8,"minLength":0,"examples":["hi"]},
         "type":{"type":"array","items":{"type":"integer"},"minItems":1},
         "either":{"anyOf":[{"type":"number"},{"type":"boolean"}]},
         "d":{"type":"object","default":{"type":"OBJECT"}}
-    },"required":["x"]});
+    },"required":["x"],"minProperties":1});
     let chat = from_gemini(&input(gemini.clone()), To::Chat).unwrap();
     assert_eq!(chat["tools"][0]["function"]["parameters"], schema);
     let anthropic = from_gemini(&input(gemini.clone()), To::Anthropic).unwrap();
@@ -243,6 +243,12 @@ fn gemini_schema_reaches_chat_and_anthropic_as_json_schema() {
         json!({"type":"TYPE_UNSPECIFIED"}),
         json!({"type":"OBJECT","properties":{"x":{"nullable":true}}}),
         json!({"type":"STRING","maxLength":"eight"}),
+        // The writer needs a property map, one item schema, a schema list and a name list.
+        json!({"type":"OBJECT","properties":[{"type":"STRING"}]}),
+        json!({"type":"ARRAY","items":[{"type":"STRING"}]}),
+        json!({"anyOf":{"a":{"type":"STRING"}}}),
+        json!({"type":"OBJECT","required":"x"}),
+        json!({"type":"OBJECT","required":[1]}),
     ] {
         assert!(matches!(
             from_gemini(&input(refused.clone()), To::Chat),

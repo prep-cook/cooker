@@ -81,7 +81,8 @@ pub(crate) fn write_function(doc: &Document, function: usize, schema_key: &str, 
 }
 
 /// Refuses a Gemini schema JSON Schema cannot express: `TYPE_UNSPECIFIED` or an unknown type,
-/// `nullable` without a type, or a count that is not a whole number.
+/// `nullable` without a type, a count that is not a whole number, or `properties`, `items`,
+/// `anyOf` or `required` of a shape [`write`] cannot write.
 pub(crate) fn check(doc: &Document, schema: usize) -> Result<()> {
     if !matches!(doc.node(schema)?.value, Value::Object) {
         return Err(Error::Unsupported);
@@ -103,12 +104,15 @@ pub(crate) fn check(doc: &Document, schema: usize) -> Result<()> {
     for key in COUNTS {
         if let Some(count) = doc.member(schema, key)?
             && doc.unsigned(count).is_err()
-            && !digits(doc, count)?
+            && count_string(doc, count)?.is_none()
         {
             return Err(Error::Unsupported);
         }
     }
     if let Some(properties) = doc.member(schema, "properties")? {
+        if !matches!(doc.node(properties)?.value, Value::Object) {
+            return Err(Error::Unsupported);
+        }
         for property in doc.children(properties)? {
             check(doc, property)?;
         }
@@ -117,8 +121,21 @@ pub(crate) fn check(doc: &Document, schema: usize) -> Result<()> {
         check(doc, items)?;
     }
     if let Some(any) = doc.member(schema, "anyOf")? {
+        if !matches!(doc.node(any)?.value, Value::Array) {
+            return Err(Error::Unsupported);
+        }
         for schema in doc.children(any)? {
             check(doc, schema)?;
+        }
+    }
+    if let Some(required) = doc.member(schema, "required")? {
+        if !matches!(doc.node(required)?.value, Value::Array) {
+            return Err(Error::Unsupported);
+        }
+        for name in doc.children(required)? {
+            if doc.chars(name).is_err() {
+                return Err(Error::Unsupported);
+            }
         }
     }
     Ok(())
@@ -176,8 +193,8 @@ pub(crate) fn write(doc: &Document, schema: usize, e: &mut Encoder<'_, '_>) -> R
                 write(doc, schema, e)?;
             }
             e.bytes(b"]")?;
-        } else if count(doc, name)? && matches!(doc.node(member)?.value, Value::String(_)) {
-            doc.write_contents(member, e)?;
+        } else if count(doc, name)? && doc.unsigned(member).is_err() {
+            e.unsigned(count_string(doc, member)?.ok_or(Error::Unsupported)?)?;
         } else {
             doc.write(member, e)?;
         }
@@ -204,20 +221,26 @@ fn type_name(doc: &Document, kind: usize) -> Result<Option<&'static str>> {
     Ok(None)
 }
 
-/// Whether a string holds only ASCII digits, as a protobuf JSON int64 does.
-fn digits(doc: &Document, node: usize) -> Result<bool> {
-    if !matches!(doc.node(node)?.value, Value::String(_)) {
-        return Ok(false);
-    }
-    let mut chars = doc.chars(node)?;
-    let mut any = false;
+/// The value of a protobuf JSON int64 string of ASCII digits, such as `"01"`; none for any
+/// other string or a value past `u64`.
+fn count_string(doc: &Document, node: usize) -> Result<Option<u64>> {
+    let Ok(mut chars) = doc.chars(node) else {
+        return Ok(None);
+    };
+    let mut value = None;
     while let Some(c) = chars.next_scalar()? {
-        if !c.is_ascii_digit() {
-            return Ok(false);
+        let Some(digit) = c.to_digit(10) else {
+            return Ok(None);
+        };
+        value = value
+            .unwrap_or(0u64)
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(digit)));
+        if value.is_none() {
+            return Ok(None);
         }
-        any = true;
     }
-    Ok(any)
+    Ok(value)
 }
 
 fn count(doc: &Document, name: Name) -> Result<bool> {
