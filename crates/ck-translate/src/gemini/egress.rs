@@ -33,6 +33,8 @@ pub struct Egress {
     choices: Table<Choice>,
     /// Open parts only; a part leaves the table when its block ends.
     blocks: Table<Block>,
+    /// Streamed parts queued behind a call outside any block until that call ends.
+    parked: Table<part::Parked>,
     terminal: bool,
     failed: bool,
     array_started: bool,
@@ -63,6 +65,8 @@ struct Block {
     held: bool,
     /// A buffered part whose content so far was written ahead of a tool call outside any block.
     split: bool,
+    /// The buffered placeholder a call outside any block fills when it ends.
+    slot: Option<usize>,
 }
 impl Egress {
     pub fn new(
@@ -104,6 +108,7 @@ impl Egress {
             top: None,
             choices: Table::new(owner)?,
             blocks: Table::new(owner)?,
+            parked: Table::new(owner)?,
             terminal: false,
             failed: false,
             array_started: false,
@@ -127,7 +132,7 @@ impl Egress {
             Kind::BlockStart => self.block_start(owner, event)?,
             Kind::Chunk => self.chunk(owner, event, output)?,
             Kind::ReasoningSignature => self.signature(event)?,
-            Kind::ToolStart => self.tool_start(owner, event)?,
+            Kind::ToolStart => self.tool_start(owner, event, output)?,
             Kind::ToolEnd => self.tool_end(owner, &event, output)?,
             Kind::ToolResult | Kind::CodeExecution | Kind::MediaTranscript => self.part_value(kind, event)?,
             Kind::MediaStart => self.media_start(event)?,

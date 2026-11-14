@@ -42,6 +42,7 @@ impl Egress {
             thought,
             held: false,
             split: false,
+            slot: None,
         })?;
         Ok(())
     }
@@ -97,27 +98,16 @@ impl Egress {
         };
         move_absorbed(doc, event, fragment, target)
     }
-    pub(super) fn tool_start(&mut self, owner: &mut Writer, event: Document) -> Result<()> {
+    pub(super) fn tool_start(
+        &mut self,
+        owner: &mut Writer,
+        event: Document,
+        output: &mut impl FnMut(ScratchLease) -> Result<()>,
+    ) -> Result<()> {
         let root = event.root();
         let x = event.required(root, "x_ck")?;
         if event.member(x, "block_index")?.is_none() {
-            let choice = event.unsigned(event.required(x, "choice_index")?)?;
-            self.open_choice(choice)?;
-            let (item, index) = key(&event)?;
-            if self.blocks.iter().any(|b| b.item == item && b.index == index) {
-                return Err(Error::Schema);
-            }
-            self.blocks.push(Block {
-                item,
-                index,
-                choice,
-                document: empty_part(owner, false)?,
-                arguments: None,
-                media: None,
-                thought: false,
-                held: false,
-                split: false,
-            })?;
+            self.open_call(owner, &event, output)?;
         }
         let name = event.required(root, "name")?;
         let id = match event
@@ -145,8 +135,53 @@ impl Egress {
         entry.arguments = Some(doc.add(None, Value::Fragments)?);
         Ok(())
     }
+    /// Opens the part of a call outside any block (Chat and Responses sources) at the call's
+    /// place: after the text its choice received before it, and before any that follows.
+    fn open_call(
+        &mut self,
+        owner: &mut Writer,
+        event: &Document,
+        output: &mut impl FnMut(ScratchLease) -> Result<()>,
+    ) -> Result<()> {
+        let x = event.required(event.root(), "x_ck")?;
+        let choice = event.unsigned(event.required(x, "choice_index")?)?;
+        self.open_choice(choice)?;
+        let (item, index) = key(event)?;
+        if self.blocks.iter().any(|b| b.item == item && b.index == index) {
+            return Err(Error::Schema);
+        }
+        let block = self.blocks.push(Block {
+            item,
+            index,
+            choice,
+            document: empty_part(owner, false)?,
+            arguments: None,
+            media: None,
+            thought: false,
+            held: false,
+            split: false,
+            slot: None,
+        })?;
+        self.write_earlier(owner, block, output)?;
+        if self.body.is_none() {
+            let call = Some(item);
+            self.parked.push(Parked {
+                choice,
+                call,
+                part: None,
+            })?;
+            return Ok(());
+        }
+        let parts = self.parts(choice)?;
+        let body = self.body.as_mut().ok_or(Error::Schema)?;
+        let slot = body.add(None, Value::Object)?;
+        body.append(parts, slot)?;
+        self.blocks[block].slot = Some(slot);
+        Ok(())
+    }
     /// Parses the collected argument fragments into the call's `args` object, and ends the
-    /// part of a call outside any block.
+    /// part of a call outside any block: it fills its buffered placeholder, or is written with
+    /// the streamed parts queued behind it.
     pub(super) fn tool_end(
         &mut self,
         owner: &mut Writer,
@@ -155,10 +190,37 @@ impl Egress {
     ) -> Result<()> {
         self.tool_args(owner, event)?;
         let x = event.required(event.root(), "x_ck")?;
-        if event.member(x, "block_index")?.is_none() {
-            let block = self.block(event)?;
-            self.write_earlier(owner, block, output)?;
-            self.block_end(owner, event, output)?;
+        if event.member(x, "block_index")?.is_some() {
+            return Ok(());
+        }
+        let block = self.block(event)?;
+        let Block {
+            item,
+            choice,
+            document,
+            slot,
+            ..
+        } = self.blocks.swap_remove(block);
+        if let Some(slot) = slot {
+            let body = self.body.as_mut().ok_or(Error::Schema)?;
+            let part = body.absorb(document)?;
+            return body.transplant(slot, part);
+        }
+        let parked = self.parked.iter().position(|p| p.call == Some(item));
+        let part = Some(document);
+        self.parked[parked.ok_or(Error::Schema)?] = Parked {
+            choice,
+            call: None,
+            part,
+        };
+        while let Some(next) = self.parked.iter().position(|p| p.choice == choice) {
+            if self.parked[next].part.is_none() {
+                break;
+            }
+            self.parked[next..].rotate_left(1);
+            let last = self.parked.len() - 1;
+            let part = self.parked.swap_remove(last).part.ok_or(Error::Schema)?;
+            self.hold(owner, choice, part, output)?;
         }
         Ok(())
     }
@@ -286,26 +348,52 @@ impl Egress {
         }
         self.append_part(choice, document)
     }
-    /// Appends a part to the buffered candidate of `choice`.
-    fn append_part(&mut self, choice: u64, document: Document) -> Result<()> {
+    /// The parts array of the buffered candidate of `choice`.
+    fn parts(&mut self, choice: u64) -> Result<usize> {
         let slot = self.choice(choice)?;
         let candidate = self.choices[slot].node.ok_or(Error::Schema)?;
+        let body = self.body.as_ref().ok_or(Error::Schema)?;
+        body.required(body.required(candidate, "content")?, "parts")
+    }
+    /// Appends a part to the buffered candidate of `choice`.
+    fn append_part(&mut self, choice: u64, document: Document) -> Result<()> {
+        let parts = self.parts(choice)?;
         let body = self.body.as_mut().ok_or(Error::Schema)?;
-        let parts = body.required(body.required(candidate, "content")?, "parts")?;
         let part = body.absorb(document)?;
         body.append(parts, part)
     }
-    /// Holds a streamed part as its choice's next record, first writing the part held before
-    /// it. A finished choice keeps its members for the last record.
+    /// Takes a streamed part out of its block: it waits behind an open call outside any block
+    /// of its choice, or becomes the choice's next record.
     fn write_part(
         &mut self,
         owner: &mut Writer,
         block: usize,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
-        let slot = self.choice(self.blocks[block].choice)?;
+        let choice = self.blocks[block].choice;
         let document = std::mem::replace(&mut self.blocks[block].document, empty_part(owner, false)?);
         self.blocks[block].held = false;
+        if self.parked.iter().any(|p| p.choice == choice) {
+            let part = Some(document);
+            self.parked.push(Parked {
+                choice,
+                call: None,
+                part,
+            })?;
+            return Ok(());
+        }
+        self.hold(owner, choice, document, output)
+    }
+    /// Holds `document` as the next record of `choice`, first writing the part held before it.
+    /// A finished choice keeps its members for the last record.
+    fn hold(
+        &mut self,
+        owner: &mut Writer,
+        choice: u64,
+        document: Document,
+        output: &mut impl FnMut(ScratchLease) -> Result<()>,
+    ) -> Result<()> {
+        let slot = self.choice(choice)?;
         if self.choices[slot].part.is_some() {
             let fields = !self.choices[slot].finished;
             self.flush(owner, slot, fields, output)?;
@@ -313,6 +401,13 @@ impl Egress {
         self.choices[slot].part = Some(document);
         Ok(())
     }
+}
+/// A streamed part queued behind an open call outside any block, or that call's own place
+/// (`call` set, `part` empty until the call ends).
+pub(super) struct Parked {
+    choice: u64,
+    call: Option<LocalId>,
+    part: Option<Document>,
 }
 /// A record's block: its `item_id` and `block_index`, or for a call outside any block (Chat
 /// and Responses sources) its `tool_call_id` with an index no block uses.

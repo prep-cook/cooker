@@ -34,8 +34,10 @@ const DS_THINKING: &[u8] = include_bytes!("fixtures/openai-live/ds-anth-thinking
 const RELAY_CHAT_TOOLS: &[u8] = include_bytes!("fixtures/openai-live/relay-chat-tools2.raw");
 const RELAY_RESPONSES_TOOL: &[u8] = include_bytes!("fixtures/openai-live/relay-resp-func1.raw");
 const OPENAI_ERROR: &[u8] = include_bytes!("fixtures/openai-live/oai-resp-func1.raw");
-/// Review repro, not a live capture: text in two chunks, then one tool call.
+// Review repros, not live captures: text and tool calls in arrival order.
 const TEXT_THEN_TOOL: &[u8] = include_bytes!("fixtures/openai-live/order-input.sse");
+const TOOL_THEN_TEXT: &[u8] = include_bytes!("fixtures/openai-live/late-text.sse");
+const ALTERNATING: &[u8] = include_bytes!("fixtures/openai-live/alternating.sse");
 
 #[derive(Clone, Copy)]
 enum Upstream {
@@ -302,36 +304,36 @@ fn gemini_function_calls_carry_the_upstream_call_id() {
 }
 
 #[test]
-fn gemini_tool_parts_follow_the_text_before_them() {
-    for framing in [Framing::Json, Framing::Sse] {
-        let (out, failure) = decode(
-            Upstream::Chat,
-            TEXT_THEN_TOOL,
-            BodyMode::Streaming,
-            61,
-            Client::Gemini(framing),
-        );
-        assert_eq!(failure, None);
-        let records = match framing {
-            Framing::Sse => events(&out),
-            _ => vec![serde_json::from_slice(&out).unwrap()],
-        };
-        let mut order = Vec::new();
-        for record in &records {
-            for part in record["candidates"][0]["content"]["parts"]
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
-                match part["text"].as_str() {
-                    Some(text) => order.push(text.to_owned()),
-                    None => order.push(format!("call {}", part["functionCall"]["name"].as_str().unwrap())),
+fn gemini_tool_parts_keep_their_arrival_order() {
+    for (input, expected) in [
+        (TEXT_THEN_TOOL, &["text I will check Paris.", "call weather"][..]),
+        (TOOL_THEN_TEXT, &["call f0", "text after"]),
+        (ALTERNATING, &["text before", "call f0", "text between", "call f1"]),
+    ] {
+        for framing in [Framing::Json, Framing::Sse] {
+            let (out, failure) = decode(Upstream::Chat, input, BodyMode::Streaming, 61, Client::Gemini(framing));
+            assert_eq!(failure, None);
+            let records = match framing {
+                Framing::Sse => events(&out),
+                _ => vec![serde_json::from_slice(&out).unwrap()],
+            };
+            // Adjacent text parts join: a stream may split one text across records.
+            let mut order: Vec<String> = Vec::new();
+            for record in &records {
+                for part in record["candidates"][0]["content"]["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    match (part["text"].as_str(), order.last_mut()) {
+                        (Some(text), Some(last)) if last.starts_with("text ") => last.push_str(text),
+                        (Some(text), _) => order.push(format!("text {text}")),
+                        (None, _) => order.push(format!("call {}", part["functionCall"]["name"].as_str().unwrap())),
+                    }
                 }
             }
+            assert_eq!(order, expected);
         }
-        let text: String = order[..order.len() - 1].concat();
-        assert_eq!(text, "I will check Paris.", "{order:?}");
-        assert_eq!(order.last().unwrap(), "call weather", "{order:?}");
     }
 }
 
