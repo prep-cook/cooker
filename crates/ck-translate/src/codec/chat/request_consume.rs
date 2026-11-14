@@ -105,7 +105,7 @@ impl Ingress {
     }
 
     fn start(&mut self, owner: &mut Writer) -> Result<()> {
-        self.emitter.request_start(
+        let record = self.emitter.request_start(
             owner,
             RequestView {
                 document: &self.document,
@@ -113,10 +113,7 @@ impl Ingress {
                 operation: self.operation,
             },
         )?;
-        let (kind, _) = codec::internal::next(owner, &mut self.reader)?;
-        if kind != Kind::RequestStart {
-            return Err(Error::Schema);
-        }
+        codec::internal::committed(&mut self.reader, record)?;
         let root = self.document.root();
         field(
             &mut self.document,

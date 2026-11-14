@@ -64,7 +64,7 @@ impl Input {
             return Ok(());
         }
         if !self.started {
-            emitter.request_start(
+            let record = emitter.request_start(
                 owner,
                 RequestView {
                     document: &self.pending.document,
@@ -72,7 +72,7 @@ impl Input {
                     operation,
                 },
             )?;
-            codec::internal::next(owner, reader)?;
+            codec::internal::committed(reader, record)?;
             let root = self.pending.document.root();
             publish_field(&mut self.pending.document, root, &[], media, emitter, owner, reader)?;
             self.started = true;
