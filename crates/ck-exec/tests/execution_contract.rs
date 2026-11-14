@@ -1,10 +1,10 @@
-//! The execution contract compiles as frozen: an executor can hold the request handle and the
-//! attempt's writer across an await and still return a `Send` future, and the handle and
-//! every protocol's ingress can move between runtime threads.
+//! The execution contract compiles as frozen: an executor can hold the request handle and
+//! both of an attempt's writers across an await and still return a `Send` future, and the
+//! handle, the store and every protocol's ingress can move between runtime threads.
 
 use ck_core::exec::ExecError;
-use ck_exec::types::{Attempt, Execute, Request, Upstream};
-use ck_stream::Writer;
+use ck_exec::types::{Attempt, Counted, Execute, Request, Streams, Upstream};
+use ck_stream::{Store, Writer};
 use ck_translate::codec::chat::{request::ChatCapability, response::Ingress};
 
 struct Probe;
@@ -21,29 +21,36 @@ impl Execute for Probe {
         &self,
         attempt: &Attempt<'_>,
         request: &Request<'_>,
-        writer: &mut Writer,
+        streams: Streams<'_>,
     ) -> Result<Upstream<Ingress>, ExecError> {
         tokio::task::yield_now().await;
-        let _held = (attempt.model, request.validated.view(), writer.id());
+        let _held = (
+            attempt.model,
+            attempt.store.used_frames(),
+            request.validated.view(),
+            streams.request.id(),
+            streams.response.id(),
+        );
         Err(ExecError::replay_required())
     }
 
     async fn count_tokens(
         &self,
-        attempt: &Attempt<'_>,
-        request: &Request<'_>,
-        writer: &mut Writer,
-    ) -> Result<Upstream<Ingress>, ExecError> {
-        self.execute(attempt, request, writer).await
+        _attempt: &Attempt<'_>,
+        _request: &Request<'_>,
+        _streams: Streams<'_>,
+    ) -> Result<Counted<Ingress>, ExecError> {
+        tokio::task::yield_now().await;
+        Ok(Counted::Local { input_tokens: 1 })
     }
 
     async fn compact(
         &self,
         attempt: &Attempt<'_>,
         request: &Request<'_>,
-        writer: &mut Writer,
+        streams: Streams<'_>,
     ) -> Result<Upstream<Ingress>, ExecError> {
-        self.execute(attempt, request, writer).await
+        self.execute(attempt, request, streams).await
     }
 }
 
@@ -51,9 +58,13 @@ fn sends<T: Send>(_: &T) {}
 
 /// A server task awaiting an attempt while it keeps the request handle stays `Send`.
 #[allow(dead_code, reason = "type-checked, never run")]
-fn server_task(attempt: &Attempt<'_>, request: &Request<'_>, mut writer: Writer) {
+fn server_task(attempt: &Attempt<'_>, request: &Request<'_>, mut upload: Writer, mut response: Writer) {
     let task = async move {
-        let upstream = Probe.execute(attempt, request, &mut writer).await;
+        let streams = Streams {
+            request: &mut upload,
+            response: &mut response,
+        };
+        let upstream = Probe.execute(attempt, request, streams).await;
         let _view = request.validated.view();
         upstream.map(|upstream| upstream.status)
     };
@@ -66,6 +77,7 @@ fn contract_types_cross_threads() {
     fn sync<T: Sync>() {}
     sync::<Request<'static>>();
     sync::<Attempt<'static>>();
+    sync::<Store>();
     send::<Writer>();
     send::<ck_translate::codec::chat::request::Ingress>();
     send::<ck_translate::anthropic::request::Ingress>();

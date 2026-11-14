@@ -7,7 +7,7 @@
 //! to the client, failover is disabled even if the socket write then fails, and a later
 //! failure reaches the client as the stream's `error` terminal in its own protocol.
 
-use ck_translate::codec::{BodyMode, Operation};
+use ck_translate::codec::Operation;
 
 /// Client protocols served over the internal stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,11 +18,20 @@ pub enum Protocol {
     Gemini,
 }
 
+/// Client body framing. `Json` is a buffered body; `Sse` and `JsonArray` stream, the latter
+/// as Gemini's `streamGenerateContent` without `alt=sse`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    Json,
+    Sse,
+    JsonArray,
+}
+
 /// What response egress encodes with. Fixed when the exchange starts; a resume reuses it
 /// and cannot replace it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Output {
     pub protocol: Protocol,
     pub operation: Operation,
-    pub mode: BodyMode,
+    pub framing: Framing,
 }

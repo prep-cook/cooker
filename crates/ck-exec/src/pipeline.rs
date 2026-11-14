@@ -1,16 +1,19 @@
 //! The runtime-owned response producer (`docs/EXECUTION-CONTRACT.md`).
 //!
 //! After [`Execute`](crate::types::Execute) returns an [`Upstream`](crate::types::Upstream),
-//! the producer owns the attempt's writer, the upstream body and the response ingress, and
-//! drives `upstream bytes -> ResponseIngress -> Writer` until a terminal record. It runs on
-//! its own task, independently of the client: a slow or disconnected client never slows or
-//! stops upstream reads (§6.6). It schedules `flush` at the ingress `flush_deadline`.
+//! the producer owns the response stream's writer, the upstream body and the response
+//! ingress, and drives `upstream bytes -> ResponseIngress -> Writer` until a terminal record.
+//! It runs on its own task, independently of the client: a slow or disconnected client never
+//! slows or stops upstream reads (§6.6). It schedules `flush` at the ingress `flush_deadline`.
 //!
-//! Terminal records: a complete upstream publishes `done`; an upstream or decode failure
-//! publishes `error`; `Writer::cancelled` resolving (cancel, shutdown, expiry, eviction)
-//! stops reading. A panic drops the writer, which publishes `stream.producer_lost`.
+//! Terminal records: a complete upstream publishes `done` and `Writer::finish(Done)`; an
+//! upstream or decode failure publishes `error`; `Writer::cancelled` resolving (cancel,
+//! shutdown, expiry, eviction) stops reading. A panic drops the writer, which publishes
+//! `stream.producer_lost`. Nothing else ends a producer: cancel goes through the allocation
+//! handle in [`Started::stream`], never through task abort.
 
 use ck_core::exec::ExecError;
+use ck_stream::Writer;
 use http::HeaderMap;
 use tokio::task::JoinHandle;
 
@@ -24,5 +27,9 @@ pub struct Started {
     pub status: u16,
     /// Upstream headers; the server decides which, if any, reach the client.
     pub headers: HeaderMap,
+    /// Allocation handle on the response stream (`Writer::allocator`). Response egress decodes
+    /// and encodes with it while the producer runs and after it ends; `finish(Cancelled)` or
+    /// `finish(Shutdown)` stops the producer, and `finish(Gone)` discards a failed attempt.
+    pub stream: Writer,
     pub producer: Producer,
 }

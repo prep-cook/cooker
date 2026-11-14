@@ -2,9 +2,9 @@
 //!
 //! Every provider module implements [`Execute`] once; the selector in `lib.rs` dispatches to
 //! it statically by `Credential::provider`. An executor encodes only a [`ValidatedRequest`]
-//! for its own destination, sends it, and hands back an [`Upstream`] whose body a
-//! runtime-owned producer decodes into the attempt's stream (`pipeline`). Executors never
-//! write client bytes, parse usage or decide commitment.
+//! fenced for its own destination, sends it, and hands back an [`Upstream`] whose body a
+//! runtime-owned producer decodes into the attempt's response stream (`pipeline`). Executors
+//! never write client bytes, parse usage or decide commitment.
 
 use std::future::Future;
 
@@ -12,7 +12,7 @@ use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::Credential;
 use ck_core::exec::{Caller, ExecError, ResolvedModel};
-use ck_stream::Writer;
+use ck_stream::{Store, Writer};
 use ck_translate::codec::{Capability, ResponseIngress, ValidatedRequest};
 use futures_util::stream::BoxStream;
 use http::HeaderMap;
@@ -26,6 +26,8 @@ pub struct Attempt<'a> {
     pub model: &'a str,
     /// Capabilities the dispatch loop bound to this attempt; `None` means the registry entry.
     pub resolved_model: Option<&'a ResolvedModel>,
+    /// The process stream store; response ingress constructors read their own stream from it.
+    pub store: &'a Store,
 }
 
 /// Client facts an executor may need besides the request document. Holds client
@@ -43,13 +45,24 @@ pub struct Client<'a> {
     pub derived_session: Option<&'a str>,
 }
 
-/// The request handle an attempt executes. `validated` is the request fence: request
-/// egress encodes only through it, after `ValidatedRequest::for_destination` matched the
-/// executor's capability. Its `view()` is also the request view client response egress
-/// reads (for example the Responses echo of `tools`), which never authorizes encoding.
+/// The request handle an attempt executes. `validated` is this attempt's fence: the client
+/// request view re-fenced against the attempt's own destination (`RequestFence::end`), so
+/// request egress encodes only what that destination accepted. Its `view()` is also the
+/// request view client response egress reads (the Responses echo of `tools`), which never
+/// authorizes encoding.
 pub struct Request<'a> {
     pub validated: ValidatedRequest<'a>,
     pub client: Client<'a>,
+}
+
+/// The two streams one attempt writes.
+pub struct Streams<'w> {
+    /// The exchange's request stream. The fenced document belongs to it, so request egress
+    /// encodes the upstream body into its scratch; every attempt's upload is charged to it.
+    pub request: &'w mut Writer,
+    /// This attempt's fresh response stream, holding the request stream (`Writer::hold`).
+    /// The response ingress is created on it.
+    pub response: &'w mut Writer,
 }
 
 /// Upstream response bytes in network order. An `Err` item is terminal. Chunks are passed
@@ -67,13 +80,20 @@ pub struct Upstream<I> {
     pub ingress: I,
 }
 
+/// A token count: from the upstream, or computed locally.
+pub enum Counted<I> {
+    /// The upstream counted; its response ingress publishes the canonical `count_tokens`.
+    Upstream(Upstream<I>),
+    /// Counted locally over the request's `Generate` projection, encoded by the destination's
+    /// request egress; the producer publishes the canonical `count_tokens` result.
+    Local { input_tokens: u64 },
+}
+
 /// A provider's execution. Implementations hold no per-request state; one value serves
 /// every credential of its providers.
 ///
 /// Errors: every `Err` is an attempt failure whose `ExecError::scope` drives failover and
-/// cooldown; it happens before any byte of this attempt reaches the client. A local
-/// operation (a tokenizer count) returns an [`Upstream`] whose body holds the provider-shaped
-/// result, so one producer path decodes every operation.
+/// cooldown; it happens before any byte of this attempt reaches the client.
 pub trait Execute: Send + Sync {
     /// Destination capability; distinct policies use distinct `Capability::destination` keys.
     type Capability: Capability + Send + Sync;
@@ -83,24 +103,25 @@ pub trait Execute: Send + Sync {
     /// The capability `credential` and `model` reach. Pure: no network, no preparation.
     fn capability(&self, attempt: &Attempt<'_>) -> Self::Capability;
 
-    /// Encodes `request` with the destination's request egress into `writer` scratch,
-    /// sends it and returns when the upstream answered. `writer` is the attempt's
-    /// response stream. Covers `Operation::Generate`.
+    /// Encodes `request` with the destination's request egress into `streams.request`
+    /// scratch, creates the response ingress on `streams.response`, sends the request and
+    /// returns when the upstream answered. Covers `Operation::Generate`.
     fn execute(
         &self,
         attempt: &Attempt<'_>,
         request: &Request<'_>,
-        writer: &mut Writer,
+        streams: Streams<'_>,
     ) -> impl Future<Output = Result<Upstream<Self::Ingress>, ExecError>> + Send;
 
-    /// [`Self::execute`] for `Operation::CountTokens`. The ingress publishes a
-    /// `count_tokens` result, never generation usage.
+    /// [`Self::execute`] for `Operation::CountTokens`. A local count re-fences the request
+    /// view with `operation: Generate` and counts what request egress encodes for it; its
+    /// capability validates a count as that projection. A count is never generation usage.
     fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
         request: &Request<'_>,
-        writer: &mut Writer,
-    ) -> impl Future<Output = Result<Upstream<Self::Ingress>, ExecError>> + Send;
+        streams: Streams<'_>,
+    ) -> impl Future<Output = Result<Counted<Self::Ingress>, ExecError>> + Send;
 
     /// [`Self::execute`] for `Operation::Compact`: the provider's native compact only; the
     /// capability refuses compact where none exists, never substituting a summary.
@@ -108,6 +129,6 @@ pub trait Execute: Send + Sync {
         &self,
         attempt: &Attempt<'_>,
         request: &Request<'_>,
-        writer: &mut Writer,
+        streams: Streams<'_>,
     ) -> impl Future<Output = Result<Upstream<Self::Ingress>, ExecError>> + Send;
 }
