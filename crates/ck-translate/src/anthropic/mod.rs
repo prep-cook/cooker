@@ -9,7 +9,7 @@ mod request_schema;
 pub mod response;
 mod usage;
 
-use crate::boundary::{failure, is, mapped, member, object, string};
+use crate::boundary::{is, mapped, member, object, string};
 use crate::codec::table::Table;
 use crate::codec::{Result, document::Document, encode::Encoder};
 

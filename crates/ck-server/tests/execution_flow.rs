@@ -227,6 +227,7 @@ impl Fixture {
             model: "m",
             resolved_model: None,
             store: &self.store,
+            identity: identity(Direction::Response, 1),
         }
     }
 

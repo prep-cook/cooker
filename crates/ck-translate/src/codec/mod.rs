@@ -150,12 +150,38 @@ impl<'a> ValidatedRequest<'a> {
     pub fn view(&self) -> RequestView<'a> {
         self.view
     }
+    pub fn destination(&self) -> &'static str {
+        self.destination
+    }
     pub fn for_destination(&self, destination: &str) -> Result<RequestView<'a>> {
         if self.destination != destination {
             return Err(Error::Destination);
         }
         Ok(self.view)
     }
+}
+
+/// Publishes the sanitized failure a response ingress ends with: the code and message of
+/// invalid boundary input, with the failure's own status and `error` event scope.
+pub(crate) fn upstream_failure(
+    emitter: &mut event::Emitter,
+    owner: &mut Writer,
+    status: u16,
+    scope: &'static str,
+) -> Result<()> {
+    emitter.emit(
+        owner,
+        event::Kind::Error,
+        event::Scope::default(),
+        |e| {
+            e.bytes(b",\"code\":\"stream.invalid_input\",\"status\":")?;
+            e.unsigned(u64::from(status))?;
+            e.bytes(b",\"message\":\"Invalid boundary input\",\"scope\":")?;
+            e.string(scope)
+        },
+        |_| Ok(()),
+    )?;
+    Ok(())
 }
 
 /// A failed or completed fence cannot be retried with a weaker destination.
@@ -213,6 +239,12 @@ pub trait ResponseIngress {
 
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()>;
     fn finish(&mut self, owner: &mut Writer) -> Result<()>;
+
+    /// Ends an incomplete response after its upstream body failed, without completing it:
+    /// publishes what the ingress holds in arrival order, as on any failure, then the canonical
+    /// upstream failure with `status` and the `error` event `scope`. `Closed` once the ingress
+    /// published its terminal record or failed.
+    fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> Result<()>;
 }
 pub trait ResponseEgress {
     fn advance(

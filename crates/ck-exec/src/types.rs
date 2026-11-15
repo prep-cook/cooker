@@ -13,6 +13,7 @@ use ck_core::config::Config;
 use ck_core::credential::Credential;
 use ck_core::exec::{Caller, ExecError, ResolvedModel};
 use ck_stream::{Store, Writer};
+use ck_translate::codec::event::Identity;
 use ck_translate::codec::{Capability, ResponseIngress, ValidatedRequest};
 use futures_util::stream::BoxStream;
 use http::HeaderMap;
@@ -28,6 +29,9 @@ pub struct Attempt<'a> {
     pub resolved_model: Option<&'a ResolvedModel>,
     /// The process stream store; response ingress constructors read their own stream from it.
     pub store: &'a Store,
+    /// Codec identity of this attempt's response stream (direction `Response`, this attempt's
+    /// number), created by the server. The response ingress and a local count publish with it.
+    pub identity: Identity,
 }
 
 /// Client facts an executor may need besides the request document. Holds client
@@ -60,8 +64,9 @@ pub struct Streams<'w> {
     /// The exchange's request stream. The fenced document belongs to it, so request egress
     /// encodes the upstream body into its scratch; every attempt's upload is charged to it.
     pub request: &'w mut Writer,
-    /// This attempt's fresh response stream, holding the request stream (`Writer::hold`).
-    /// The response ingress is created on it.
+    /// This attempt's fresh response stream, created with `Store::create_dependent(request)`
+    /// so its records and metadata charge the exchange quota. The response ingress is
+    /// created on it.
     pub response: &'w mut Writer,
 }
 
@@ -131,4 +136,21 @@ pub trait Execute: Send + Sync {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> impl Future<Output = Result<Upstream<Self::Ingress>, ExecError>> + Send;
+}
+
+/// `statusErr{code, msg}`: no retry hint, no headers; an empty message reads `status N`.
+pub(crate) fn status_err(status: u16, message: impl Into<Bytes>) -> ExecError {
+    let mut body: Bytes = message.into();
+    if body.is_empty() {
+        body = Bytes::from(format!("status {status}"));
+    }
+    ExecError {
+        status,
+        scope: crate::upstream::scope_for(status),
+        body,
+        headers: Box::default(),
+        retry_after: None,
+        direct: false,
+        addon: None,
+    }
 }

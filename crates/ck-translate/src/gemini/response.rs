@@ -113,7 +113,12 @@ impl Ingress {
     }
     fn result(&mut self, owner: &mut Writer, result: Result<()>) -> Result<()> {
         self.closed = result.is_err();
-        crate::boundary::reported(result, &mut self.state.emitter, owner, false)
+        if let Err(error) = &result
+            && !matches!(error, Error::Storage(_))
+        {
+            codec::upstream_failure(&mut self.state.emitter, owner, 502, "upstream")?;
+        }
+        result
     }
     fn array_prefix(&mut self, owner: &mut Writer) -> Result<()> {
         let source = self.source.as_ref().ok_or(Error::Closed)?;
@@ -142,6 +147,11 @@ impl Ingress {
     }
 }
 impl codec::ResponseIngress for Ingress {
+    fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> Result<()> {
+        crate::boundary::enter(self.owner, owner, self.closed)?;
+        self.closed = true;
+        codec::upstream_failure(&mut self.state.emitter, owner, status, scope)
+    }
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
         crate::boundary::enter(self.owner, owner, self.closed)?;
         let result = (|| {

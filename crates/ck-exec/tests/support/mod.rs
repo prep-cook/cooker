@@ -223,6 +223,7 @@ impl Exchange {
             model: &self.model,
             resolved_model: None,
             store,
+            identity: identity(Direction::Response),
         }
     }
 

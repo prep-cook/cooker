@@ -10,7 +10,7 @@ pub mod response;
 mod snapshot;
 mod usage;
 
-use crate::boundary::{chat_effort, failure, is, mapped, member, object, string};
+use crate::boundary::{chat_effort, is, mapped, member, object, string};
 use crate::codec::table::Table;
 use crate::codec::{
     Error, Result,
