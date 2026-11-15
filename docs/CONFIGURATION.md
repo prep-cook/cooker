@@ -350,6 +350,15 @@ service-name ports such as `:http` are not accepted.
 
 The setting is read from SQLite before the request runtime starts. Changing it requires a restart; `TOKIO_WORKER_THREADS` overrides it. YAML edits after import have no effect. Remote-store environment settings do not provide an alternate source of thread configuration or runtime configuration.
 
+## realtime
+
+| Setting | What it does |
+|---|---|
+| `realtime.ping-interval-seconds` | Seconds between the WebSocket pings the gateway sends to a realtime client; default 30. Must be less than `realtime.read-timeout-seconds`. Deploy-only; restart required. |
+| `realtime.read-timeout-seconds` | Seconds a realtime client connection may go without a pong before the gateway closes it; default 60. Only a pong extends it. Deploy-only; restart required. |
+| `realtime.write-timeout-seconds` | Seconds one write to a realtime client may block before the gateway closes the session; default 10. Deploy-only; restart required. |
+| `realtime.max-sockets-per-key` | Concurrent realtime sockets per client key; default 0, no limit. Deploy-only; restart required. |
+
 ## model-routers
 
 A model router is a model name, such as `smart`, that picks the model and effort for each request, so the client does not have to choose. It is modelled on OpenRouter's Jev Router: a judge grades how hard each request is, and the router picks the cheapest model whose measured capability meets that difficulty. Scores and prices come from [Artificial Analysis](https://artificialanalysis.ai/), which needs a free API key:

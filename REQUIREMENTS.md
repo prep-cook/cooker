@@ -90,6 +90,17 @@ S1 fixes this configuration contract; `ck-stream::Config` implements it for the 
 
 These values need no live-editable admin page or page exception under `crates/AGENTS.md`, Admin panel. Later hot-change support must include its admin page in the same change. Owner-approved codec/pipeline tolerances in `docs/INTERNAL-STREAM.md`, §9.2, allow at most 5% regression per pipeline metric and 0% for memory/storage (2026-11-14 morning, option B); codec CPU and allocation-count rows are reported against absolute per-event budgets instead (2026-11-15). They do not change the existing budgets above or the §9.3 storage gate.
 
+## Deploy-only realtime settings
+
+Read and validated at startup; every change requires a restart. Defaults come from established gateways and libraries (Settled 58).
+
+| Setting | Default | Classification | Source of the default |
+| --- | --- | --- | --- |
+| `realtime.ping-interval-seconds` | 30 | Deploy-only; restart required | Half the read deadline, following SignalR's recommended 2:1 timeout-to-keepalive ratio; below the 60 s idle timeouts of nginx and AWS ALB |
+| `realtime.read-timeout-seconds` | 60 | Deploy-only; restart required | gorilla/websocket pongWait 60 s; nginx WebSocket proxying 60 s (proxy_read_timeout); AWS ALB idle timeout 60 s |
+| `realtime.write-timeout-seconds` | 10 | Deploy-only; restart required | gorilla/websocket writeWait 10 s |
+| `realtime.max-sockets-per-key` | 0 (no limit) | Deploy-only; restart required | nginx limit_conn applies only when configured; same convention as codex.live-media-relay.max-sessions |
+
 ## Enforcement
 
 Names exactly match `###` headings and tags. Gate commands cover existing mechanical checks; Review criterion names the exact `REVIEW.md` section for judgment. Missing required gates remain blank and dated under "Not yet enforced".
@@ -169,6 +180,7 @@ Intentional designs that look like defects:
 | ProviderIcon.tsx draws brand marks from vendored providerMarks.ts path data | Lucide lacks brand marks; monochrome vendored artwork follows text color; check:ui permits that file's SVG | Existing ui/REQUIREMENTS.md design; attribution/license provenance stays in the existing source and notices |
 | Optional Rosé Pine palettes (Main, Moon, Dawn) may fall below WCAG AA | Preserve the optional palettes' published colors; the default Neutral palette must meet AA. Measurements below distinguish AA failures from stricter project-target misses. | An owner, 2026-11-13: 「主題的話是例外的」 |
 | An Anthropic request the Claude OAuth cloak or Claude Code identity shapes goes upstream as prepared from the client's own bytes | The cloak's detection reads the client's member order and `cch` signs the body built from those bytes; re-encoding would change the identity, session and fingerprint (`docs/EXECUTION-CONTRACT.md`, G5) | An owner, 2026-11-16: 「別的按建議」, adopting option (a): 「在契約加一條 G5：把客戶端的原始位元組傳進執行器，只有 cloak 原樣送出，作為唯一的直通例外」 |
+| Live-session messages (Realtime, Live, WebRTC), media and control alike, are forwarded as received; only a metadata projection enters the internal stream, and client-to-upstream messages are validated before forwarding | No gateway component consumes media bytes, and the sessions are provider-locked and same-protocol, so conversion would add latency, copies and storage for nothing; resume is meaningless because session state depends on what the user heard | An owner (xz-dev), 2026-11-15: 「如果是实时传输优化（比如 Realtime 或者 WebRTC 这种根本不存在需要保存数据进行断线重连而是每次都发送的新的数据）那么我们不需要 SSE 保存数据，只需要借用 SSE 数据管线传输元数据而非还有数据本身，避免破坏延迟和增加无意义的数据转换和传输」 |
 
 Contrast inventory copied from `ui/REQUIREMENTS.md`. Browser rows cover rendered sign-in/System pages, open menus and info/error banners at 1440 px in English. Palette rows are computed mapped pairs, not proof they appear in a measured page. Dawn applies to both Rosé Pine palettes. Disabled text is exempt where noted; that does not exempt placeholder text.
 
