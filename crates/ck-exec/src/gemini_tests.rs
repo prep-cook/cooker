@@ -139,7 +139,7 @@ pub(crate) fn check_refused_capture(name: &str, s: &Value, events: &mut std::col
     );
     assert_eq!(
         events.pop_front(),
-        Some(Captured::Error(message.to_owned())),
+        Some(Captured::Error(crate::xai_url::redacted_go_error(message))),
         "{name}: refused error capture"
     );
 }
@@ -648,7 +648,7 @@ async fn go_reference_scenarios() {
         let want_error = s["error"].as_object().map(|e| {
             (
                 e["status"].as_u64().unwrap() as u16,
-                e["message"].as_str().unwrap().to_owned(),
+                crate::xai_url::redacted_go_error(e["message"].as_str().unwrap()),
             )
         });
         // Go's status 0 is an error without a status code (a scanner error); Rust errors

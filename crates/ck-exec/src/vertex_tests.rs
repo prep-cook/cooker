@@ -600,3 +600,46 @@ fn a_refused_baseline_alone_does_not_refuse_the_request() {
             .is_err()
     );
 }
+
+/// A Vertex base URL refused before sending (Go's parser, then its transport) names
+/// neither its password nor its query key in the returned error or the captured error.
+#[tokio::test]
+async fn refused_base_urls_never_print_url_credentials() {
+    use crate::gemini::tests::{Captured, Captures};
+    const SECRET: &str = "sk-review-secret";
+    let s = fixture()["scenarios"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "key_empty_host")
+        .unwrap();
+    for (base, want) in [
+        (
+            format!("http://user:{SECRET}@127.0.0.1:bad/?api_key={SECRET}"),
+            r#"parse "<redacted url>": invalid port after host"#,
+        ),
+        (
+            format!("ftp://user:{SECRET}@127.0.0.1/?api_key={SECRET}"),
+            r#"Post "ftp://127.0.0.1/?api_key=***": unsupported protocol scheme "ftp""#,
+        ),
+    ] {
+        let config = s["config"].as_str().unwrap().replace("https:relay.example", &base);
+        let cfg = Config::parse(&config).unwrap();
+        let cred = credential(s, &cfg, "", "");
+        let captures = Arc::new(Captures::default());
+        let mut req = request(s);
+        req.usage = ck_core::exec::UsageSink::default().with_capture(captures.sink());
+        let error = VertexExecutor::default().execute(&cred, req, &cfg).await.err().unwrap();
+        assert_eq!(String::from_utf8_lossy(&error.body), want, "{base}");
+        // The request event carries the URL as sent; the log writer masks it.
+        let errors: Vec<_> = captures
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, Captured::Error(_)))
+            .collect();
+        assert!(!format!("{errors:?}").contains(SECRET), "{errors:?}");
+        if base.starts_with("ftp:") {
+            assert_eq!(errors, [Captured::Error(want.to_owned())]);
+        }
+    }
+}

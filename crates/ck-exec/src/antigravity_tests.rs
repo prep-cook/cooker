@@ -354,7 +354,10 @@ async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
                 };
                 (status, normalize(message))
             }),
-            want_error.map(|e| (go_status(e), normalize(e["message"].as_str().unwrap()))),
+            want_error.map(|e| {
+                let message = crate::xai_url::redacted_go_error(e["message"].as_str().unwrap());
+                (go_status(e), normalize(&message))
+            }),
             "{name}: error"
         );
         if let Some(want) = want_error.and_then(|e| e.get("retry_after_ms")).and_then(Value::as_u64) {

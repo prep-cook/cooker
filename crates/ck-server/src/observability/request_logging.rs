@@ -617,7 +617,8 @@ impl RequestLog {
                 if record.upstream.error {
                     part.push(b'\n');
                 }
-                writeln!(part, "Error: {error}").unwrap();
+                // Defense in depth: executors redact URLs in their errors already.
+                writeln!(part, "Error: {}", ck_wire::redact::urls_in(error)).unwrap();
                 record.api_response.append(&record.state.dir, &part);
                 record.upstream.error = true;
             }
@@ -686,7 +687,7 @@ impl RequestLog {
                 if !stage.is_empty() {
                     writeln!(part, "Stage: {stage}").unwrap();
                 }
-                writeln!(part, "Error: {error}").unwrap();
+                writeln!(part, "Error: {}", ck_wire::redact::urls_in(error)).unwrap();
                 upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
             }
         }
@@ -2740,6 +2741,38 @@ mod tests {
         assert_eq!(
             logged_url("https://user@host.example/x"),
             "https://<redacted>@host.example/x"
+        );
+    }
+
+    /// Error text an executor hands the log names no URL credential, even when the
+    /// executor did not redact it.
+    #[tokio::test]
+    async fn urls_in_captured_errors_are_redacted() {
+        use ck_core::exec::CaptureEvent::*;
+        const SECRET: &str = "sk-review-secret";
+        let error =
+            format!(r#"Post "ftp://user:{SECRET}@127.0.0.1/?api_key={SECRET}": unsupported protocol scheme "ftp""#);
+        let dial =
+            format!("dial failed: error sending request for uri (http://127.0.0.1:1/?api_key={SECRET}/responses): EOF");
+        let content = persisted(true, StatusCode::OK, move |log| {
+            let sink = log.capture_sink();
+            sink.record(Request(upstream_request("https://fixture.invalid/v1", &[], b"")));
+            sink.record(ResponseError(&error));
+            sink.record(WebsocketError {
+                stage: "dial",
+                error: &dial,
+            });
+        })
+        .await;
+        let content = String::from_utf8(content).unwrap();
+        assert!(!content.contains(SECRET), "{content}");
+        assert!(
+            content.contains(r#"Error: Post "ftp://127.0.0.1/?api_key=***": unsupported protocol scheme "ftp""#),
+            "{content}"
+        );
+        assert!(
+            content.contains("Error: dial failed: error sending request for uri (http://127.0.0.1:1/?api_key=*** EOF"),
+            "{content}"
         );
     }
 

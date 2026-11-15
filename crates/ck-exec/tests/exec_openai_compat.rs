@@ -357,6 +357,31 @@ async fn upstream_refusals_fail_the_attempt_before_commitment() {
     assert_eq!(upstream.requests(), 0);
 }
 
+/// A base URL refused before sending (Go's parser, then its transport) names neither its
+/// password nor its query key in the attempt's error.
+#[tokio::test]
+async fn refused_base_urls_never_print_url_credentials() {
+    const SECRET: &str = "sk-review-secret";
+    for (base, want) in [
+        (
+            format!("http://user:{SECRET}@127.0.0.1:bad/?api_key={SECRET}"),
+            r#"parse "<redacted url>": invalid port after host"#,
+        ),
+        (
+            format!("ftp://user:{SECRET}@127.0.0.1/?api_key={SECRET}"),
+            r#"Post "ftp://127.0.0.1/?api_key=***": unsupported protocol scheme "ftp""#,
+        ),
+    ] {
+        let upstream = StreamUpstream::start([]).await;
+        let (streams, mut exchange) = (Streams::new(), exchange(&upstream));
+        exchange.credential.attributes.insert("base_url".into(), base);
+        let (started, _, _request) = run(&streams, &exchange, "chat", Operation::Generate, CHAT, 64).await;
+        let body = String::from_utf8_lossy(&started.err().unwrap().body).into_owned();
+        assert_eq!(body, want);
+        assert_eq!(upstream.requests(), 0);
+    }
+}
+
 /// A count is local: nothing goes upstream, and the stream carries the canonical result.
 #[tokio::test]
 async fn a_count_is_local() {

@@ -56,7 +56,10 @@ pub fn validate_endpoint(raw: &str, field: &str) -> Result<String, String> {
     }
     let parsed = xai_url::parse(raw).map_err(|e| format!("xai discovery {field} is invalid: {e}"))?;
     if parsed.scheme != "https" {
-        return Err(format!("xai discovery {field} must use https: {}", quote(raw)));
+        return Err(format!(
+            "xai discovery {field} must use https: {}",
+            quote(ck_wire::redact::url(raw))
+        ));
     }
     let host = parsed.hostname.trim().go_lower();
     if host != "x.ai" && !host.ends_with(".x.ai") {

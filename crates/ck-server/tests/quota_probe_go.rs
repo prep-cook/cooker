@@ -266,6 +266,8 @@ async fn quota_probe_fetch_matches_go() {
                     .unwrap_or_default();
                 let version = res.headers().contains_key("x-ck-version");
                 let text = res.text().await.unwrap();
+                // A probe URL carries the credential's token after substitution.
+                assert!(!text.contains("sk-review-secret"), "step {i}: {text}");
                 serde_json::json!({
                     "status": status,
                     "content_type": content_type,

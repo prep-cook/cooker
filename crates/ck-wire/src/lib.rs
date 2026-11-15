@@ -25,6 +25,7 @@
 //!   caches, shared by the Antigravity translators and executor.
 //! - `gostr`: Go's `strings.ToLower`, `strings.EqualFold`, `strings.TrimSpace` and
 //!   `strconv.Quote` on Go's own Unicode tables (owner: Google).
+//! - `redact`: URLs in error and log text, without userinfo, query values or fragment.
 //!
 //! The proxy-aware HTTP client (executor/helps/proxy_helpers.go) touches the network and
 //! lives in ck-exec instead.
@@ -40,6 +41,7 @@ pub mod json;
 #[cfg(test)]
 mod json_go_vectors;
 pub mod payload;
+pub mod redact;
 pub mod schema;
 pub mod session;
 pub mod signature;

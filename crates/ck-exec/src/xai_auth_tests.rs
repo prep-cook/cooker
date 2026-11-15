@@ -172,10 +172,22 @@ fn endpoint_validation_matches_go_net_url() {
         let want = if case[1].as_bool().unwrap() {
             Ok(case[2].as_str().unwrap().to_owned())
         } else {
-            Err(case[2].as_str().unwrap().to_owned())
+            Err(crate::xai_url::redacted_go_error(case[2].as_str().unwrap()))
         };
         assert_eq!(got, want, "ValidateOAuthEndpoint({raw:?})");
     }
+}
+
+/// A refused discovery endpoint names neither its password nor its query key.
+#[test]
+fn refused_endpoints_never_print_url_credentials() {
+    assert_eq!(
+        validate_endpoint(
+            "http://u:sk-review-secret@auth.x.ai/t?k=sk-review-secret",
+            "token_endpoint"
+        ),
+        Err(r#"xai discovery token_endpoint must use https: "http://auth.x.ai/t?k=***""#.to_owned())
+    );
 }
 
 #[test]

@@ -232,6 +232,8 @@ fn wreq_proxy_url(url: &str) -> String {
     }
 }
 
+pub use crate::upstream::transport_text;
+
 /// `proxyutil.Redact`: a proxy URL safe for logs (no user info).
 pub fn redact(raw: &str) -> String {
     match url::Url::parse(raw.trim()) {
@@ -968,7 +970,7 @@ async fn exchange(
                         ExecError::local(
                             500,
                             FailureScope::Transport,
-                            format!("failed to parse Location header {location:?}"),
+                            format!("failed to parse Location header {:?}", ck_wire::redact::url(&location)),
                         ),
                         &hop_url,
                     )

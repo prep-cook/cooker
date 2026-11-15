@@ -8,6 +8,11 @@
           "Body": "{\"subscription\":{\"plan\":\"pro\"},\"groups\":[{\"buckets\":[{\"remainingFraction\":\"0.5\"}]}]}",
           "Location": ""
         },
+        "/badloc": {
+          "Status": 302,
+          "Body": "",
+          "Location": "http://u:sk-review-secret@[::1/x?api_key=sk-review-secret"
+        },
         "/case": {
           "Status": 200,
           "Body": "{\"subscription\":{\"plan\":\"paid\"},\"Subscription\":null}",
@@ -64,6 +69,8 @@
         "probe-empty.json": "{\"type\":\"codex\",\"email\":\"p6@example.invalid\",\"quota_probe\":{\"url\":\"UPSTREAM/empty\"}}",
         "probe-ftp.json": "{\"type\":\"codex\",\"email\":\"p16@example.invalid\",\"quota_probe\":{\"url\":\"ftp://127.0.0.1:1/quota\"}}",
         "probe-headers.json": "{\"type\":\"codex\",\"email\":\"p17@example.invalid\",\"quota_probe\":{\"url\":\"UPSTREAM/quota\",\"method\":\"ſ\",\"header\":{\"Host\":\"other.example\",\"Content-Length\":\"5\",\"Transfer-Encoding\":\"chunked\",\"Trailer\":\"X-T\",\"x-a\":\"1\"}}}",
+        "probe-leak-ftp.json": "{\"type\":\"codex\",\"email\":\"p23@example.invalid\",\"access_token\":\"sk-review-secret\",\"quota_probe\":{\"url\":\"ftp://user:$TOKEN$@127.0.0.1:1/quota?api_key=$TOKEN$\"}}",
+        "probe-leak.json": "{\"type\":\"codex\",\"email\":\"p22@example.invalid\",\"access_token\":\"sk-review-secret\",\"quota_probe\":{\"url\":\"UPSTREAM/badloc?api_key=$TOKEN$\"}}",
         "probe-map.json": "{\"type\":\"codex\",\"email\":\"p2@example.invalid\",\"access_token\":\"t2\",\"quota_probe\":{\"url\":\"UPSTREAM/mapped\",\"headers\":{\"X-H\":\"h\"},\"mapping\":{\"plan\":\"account.plan\",\"tier_name\":\"\",\"tierName\":\"account.tier\",\"tier_id\":\"missing.path\",\"tierId\":\"account.tier_id\",\"groups\":[{\"display_name\":\"usage.label\",\"buckets_path\":\"usage.items\",\"window_key\":\"w\",\"remaining_amount_key\":\"left\",\"total_amount_key\":\"max\",\"reset_time_key\":\"resets\"},{\"displayName\":\"Literal name\",\"buckets\":[{\"remaining_fraction\":\"fixed.frac\",\"window\":\"fixed.window\",\"description\":\"just text\",\"reset_time\":\"fixed.reset\"},{\"remaining_amount\":\"fixed.left\",\"total_amount\":\"fixed.zero\"},{\"remaining_amount\":\"fixed.left\",\"total_amount\":\"fixed.max\",\"window\":\"weekly\"}]},{\"display_name\":\"nothing\",\"buckets_path\":\"usage.none\"}]}}}",
         "probe-mapfail.json": "{\"type\":\"codex\",\"email\":\"p3@example.invalid\",\"quota_probe\":{\"url\":\"UPSTREAM/mapped\",\"mapping\":{\"plan\":\"no.such\",\"groups\":[{\"buckets_path\":\"usage.none\"}]}}}",
         "probe-nohost.json": "{\"type\":\"codex\",\"email\":\"p15@example.invalid\",\"quota_probe\":{\"url\":\"http:///127.0.0.1:1/quota\"}}",
@@ -705,6 +712,34 @@
           "uri": "/case"
         }
       ]
+    },
+    {
+      "op": "http",
+      "args": {
+        "method": "POST",
+        "path": "/v0/management/quota/fetch",
+        "body": "{\"auth_index\":\"AUTHINDEX(probe-leak.json)\"}"
+      },
+      "result": {
+        "status": 502,
+        "content_type": "application/json; charset=utf-8",
+        "body": "{\"error\":\"quota probe failed: probe request failed: Get \\\"UPSTREAM/badloc?api_key=***\\\": failed to parse Location header \\\"\\u003credacted url\\u003e\\\"\"}",
+        "version_headers": true
+      }
+    },
+    {
+      "op": "http",
+      "args": {
+        "method": "POST",
+        "path": "/v0/management/quota/fetch",
+        "body": "{\"auth_index\":\"AUTHINDEX(probe-leak-ftp.json)\"}"
+      },
+      "result": {
+        "status": 502,
+        "content_type": "application/json; charset=utf-8",
+        "body": "{\"error\":\"quota probe failed: probe request failed: Get \\\"ftp://127.0.0.1:1/quota?api_key=***\\\": unsupported protocol scheme \\\"ftp\\\"\"}",
+        "version_headers": true
+      }
     }
   ]
 }
