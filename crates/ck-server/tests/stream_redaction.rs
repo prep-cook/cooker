@@ -121,3 +121,57 @@ async fn the_identity_travels_only_in_headers() {
     let (status, _) = status_body(get(&app, KEY, &format!("?after=v1.e.0&x-ck-stream-id={id}"), &[]).await).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[derive(Clone, Default)]
+struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn access_logs_carry_no_cursor_or_identity() {
+    use tracing::instrument::WithSubscriber;
+    let fixture = Fixture::new(|_| {});
+    let mut live = commit(&fixture, owner(KEY), Framing::Sse, STREAMED);
+    answer(&mut live);
+    live.stopped().await;
+    let app = ck_server::observability::api::router(&fixture.rt, fixture.app());
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    let unknown = StreamId::random().header_value().to_str().unwrap().to_owned();
+    async {
+        // A delivered resume and a 410, each with its cursor in the query and the header.
+        for id in [live.header(), unknown.clone()] {
+            let response = get(
+                &app,
+                KEY,
+                "?after=v1.e.123456789",
+                &[("x-ck-stream-id", &id), ("last-event-id", "v1.e.987654321")],
+            )
+            .await;
+            let _ = body(response).await;
+        }
+        let (status, _) = status_body(resume(&app, &live, "v1.e.2").await).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("/v1/streams?after=<redacted>"), "{log}");
+    for secret in ["123456789", "987654321", "v1.e.2", &live.header(), &unknown] {
+        assert!(!log.contains(secret), "{secret:?} reached the access log:\n{log}");
+    }
+}

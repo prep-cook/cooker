@@ -187,7 +187,7 @@ async fn every_unusable_identity_gets_the_same_410() {
         (KEY, &header.to_ascii_uppercase()),
     ] {
         // Unknown, foreign and malformed ids alike, whatever the cursor says.
-        for query in ["?after=v1.e.0", "?after=v1.b.0", "?after=v1.e.99"] {
+        for query in ["?after=v1.e.0", "?after=v1.b.0", "?after=v1.e.99", "?after=bad", ""] {
             let got = status_body(get(&app, key, query, &[("x-ck-stream-id", id)]).await).await;
             assert_eq!(got, reference, "{key} {id} {query}");
         }
@@ -225,8 +225,15 @@ async fn an_unread_stream_expires_and_an_attached_reader_keeps_its_stream() {
     assert_eq!(resume(&app, &idle, "v1.e.0").await.status(), StatusCode::OK);
     fixture.advance(Duration::from_secs(61));
     fixture.advance(Duration::from_secs(1));
-    let (status, text) = status_body(resume(&app, &idle, "v1.e.0").await).await;
-    assert_eq!((status, text.contains("stream.gone")), (StatusCode::GONE, true));
+    // The expired handle is still registered; whatever the cursor, it answers as an
+    // unknown id does.
+    let unknown = StreamId::random().header_value().to_str().unwrap().to_owned();
+    for query in ["?after=v1.e.0", "?after=v1.b.0", "?after=bad", ""] {
+        let expired = status_body(get(&app, KEY, query, &[("x-ck-stream-id", &idle.header())]).await).await;
+        let reference = status_body(get(&app, KEY, query, &[("x-ck-stream-id", &unknown)]).await).await;
+        assert_eq!(expired, reference, "{query}");
+        assert_eq!(expired.0, StatusCode::GONE);
+    }
 
     // The waiting reader counts as reading: the live stream outlives the TTL.
     fixture.advance(Duration::from_secs(7200));

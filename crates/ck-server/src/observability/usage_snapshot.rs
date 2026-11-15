@@ -2,8 +2,9 @@
 
 use ck_stream::{Read, Reader, Writer};
 use ck_translate::codec::document::{Document, Value};
+use ck_translate::codec::encode::{self, Encoder};
 use ck_translate::codec::event::Kind;
-use ck_translate::codec::{self, RequestView, encode, internal};
+use ck_translate::codec::{self, RequestView, internal};
 
 /// The counts `usage_record::Tracker` records: one attempt's latest canonical `x_ck.usage`
 /// snapshot (`docs/INTERNAL-STREAM.md` §3.5), read from the attempt's stream by a
@@ -113,7 +114,9 @@ fn text(doc: &Document, name: &str) -> codec::Result<Option<Option<String>>> {
 }
 
 /// A hash naming the request's cacheable prefix: its tools and its leading system and
-/// developer messages. Requests sharing both share the value; nothing of the text is kept.
+/// developer messages. Requests sharing both share the value, whatever their client protocol
+/// and member order: the hash covers a canonical encoding ([`write_sorted`]). Nothing of
+/// the text is kept.
 /// Empty when the request has neither. `owner` is an allocation handle on the request
 /// stream, whose scratch holds the hashed encoding until this returns.
 pub fn prompt_prefix(request: RequestView<'_>, owner: &mut Writer) -> codec::Result<String> {
@@ -138,17 +141,17 @@ pub fn prompt_prefix(request: RequestView<'_>, owner: &mut Writer) -> codec::Res
     let encoded = encode::scratch(owner, |e| {
         e.bytes(b"[")?;
         match tools {
-            Some(tools) => doc.write(tools, e)?,
+            Some(tools) => write_sorted(doc, tools, e)?,
             None => e.bytes(b"null")?,
         }
         for &message in &system {
             e.bytes(b",")?;
-            doc.write(message, e)?;
+            write_sorted(doc, message, e)?;
         }
         e.bytes(b"]")
     })?;
     let mut hash = sha2::Sha256::new();
-    hash.update(b"ck:prompt-prefix:v2\0");
+    hash.update(b"ck:prompt-prefix:v3\0");
     let mut offset = 0;
     while offset < encoded.len() {
         let chunk = encoded.chunk(offset)?;
@@ -160,4 +163,48 @@ pub fn prompt_prefix(request: RequestView<'_>, owner: &mut Writer) -> codec::Res
         "{:016x}",
         u64::from_be_bytes(digest[..8].try_into().expect("8 bytes"))
     ))
+}
+
+/// Writes `node` with every object's members sorted by name, recursively, array order kept
+/// and strings re-escaped from their decoded text, so equal values encode equally whatever
+/// member order or escapes their source used.
+fn write_sorted(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> codec::Result<()> {
+    match doc.node(node)?.value {
+        Value::Object => {
+            let mut members = Vec::new();
+            for child in doc.children(node)? {
+                let mut name = String::new();
+                let mut chars = doc.name_chars(doc.node(child)?.name.ok_or(codec::Error::Schema)?)?;
+                while let Some(c) = chars.next_scalar()? {
+                    name.push(c);
+                }
+                members.push((name, child));
+            }
+            members.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            e.bytes(b"{")?;
+            for (index, (name, child)) in members.iter().enumerate() {
+                e.bytes(if index == 0 { b"" } else { b"," })?;
+                e.string(name)?;
+                e.bytes(b":")?;
+                write_sorted(doc, *child, e)?;
+            }
+            e.bytes(b"}")
+        }
+        Value::Array => {
+            e.bytes(b"[")?;
+            for (index, child) in doc.children(node)?.enumerate() {
+                e.bytes(if index == 0 { b"" } else { b"," })?;
+                write_sorted(doc, child, e)?;
+            }
+            e.bytes(b"]")
+        }
+        Value::String(_) | Value::Text(_) => e.quoted_json(|e| {
+            let mut chars = doc.chars(node)?;
+            while let Some(c) = chars.next_scalar()? {
+                e.bytes(c.encode_utf8(&mut [0; 4]).as_bytes())?;
+            }
+            Ok(())
+        }),
+        _ => doc.write(node, e),
+    }
 }

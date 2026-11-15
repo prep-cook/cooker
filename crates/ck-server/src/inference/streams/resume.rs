@@ -76,12 +76,13 @@ impl From<codec::Error> for Failure {
 
 async fn start(rt: &Runtime, caller: Caller, query: &str, headers: &HeaderMap) -> Result<Response, Failure> {
     let id = single(headers, STREAM_ID_HEADER)?.ok_or(Failure::Request("X-Ck-Stream-Id is required."))?;
-    let last_event = single(headers, "last-event-id")?;
-    let after = query_cursor(query)?;
-    // Authorization comes before any cursor lookup: every unusable id is the same 410.
+    // Authorization and liveness come before any cursor check: every unknown, foreign,
+    // expired or evicted id is the same 410, whatever cursor arrives with it.
     let id = StreamId::parse(id.as_bytes()).ok_or(Failure::Gone)?;
     let owner = Owner { caller, scope: None };
     let attached = rt.streams().attach(&id, &owner).ok_or(Failure::Gone)?;
+    let last_event = single(headers, "last-event-id")?;
+    let after = query_cursor(query)?;
     let framing = attached.output.framing;
     // `Last-Event-ID` replaces `after` for SSE only.
     let last_event = match last_event.filter(|_| framing == Framing::Sse) {

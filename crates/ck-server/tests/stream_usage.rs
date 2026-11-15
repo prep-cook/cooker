@@ -101,8 +101,10 @@ async fn a_stream_without_usage_reports_none_not_zero() {
     assert_eq!(facts.model.as_deref(), Some("m"));
 }
 
-/// The usage record's prompt-prefix hash of a Chat request, from its request view.
-fn prefix(fixture: &Fixture, body: &str) -> String {
+/// The usage record's prompt-prefix hash of a client request: Chat, or Anthropic Messages
+/// when `anthropic`.
+fn prefix_of(fixture: &Fixture, anthropic: bool, body: &str) -> String {
+    use ck_translate::anthropic::request::{AnthropicCapability, Ingress as AnthropicIngress};
     use ck_translate::codec::chat::request;
     use ck_translate::codec::event::{Direction, Identity, LocalId};
     use ck_translate::codec::{Operation, RequestIngress};
@@ -117,13 +119,45 @@ fn prefix(fixture: &Fixture, body: &str) -> String {
                 attempt: 0,
                 direction: Direction::Request,
             };
-            let mut ingress =
-                request::Ingress::new(&mut stream, store, identity, Operation::Generate, 1 << 20).unwrap();
-            ingress.advance(&mut stream, body.as_bytes()).unwrap();
-            let validated = ingress.finish(&mut stream, &request::ChatCapability).unwrap();
-            usage_snapshot::prompt_prefix(validated.view(), &mut stream).unwrap()
+            let (operation, limit) = (Operation::Generate, 1 << 20);
+            if anthropic {
+                let mut ingress = AnthropicIngress::new(&mut stream, store, identity, operation, limit).unwrap();
+                ingress.advance(&mut stream, body.as_bytes()).unwrap();
+                let validated = ingress.finish(&mut stream, &AnthropicCapability::default()).unwrap();
+                usage_snapshot::prompt_prefix(validated.view(), &mut stream).unwrap()
+            } else {
+                let mut ingress = request::Ingress::new(&mut stream, store, identity, operation, limit).unwrap();
+                ingress.advance(&mut stream, body.as_bytes()).unwrap();
+                let validated = ingress.finish(&mut stream, &request::ChatCapability).unwrap();
+                usage_snapshot::prompt_prefix(validated.view(), &mut stream).unwrap()
+            }
         })
         .unwrap()
+}
+
+fn prefix(fixture: &Fixture, body: &str) -> String {
+    prefix_of(fixture, false, body)
+}
+
+#[tokio::test]
+async fn the_prompt_prefix_is_the_same_across_client_protocols_and_member_order() {
+    let fixture = Fixture::new(|_| {});
+    let chat = prefix(
+        &fixture,
+        r#"{"model":"m","messages":[{"content":"be brief","role":"system"},{"role":"user","content":"hi"}]}"#,
+    );
+    let ordered = prefix(
+        &fixture,
+        r#"{"model":"m","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#,
+    );
+    let anthropic = prefix_of(
+        &fixture,
+        true,
+        r#"{"model":"m","max_tokens":16,"system":"be brief","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(chat, ordered, "member order is not part of the prefix");
+    assert_eq!(chat, anthropic, "the client protocol is not part of the prefix");
+    assert_ne!(chat, "");
 }
 
 #[tokio::test]

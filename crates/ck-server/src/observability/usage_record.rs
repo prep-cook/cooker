@@ -2070,6 +2070,9 @@ pub struct Tracker {
     observer: std::sync::Arc<Observer>,
     stream: StreamUsage,
     body: Option<Detail>,
+    /// The attempt's canonical usage ([`Tracker::canonical`]). It is the record's usage on
+    /// success and on failure alike, whatever the provider.
+    canonical: Option<Detail>,
     model: ResponseModel,
     first: Option<std::time::Duration>,
     published: bool,
@@ -2144,6 +2147,7 @@ impl Tracker {
             }),
             stream: StreamUsage::default(),
             body: None,
+            canonical: None,
             model: ResponseModel::default(),
             first: None,
             published: false,
@@ -2198,15 +2202,13 @@ impl Tracker {
     }
 
     /// The attempt's canonical usage and response facts (`usage_snapshot::read`); they
-    /// replace what the legacy parsers saw. A missing snapshot leaves the usage unknown.
+    /// replace what the legacy parsers saw. Without a snapshot every count is unreported.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "Q1 (temporary): D2's dispatch is the first caller")
     )]
     pub fn canonical(&mut self, usage: Option<&CanonicalUsage>, facts: &ResponseFacts) {
-        if let Some(usage) = usage {
-            self.body = Some(Detail::canonical(usage, facts));
-        }
+        self.canonical = Some(Detail::canonical(usage.unwrap_or(&CanonicalUsage::default()), facts));
         if let Some(model) = &facts.model {
             self.model.set(model);
         }
@@ -2251,7 +2253,11 @@ impl Tracker {
             record.response_model = outcome.model;
             (latency, ttft) = (outcome.latency, outcome.ttft);
         } else {
-            let usage = if reported.seen {
+            let canonical = self.canonical.take();
+            let kept = canonical.is_some() || self.observer.provider == "claude";
+            let usage = if canonical.is_some() {
+                canonical
+            } else if reported.seen {
                 reported.usage()
             } else {
                 self.body.take().or_else(|| self.stream.detail().cloned())
@@ -2274,7 +2280,7 @@ impl Tracker {
                     if record.response_headers.is_empty() {
                         record.response_headers = go_headers(&error.headers);
                     }
-                    if self.observer.provider == "claude" {
+                    if kept {
                         usage.unwrap_or_default()
                     } else {
                         Detail::default()
@@ -2532,6 +2538,52 @@ mod tests {
         assert_eq!(record["token_breakdown"]["total_tokens"], 30);
         assert_eq!(record["response_model"], "m-served");
         assert_eq!(record["response_service_tier"], "flex");
+    }
+
+    #[test]
+    fn canonical_usage_survives_failure_and_a_missing_snapshot_is_unreported() {
+        use ck_core::exec::{ExecError, FailureScope};
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAI,
+            Format::OpenAI,
+            "m",
+            b"{}",
+            true,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let error = ExecError::local(502, FailureScope::Transport, "upstream");
+        let usage = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            total_tokens: Some(30),
+            ..CanonicalUsage::default()
+        };
+        let response = ResponseFacts::default();
+        // Not a Claude credential: the legacy failure path would drop the counts.
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("openai-compatibility"), "m");
+        tracker.canonical(Some(&usage), &response);
+        tracker.fail(&error);
+        let mut none = Tracker::start(&rt, &facts, &credential_for("openai-compatibility"), "m");
+        none.canonical(None, &response);
+        none.succeed();
+        let raw = rt.usage_queue().pop_oldest(10);
+        let records: Vec<Value> = raw.iter().map(|r| serde_json::from_slice(r).unwrap()).collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["failed"], true);
+        assert_eq!(
+            records[0]["tokens"],
+            serde_json::json!({
+                "input_tokens": 10, "output_tokens": 20, "total_tokens": 30,
+                "cache_read_tokens_present": false,
+            })
+        );
+        assert_eq!(
+            records[1]["tokens"],
+            serde_json::json!({"cache_read_tokens_present": false}),
+            "no snapshot is unknown usage, not zero"
+        );
     }
 
     #[test]

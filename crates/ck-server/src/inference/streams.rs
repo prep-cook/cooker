@@ -188,8 +188,9 @@ impl Registry {
     /// for an unknown, foreign, expired or evicted id.
     pub(crate) fn attach(&self, id: &StreamId, owner: &Owner) -> Option<Attached> {
         let handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
-        // An expired or evicted stream fails the reader's attachment with the same 410.
-        let handle = handles.live.get(id).filter(|h| h.owner == *owner)?;
+        // Liveness is settled here, before any cursor check, and without refreshing the
+        // stream's last read: an expired handle the sweep has not removed yet is unknown.
+        let handle = handles.live.get(id).filter(|h| h.owner == *owner && !h.gone())?;
         Some(Attached {
             output: handle.output,
             response: handle.response.allocator(),
