@@ -73,6 +73,9 @@ fn normalize_input(doc: &mut Document, owner: &mut Writer, x: usize, original: u
             doc.set(m, "role", Value::Text("user"))?;
             doc.rename(input, "content")?;
             doc.append(m, input)?;
+            // Tells this content from a one-message `input` array's for a destination whose
+            // upload differs; bound to the content, so no egress writes it.
+            mark(doc, original, input, "input", Value::Bool(true))?;
         } else if matches!(doc.node(input)?.value, Value::Array) {
             let mut items = Items {
                 messages,

@@ -11,6 +11,7 @@
 use crate::gostr::GoStr;
 mod apply;
 mod providers;
+mod source;
 mod summary;
 mod validate;
 
@@ -436,43 +437,43 @@ pub(crate) fn extract_configuration_update_config(body: &[u8]) -> Config {
     }
 }
 
-pub(crate) fn strip_configuration_updates(body: &[u8]) -> Vec<u8> {
-    if body.is_empty() || !json::valid(body) {
-        return body.to_vec();
+pub(crate) fn strip_configuration_updates(body: Vec<u8>) -> Vec<u8> {
+    if body.is_empty() || !json::valid(&body) {
+        return body;
     }
-    let input = json::get(body, "input");
+    let input = json::get(&body, "input");
     if !input.is_array() {
-        return body.to_vec();
+        return body;
     }
-    let mut kept = Vec::new();
+    let update = |item: &json::Res<'_>| &*item.get("type").bytes() == b"configuration_update";
     let mut removed = false;
     input.each(|_, item| {
-        if &*item.get("type").bytes() == b"configuration_update" {
-            removed = true;
-        } else {
+        removed = update(&item);
+        !removed
+    });
+    if !removed {
+        return body;
+    }
+    let mut kept = Vec::new();
+    input.each(|_, item| {
+        if !update(&item) {
             kept.push(item.raw().to_vec());
         }
         true
     });
-    if !removed {
-        return body.to_vec();
-    }
-    let mut out = body.to_vec();
-    json::set_raw(&mut out, "input", json::join(&kept));
+    let kept = json::join(&kept);
+    let mut out = body;
+    json::set_raw(&mut out, "input", kept);
     out
 }
 
-pub(crate) fn strip_responses_effort(body: &[u8]) -> Vec<u8> {
-    if body.is_empty() || !json::valid(body) || !json::get(body, "reasoning.effort").exists() {
-        return body.to_vec();
+pub(crate) fn strip_responses_effort(body: Vec<u8>) -> Vec<u8> {
+    if body.is_empty() || !json::valid(&body) || !json::get(&body, "reasoning.effort").exists() {
+        return body;
     }
-    let mut result = body.to_vec();
-    if json::try_delete(body, "reasoning.effort")
-        .map(|next| result = next)
-        .is_err()
-    {
-        return body.to_vec();
-    }
+    let Ok(mut result) = json::try_delete(&body, "reasoning.effort") else {
+        return body;
+    };
     if is_empty_object(&result, "reasoning") {
         json::delete(&mut result, "reasoning");
     }

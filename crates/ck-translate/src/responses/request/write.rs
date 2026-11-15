@@ -250,7 +250,16 @@ fn write_content(view: RequestView<'_>, content: usize, assistant: bool, e: &mut
 fn write_message_item(view: RequestView<'_>, message: usize, content: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
     let assistant = is(doc, message, "role", "assistant")?;
-    e.bytes(b"{\"type\":\"message\",\"role\":")?;
+    // A Responses client's untyped message item goes out untyped, as sent; its string `input`
+    // became a typed one.
+    let untyped = is(doc, doc.required(doc.root(), "x_ck")?, "original_protocol", "responses")?
+        && native(doc, message, "type")?.is_none()
+        && native(doc, content, "input")?.is_none();
+    e.bytes(if untyped {
+        b"{\"role\":"
+    } else {
+        b"{\"type\":\"message\",\"role\":"
+    })?;
     doc.write(doc.required(message, "role")?, e)?;
     e.bytes(b",\"content\":")?;
     if matches!(doc.node(content)?.value, Value::Array) {

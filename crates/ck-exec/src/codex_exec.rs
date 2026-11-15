@@ -23,7 +23,7 @@ use ck_translate::responses::response::Ingress;
 
 use crate::codex::{CodexExecutor, ErrorBody};
 use crate::codex_capture::Wire;
-use crate::codex_events::{self as events, Events};
+use crate::codex_events::{self as events, Backend, Events};
 use crate::codex_replay::Scope;
 use crate::codex_request::{self as request, Call, Settings, View};
 use crate::codex_response::SCANNER_MAX_LINE;
@@ -87,7 +87,14 @@ impl Execute for CodexExecutor {
             .post_shaped(&view, &settings, &body, call, request.client.usage)
             .await?;
         let replay = Some((self.replay.clone(), body.scope));
-        let rules = Events::new(scratch, body.optimized, settings.model_level_cooling, replay);
+        let rules = Events::new(
+            scratch,
+            body.optimized,
+            Backend::Codex {
+                model_level_cooling: settings.model_level_cooling,
+            },
+            replay,
+        );
         Ok(Upstream {
             status: upstream.status,
             headers: upstream.headers,
@@ -276,18 +283,20 @@ impl<'r> Shape<'r> {
             .attempt
             .resolved_model
             .map(|r| ck_wire::thinking::ModelCaps::from(&r.info));
-        let thought = ck_wire::thinking::apply_request_thinking(&ck_wire::thinking::RequestThinking {
-            body,
-            payload: body,
-            original: body,
-            model: self.attempt.model,
-            from: target.as_str(),
-            to: target.as_str(),
-            provider: "codex",
-            resolved: caps.as_ref().map(Some),
-            has_request_transformer: false,
-            updates_changed: false,
-        })
+        let thought = ck_wire::thinking::apply_request_thinking(
+            &ck_wire::thinking::RequestThinking {
+                payload: Some(body),
+                original: Some(body),
+                model: self.attempt.model,
+                from: target.as_str(),
+                to: target.as_str(),
+                provider: "codex",
+                resolved: caps.as_ref().map(Some),
+                has_request_transformer: false,
+                updates_changed: false,
+            },
+            body.to_vec(),
+        )
         .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
         String::from_utf8(thought)
             .map_err(|_| ExecError::local(400, FailureScope::Request, "request body is not valid UTF-8 JSON"))
@@ -415,7 +424,7 @@ fn encode(
 }
 
 /// The client's protocol, as `Format` names it.
-fn source(doc: &Document) -> codec::Result<Format> {
+pub(crate) fn source(doc: &Document) -> codec::Result<Format> {
     let x = doc.required(doc.root(), "x_ck")?;
     let protocol = doc.required(x, "original_protocol")?;
     for (name, format) in [
@@ -434,7 +443,7 @@ fn source(doc: &Document) -> codec::Result<Format> {
 /// Whether the client streams, which picks Go's stream or non-stream body rules: as its
 /// `stream` member says. A Gemini client states it only in its route, which the request
 /// handle does not carry, so it counts as streaming.
-fn streaming(doc: &Document) -> codec::Result<bool> {
+pub(crate) fn streaming(doc: &Document) -> codec::Result<bool> {
     match doc.member(doc.root(), "stream")? {
         Some(node) => Ok(matches!(doc.node(node)?.value, Value::Bool(true))),
         None => Ok(source(doc)? == Format::Gemini),
@@ -476,7 +485,7 @@ fn observed(body: crate::types::Body, usage: UsageSink, wire: Wire) -> crate::ty
 }
 
 /// The encoded upload as one body; the HTTP client takes ownership of it.
-fn copy(lease: &ScratchLease) -> Result<Vec<u8>, ExecError> {
+pub(crate) fn copy(lease: &ScratchLease) -> Result<Vec<u8>, ExecError> {
     let mut body = Vec::with_capacity(lease.len());
     while body.len() < lease.len() {
         let chunk = lease
@@ -489,7 +498,7 @@ fn copy(lease: &ScratchLease) -> Result<Vec<u8>, ExecError> {
 
 /// A failure before anything was sent (contract §9): storage rows by the inner error;
 /// anything else is a gateway defect, since the request passed this destination's fence.
-fn encoding(error: codec::Error) -> ExecError {
+pub(crate) fn encoding(error: codec::Error) -> ExecError {
     match error {
         codec::Error::Storage(ck_stream::Error::StorageExhausted | ck_stream::Error::Io(_)) => {
             ExecError::local(503, FailureScope::Request, "stream.storage_exhausted")

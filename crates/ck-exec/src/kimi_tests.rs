@@ -524,18 +524,20 @@ fn pure_functions_match_go_vectors() {
                 let (from, to) = (v["from"].as_str().unwrap(), v["to"].as_str().unwrap());
                 // Go's registry: only the Codex target registers translators from these.
                 let has_request_transformer = to == "codex" && matches!(from, "openai" | "openai-response");
-                apply_request_thinking(&RequestThinking {
-                    body: bytes,
-                    payload: bytes,
-                    original: bytes,
-                    model: v["model"].as_str().unwrap(),
-                    from,
-                    to,
-                    provider: "kimi",
-                    resolved: None,
-                    has_request_transformer,
-                    updates_changed: false,
-                })
+                apply_request_thinking(
+                    &RequestThinking {
+                        payload: Some(bytes),
+                        original: Some(bytes),
+                        model: v["model"].as_str().unwrap(),
+                        from,
+                        to,
+                        provider: "kimi",
+                        resolved: None,
+                        has_request_transformer,
+                        updates_changed: false,
+                    },
+                    bytes.to_vec(),
+                )
                 .map(text)
                 .map_err(|e| e.message)
             }

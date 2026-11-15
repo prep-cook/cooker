@@ -177,19 +177,21 @@ pub(crate) fn prepare(
     let original_translated = crate::translate::baseline_or_working(original_translated, &body);
     let original_translated = preserve_output_controls(original_translated, &original_payload, req.source_format);
     let body = preserve_output_controls(body, &req.body, req.source_format);
-    let mut body = thinking::apply_request_thinking(&RequestThinking {
-        body: &body,
-        payload: &req.body,
-        original: &original_payload,
-        model: &req.model,
-        from: req.source_format.as_str(),
-        // Go passes the executor identifier as the target format.
-        to: PROVIDER,
-        provider: PROVIDER,
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer: false,
-        updates_changed: false,
-    })
+    let mut body = thinking::apply_request_thinking(
+        &RequestThinking {
+            payload: Some(&req.body[..]),
+            original: Some(&original_payload[..]),
+            model: &req.model,
+            from: req.source_format.as_str(),
+            // Go passes the executor identifier as the target format.
+            to: PROVIDER,
+            provider: PROVIDER,
+            resolved: caps.as_ref().map(Some),
+            has_request_transformer: false,
+            updates_changed: false,
+        },
+        body.to_vec(),
+    )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
     set_str_if_different(&mut body, "model", &base_model);
     set_bool_if_different(&mut body, "stream", stream);

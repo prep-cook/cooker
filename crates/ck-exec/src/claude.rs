@@ -1449,18 +1449,20 @@ impl<'a> Ctx<'a> {
     /// `helps.ApplyRequestThinking` with provider `claude`.
     fn apply_thinking(&self, req: &Input<'_>, body: String) -> Result<String, ExecError> {
         use ck_wire::thinking::{RequestThinking, apply_request_thinking};
-        apply_request_thinking(&RequestThinking {
-            body: body.as_bytes(),
-            payload: req.body,
-            original: req.original_body,
-            model: req.model,
-            from: req.source_format.as_str(),
-            to: Format::Claude.as_str(),
-            provider: "claude",
-            resolved: self.resolved.as_ref().map(Some),
-            has_request_transformer: req.transformed,
-            updates_changed: false,
-        })
+        apply_request_thinking(
+            &RequestThinking {
+                payload: Some(req.body),
+                original: Some(req.original_body),
+                model: req.model,
+                from: req.source_format.as_str(),
+                to: Format::Claude.as_str(),
+                provider: "claude",
+                resolved: self.resolved.as_ref().map(Some),
+                has_request_transformer: req.transformed,
+                updates_changed: false,
+            },
+            body.as_bytes().to_vec(),
+        )
         .map(text)
         .map_err(|e| {
             if e.code.is_some() {

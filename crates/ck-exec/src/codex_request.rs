@@ -402,18 +402,20 @@ fn translate_request(req: &ExecRequest, call: Call, is_compat: bool) -> Result<(
         .resolved_model
         .as_ref()
         .map(|r| ck_wire::thinking::ModelCaps::from(&r.info));
-    let thought = ck_wire::thinking::apply_request_thinking(&ck_wire::thinking::RequestThinking {
-        body: &body,
-        payload: &req.body,
-        original: &req.original_body,
-        model: &req.model,
-        from: req.source_format.as_str(),
-        to: target.as_str(),
-        provider: "codex",
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer: registered,
-        updates_changed: false,
-    })
+    let thought = ck_wire::thinking::apply_request_thinking(
+        &ck_wire::thinking::RequestThinking {
+            payload: Some(&req.body[..]),
+            original: Some(&req.original_body[..]),
+            model: &req.model,
+            from: req.source_format.as_str(),
+            to: target.as_str(),
+            provider: "codex",
+            resolved: caps.as_ref().map(Some),
+            has_request_transformer: registered,
+            updates_changed: false,
+        },
+        body.to_vec(),
+    )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
     let body = String::from_utf8(thought)
         .map_err(|_| ExecError::local(400, FailureScope::Request, "request body is not valid UTF-8 JSON"))?;
