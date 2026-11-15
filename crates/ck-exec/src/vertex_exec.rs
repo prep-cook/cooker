@@ -11,6 +11,7 @@
 //! and neither route has a native compact.
 
 use bytes::Bytes;
+use ck_core::credential::Credential;
 use ck_core::exec::ExecError;
 use ck_core::format::Format;
 use ck_stream::Writer;
@@ -41,27 +42,30 @@ pub(crate) fn destination(executor: &VertexExecutor, attempt: &Attempt<'_>) -> O
 }
 
 /// The route an attempt's model takes: the Gemini request codec, or the relay's Chat codec
-/// without its native compact.
+/// without its native compact. `google_key` marks an API key bound for Google's Vertex host.
 pub enum VertexCapability {
-    Gemini,
+    Gemini { google_key: bool },
     OpenApi,
 }
 
 impl Capability for VertexCapability {
     fn destination(&self) -> &'static str {
         match self {
-            Self::Gemini => GeminiCapability.destination(),
+            Self::Gemini { .. } => GeminiCapability.destination(),
             Self::OpenApi => RelayCapability.destination(),
         }
     }
 
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
         match self {
-            // Vertex's count request has no cached content, which changes the count.
-            Self::Gemini if view.operation == Operation::CountTokens && cached_content(view.document)? => {
+            // Vertex accepts an API key only for generation, and its count request has no
+            // cached content, which changes the count.
+            Self::Gemini { google_key }
+                if view.operation == Operation::CountTokens && (*google_key || cached_content(view.document)?) =>
+            {
                 Err(codec::Error::Unsupported)
             }
-            Self::Gemini => GeminiCapability.validate(view),
+            Self::Gemini { .. } => GeminiCapability.validate(view),
             Self::OpenApi if view.operation == Operation::Compact => Err(codec::Error::Unsupported),
             Self::OpenApi => RelayCapability.validate(view),
         }
@@ -120,7 +124,9 @@ impl Execute for VertexExecutor {
         if vertex_openapi::should_execute(attempt.credential, attempt.model) {
             VertexCapability::OpenApi
         } else {
-            VertexCapability::Gemini
+            VertexCapability::Gemini {
+                google_key: google_api_key(attempt.credential),
+            }
         }
     }
 
@@ -131,7 +137,7 @@ impl Execute for VertexExecutor {
         streams: Streams<'_>,
     ) -> Result<Upstream<VertexIngress>, ExecError> {
         match self.capability(attempt) {
-            VertexCapability::Gemini => self.google(attempt, request, streams, Operation::Generate).await,
+            VertexCapability::Gemini { .. } => self.google(attempt, request, streams, Operation::Generate).await,
             VertexCapability::OpenApi => self.endpoints_openapi(attempt, request, streams).await,
         }
     }
@@ -143,7 +149,7 @@ impl Execute for VertexExecutor {
         streams: Streams<'_>,
     ) -> Result<Counted<VertexIngress>, ExecError> {
         match self.capability(attempt) {
-            VertexCapability::Gemini => self
+            VertexCapability::Gemini { .. } => self
                 .google(attempt, request, streams, Operation::CountTokens)
                 .await
                 .map(Counted::Upstream),
@@ -176,7 +182,9 @@ impl VertexExecutor {
         operation: Operation,
     ) -> Result<Upstream<VertexIngress>, ExecError> {
         let count = operation == Operation::CountTokens;
-        let stream = !count && streaming(request.validated.view().document).map_err(encoding)?;
+        let doc = request.validated.view().document;
+        // Vertex streams one candidate only; a request for several calls `generateContent`.
+        let stream = !count && streaming(doc).map_err(encoding)? && !several_candidates(doc).map_err(encoding)?;
         let egress = Egress {
             destination: GeminiCapability.destination(),
             upstream_stream: stream,
@@ -379,6 +387,22 @@ fn cached_content(doc: &Document) -> codec::Result<bool> {
         }
     }
     Ok(!matches!(doc.node(node)?.value, Value::Null))
+}
+
+/// Whether the credential authenticates to Google's Vertex host with an API key, which
+/// Vertex accepts only for `generateContent` and `streamGenerateContent`.
+fn google_api_key(credential: &Credential) -> bool {
+    let (key, base) = vertex::api_creds(credential);
+    !key.is_empty() && vertex_openapi::is_google_host(&base)
+}
+
+/// Whether the request asks for more than one candidate (Chat `n`, Gemini `candidateCount`);
+/// the Gemini fence admits only an unsigned `n`.
+fn several_candidates(doc: &Document) -> codec::Result<bool> {
+    match doc.member(doc.root(), "n")? {
+        Some(n) => Ok(doc.unsigned(n)? > 1),
+        None => Ok(false),
+    }
 }
 
 /// The `<publisher>/<model>` upstream model of the `endpoints/openapi` route, keeping a
