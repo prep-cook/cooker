@@ -30,7 +30,7 @@ pub const PROVIDER: &str = "gemini";
 const DESTINATION: &str = "gemini";
 
 /// The member a `countTokens` body carries a whole generation request in.
-const COUNT_WRAPPER: &str = "generateContentRequest";
+pub(crate) const COUNT_WRAPPER: &str = "generateContentRequest";
 
 impl Execute for GeminiExecutor {
     type Capability = GeminiCapability;
@@ -52,7 +52,7 @@ impl Execute for GeminiExecutor {
             upstream_stream: stream,
         };
         let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
-        let call = Call::new(attempt, request)?;
+        let call = Call::new(attempt, request, PROVIDER, wire::model_name)?;
         let body = call.generate(upload)?;
         let mode = if stream {
             BodyMode::Streaming
@@ -92,7 +92,7 @@ impl Execute for GeminiExecutor {
             upstream_stream: false,
         };
         let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
-        let call = Call::new(attempt, request)?;
+        let call = Call::new(attempt, request, PROVIDER, wire::model_name)?;
         let body = call.count(upload);
         let ingress = Ingress::new(
             streams.response,
@@ -150,29 +150,38 @@ impl GeminiExecutor {
         if (200..300).contains(&upstream.status) {
             return Ok(upstream);
         }
-        let status = upstream.status;
-        let body = proxy::read_all(upstream.body, proxy::MAX_ERROR_BODY, true)
-            .await
-            .unwrap_or_default();
-        // The upstream's body as received, an empty one included.
-        Err(ExecError {
-            status,
-            scope: crate::upstream::scope_for(status),
-            body,
-            headers: Box::default(),
-            retry_after: None,
-            direct: false,
-            addon: None,
-        })
+        Err(refused(upstream).await)
+    }
+}
+
+/// A non-2xx answer as the attempt's failure: the upstream's status, and its body as
+/// received, an empty one included.
+pub(crate) async fn refused(upstream: proxy::Upstream) -> ExecError {
+    let status = upstream.status;
+    let body = proxy::read_all(upstream.body, proxy::MAX_ERROR_BODY, true)
+        .await
+        .unwrap_or_default();
+    ExecError {
+        status,
+        scope: crate::upstream::scope_for(status),
+        body,
+        headers: Box::default(),
+        retry_after: None,
+        direct: false,
+        addon: None,
     }
 }
 
 /// One attempt's facts the upload adjustments and the send read.
-struct Call<'r> {
+pub(crate) struct Call<'r> {
     attempt: &'r Attempt<'r>,
     request: &'r Request<'r>,
+    /// The executor payload rules name.
+    executor: &'static str,
     /// The upstream model without its thinking suffix.
-    base_model: String,
+    pub(crate) base_model: String,
+    /// The upstream model's resource name, as request bodies name it.
+    resource: String,
     /// The model the client asked for, as payload rules match it.
     requested: String,
     /// The client's protocol, named as payload rules name it.
@@ -180,19 +189,28 @@ struct Call<'r> {
 }
 
 impl<'r> Call<'r> {
-    fn new(attempt: &'r Attempt<'r>, request: &'r Request<'r>) -> Result<Self, ExecError> {
+    /// `resource` names the upstream model (without its thinking suffix) in request bodies.
+    pub(crate) fn new(
+        attempt: &'r Attempt<'r>,
+        request: &'r Request<'r>,
+        executor: &'static str,
+        resource: impl FnOnce(&str) -> String,
+    ) -> Result<Self, ExecError> {
         let document = request.validated.view().document;
+        let base_model = parse_suffix(attempt.model).model_name.trim().to_owned();
         Ok(Self {
             attempt,
             request,
-            base_model: parse_suffix(attempt.model).model_name.trim().to_owned(),
+            executor,
+            resource: resource(&base_model),
+            base_model,
             requested: requested_model(document).map_err(encoding)?,
             source: source(document).map_err(encoding)?,
         })
     }
 
     /// A generation body: the suffix's thinking, the upstream model, then the payload rules.
-    fn generate(&self, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
+    pub(crate) fn generate(&self, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
         let caps = self.attempt.resolved_model.map(|r| ModelCaps::from(&r.info));
         let mut body = thinking::apply_request_thinking(&RequestThinking {
             body: &upload,
@@ -243,20 +261,19 @@ impl<'r> Call<'r> {
     }
 
     /// Names the upstream model at `path`, as the URL does.
-    fn name_model(&self, body: &mut Vec<u8>, path: &str) {
-        let name = wire::model_name(&self.base_model);
-        if gj::get(body, path).str() != name {
-            gj::set_str(body, path, name);
+    pub(crate) fn name_model(&self, body: &mut Vec<u8>, path: &str) {
+        if gj::get(body, path).str() != self.resource {
+            gj::set_str(body, path, &self.resource);
         }
     }
 
     /// The configured payload rules under `root`, the last change to the body.
-    fn rules(&self, root: &str, original: &[u8], body: Vec<u8>) -> Vec<u8> {
+    pub(crate) fn rules(&self, root: &str, original: &[u8], body: Vec<u8>) -> Vec<u8> {
         let rules = ck_wire::payload::Rules::of(self.attempt.cfg);
         ck_wire::payload::apply(
             &rules,
             &ck_wire::payload::Request {
-                target_executor: PROVIDER,
+                target_executor: self.executor,
                 model: &self.base_model,
                 requested_model: &self.requested,
                 protocol: Format::Gemini.as_str(),
@@ -300,7 +317,7 @@ fn requested_model(doc: &Document) -> codec::Result<String> {
 
 /// Whether the upstream streams: as the client's `stream` member says. A Gemini client
 /// states it only in its route, which the request handle does not carry, so it streams.
-fn streaming(doc: &Document) -> codec::Result<bool> {
+pub(crate) fn streaming(doc: &Document) -> codec::Result<bool> {
     match doc.member(doc.root(), "stream")? {
         Some(node) => Ok(matches!(doc.node(node)?.value, Value::Bool(true))),
         None => Ok(source(doc)? == Format::Gemini.as_str()),
@@ -308,7 +325,7 @@ fn streaming(doc: &Document) -> codec::Result<bool> {
 }
 
 /// The encoded upload as one body; the HTTP client takes ownership of it.
-fn copy(lease: &ScratchLease) -> Result<Vec<u8>, ExecError> {
+pub(crate) fn copy(lease: &ScratchLease) -> Result<Vec<u8>, ExecError> {
     let mut body = Vec::with_capacity(lease.len());
     while body.len() < lease.len() {
         let chunk = lease
@@ -321,7 +338,7 @@ fn copy(lease: &ScratchLease) -> Result<Vec<u8>, ExecError> {
 
 /// A failure before anything was sent (contract §9): storage rows by the inner error;
 /// anything else is a gateway defect, since the request passed this destination's fence.
-fn encoding(error: codec::Error) -> ExecError {
+pub(crate) fn encoding(error: codec::Error) -> ExecError {
     match error {
         codec::Error::Storage(ck_stream::Error::StorageExhausted | ck_stream::Error::Io(_)) => {
             ExecError::local(503, FailureScope::Request, "stream.storage_exhausted")
