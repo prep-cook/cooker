@@ -48,6 +48,14 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
             return Err(Error::Unsupported);
         }
     }
+    // Chat `logprobs` would map to `include: ["message.output_text.logprobs"]`, but nothing
+    // translates the returned log probabilities back, so a request for them is refused rather
+    // than dropped. `false` and null ask for the default, which egress leaves unwritten.
+    if let Some(n) = doc.member(root, "logprobs")?
+        && !matches!(doc.node(n)?.value, Value::Null | Value::Bool(false))
+    {
+        return Err(Error::Unsupported);
+    }
     if let Some(choice) = doc.member(root, "tool_choice")?
         && matches!(doc.node(choice)?.value, Value::Object)
         && let Some(allowed) = doc.member(choice, "allowed_tools")?

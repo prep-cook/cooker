@@ -493,3 +493,30 @@ fn chat_allowed_tools_reach_responses_flat() {
     beside["tool_choice"]["function"] = json!({"name":"f"});
     unsupported(translate(P::Chat, P::Responses, &beside));
 }
+
+/// Chat `logprobs` has no Responses member: `true` needs a response translation that does not
+/// exist, so it is refused; `false` and null ask for the default and are not written. Responses
+/// takes `top_logprobs` alone, so it reaches the upstream without `logprobs`.
+#[test]
+fn chat_logprobs_are_judged_by_responses() {
+    let request = |extra: Value| {
+        let mut input = json!({"model":"gpt-x","messages":[{"role":"user","content":"hi"}]});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        input
+    };
+    unsupported(translate(
+        P::Chat,
+        P::Responses,
+        &request(json!({"logprobs":true,"top_logprobs":2})),
+    ));
+    for logprobs in [json!(false), Value::Null] {
+        let out = translate(P::Chat, P::Responses, &request(json!({"logprobs":logprobs}))).unwrap();
+        assert_eq!(out.get("logprobs"), None, "{out}");
+    }
+    let out = translate(P::Chat, P::Responses, &request(json!({"top_logprobs":2}))).unwrap();
+    assert_eq!(out["top_logprobs"], 2);
+    assert_eq!(out.get("logprobs"), None, "{out}");
+}
