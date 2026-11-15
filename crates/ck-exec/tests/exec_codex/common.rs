@@ -224,7 +224,7 @@ pub async fn egress_for(
         }
         "responses" => {
             deliver(
-                responses::egress::Egress::new(stream, op, mode, |_, _| {}).unwrap(),
+                crate::support::responses_egress(stream, op, mode).unwrap(),
                 stream,
                 reader,
             )

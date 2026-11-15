@@ -13,11 +13,13 @@ impl State {
         }
         let scope = self.scope(position);
         let incomplete = doc.string_is(finish, "length")? || doc.string_is(finish, "content_filter")?;
-        // Validate every tool before publishing any successful close for this choice.
+        // Finish every parser before publishing any close for this choice. Arguments that are
+        // not JSON still close: `tool.end` reports them with `valid_json: false`.
         for tool in self.choices[position].tools.iter_mut() {
             if let (Some(parser), Some(arguments)) = (&mut tool.parser, &tool.arguments)
                 && let Err(error) = parser.finish(arguments)
                 && !incomplete
+                && !json::not_json(&error)
             {
                 return Err(error);
             }
@@ -74,7 +76,11 @@ impl State {
             let mut tool_scope = scope;
             tool_scope.tool_index = Some(tool.index);
             tool_scope.tool_call_id = Some(tool.id);
-            let valid = tool.parser.as_ref().map(|parser| parser.is_finished());
+            let valid = if tool.invalid {
+                Some(false)
+            } else {
+                tool.parser.as_ref().map(|parser| parser.is_finished())
+            };
             self.emitter.emit(
                 owner,
                 Kind::ToolEnd,

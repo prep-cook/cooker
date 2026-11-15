@@ -211,7 +211,7 @@ fn assert_every_egress(streams: &Streams, owner: &mut Writer, mode: BodyMode, te
     let chat = deliver(streams, owner, &mut chat);
     let mut messages = anthropic::egress::Egress::new(owner, id, op, mode, |_| {}).unwrap();
     let messages = deliver(streams, owner, &mut messages);
-    let mut responses = responses::egress::Egress::new(owner, op, mode, |_, _| {}).unwrap();
+    let mut responses = crate::support::responses_egress(owner, op, mode).unwrap();
     let responses = deliver(streams, owner, &mut responses);
     let mut native = gemini::egress::Egress::new(owner, id, op, mode, |_| {}).unwrap();
     let native = deliver(streams, owner, &mut native);
@@ -255,6 +255,39 @@ async fn chat_without_stream_calls_generate_content() {
     assert_eq!(published.terminal, Some(Terminal::Done));
     assert_api_key_request(&upstream.captured()[0], &format!("{MODELS}:generateContent"));
     assert_every_egress(&streams, &mut owner, BodyMode::Buffered, "Hel", GEMINI_STOPS);
+}
+
+/// Vertex streams no more than one candidate: a request for several calls `generateContent`,
+/// also when its client streams or states no route. One candidate keeps the stream.
+#[tokio::test]
+async fn several_candidates_call_generate_content() {
+    let gemini = |count: u32| {
+        format!(
+            r#"{{"contents":[{{"role":"user","parts":[{{"text":"hi"}}]}}],"generationConfig":{{"candidateCount":{count}}}}}"#
+        )
+    };
+    let chat = r#"{"model":"m","stream":true,"n":2,"messages":[{"role":"user","content":"hi"}]}"#;
+    let cases = [
+        (Client::Gemini, gemini(2), ":generateContent", 2),
+        (Client::Chat, chat.to_owned(), ":generateContent", 2),
+        (Client::Gemini, gemini(1), ":streamGenerateContent?alt=sse", 1),
+    ];
+    for (client, body, method, count) in cases {
+        let streams = Streams::new();
+        let reply = if count > 1 { Reply::json(JSON) } else { Reply::sse(SSE) };
+        let upstream = StreamUpstream::start([reply]).await;
+        let run = run(&streams, &upstream, client, Operation::Generate, &body, 9).await;
+        let (outcome, published, _) = produce(&streams, run.started.unwrap()).await;
+        outcome.unwrap();
+        assert_eq!(published.terminal, Some(Terminal::Done));
+        let captured = &upstream.captured()[0];
+        assert_api_key_request(captured, &format!("{MODELS}{method}"));
+        assert_eq!(
+            json_body(captured)["generationConfig"]["candidateCount"],
+            count,
+            "{body}"
+        );
+    }
 }
 
 #[tokio::test]

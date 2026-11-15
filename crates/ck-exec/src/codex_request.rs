@@ -426,7 +426,8 @@ fn translate_request(req: &ExecRequest, call: Call, is_compat: bool) -> Result<(
 /// prompt cache key, the input id sanitizing and the SIWC WebSocket rules (868e137).
 pub(crate) struct Finalizer {
     pub(crate) call: Call,
-    /// The translated original request, the baseline for `default` rules.
+    /// The baseline `default` rules check: the translated original request, or its
+    /// `Rules::baseline`.
     pub(crate) original: Vec<u8>,
 }
 
@@ -443,7 +444,7 @@ impl Finalizer {
 /// The payload rules on a `response.steer` frame: the frame is its own baseline, and
 /// its `type` stays `response.steer`.
 pub(crate) fn steer_rules(req: &ExecRequest, settings: &Settings, payload: String) -> String {
-    let original = payload.clone().into_bytes();
+    let original = settings.payload.baseline("", payload.as_bytes()).unwrap_or_default();
     let out = apply_payload(&Inbound::of(req), settings, Call::Websocket, payload, &original);
     set_str(&out, "type", "response.steer")
 }

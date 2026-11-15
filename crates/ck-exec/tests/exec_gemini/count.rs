@@ -88,7 +88,7 @@ async fn responses_has_no_count_to_receive() {
     let id = identity(Direction::Request);
     let ingress = responses::request::Ingress::new(&mut writer, &streams.store, id, Operation::CountTokens, LIMIT);
     assert!(matches!(ingress.err(), Some(codec::Error::Unsupported)));
-    let egress = responses::egress::Egress::new(&mut writer, Operation::CountTokens, BodyMode::Buffered, |_, _| {});
+    let egress = crate::support::responses_egress(&mut writer, Operation::CountTokens, BodyMode::Buffered);
     assert!(matches!(egress.err(), Some(codec::Error::Unsupported)));
 }
 

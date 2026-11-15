@@ -166,7 +166,7 @@ impl Fixture {
         self.deliver(id, stream, &mut native, &mut anthropic_out).await;
         let chat = codec::chat::egress::Egress::new(stream, response, Operation::Generate, mode, true, |_| {});
         self.deliver(id, stream, &mut chat.unwrap(), &mut Vec::new()).await;
-        let responses = responses::egress::Egress::new(stream, Operation::Generate, mode, |_, _| {});
+        let responses = crate::support::responses_egress(stream, Operation::Generate, mode);
         self.deliver(id, stream, &mut responses.unwrap(), &mut Vec::new()).await;
         let gemini = gemini::egress::Egress::new(stream, response, Operation::Generate, mode, |_| {});
         self.deliver(id, stream, &mut gemini.unwrap(), &mut Vec::new()).await;

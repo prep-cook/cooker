@@ -47,17 +47,27 @@ pub(super) fn normalize(doc: &mut Document, owner: &mut Writer, operation: Opera
     if let Some(wire_x) = wire_x {
         preserve(doc, original, root, wire_x)?;
     }
-    normalize_input(doc, owner, x, original)?;
+    normalize_input(doc, owner, operation, x, original)?;
     normalize_options(doc, x, original)?;
     normalize_tools(doc, owner, x, original)?;
     preserve_unknown(doc, original, root, ROOT_FIELDS)?;
     pointers(doc, owner, original)
 }
-/// Moves `instructions` and `input` into canonical messages.
-fn normalize_input(doc: &mut Document, owner: &mut Writer, x: usize, original: usize) -> Result<()> {
+/// Moves `instructions` and `input` into canonical messages. A null `instructions`, and a
+/// compact's null `input`, are documented as absent.
+fn normalize_input(
+    doc: &mut Document,
+    owner: &mut Writer,
+    operation: Operation,
+    x: usize,
+    original: usize,
+) -> Result<()> {
     let root = doc.root();
     let messages = doc.set(root, "messages", Value::Array)?;
-    if let Some(instructions) = doc.remove(root, "instructions")? {
+    let null = |doc: &Document, node: usize| Ok::<_, Error>(matches!(doc.node(node)?.value, Value::Null));
+    if let Some(instructions) = doc.remove(root, "instructions")?
+        && !null(doc, instructions)?
+    {
         string(doc, instructions)?;
         let message = doc.add(None, Value::Object)?;
         doc.append(messages, message)?;
@@ -66,7 +76,9 @@ fn normalize_input(doc: &mut Document, owner: &mut Writer, x: usize, original: u
         doc.append(message, instructions)?;
         mark(doc, original, message, "instructions", Value::Bool(true))?;
     }
-    if let Some(input) = doc.remove(root, "input")? {
+    if let Some(input) = doc.remove(root, "input")?
+        && !(operation == Operation::Compact && null(doc, input)?)
+    {
         if matches!(doc.node(input)?.value, Value::String(_) | Value::Utf8Media) {
             let m = doc.add(None, Value::Object)?;
             doc.append(messages, m)?;

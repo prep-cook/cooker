@@ -24,8 +24,17 @@ fn json_matches_go_sjson_and_gjson_vectors() {
             op => panic!("{op}"),
         }
         .unwrap_or_else(|_| doc.to_vec());
-        if got != case["out"].as_str().unwrap().as_bytes() {
-            failures.push(format!("{case}\n  got: {}", String::from_utf8_lossy(&got)));
+        // The same edit on an owned document, which `json::splice` makes in place.
+        let mut edited = doc.to_vec();
+        match case["op"].as_str().unwrap() {
+            "delete" => json::delete(&mut edited, path),
+            "set_raw" => json::set_raw(&mut edited, path, value),
+            _ => json::set_str(&mut edited, path, value),
+        };
+        for got in [got, edited] {
+            if got != case["out"].as_str().unwrap().as_bytes() {
+                failures.push(format!("{case}\n  got: {}", String::from_utf8_lossy(&got)));
+            }
         }
     }
     for case in fixture["reads"].as_array().unwrap() {

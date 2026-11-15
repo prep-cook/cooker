@@ -75,7 +75,7 @@ fn plain_error(message: impl Into<String>) -> ExecError {
 
 /// `vertexAPICreds`: the `api_key` and `base_url` attributes as stored, else the file's
 /// `access_token`.
-fn api_creds(credential: &Credential) -> (String, String) {
+pub(crate) fn api_creds(credential: &Credential) -> (String, String) {
     let attr = |k: &str| credential.attributes.get(k).cloned().unwrap_or_default();
     let mut key = attr("api_key");
     if key.is_empty() {

@@ -153,11 +153,29 @@ impl<'a> ValidatedRequest<'a> {
     pub fn destination(&self) -> &'static str {
         self.destination
     }
+    /// The view, for a request egress encoding for `destination`. A request validated against
+    /// [`ClientCapability`] is refused whatever the egress's key, so it never reaches an upstream.
     pub fn for_destination(&self, destination: &str) -> Result<RequestView<'a>> {
-        if self.destination != destination {
+        if self.destination == CLIENT || self.destination != destination {
             return Err(Error::Destination);
         }
         Ok(self.view)
+    }
+}
+
+/// [`ClientCapability`]'s destination key.
+pub const CLIENT: &str = "client";
+
+/// The capability the client fence closes against (contract §4, G8). It adds no check to the
+/// fence's own document and media checks, and no request egress encodes a request validated
+/// against it: every attempt re-fences the view for its own destination first.
+pub struct ClientCapability;
+impl Capability for ClientCapability {
+    fn destination(&self) -> &'static str {
+        CLIENT
+    }
+    fn validate(&self, _: RequestView<'_>) -> Result<()> {
+        Ok(())
     }
 }
 

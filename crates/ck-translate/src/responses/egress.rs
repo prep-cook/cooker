@@ -3,7 +3,8 @@ use crate::codec::{
     self, BodyMode, Error, Operation, Result,
     document::{Document, Value},
     encode::{self, Encoder},
-    event::Kind,
+    event::{Kind, LocalId},
+    identity::Producer,
     internal,
 };
 use ck_stream::{ScratchLease, Writer};
@@ -27,7 +28,8 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     owner: u64,
     mode: BodyMode,
     document: Document,
-    id: codec::identity::ResponseId,
+    /// The account whose opaque items this response carries.
+    producer: Producer,
     terminal: bool,
     sequence: u64,
     /// The canonical stream this egress reads; it checks each record's `seq`.
@@ -43,14 +45,23 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     owed: bool,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
-    pub fn new(owner: &mut Writer, operation: Operation, mode: BodyMode, diagnostic: F) -> Result<Self> {
+    /// The egress for one exchange, live or resumed alike. `id` is the exchange's response id,
+    /// the only id its client sees: a source id never replaces it. `producer` made the
+    /// committed attempt's response.
+    pub fn new(
+        owner: &mut Writer,
+        id: LocalId,
+        producer: Producer,
+        operation: Operation,
+        mode: BodyMode,
+        diagnostic: F,
+    ) -> Result<Self> {
         if operation == Operation::CountTokens || (operation == Operation::Compact && mode == BodyMode::Streaming) {
             return Err(Error::Unsupported);
         }
-        let id = codec::identity::ResponseId::new("resp_", owner.id())?;
         let document = super::mapped(owner, |e| {
             e.bytes(b"{\"id\":")?;
-            e.string(id.issued().ok_or(Error::Schema)?.as_str())?;
+            e.string(id.as_str())?;
             e.bytes(b",\"object\":")?;
             e.string(if operation == Operation::Compact {
                 "response.compaction"
@@ -69,7 +80,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             owner: owner.id(),
             mode,
             document,
-            id,
+            producer,
             terminal: false,
             sequence: 0,
             binding: internal::Binding::new(owner, None),
@@ -79,6 +90,10 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             pending: None,
             owed: false,
         })
+    }
+    /// The account whose opaque items this response carries.
+    pub fn producer(&self) -> Producer {
+        self.producer
     }
     fn emit(
         &mut self,

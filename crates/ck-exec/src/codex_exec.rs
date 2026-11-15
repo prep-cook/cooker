@@ -277,16 +277,16 @@ impl<'r> Shape<'r> {
         (view, settings)
     }
 
-    /// The model suffix's thinking on `body`, already in `target`'s protocol.
-    fn think(&self, body: &[u8], target: Format) -> Result<String, ExecError> {
+    /// The model suffix's thinking on `body`, already in `target`'s protocol and edited in place.
+    fn think(&self, body: Vec<u8>, target: Format) -> Result<String, ExecError> {
         let caps = self
             .attempt
             .resolved_model
             .map(|r| ck_wire::thinking::ModelCaps::from(&r.info));
         let thought = ck_wire::thinking::apply_request_thinking(
             &ck_wire::thinking::RequestThinking {
-                payload: Some(body),
-                original: Some(body),
+                payload: None,
+                original: None,
                 model: self.attempt.model,
                 from: target.as_str(),
                 to: target.as_str(),
@@ -295,7 +295,7 @@ impl<'r> Shape<'r> {
                 has_request_transformer: false,
                 updates_changed: false,
             },
-            body.to_vec(),
+            body,
         )
         .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
         String::from_utf8(thought)
@@ -311,10 +311,11 @@ impl<'r> Shape<'r> {
         call: Call,
         replay: &Arc<crate::codex_replay::Cache>,
     ) -> Result<Shaped<'r>, ExecError> {
-        let original = crate::codex_upload::require(self.upload.to_vec());
-        let thought = self.think(&original, Format::Codex)?;
+        let body = crate::codex_upload::require(self.upload.to_vec());
+        let baseline = settings.payload.baseline("", &body).unwrap_or_default();
+        let thought = self.think(body, Format::Codex)?;
         let inbound = self.inbound();
-        let shaped = codex_shape::shape_body(&inbound, view, settings, call, thought, original);
+        let shaped = codex_shape::shape_body(&inbound, view, settings, call, thought, baseline);
         let (body, scope) = if self.source == Format::Claude {
             let client = &self.request.client;
             let session = codex_shape::replay_session(shaped.body.as_bytes(), client.headers, client.execution_session);
@@ -329,9 +330,10 @@ impl<'r> Shape<'r> {
 
     /// A `/responses/compact` body: the upload is already the Responses request compact sends.
     fn compact(&self, view: &View<'_>, settings: &Settings) -> Result<Shaped<'r>, ExecError> {
-        let thought = self.think(self.upload, Format::OpenAIResponse)?;
+        let baseline = settings.payload.baseline("", self.upload).unwrap_or_default();
+        let thought = self.think(self.upload.to_vec(), Format::OpenAIResponse)?;
         let inbound = self.inbound();
-        let shaped = codex_shape::shape_body(&inbound, view, settings, Call::Compact, thought, self.upload.to_vec());
+        let shaped = codex_shape::shape_body(&inbound, view, settings, Call::Compact, thought, baseline);
         Ok(self.finish(
             &inbound,
             settings,
@@ -369,8 +371,10 @@ impl<'r> Shape<'r> {
     /// rules.
     fn count(&self) -> Result<Vec<u8>, ExecError> {
         use crate::codex_json::{delete, set_bool_if_different, set_str_if_different};
-        let original = crate::codex_upload::require(self.upload.to_vec());
-        let mut body = self.think(&original, Format::Codex)?;
+        let body = crate::codex_upload::require(self.upload.to_vec());
+        let rules = ck_wire::payload::Rules::of(self.attempt.cfg);
+        let baseline = rules.baseline("", &body);
+        let mut body = self.think(body, Format::Codex)?;
         body = set_str_if_different(body, "model", &request::base_model(self.attempt.model));
         for key in [
             "previous_response_id",
@@ -391,7 +395,6 @@ impl<'r> Shape<'r> {
             "" => self.attempt.model.trim(),
             requested => requested,
         };
-        let rules = ck_wire::payload::Rules::of(self.attempt.cfg);
         Ok(ck_wire::payload::apply(
             &rules,
             &ck_wire::payload::Request {
@@ -401,7 +404,7 @@ impl<'r> Shape<'r> {
                 protocol: Format::Codex.as_str(),
                 from_protocol: self.source.as_str(),
                 root: "",
-                original: &original,
+                original: baseline.as_deref().unwrap_or_default(),
                 request_path: inbound.request_path,
                 headers: Some(inbound.headers),
             },

@@ -24,7 +24,8 @@ use crate::http::egress::Output;
 
 pub use cursor::{Cursor, Units};
 pub use protocol::ProtocolEgress;
-pub use resume::resume;
+pub(crate) use resume::{Replay, delivery};
+pub use resume::{Uncommitted, resume};
 
 /// Request and response header carrying a [`StreamId`]. Request capture and logs redact it.
 pub const STREAM_ID_HEADER: &str = "x-ck-stream-id";
@@ -89,6 +90,24 @@ pub struct Exchange {
     /// and each attempt's request egress encodes its upload into its scratch. At commitment
     /// the exchange finishes it with `Terminal::Done` and keeps an allocation handle.
     pub request: Writer,
+}
+
+impl Exchange {
+    /// Commitment (`docs/EXECUTION-CONTRACT.md` §6): the request stream ends with `Done` and
+    /// the attempt whose egress emitted the first deliverable byte becomes the exchange's
+    /// handle, registered under a fresh id. `response` is that attempt's allocation handle.
+    pub(crate) fn commit(mut self, registry: &Registry, response: Writer) -> StreamId {
+        self.request.finish(Terminal::Done);
+        let id = StreamId::random();
+        registry.register(StreamHandle {
+            id,
+            owner: self.owner,
+            output: self.output,
+            response,
+            request: self.request.allocator(),
+        });
+        id
+    }
 }
 
 /// A committed response retained for delivery and resume until the response stream expires

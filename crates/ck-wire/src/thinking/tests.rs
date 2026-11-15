@@ -192,7 +192,7 @@ fn replay(fn_name: &str, input: &Value) -> Option<Value> {
             &b(&input["body"]),
             s(&input["provider"]),
         )),
-        "strip_thinking" => enc(&strip_thinking_config(&b(&input["body"]), s(&input["provider"]))),
+        "strip_thinking" => enc(&strip_thinking_config(b(&input["body"]), s(&input["provider"]))),
         "parse_suffix" => {
             let r = parse_suffix(s(input));
             serde_json::json!({"model_name": r.model_name, "has_suffix": r.has_suffix, "raw_suffix": r.raw_suffix})
@@ -201,7 +201,7 @@ fn replay(fn_name: &str, input: &Value) -> Option<Value> {
             let info = caps(&input["info"]);
             match apply_provider(
                 s(&input["provider"]),
-                &b(&input["body"]),
+                b(&input["body"]),
                 &config(&input["config"]),
                 info.as_ref(),
             )
@@ -227,7 +227,7 @@ fn replay(fn_name: &str, input: &Value) -> Option<Value> {
 
 #[test]
 fn replays_every_go_thinking_call() {
-    let ran = replay_all(crate::go_calls().map(str::to_owned));
+    let ran = replay_all(crate::go_calls().map(str::to_owned), "calls");
     assert!(ran["apply_thinking"] > 300, "{ran:?}");
     assert!(ran["applier"] > 200 && ran["validate_config"] > 200, "{ran:?}");
 }
@@ -239,7 +239,7 @@ fn replays_go_thinking_matrix() {
     use std::io::BufRead;
     let gz = include_bytes!("../../tests/fixtures/go_thinking_matrix.jsonl.gz");
     let lines = std::io::BufReader::new(flate2::read::GzDecoder::new(&gz[..])).lines();
-    let ran = replay_all(lines.map(Result::unwrap));
+    let ran = replay_all(lines.map(Result::unwrap), "matrix");
     assert_eq!(ran["applier"], 17868, "{ran:?}");
     assert_eq!(ran["apply_thinking"], 8064, "{ran:?}");
 }
@@ -349,19 +349,21 @@ fn an_unchanged_body_is_handed_back() {
     }
 }
 
-fn replay_all(lines: impl Iterator<Item = String>) -> std::collections::BTreeMap<String, usize> {
+fn replay_all(lines: impl Iterator<Item = String>, suite: &str) -> std::collections::BTreeMap<String, usize> {
+    // The 2026-11-15 owner ruling replaces these Go effort outcomes, not their inputs.
+    let snapping: Value = serde_json::from_str(include_str!("../../tests/fixtures/thinking_level_snap.json")).unwrap();
     let mut ran = std::collections::BTreeMap::<String, usize>::new();
     let mut failures = Vec::new();
-    for line in lines {
+    for (index, line) in lines.enumerate() {
         let line = line.as_str();
         let record: Value = serde_json::from_str(line).unwrap();
         let fn_name = s(&record["fn"]).to_owned();
         let got = with_lookups(&record, || replay(&fn_name, &record["in"]));
         let Some(got) = got else { continue };
         *ran.entry(fn_name.clone()).or_default() += 1;
-        let want = record["out"].clone();
+        let want = snapping[suite].get(index.to_string()).unwrap_or(&record["out"]);
         let missed = MISSED.with(|m| m.borrow().clone());
-        if got != want || !missed.is_empty() {
+        if &got != want || !missed.is_empty() {
             failures.push(format!(
                 "{fn_name}\n  in:   {}\n  want: {want}\n  got:  {got}\n  unrecorded lookups: {missed:?}",
                 record["in"]
@@ -412,6 +414,66 @@ fn kimi_thread_request_vectors() {
         count += 1;
     }
     assert_eq!(count, 16);
+}
+
+#[test]
+fn reasoning_levels_snap_to_model_support() {
+    for (levels, requested, expected) in [
+        (&["high", "xhigh"][..], "minimal", "high"),
+        (&["high", "xhigh"][..], "low", "high"),
+        (&["high", "xhigh"][..], "max", "xhigh"),
+        (&["high", "xhigh"][..], "high", "high"),
+        (&["minimal", "high", "xhigh", "max"][..], "medium", "high"),
+        (&["minimal", "high", "xhigh", "max"][..], "low", "minimal"),
+        (&["high", "low"][..], "medium", "low"),
+    ] {
+        let info = ModelCaps {
+            kind: "openai".into(),
+            thinking: Some(ThinkingSupport {
+                levels: levels.iter().map(|level| (*level).into()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for from in ["openai", "claude"] {
+            for from_suffix in [false, true] {
+                assert_eq!(
+                    validate_config(Config::level(requested), Some(&info), from, "openai", from_suffix),
+                    Ok(Config::level(expected)),
+                    "{levels:?}: {requested}, {from}, suffix={from_suffix}"
+                );
+            }
+        }
+    }
+    for (levels, input, expected) in [
+        (
+            &["high", "xhigh"][..],
+            Config::level("ultra"),
+            Err(ErrorCode::UnknownLevel),
+        ),
+        (&["high", "xhigh"][..], Config::level(""), Err(ErrorCode::UnknownLevel)),
+        (&[][..], Config::level("minimal"), Ok(Config::level("minimal"))),
+        (&["high", "xhigh"][..], Config::none(), Ok(Config::none())),
+        (&["high", "xhigh"][..], Config::auto(), Ok(Config::auto())),
+    ] {
+        let info = ModelCaps {
+            kind: "openai".into(),
+            thinking: Some(ThinkingSupport {
+                zero_allowed: true,
+                dynamic_allowed: true,
+                levels: levels.iter().map(|level| (*level).into()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for from in ["openai", "claude"] {
+            assert_eq!(
+                validate_config(input.clone(), Some(&info), from, "openai", false).map_err(|e| e.code.unwrap()),
+                expected,
+                "{levels:?}: {input:?}, {from}"
+            );
+        }
+    }
 }
 
 #[test]

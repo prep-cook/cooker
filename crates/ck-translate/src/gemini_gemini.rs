@@ -61,16 +61,9 @@ fn fixed_role(content: &Res<'_>, previous: &[u8]) -> Option<Vec<u8>> {
     })
 }
 
-/// ConvertGeminiRequestToGemini: renames camelCase tool declarations, fixes missing or
-/// invalid content roles, sanitizes thought signatures, renames `responseSchema`,
-/// backfills empty function-response names and attaches default safety settings.
+/// Gemini and Vertex retain the historical schema rewrites and safety settings.
 pub(crate) fn convert(input: &[u8]) -> Vec<u8> {
-    let contents = if input.is_empty() {
-        Res::default()
-    } else {
-        gj::get(input, "contents")
-    };
-    if !contents.exists() {
+    if !gj::get(input, "contents").exists() {
         return attach_default_safety_settings(input.to_vec(), "safetySettings");
     }
     let mut raw = input.to_vec();
@@ -114,7 +107,37 @@ pub(crate) fn convert(input: &[u8]) -> Vec<u8> {
         }
     }
 
-    let mut out = raw.clone();
+    let mut out = normalize_contents(&raw);
+    if gj::get(&raw, "generationConfig.responseSchema").exists() {
+        // Go keeps its empty result when a schema rename fails.
+        let value = gj::get(&out, "generationConfig.responseSchema").into_owned();
+        out = if value.exists() {
+            gj::try_set_raw(&out, "generationConfig.responseJsonSchema", &value.raw)
+                .and_then(|next| gj::try_delete(&next, "generationConfig.responseSchema"))
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+    }
+    out = backfill_function_response_names(out);
+    attach_default_safety_settings(out, "safetySettings")
+}
+
+/// AI Studio preserves the client's schema dialects and omitted safety policy.
+pub(crate) fn convert_aistudio(input: &[u8]) -> Vec<u8> {
+    backfill_function_response_names(normalize_contents(input))
+}
+
+fn normalize_contents(input: &[u8]) -> Vec<u8> {
+    let contents = if input.is_empty() {
+        Res::default()
+    } else {
+        gj::get(input, "contents")
+    };
+    if !contents.exists() {
+        return input.to_vec();
+    }
+    let mut out = input.to_vec();
     let mut previous: Vec<u8> = vec![];
     if contents.is_array() {
         let mut changed = false;
@@ -158,22 +181,7 @@ pub(crate) fn convert(input: &[u8]) -> Vec<u8> {
         });
     }
 
-    out = ck_wire::signature::sanitize_gemini_request_thought_signatures(&out, "contents");
-
-    if gj::get(&raw, "generationConfig.responseSchema").exists() {
-        // util.RenameKey; Go keeps its empty result when an edit fails.
-        let value = gj::get(&out, "generationConfig.responseSchema").into_owned();
-        out = if value.exists() {
-            gj::try_set_raw(&out, "generationConfig.responseJsonSchema", &value.raw)
-                .and_then(|next| gj::try_delete(&next, "generationConfig.responseSchema"))
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
-    }
-
-    out = backfill_function_response_names(out);
-    attach_default_safety_settings(out, "safetySettings")
+    ck_wire::signature::sanitize_gemini_request_thought_signatures(&out, "contents")
 }
 
 /// Function-call names of a model turn, in order.
@@ -190,6 +198,33 @@ fn call_names(content: &Res<'_>) -> Vec<Vec<u8>> {
 
 fn blank_response_name(part: &Res<'_>) -> bool {
     trim_space(&part.get("functionResponse.name").bytes()).is_empty()
+}
+
+fn needs_response_names(contents: &Res<'_>, pending: &mut Vec<Vec<u8>>) -> bool {
+    let mut needed = false;
+    contents.each(|_, content| {
+        if content.get("role").bytes().as_ref() == b"model" {
+            *pending = call_names(&content);
+            return true;
+        }
+        if pending.is_empty() {
+            return true;
+        }
+        let mut index = 0;
+        content.get("parts").each(|_, part| {
+            if part.get("functionResponse").exists() {
+                if blank_response_name(&part) && index < pending.len() {
+                    needed = true;
+                    return false;
+                }
+                index += 1;
+            }
+            true
+        });
+        pending.clear();
+        !needed
+    });
+    needed
 }
 
 /// backfillEmptyFunctionResponseNames: an empty functionResponse.name takes the name of
@@ -211,32 +246,8 @@ fn backfill_function_response_names(data: Vec<u8>) -> Vec<u8> {
         return backfill_legacy(&data, &contents);
     }
 
-    // geminiFunctionResponseNamesNeedBackfill.
     let mut pending: Vec<Vec<u8>> = vec![];
-    let mut needed = false;
-    contents.each(|_, content| {
-        if content.get("role").bytes().as_ref() == b"model" {
-            pending = call_names(&content);
-            return true;
-        }
-        if pending.is_empty() {
-            return true;
-        }
-        let mut index = 0;
-        content.get("parts").each(|_, part| {
-            if part.get("functionResponse").exists() {
-                if blank_response_name(&part) && index < pending.len() {
-                    needed = true;
-                    return false;
-                }
-                index += 1;
-            }
-            true
-        });
-        pending.clear();
-        !needed
-    });
-    if !needed {
+    if !needs_response_names(&contents, &mut pending) {
         return data;
     }
 

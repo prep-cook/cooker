@@ -8,8 +8,8 @@ This page fixes the interfaces Phase D units build against: stream ownership, th
 | --- | --- | --- |
 | `Execute`, `Attempt`, `Client`, `Request`, `Streams`, `Upstream`, `Body`, `Counted` | `crates/ck-exec/src/types.rs` | each provider unit |
 | `Producer`, `Started` | `crates/ck-exec/src/pipeline.rs` | D1 |
-| `Protocol`, `Framing`, `Output` | `crates/ck-server/src/http/egress.rs` | D2 |
-| `Exchange`, `Owner`, `StreamHandle`, `StreamId` | `crates/ck-server/src/inference/streams.rs` | D2 (exchange), D3 (registry, resume) |
+| `Protocol`, `Framing`, `Output`, `deliver`, `Failed` | `crates/ck-server/src/http/egress.rs` | D2 |
+| `Exchange`, `Owner`, `StreamHandle`, `StreamId`, `Uncommitted` | `crates/ck-server/src/inference/streams.rs` | D2 (exchange), D3 (registry, resume) |
 | `CanonicalUsage`, `ResponseFacts` (tracker input) | `crates/ck-server/src/observability/usage_snapshot.rs` | D3 |
 | `Writer::allocator`, `Store::create_dependent`, `Writer::now` | `crates/ck-stream/src/publication/writer.rs` | done in D0 |
 
@@ -45,19 +45,19 @@ Every provider module implements `Execute` once. The selector in `crates/ck-exec
 
 `Client::usage` carries request-side facts only (§8, G4).
 
-**G5, the client's own bytes for the Claude cloak.** `Client::original` borrows the client's request body as the server received it; the server fills it on every attempt from the body it already holds, without a copy. Only the Claude executor reads it, and only for an Anthropic Messages request that the OAuth cloak or the Claude Code identity shapes: a credential the cloak may serve (an OAuth token, a fingerprint profile or a cloak setting), or a request the Claude Code detection confirms from its headers and body. That request is prepared from these bytes exactly as the old route prepares them, and the result goes upstream, because the detection reads the client's member order and `cch` signs the body the cloak built from them. This is the single exception to the no-raw-passthrough rule in `crates/AGENTS.md` (owner ruling 2026-11-16, Q14 option (a)). The fence (§4) still validates the request first, so the capability refuses what it refuses for any other client. Every other request, including a foreign client's request on a cloak credential, is encoded from the fenced view.
+**G5, the client's own bytes for the Claude cloak.** `Client::original` borrows the client's request body as the server received it; the server fills it on every attempt from the body it already holds, without a copy. Only the Claude executor reads it, and only for an Anthropic Messages request that the OAuth cloak or the Claude Code identity shapes: a credential the cloak may serve (an OAuth token, a fingerprint profile or a cloak setting), or a request the Claude Code detection confirms from its headers and body. That request is prepared from these bytes exactly as the old route prepares them, and the result goes upstream, because the detection reads the client's member order and `cch` signs the body the cloak built from them. This is one of two exceptions to the no-raw-passthrough rule in `crates/AGENTS.md` (owner ruling 2026-11-16, Q14 option (a)); live-session messages are the other (Settled 55). The fence (§4) still validates the request first, so the capability refuses what it refuses for any other client. Every other request, including a foreign client's request on a cloak credential, is encoded from the fenced view.
 
-A generation the cloak may shape whose upstream answers in one JSON body stays on the old arm: restoring its tool aliases and recording its session continuity read the complete body, which §3 forbids collecting. Only the fenced document shows the client's `stream` member, so for it `destination` answers the capability key while `fence`, `refence` and `start` refuse with `Destination`. A streamed generation and every count run on the contract path.
+A generation the cloak may shape whose upstream answers in one JSON body stays on the old arm: restoring its tool aliases and recording its session continuity read the complete body, which §3 forbids collecting. Only the fenced document shows the client's `stream` member, so for it `destination` answers the capability key while `refence` and `start` refuse with `Destination`. A streamed generation and every count run on the contract path.
 
-**G6, routing headers.** `Attempt::headers` is the client's request headers, which the server fills on every attempt. The selector reads them only to decide whether an attempt stays on a provider's old arm (`destination` answers `None`, `fence` and `refence` refuse with `Destination`, `start` refuses), before any byte of the attempt is sent. Request execution reads `Client::headers`. Claude no longer routes by them: G5 gives its executor the client's own body.
+**G6, routing headers.** `Attempt::headers` is the client's request headers, which the server fills on every attempt. The selector reads them only to decide whether an attempt stays on a provider's old arm (`destination` answers `None`, or `refence` and `start` refuse with `Destination`), before any byte of the attempt is sent. Request execution reads `Client::headers`. Claude no longer routes by them: G5 gives its executor the client's own body.
 
 `Request<'a>`, `Attempt<'a>` and `Store` are `Sync`, so a server task may hold them across an await.
 
 ## 4. Fences and failover
 
-1. **Client fence.** Request ingress `finish` validates the complete request against the first attempt's capability and publishes `request.end`. A failure is 400 with no upstream request.
-2. **Re-fence per attempt.** Every attempt, the first included, builds its `Request::validated` with `RequestFence::default().end(client_fence.view(), &capability)` for its own destination. A re-fence failure is an attempt failure with scope `Model`: nothing was sent.
-3. **Q2 policy hook.** Whether a candidate whose capability key differs from the client fence's key is attempted at all is the owner's Q2 ruling: revalidate per destination (step 2 already does this) or restrict failover to the same key. D2 applies it in one predicate in `inference/dispatch.rs`, `fn admits(fenced: &'static str, candidate: &'static str) -> bool`, before step 2, with the fenced key from `ValidatedRequest::destination` and the candidate's key from `Executors::destination`. The predicate's body is the ruling; D2 does not merge without it.
+1. **Client fence (G8).** Request ingress `finish` closes the client fence against `codec::ClientCapability`, whose key is `codec::CLIENT`, and publishes `request.end`. The fence checks the complete document and its media but no destination, so a refused fence publishes a failure for the client's own request, never for one candidate's. No request egress encodes a request validated against this key: `ValidatedRequest::for_destination` refuses it. A failure is answered before candidate selection with no upstream request: 400 for `Json`, `Utf8`, `DuplicateKey`, `Truncated`, `Schema` and `Unsupported`, 413 for `Limit` and `EventTooLarge`.
+2. **Re-fence per attempt.** Every attempt, the first included, builds its `Request::validated` with `RequestFence::default().end(client_fence.view(), &capability)` for its own destination. Only this re-fence authorizes encoding. A re-fence failure is an attempt failure with scope `Model`: nothing was sent.
+3. **Q2.** Every candidate is attempted through step 2, whatever its capability key; failover is not restricted to the client fence's key (owner ruling 2026-11-16).
 
 D1 adds these selector methods:
 
@@ -66,7 +66,8 @@ impl Executors {
     /// The attempt's capability key; `None` while its provider is not converted, in which
     /// case D2 takes the old execution path before fencing.
     pub fn destination(&self, attempt: &Attempt<'_>) -> Option<&'static str>;
-    /// Step 1: closes the client fence against the first attempt's destination.
+    /// Closes a fence against the attempt's destination. The server does not call it: the
+    /// client fence is step 1 (G8). D9 deletes it.
     pub fn fence<'a, I: RequestIngress>(&self, attempt: &Attempt<'_>, ingress: &'a mut I, request: &mut Writer)
         -> codec::Result<ValidatedRequest<'a>>;
     /// Step 2: re-fences the client view for this attempt's destination.
@@ -80,7 +81,7 @@ impl Executors {
 
 ## 5. Producer
 
-`pipeline::Started` is what an attempt yields once the upstream answered: status, headers, the response stream's allocator (`Started::stream`) and the `Producer` task. The producer owns the response stream's producer writer, the upstream body and the response ingress. It drives `upstream bytes -> ResponseIngress -> Writer` on its own task, schedules `flush` at `flush_deadline`, finishes the writer with `Terminal::Done` after the ingress completes, and stops when `Writer::cancelled` resolves. A slow or absent client never slows it.
+`pipeline::Started` is what an attempt yields once the upstream answered: status, headers, the response stream's allocator (`Started::stream`) and the `Producer` task. The producer owns the response stream's producer writer, the upstream body and the response ingress. It drives `upstream bytes -> ResponseIngress -> Writer` on its own task, schedules `flush` at `flush_deadline`, finishes the writer with `Terminal::Done` after the ingress completes, and stops when `Writer::cancelled` resolves. For document streams, a slow or absent client never slows it; live sessions use transport flow control instead (Settled 55).
 
 The producer's output, `Result<(), ExecError>`, is the attempt's routing outcome. `Err` carries the scope the scheduler and cooldown use.
 
@@ -88,7 +89,7 @@ The producer's output, `Result<(), ExecError>`, is the attempt's routing outcome
 
 An `Exchange` is one client request: its `Owner`, its egress `Output` and the request stream's producer writer. `Owner` is the creating `Caller` plus, for an ephemeral client key, its grant's call scope (`sess_...`); a resume must match both. `Output` is the client protocol, operation and `Framing` (`Json`, `Sse`, or Gemini's `JsonArray`), fixed when the exchange starts.
 
-At commitment the exchange finishes the request stream with `Terminal::Done` and becomes a `StreamHandle`, registered under a fresh `StreamId` of 128 random bits. The handle keeps the owner, the output, the response stream's allocator and the request stream's allocator. `StreamId` has no `Debug` or `Display` and travels only in `X-Ck-Stream-Id`.
+`http::egress::deliver` drives one attempt's response stream through the client codec. At commitment the exchange finishes the request stream with `Terminal::Done` and becomes a `StreamHandle`, registered under a fresh `StreamId` of 128 random bits; then the response goes out with `X-Ck-Stream-Id`, the zero cursor in `X-Ck-Stream-Cursor`, the caller's trace, routing and upstream headers, and the first bytes. An attempt whose stream publishes `error` or a terminal before any deliverable byte returns `Failed` with the exchange and an `Uncommitted` reason; the `error` record never reaches the egress. The live body is the resume body from the zero cursor, so SSE events carry `id: v1.e.<n>` from the start. The handle keeps the owner, the output, the response stream's allocator and the request stream's allocator. `StreamId` has no `Debug` or `Display` and travels only in `X-Ck-Stream-Id`.
 
 Resume looks up the handle, authorizes the caller against `StreamHandle::owner` before any cursor lookup, attaches a reader with `Store::reader(response.id(), ..)`, rebuilds the request view (§2) and re-encodes with `StreamHandle::output`. A resume request cannot change the output, select a provider or start an attempt.
 
@@ -100,7 +101,7 @@ Resume looks up the handle, authorizes the caller against `StreamHandle::owner` 
 
 ## 8. Usage
 
-The tracker's input is `CanonicalUsage` and `ResponseFacts`, read from the attempt's response stream by a runtime-owned reader, independently of client delivery, so a resumed or second reader never accounts again. `CanonicalUsage` is the latest canonical `x_ck.usage` snapshot: a later snapshot replaces the earlier one, and `None` is an absent count, not zero. `ResponseFacts` carries the `response.start` model and the last chunk `service_tier`. The Go breakdown is derived from the counts. D3 deletes `parse_body`, `StreamUsage` and the `Tracker::body`/`event` byte parsers.
+The tracker's input is `CanonicalUsage` and `ResponseFacts`, read from the attempt's response stream by a runtime-owned reader, independently of client delivery, so a resumed or second reader never accounts again. `CanonicalUsage` is the latest canonical `x_ck.usage` snapshot: a later snapshot replaces the earlier one, and `None` is an absent count, not zero. `CanonicalUsage` also carries billing dimensions besides the token counts, each in its own unit: the service tier a source reports inside its usage, and the dimensions `usage_snapshot::DIMENSIONS` lists for the source protocol, read from the snapshot's `native` value, so provider fields stay out of the canonical snapshot. The legacy parsers read the same rows from the upstream usage object. The usage record writes them under `dimensions` and leaves out a dimension the upstream did not report. `ResponseFacts` carries the `response.start` model and the last chunk `service_tier`, which takes precedence over the usage tier. The Go breakdown is derived from the counts. D3 deletes `parse_body`, `StreamUsage` and the `Tracker::body`/`event` byte parsers.
 
 **G4, request-side facts.** `Client::usage` is the attempt's `UsageSink`. An executor reports through it only what the canonical stream does not carry: `request` (the body sent upstream, for the reasoning effort), `upstream_model`, `claude_cache`, `round_trip_started`, `first_byte`, and upstream request and response capture through its `CaptureSink`. It never calls a `response_*` method; response usage is the canonical snapshot above.
 
@@ -114,7 +115,7 @@ Commitment is the first deliverable byte the client's `ResponseEgress` emits. Be
 | --- | --- | --- | --- |
 | Client syntax or schema (`Json`, `Utf8`, `DuplicateKey`, `Truncated`, `Schema`) or unsupported semantics (`Unsupported`) at request ingress or the client fence | `codec::Error` | 400 in the client's error shape; no upstream request | not reachable |
 | Client size (`Limit`, `EventTooLarge`) at request ingress | `codec::Error` | 413; no upstream request | not reachable |
-| Re-fence refused for a later attempt | `codec::Error` | attempt failure, scope `Model`; nothing sent | not reachable |
+| Re-fence refused for an attempt | `codec::Error` | attempt failure, scope `Model`; nothing sent | not reachable |
 | `Storage(StorageExhausted)` or `Storage(Io)` while the producer runs | `stream.storage_exhausted`, 503, scope `resource` | resource error to the client; no failover | the stream's terminal, delivered as `error` |
 | `Storage(StorageExhausted)` or `Storage(Io)` in an egress or resume allocation after the producer's terminal | a failure of that one delivery; the stream keeps its terminal | 503 `stream.storage_exhausted`; no failover | that delivery ends its HTTP response with the protocol's error terminal, or with 503 if it has sent nothing yet; other readers and later resumes are unaffected |
 | `Storage(Gone)`: expiry or eviction of a stream the exchange uses | `stream.gone`, 410, scope `resource` | resource error to the client; no failover | attached readers receive `error`; resume answers 410 |
@@ -125,7 +126,8 @@ Commitment is the first deliverable byte the client's `ResponseEgress` emits. Be
 | Producer panic or dropped writer | `stream.producer_lost`, 502, scope `upstream` | attempt failure | delivered as `error` |
 | Explicit client cancel | `Terminal::Cancelled` | nothing is delivered | delivered as the protocol's cancellation where it has one |
 | Shutdown | `Terminal::Shutdown` | the listener's shutdown response; no failover | delivered as the shutdown terminal |
-| Client disconnect | nothing | the reader lease is released; the producer continues | same |
+| Client disconnect on a document stream | nothing | the reader lease is released; the producer continues | same |
+| Client disconnect on a live session or Responses WebSocket turn | Terminal::ClientDisconnected (cancelled, reason client_disconnect) | nothing is delivered | not reachable: the client is gone |
 
 Only an attempt failure before commitment may fail over. The client sees the official API's error shape for its protocol in every row.
 
@@ -139,13 +141,12 @@ D0 declares every module that D1–D3 and the provider units create, so later un
 
 ## 12. Phase E boundary
 
-Phase E extends this contract; it does not change it. It reuses `Attempt`, `Client`, `Body`, the producer and its allocator, `Exchange`, `StreamHandle` and §2–§9 unchanged.
+Phase E extends this contract; it does not change it. It reuses `Attempt`, `Client`, `Body`, the producer and its allocator, `Exchange`, `StreamHandle` and §2–§9 unchanged, except that live-session messages are forwarded as received under transport flow control and only their metadata projection goes through the producer (Settled 55).
 
 - One-shot media operations (images, speech, video create, retrieve and content) keep the `Execute` shape. E adds their `codec::Operation` variants together with the codecs that accept them; `Operation` lives in `codec/mod.rs` and is matched exhaustively in `codec/event.rs`, so the variants land after the codec request-ingress work (R1) merges.
-- Duplex sessions (Realtime, Live, Responses WebSocket) need request-direction admission after the first turn and a retained upstream session. E defines that as its own trait in its own file next to `types.rs`; a session's turns each run as attempts under this contract, and reattachment uses the `StreamHandle` of §6.
+- Duplex sessions (Realtime, Live, Responses WebSocket) need request-direction admission after the first turn and a retained upstream session. E defines that as its own trait in its own file next to `types.rs`; a session's turns each run as attempts under this contract. A client disconnect closes a live session and cancels an in-flight Responses WebSocket turn; neither reattaches (Settled 55, 56).
 
 ## 13. Open for an owner
 
-- **Q2, failover across capabilities.** §4 step 3 fixes where the policy applies; the policy itself needs the ruling.
 - **Q7, Interactions and legacy completions.** No codec exists, so no module is declared for them.
 - **G5, buffered cloaked generations.** They stay on the old arm until an owner decides between allowing the Claude relay to collect a buffered body for tool-alias restore and continuity, and sending every cloaked generation upstream as a stream, which changes its `stream` member.

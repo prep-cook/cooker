@@ -78,6 +78,11 @@ struct Run {
 type Feed = Box<dyn FnMut(&mut ck_stream::Writer, Option<&[u8]>)>;
 
 fn run(source: Source, input: &[u8], client: Client, mode: BodyMode) -> Run {
+    run_in(source, input, client, mode, 13)
+}
+
+/// [`run`], feeding the ingress `step` bytes per advance.
+fn run_in(source: Source, input: &[u8], client: Client, mode: BodyMode, step: usize) -> Run {
     let mut m = Mapped::new();
     let mut ingress: Feed = match source {
         Source::Responses(upstream) => {
@@ -128,11 +133,22 @@ fn run(source: Source, input: &[u8], client: Client, mode: BodyMode) -> Run {
         Client::Anthropic => Box::new(
             anthropic::egress::Egress::new(&mut m.writer, identity(), Operation::Generate, mode, |_| {}).unwrap(),
         ),
-        Client::Responses => {
-            Box::new(responses::egress::Egress::new(&mut m.writer, Operation::Generate, mode, |_, _| {}).unwrap())
-        }
+        Client::Responses => Box::new(
+            responses::egress::Egress::new(
+                &mut m.writer,
+                codec::event::LocalId::new("resp_test").unwrap(),
+                codec::identity::Producer {
+                    provider: codec::event::LocalId::new("test").unwrap(),
+                    credential: [0; 32],
+                },
+                Operation::Generate,
+                mode,
+                |_, _| {},
+            )
+            .unwrap(),
+        ),
     };
-    for chunk in input.chunks(13) {
+    for chunk in input.chunks(step) {
         ingress(&mut m.writer, Some(chunk));
     }
     ingress(&mut m.writer, None);
@@ -326,22 +342,6 @@ fn anthropic_buffered_body_takes_a_late_source_id_and_streaming_keeps_its_own() 
     assert_eq!(start["message"]["id"], format!("msg_s{}", streamed.writer));
 }
 
-#[test]
-fn responses_buffered_body_takes_a_late_source_id_and_streaming_keeps_its_own() {
-    assert_eq!(late_id_body(Client::Responses), "resp_late");
-    let streamed = run(
-        Source::Responses(BodyMode::Streaming),
-        &late_id_stream(),
-        Client::Responses,
-        BodyMode::Streaming,
-    );
-    let events = data(&streamed.output);
-    assert!(events.len() > 2, "{events:?}");
-    for event in events.iter().filter(|event| event.get("response").is_some()) {
-        assert_eq!(event["response"]["id"], format!("resp_s{}", streamed.writer), "{event}");
-    }
-}
-
 /// An Anthropic stream, after a leading ping when `ping`, whose message carries `id` when given.
 fn anthropic_stream(ping: bool, id: Option<&str>) -> Vec<u8> {
     let mut message = json!({"type":"message","role":"assistant","model":"claude","content":[],"usage":{"input_tokens":1,"output_tokens":0}});
@@ -421,25 +421,23 @@ fn chat_stream_without_id() -> Vec<u8> {
 }
 
 #[test]
-fn chat_source_without_an_id_gets_native_ids() {
+fn chat_source_without_an_id_gets_an_anthropic_message_id() {
     let input = chat_stream_without_id();
-    for (client, prefix) in [(Client::Anthropic, "msg_s"), (Client::Responses, "resp_s")] {
-        let buffered = run(Source::Chat, &input, client, BodyMode::Buffered);
-        let body: Value = serde_json::from_slice(&buffered.output).unwrap();
-        assert_eq!(body["id"], format!("{prefix}{}", buffered.writer));
-        let streamed = run(Source::Chat, &input, client, BodyMode::Streaming);
-        let events = data(&streamed.output);
-        let ids: Vec<_> = events
-            .iter()
-            .filter_map(|event| event.get("message").or(event.get("response")))
-            .map(|carrier| carrier["id"].clone())
-            .collect();
-        assert!(!ids.is_empty(), "{events:?}");
-        assert!(
-            ids.iter().all(|id| *id == format!("{prefix}{}", streamed.writer)),
-            "{ids:?}"
-        );
-    }
+    let buffered = run(Source::Chat, &input, Client::Anthropic, BodyMode::Buffered);
+    let body: Value = serde_json::from_slice(&buffered.output).unwrap();
+    assert_eq!(body["id"], format!("msg_s{}", buffered.writer));
+    let streamed = run(Source::Chat, &input, Client::Anthropic, BodyMode::Streaming);
+    let events = data(&streamed.output);
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.get("message"))
+        .map(|message| message["id"].clone())
+        .collect();
+    assert!(!ids.is_empty(), "{events:?}");
+    assert!(
+        ids.iter().all(|id| *id == format!("msg_s{}", streamed.writer)),
+        "{ids:?}"
+    );
     // The premise: ingress marks the stream id it fills in.
     let canonical = run(Source::Chat, &input, Client::Anthropic, BodyMode::Buffered).canonical;
     assert!(canonical.contains("\"synthetic\":[\"id\"]"), "{canonical}");
@@ -469,30 +467,57 @@ fn chat_stream_keeps_the_first_source_id_it_showed() {
     assert_eq!(chunks.last().unwrap()["model"], "m2");
 }
 
-#[test]
-fn responses_buffered_body_takes_a_source_id_from_a_later_chunk() {
-    let input = chat_stream_with_ids(None);
-    let chat = run(Source::Chat, &input, Client::Chat, BodyMode::Buffered);
-    let chat: Value = serde_json::from_slice(&chat.output).unwrap();
-    let responses = run(Source::Chat, &input, Client::Responses, BodyMode::Buffered);
-    let responses: Value = serde_json::from_slice(&responses.output).unwrap();
-    assert_eq!((&chat["id"], &chat["model"]), (&json!("chatcmpl_second"), &json!("m2")));
-    assert_eq!((&responses["id"], &responses["model"]), (&chat["id"], &chat["model"]));
+/// Every response id a Responses client sees: the body's, or that of each streamed event's
+/// `response`.
+fn shown_ids(output: &[u8], mode: BodyMode) -> Vec<Value> {
+    if mode == BodyMode::Buffered {
+        return vec![serde_json::from_slice::<Value>(output).unwrap()["id"].clone()];
+    }
+    data(output)
+        .iter()
+        .filter_map(|event| event.get("response"))
+        .map(|response| response["id"].clone())
+        .collect()
 }
 
 #[test]
-fn responses_body_takes_an_anthropic_message_identity_after_a_ping() {
+fn responses_clients_see_only_the_exchange_id() {
+    let cases = [
+        ("start", Source::Responses(BodyMode::Buffered), body(Some("resp_up"))),
+        ("start", Source::Anthropic, anthropic_stream(false, Some("msg_up"))),
+        (
+            "start after a ping",
+            Source::Anthropic,
+            anthropic_stream(true, Some("msg_up")),
+        ),
+        ("chunk", Source::Chat, chat_stream_with_ids(Some("chatcmpl_first"))),
+        ("later chunk", Source::Chat, chat_stream_with_ids(None)),
+        ("snapshot", Source::Responses(BodyMode::Streaming), late_id_stream()),
+    ];
+    for (case, source, input) in cases {
+        for mode in [BodyMode::Buffered, BodyMode::Streaming] {
+            let output = run(source, &input, Client::Responses, mode).output;
+            let ids = shown_ids(&output, mode);
+            assert!(
+                !ids.is_empty() && ids.iter().all(|id| *id == "resp_test"),
+                "{case}, {mode:?}: {ids:?}"
+            );
+            // A source fed one byte per advance gives the same client bytes.
+            let bytewise = run_in(source, &input, Client::Responses, mode, 1).output;
+            assert_eq!(bytewise, output, "{case}, {mode:?}");
+        }
+    }
+}
+
+#[test]
+fn responses_body_takes_the_model_of_an_anthropic_message_after_a_ping() {
     let input = anthropic_stream(true, Some("msg_real"));
     let buffered = run(Source::Anthropic, &input, Client::Responses, BodyMode::Buffered);
     let body: Value = serde_json::from_slice(&buffered.output).unwrap();
-    assert_eq!((&body["id"], &body["model"]), (&json!("msg_real"), &json!("claude")));
+    assert_eq!(body["model"], "claude");
     let streamed = run(Source::Anthropic, &input, Client::Responses, BodyMode::Streaming);
     let events = data(&streamed.output);
-    // `response.created` follows the ping, so the client keeps the issued id; the model refreshes.
     let responses: Vec<_> = events.iter().filter_map(|event| event.get("response")).collect();
     assert!(responses.len() > 1, "{events:?}");
-    for response in &responses {
-        assert_eq!(response["id"], format!("resp_s{}", streamed.writer), "{response}");
-    }
     assert_eq!(responses.last().unwrap()["model"], "claude");
 }

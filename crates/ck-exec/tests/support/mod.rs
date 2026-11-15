@@ -151,6 +151,23 @@ pub fn identity(direction: Direction) -> Identity {
     }
 }
 
+pub type ResponsesEgress = ck_translate::responses::egress::Egress<fn(&'static str, u64)>;
+
+/// The Responses client egress of the test exchange, whose response id is `resp_test`.
+pub fn responses_egress(
+    stream: &mut Writer,
+    operation: codec::Operation,
+    mode: codec::BodyMode,
+) -> codec::Result<ResponsesEgress> {
+    let id = LocalId::new("resp_test").expect("a valid local id");
+    let provider = LocalId::new("test").expect("a valid local id");
+    let producer = codec::identity::Producer {
+        provider,
+        credential: [0; 32],
+    };
+    ck_translate::responses::egress::Egress::new(stream, id, producer, operation, mode, |_, _| {})
+}
+
 /// Feeds `body` into `ingress` `step` bytes at a time and closes the fence against
 /// `destination`. `owner` is the writer the ingress was created on.
 pub fn fence<'a, I: RequestIngress>(

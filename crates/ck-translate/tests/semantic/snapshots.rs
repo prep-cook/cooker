@@ -164,7 +164,7 @@ fn snapshots_preserve_absence_null_empty_and_unknown_metadata() {
 }
 
 #[test]
-fn snapshots_complete_pending_audio_and_reject_incomplete_tool_json_atomically() {
+fn snapshots_complete_pending_audio_and_reject_contradictions_atomically() {
     for prefix in ["A", "AQ", "AQI", "AQIDB", "AQIDBA", "AQIDBA="] {
         let wire = stream(&[
             json!({"choices":[{"index":0,"delta":{"audio":{"data":prefix}}}]}),
@@ -178,12 +178,6 @@ fn snapshots_complete_pending_audio_and_reject_incomplete_tool_json_atomically()
         json!({"choices":[{"index":0,"delta":{"audio":{"data":"AQ"}}}]}),
         json!({"choices":[{"index":0,"message":{"audio":{"data":"Ag=="},"content":"SHOULD_NOT_ESCAPE"},"finish_reason":"stop"}]}),
     );
-    for arguments in ["{", "{\"x\":"] {
-        reject(
-            json!({"choices":[{"index":0,"delta":{"content":"a","tool_calls":[{"index":0,"id":"a","function":{"name":"f","arguments":"{"}}]}}]}),
-            json!({"choices":[{"index":0,"message":{"content":"aSHOULD_NOT_ESCAPE","tool_calls":[{"id":"a","function":{"arguments":arguments}}]},"finish_reason":"tool_calls"}]}),
-        );
-    }
     reject(
         json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"f","arguments":"{}"}}]}}]}),
         json!({"choices":[{"index":0,"message":{"content":"SHOULD_NOT_ESCAPE","tool_calls":[{"id":"a","custom":{"name":"f","input":"text"}}]},"finish_reason":"tool_calls"}]}),
@@ -219,10 +213,6 @@ fn snapshots_reader_rejects_a_foreign_store() {
 
 #[test]
 fn snapshots_validate_retained_children_of_every_finishing_choice() {
-    reject(
-        json!({"choices":[{"index":0,"delta":{"content":"a"}},{"index":1,"delta":{"tool_calls":[{"index":0,"id":"t","function":{"name":"f","arguments":"{"}}]}}]}),
-        json!({"choices":[{"index":0,"message":{"content":"aSHOULD_NOT_ESCAPE"},"finish_reason":"stop"},{"index":1,"finish_reason":"tool_calls"}]}),
-    );
     reject(
         json!({"choices":[{"index":0,"delta":{"content":"a"}},{"index":1,"delta":{"audio":{"data":"AQ"}}}]}),
         json!({"choices":[{"index":0,"message":{"content":"aSHOULD_NOT_ESCAPE"},"finish_reason":"stop"},{"index":1,"message":{},"finish_reason":"stop"}]}),

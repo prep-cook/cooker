@@ -2,6 +2,7 @@
 //! the payload-rule order it shares with generation, and what each client egress makes of it.
 
 use super::*;
+use ck_core::credential::Credential;
 
 /// A Vertex `countTokens` answer.
 const COUNT: &str =
@@ -100,14 +101,65 @@ async fn count_payload_rules_run_last() {
 
 /// Fences a Gemini client's `operation` request on the Gemini route.
 fn gemini_fence(operation: Operation, body: &str) -> Result<(), codec::Error> {
+    fence_then(&credential("vertex", "http://127.0.0.1:1", KEY), None, operation, body)
+}
+
+/// Fences a Gemini client's `operation` request for `first`, then re-fences it for `next`
+/// as a later attempt.
+fn fence_then(
+    first: &Credential,
+    next: Option<&Credential>,
+    operation: Operation,
+    body: &str,
+) -> Result<(), codec::Error> {
     let streams = Streams::new();
-    let exchange = Exchange::new(credential("vertex", "http://127.0.0.1:1", KEY), MODEL, "/client");
+    let exchange = Exchange::new(first.clone(), MODEL, "/client");
     let attempt = exchange.attempt(&streams.store);
     let mut writer = streams.request();
     let id = identity(Direction::Request);
     let mut ingress = gemini::request::Ingress::new(&mut writer, &streams.store, id, operation, MODEL, LIMIT).unwrap();
     ingress.advance(&mut writer, body.as_bytes()).unwrap();
-    executors().fence(&attempt, &mut ingress, &mut writer).map(drop)
+    let executors = executors();
+    let validated = executors.fence(&attempt, &mut ingress, &mut writer)?;
+    let Some(next) = next else { return Ok(()) };
+    let exchange = Exchange::new(next.clone(), MODEL, "/client");
+    executors
+        .refence(&exchange.attempt(&streams.store), validated.view())
+        .map(drop)
+}
+
+/// A service account; the fence reads no more of it than its presence.
+fn account() -> Credential {
+    let mut credential = credential("vertex", "", "");
+    credential.attributes.remove("api_key");
+    credential.metadata.insert("project_id".into(), json!("proj"));
+    credential
+        .metadata
+        .insert("service_account".into(), json!({"type": "service_account"}));
+    credential
+}
+
+/// Vertex accepts an API key only for generation: a count whose key goes to Google's Vertex
+/// host is refused at the fence, so nothing is sent, and a later attempt on such a key is
+/// skipped. A service account counts; a key for another base is a relay's contract, not
+/// Vertex's.
+#[test]
+fn a_google_api_key_count_is_refused_before_send() {
+    let bases = [
+        "",
+        "https://aiplatform.googleapis.com",
+        "https://us-central1-aiplatform.googleapis.com/v1beta1",
+    ];
+    for base in bases {
+        let key = credential("vertex", base, KEY);
+        let refused = fence_then(&key, None, Operation::CountTokens, GEMINI);
+        assert!(matches!(refused, Err(codec::Error::Unsupported)), "{base}");
+        let skipped = fence_then(&account(), Some(&key), Operation::CountTokens, GEMINI);
+        assert!(matches!(skipped, Err(codec::Error::Unsupported)), "{base}");
+        fence_then(&key, None, Operation::Generate, GEMINI).unwrap();
+    }
+    fence_then(&account(), None, Operation::CountTokens, GEMINI).unwrap();
+    gemini_fence(Operation::CountTokens, GEMINI).unwrap();
 }
 
 /// Cached content changes the count, and Vertex's count request cannot name it: the fence

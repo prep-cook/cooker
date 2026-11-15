@@ -223,21 +223,18 @@ impl<'r> Shape<'r> {
     }
 
     /// The client's model, and the client's request as the old path's default rules read it
-    /// when a default rule does: the upload without the `stream` the egress wrote for a Chat or
-    /// Responses client that sent none (a Gemini client's old baseline had one). Only default
-    /// rules check a baseline, so only they pay for a copy.
-    // ponytail: with default rules the baseline is a second heap body until the rules ran,
-    // because ck_wire::payload reads it as one slice; a payload reader over the upload's scratch
-    // lease would keep it in pool storage.
+    /// (`Rules::baseline`, when a default rule is configured): the upload without the `stream`
+    /// the egress wrote for a Chat or Responses client that sent none (a Gemini client's old
+    /// baseline had one).
     fn baseline(&self, upload: &[u8]) -> (Option<Vec<u8>>, String) {
         let requested = gj::get(upload, "model").str().trim().to_owned();
-        let baseline = ck_wire::payload::Rules::of(self.attempt.cfg).has_defaults().then(|| {
-            let mut baseline = upload.to_vec();
-            if !self.stream_member && self.source != Format::Gemini {
-                drop_stream(&mut baseline);
-            }
-            baseline
-        });
+        let mut baseline = ck_wire::payload::Rules::of(self.attempt.cfg).baseline("", upload);
+        if let Some(baseline) = baseline.as_mut()
+            && !self.stream_member
+            && self.source != Format::Gemini
+        {
+            drop_stream(baseline);
+        }
         (baseline, requested)
     }
 

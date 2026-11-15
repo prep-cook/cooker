@@ -12,7 +12,8 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
 use bytes::Bytes;
 use ck_core::exec::Caller;
-use ck_stream::{Lease, Read, Reader, Writer};
+use ck_stream::{Lease, Read, Reader, Terminal, Writer};
+use ck_translate::codec::event::Kind;
 use ck_translate::codec::{self, RequestView, ResponseEgress};
 
 use super::protocol::response_identity;
@@ -101,6 +102,12 @@ async fn start(rt: &Runtime, caller: Caller, query: &str, headers: &HeaderMap) -
     }
     let mut replay = Replay::open(rt.streams(), attached, cursor).await?;
     let first = replay.catch_up()?;
+    Ok(delivery(replay, first, framing, &id, cursor))
+}
+
+/// A client response delivering `replay` after `cursor`, which `first` begins. Live delivery
+/// and resume answer with the same headers.
+pub(crate) fn delivery(replay: Replay, first: Vec<Bytes>, framing: Framing, id: &StreamId, cursor: Cursor) -> Response {
     let mut response = Response::new(body(replay, first));
     let set = response.headers_mut();
     set.insert(
@@ -117,7 +124,7 @@ async fn start(rt: &Runtime, caller: Caller, query: &str, headers: &HeaderMap) -
         CURSOR_HEADER,
         HeaderValue::from_str(&cursor.to_string()).expect("cursor text"),
     );
-    Ok(response)
+    response
 }
 
 /// The one value of `name`; a repeated header is a client error.
@@ -144,9 +151,10 @@ fn query_cursor(query: &str) -> Result<Option<Cursor>, Failure> {
     Ok(cursor)
 }
 
-/// One resumed delivery: a reader from the stream's first record re-encoded through the
-/// stream's output, with the body before the cursor dropped.
-struct Replay {
+/// One delivery: a reader from the stream's first record encoded through the stream's
+/// output, with the body before the cursor dropped. The live client gets it from the zero
+/// cursor, so a resume re-encodes exactly the bytes the live client got.
+pub(crate) struct Replay {
     response: Writer,
     reader: Reader,
     egress: ProtocolEgress,
@@ -189,6 +197,40 @@ impl Replay {
         })
     }
 
+    /// Live delivery of the response stream `response`, encoded by `egress` from the zero
+    /// cursor.
+    pub(crate) fn live(response: Writer, reader: Reader, egress: ProtocolEgress, framing: Framing) -> Self {
+        Self {
+            response,
+            reader,
+            egress,
+            units: Units::new(framing, Cursor::start(framing)),
+            ended: None,
+        }
+    }
+
+    /// The commitment point (`docs/EXECUTION-CONTRACT.md` §9): encodes records until the
+    /// egress emits deliverable bytes and returns them. Records the egress turns into no bytes,
+    /// such as metadata, deliver nothing. An `error` record ends the attempt before it reaches
+    /// the egress, so a failed attempt never commits.
+    pub(crate) async fn first(&mut self) -> Result<Vec<Bytes>, Uncommitted> {
+        loop {
+            let lease = match self.reader.next().await {
+                Some(Read::Record(lease)) if lease.record().kind == Kind::Error as u32 => {
+                    return Err(Uncommitted::Error);
+                }
+                Some(Read::Record(lease)) => lease,
+                Some(Read::Terminal(terminal)) => return Err(Uncommitted::Terminal(terminal)),
+                None => return Err(Uncommitted::Terminal(Terminal::ProducerLost)),
+            };
+            let mut out = Vec::new();
+            self.advance(lease, &mut out).map_err(Uncommitted::Codec)?;
+            if !out.is_empty() {
+                return Ok(out);
+            }
+        }
+    }
+
     /// Produces the body up to the cursor from the records already published and returns
     /// the bytes past it. A cursor past the published output is a client error.
     fn catch_up(&mut self) -> Result<Vec<Bytes>, Failure> {
@@ -213,7 +255,7 @@ impl Replay {
         }
     }
 
-    fn advance(&mut self, lease: Lease, out: &mut Vec<Bytes>) -> Result<(), Failure> {
+    fn advance(&mut self, lease: Lease, out: &mut Vec<Bytes>) -> codec::Result<()> {
         let Self {
             response,
             egress,
@@ -222,8 +264,7 @@ impl Replay {
         } = self;
         egress.advance(response, lease, |output| {
             units.push(&output, out).map_err(codec::Error::Storage)
-        })?;
-        Ok(())
+        })
     }
 
     /// The next body bytes; `None` at the end, `Some(Err)` to close the body abnormally.
@@ -254,6 +295,17 @@ impl Replay {
             }
         }
     }
+}
+
+/// What ended an attempt before its first deliverable byte. Nothing reached the client.
+#[derive(Debug)]
+pub enum Uncommitted {
+    /// The stream published an `error` record: an upstream or producer failure.
+    Error,
+    /// The stream ended with this terminal and no deliverable byte.
+    Terminal(Terminal),
+    /// The egress failed: storage, or a gateway defect.
+    Codec(codec::Error),
 }
 
 /// The response body. Dropping it, as a client disconnect does, releases only the reader.

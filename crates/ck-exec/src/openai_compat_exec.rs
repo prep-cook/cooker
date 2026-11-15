@@ -322,6 +322,9 @@ async fn send(
     Err(compat::status_error(status, headers, body, true))
 }
 
+/// What `prepare` returns: the body, the payload-rule baseline and the client's model.
+type Prepared = (Vec<u8>, Option<Vec<u8>>, String);
+
 /// What the upload adjustments read besides the upload itself.
 struct Relay<'r> {
     attempt: &'r Attempt<'r>,
@@ -354,7 +357,7 @@ impl<'r> Relay<'r> {
         if stream {
             payload::set_bool_if_different(&mut body, "stream_options.include_usage", true);
         }
-        Ok(self.rules(Format::OpenAI, &original, &requested, body))
+        Ok(self.rules(Format::OpenAI, original, &requested, body))
     }
 
     /// A `/responses/compact` body.
@@ -364,19 +367,20 @@ impl<'r> Relay<'r> {
             body = payload::normalize_tool_results_text_only(body);
         }
         body = payload::sanitize_reasoning_encrypted_content(body);
-        Ok(self.rules(Format::OpenAIResponse, &original, &requested, body))
+        Ok(self.rules(Format::OpenAIResponse, original, &requested, body))
     }
 
     /// The Chat body a local count measures: the generation's body before the relay's
     /// compatibility rewrites.
     fn count(&self, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
         let (body, original, requested) = self.prepare(upload, Format::OpenAI)?;
-        Ok(self.rules(Format::OpenAI, &original, &requested, body))
+        Ok(self.rules(Format::OpenAI, original, &requested, body))
     }
 
     /// Sets the upstream model and applies the suffix's thinking. Returns the body, the
-    /// payload-rule baseline (the upload with the upstream model) and the client's model.
-    fn prepare(&self, mut upload: Vec<u8>, target: Format) -> Result<(Vec<u8>, Vec<u8>, String), ExecError> {
+    /// payload-rule baseline (`Rules::baseline` of the upload with the upstream model) and the
+    /// client's model.
+    fn prepare(&self, mut upload: Vec<u8>, target: Format) -> Result<Prepared, ExecError> {
         let requested = gj::get(&upload, "model").str().trim().to_owned();
         let requested = if requested.is_empty() {
             self.attempt.model.trim().to_owned()
@@ -384,11 +388,12 @@ impl<'r> Relay<'r> {
             requested
         };
         payload::set_str_if_different(&mut upload, "model", &self.base_model);
+        let baseline = ck_wire::payload::Rules::of(self.attempt.cfg).baseline("", &upload);
         let caps = self.attempt.resolved_model.map(|r| ModelCaps::from(&r.info));
         let body = thinking::apply_request_thinking(
             &RequestThinking {
-                payload: Some(&upload[..]),
-                original: Some(&upload[..]),
+                payload: None,
+                original: None,
                 model: self.attempt.model,
                 // The upload is already in the target protocol.
                 from: target.as_str(),
@@ -398,10 +403,10 @@ impl<'r> Relay<'r> {
                 has_request_transformer: false,
                 updates_changed: false,
             },
-            upload.to_vec(),
+            upload,
         )
         .map_err(|e| ExecError::local(400, FailureScope::Request, e.message))?;
-        Ok((body, upload, requested))
+        Ok((body, baseline, requested))
     }
 
     /// `applyPromptCacheKey`: the request's own key, else a Claude Code session's, else one
@@ -430,7 +435,7 @@ impl<'r> Relay<'r> {
     }
 
     /// The configured payload rules, the last change to the body.
-    fn rules(&self, target: Format, original: &[u8], requested: &str, body: Vec<u8>) -> Vec<u8> {
+    fn rules(&self, target: Format, original: Option<Vec<u8>>, requested: &str, body: Vec<u8>) -> Vec<u8> {
         let rules = ck_wire::payload::Rules::of(self.attempt.cfg);
         ck_wire::payload::apply(
             &rules,
@@ -441,7 +446,7 @@ impl<'r> Relay<'r> {
                 protocol: target.as_str(),
                 from_protocol: self.source,
                 root: "",
-                original,
+                original: original.as_deref().unwrap_or_default(),
                 request_path: self.request.client.route,
                 headers: Some(self.request.client.headers),
             },

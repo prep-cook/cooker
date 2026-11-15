@@ -119,7 +119,7 @@ fn failing(input: &[u8], mode: BodyMode, downstream: BodyMode) -> (Vec<u8>, Vec<
     )
     .unwrap();
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-    let mut egress = responses::egress::Egress::new(&mut m.writer, Operation::Generate, downstream, |_, _| {}).unwrap();
+    let mut egress = crate::client_egress(&mut m.writer, Operation::Generate, downstream).unwrap();
     let ingested = ingress
         .advance(&mut m.writer, input)
         .and_then(|()| ingress.finish(&mut m.writer));
@@ -149,7 +149,7 @@ fn failed_response(out: &[u8], downstream: BodyMode) -> Value {
     let events = client_events(out);
     let types: Vec<_> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
     assert_eq!(types, ["response.created", "response.failed"]);
-    assert_eq!(events[0]["response"]["id"], "r");
+    assert_eq!(events[0]["response"]["id"], "resp_test");
     events[1]["response"].clone()
 }
 
@@ -169,7 +169,8 @@ fn failed_responses_keep_their_identity_and_usage() {
             let (out, canonical) = failing(input.as_bytes(), mode, downstream);
             assert!(!format!("{canonical:?}").contains("SENSITIVE"));
             let response = failed_response(&out, downstream);
-            for name in ["id", "model", "created_at"] {
+            assert_eq!(response["id"], "resp_test", "{input}");
+            for name in ["model", "created_at"] {
                 assert_eq!(response[name], failed[name], "{name} {input}");
             }
             assert_eq!(response["usage"], super::sdk::official_usage(&failed["usage"]));
@@ -201,7 +202,8 @@ fn failed_responses_publish_only_their_identity_and_usage() {
             let (out, canonical) = failing(input.as_bytes(), mode, downstream);
             assert!(!format!("{canonical:?}").contains("SENSITIVE"), "{canonical:?}");
             let response = failed_response(&out, downstream);
-            for name in ["id", "object", "created_at", "model"] {
+            assert_eq!(response["id"], "resp_test", "{input}");
+            for name in ["object", "created_at", "model"] {
                 assert_eq!(response[name], failed[name], "{name} {input}");
             }
             assert_eq!(response["usage"], super::sdk::official_usage(&failed["usage"]));
@@ -255,11 +257,11 @@ fn a_heartbeat_before_creation_fixes_no_identity() {
         let events = json_events(&format!("{prefix}{lifecycle}"));
         let created = events.iter().find(|e| e["type"] == "response.created").unwrap();
         assert_eq!(created["response"]["status"], "queued", "{prefix}");
-        // A stream whose only snapshot is the terminal one takes its identity from it.
+        // A stream whose only snapshot is the terminal one still opens with `response.created`.
         let terminal = json_events(&format!("{prefix}{COMPLETED}"));
         assert_eq!(terminal[0]["type"], "response.created");
         for event in events.iter().chain(&terminal).filter(|e| e.get("response").is_some()) {
-            assert_eq!(event["response"]["id"], "r", "{prefix}");
+            assert_eq!(event["response"]["id"], "resp_test", "{prefix}");
         }
     }
 }

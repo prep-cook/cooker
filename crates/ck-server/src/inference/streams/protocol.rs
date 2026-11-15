@@ -52,8 +52,21 @@ impl ProtocolEgress {
                 |_| {},
             )?)),
             Protocol::Responses => {
+                // ponytail: the id derives from the committed response stream, the same for live
+                // delivery and resume, and the producer is a placeholder nothing reads. The state
+                // store (D2-6b) needs one id across attempts and envelopes (D2-6a) need the real
+                // producer; each passes it through `StreamHandle` and `Attached`.
+                let id = codec::identity::ResponseId::new("resp_", stream.id())?
+                    .issued()
+                    .ok_or(codec::Error::Schema)?;
+                let producer = codec::identity::Producer {
+                    provider: LocalId::new("unknown")?,
+                    credential: [0; 32],
+                };
                 let ignore: fn(&'static str, u64) = |_, _| {};
-                Self::Responses(responses::egress::Egress::new(stream, operation, mode, ignore)?)
+                Self::Responses(responses::egress::Egress::new(
+                    stream, id, producer, operation, mode, ignore,
+                )?)
             }
             Protocol::Gemini => {
                 let framing = match output.framing {

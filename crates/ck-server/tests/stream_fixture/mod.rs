@@ -12,7 +12,7 @@ use ck_core::config::Config;
 use ck_core::exec::Caller;
 use ck_server::Runtime;
 use ck_server::http::egress::{Framing, Output, Protocol};
-use ck_server::inference::streams::{Owner, StreamHandle, StreamId};
+use ck_server::inference::streams::{Exchange, Owner, StreamHandle, StreamId};
 use ck_stream::{ManualClock, Store, Terminal, Writer};
 use ck_translate::codec::chat::{request, response};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
@@ -104,7 +104,7 @@ pub fn owner(key: &str) -> Owner {
     }
 }
 
-fn identity(direction: Direction) -> Identity {
+pub fn identity(direction: Direction) -> Identity {
     Identity {
         request_id: LocalId::new("request").unwrap(),
         stream_id: LocalId::new("stream").unwrap(),
@@ -113,24 +113,30 @@ fn identity(direction: Direction) -> Identity {
     }
 }
 
-/// A committed exchange: its producer publishes what the test sends as upstream bytes.
+/// An exchange's attempt: its producer publishes what the test sends as upstream bytes.
 pub struct Live {
+    /// The handle's id once committed.
     pub id: StreamId,
     /// Allocation handle on the response stream, as the runtime's usage reader holds it.
     pub response: Writer,
-    upstream: Option<mpsc::UnboundedSender<Bytes>>,
+    upstream: Option<mpsc::UnboundedSender<Option<Bytes>>>,
     /// The terminal the producer saw: `Done` when it finished the stream itself.
     pub producer: tokio::task::JoinHandle<Terminal>,
 }
 
 impl Live {
     pub fn send(&self, bytes: impl Into<Bytes>) {
-        self.upstream.as_ref().unwrap().send(bytes.into()).unwrap();
+        self.upstream.as_ref().unwrap().send(Some(bytes.into())).unwrap();
     }
 
     /// The upstream body ends: the producer finishes the stream with `Done`.
     pub fn end(&mut self) {
         self.upstream = None;
+    }
+
+    /// The upstream body fails: the producer publishes the upstream failure.
+    pub fn fail(&mut self) {
+        self.upstream.take().unwrap().send(None).unwrap();
     }
 
     /// The producer's terminal; a producer still running after five seconds fails the test.
@@ -146,11 +152,11 @@ impl Live {
     }
 }
 
-/// Runs request ingress, starts one attempt and commits it under a fresh id: the steps D2's
-/// dispatch performs, reduced to what the stream contract fixes.
-pub fn commit(fixture: &Fixture, owner: Owner, framing: Framing, body: &[u8]) -> Live {
+/// Runs request ingress for `body` and starts one attempt with a Chat upstream: the exchange
+/// before commitment. The attempt's id is set at commitment.
+pub fn start(fixture: &Fixture, owner: Owner, output: Output, body: &[u8]) -> (Exchange, Live) {
     let streams = fixture.rt.streams();
-    let (mut request, writer, ingress) = streams
+    let (request, writer, ingress) = streams
         .with_store(|store| {
             let mut request = store.create().unwrap();
             let mut client = request::Ingress::new(
@@ -180,33 +186,42 @@ pub fn commit(fixture: &Fixture, owner: Owner, framing: Framing, body: &[u8]) ->
     let response = writer.allocator();
     let (sender, receiver) = mpsc::unbounded_channel();
     let producer = streams.spawn(produce(ingress, writer, receiver));
-    request.finish(Terminal::Done);
-    let id = StreamId::random();
-    streams.register(StreamHandle {
-        id,
-        owner,
-        output: Output {
-            protocol: Protocol::Chat,
-            operation: Operation::Generate,
-            framing,
-        },
-        response: response.allocator(),
-        request: request.allocator(),
-    });
-    Live {
-        id,
+    let exchange = Exchange { owner, output, request };
+    let live = Live {
+        id: StreamId([0; 16]),
         response,
         upstream: Some(sender),
         producer,
-    }
+    };
+    (exchange, live)
 }
 
-/// D1's producer reduced to the contract: publishes upstream bytes until they end or the
-/// stream stops.
+/// [`start`] for a Chat client, committed at once under a fresh id.
+pub fn commit(fixture: &Fixture, owner: Owner, framing: Framing, body: &[u8]) -> Live {
+    let output = Output {
+        protocol: Protocol::Chat,
+        operation: Operation::Generate,
+        framing,
+    };
+    let (mut exchange, mut live) = start(fixture, owner, output, body);
+    exchange.request.finish(Terminal::Done);
+    live.id = StreamId::random();
+    fixture.rt.streams().register(StreamHandle {
+        id: live.id,
+        owner: exchange.owner,
+        output,
+        response: live.response.allocator(),
+        request: exchange.request.allocator(),
+    });
+    live
+}
+
+/// D1's producer reduced to the contract: publishes upstream bytes until they end, fail or
+/// the stream stops.
 async fn produce(
     mut ingress: response::Ingress,
     mut writer: Writer,
-    mut upstream: mpsc::UnboundedReceiver<Bytes>,
+    mut upstream: mpsc::UnboundedReceiver<Option<Bytes>>,
 ) -> Terminal {
     let stopped = writer.cancelled();
     tokio::pin!(stopped);
@@ -214,7 +229,18 @@ async fn produce(
         tokio::select! {
             terminal = &mut stopped => return terminal,
             bytes = upstream.recv() => match bytes {
-                Some(bytes) => ingress.advance(&mut writer, &bytes).unwrap(),
+                // Held output is flushed at once, as the producer does once its deadline passed.
+                Some(Some(bytes)) => {
+                    ingress.advance(&mut writer, &bytes).unwrap();
+                    if ingress.flush_deadline().is_some() {
+                        ingress.flush(&mut writer).unwrap();
+                    }
+                }
+                Some(None) => {
+                    ingress.fail(&mut writer, 502, "upstream").unwrap();
+                    writer.finish(Terminal::UpstreamError);
+                    return Terminal::UpstreamError;
+                }
                 None => {
                     ingress.finish(&mut writer).unwrap();
                     writer.finish(Terminal::Done);

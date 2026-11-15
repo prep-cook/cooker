@@ -55,19 +55,14 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         super::super::merge(doc, doc.root(), node)
     }
 
-    /// Restores the native identity; `response.created` is owed until `created` publishes it.
-    /// Fields the source did not supply keep the response's own values.
+    /// Restores the source's model, creation time and status; `response.created` is owed until
+    /// `created` publishes it. Fields the source did not supply keep the response's own values,
+    /// and the exchange id stays.
     pub(super) fn response_start(&mut self, incoming: Document) -> Result<()> {
         let doc = &mut self.document;
         let target = doc.root();
         let node = doc.absorb(incoming)?;
-        self.id.start(doc, node)?;
-        for (from, to) in [
-            ("id", "id"),
-            ("model", "model"),
-            ("created", "created_at"),
-            ("status", "status"),
-        ] {
+        for (from, to) in [("model", "model"), ("created", "created_at"), ("status", "status")] {
             if let Some(value) = doc.remove(node, from)?
                 && !codec::identity::synthetic(doc, node, from)?
             {
@@ -79,8 +74,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         Ok(())
     }
 
-    /// Absorbs a canonical record. A chunk's root `model` replaces the response's, and its `id`
-    /// does under [`codec::identity::ResponseId`]'s rule.
+    /// Absorbs a canonical record. A chunk's root `model` replaces the response's; its `id` does
+    /// not replace the exchange id.
     pub(super) fn absorb(&mut self, kind: Kind, incoming: Document) -> Result<usize> {
         let node = self.document.absorb(incoming)?;
         if kind != Kind::Chunk {
@@ -88,12 +83,6 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         }
         let doc = &mut self.document;
         let root = doc.root();
-        if let Some(id) = doc.member(node, "id")?
-            && self.id.adopts(doc, id, self.sequence > 0)?
-        {
-            let target = doc.set(root, "id", Value::Null)?;
-            doc.transplant(target, id)?;
-        }
         if let Some(model) = doc.member(node, "model")? {
             let target = doc.set(root, "model", Value::Null)?;
             doc.transplant(target, model)?;
@@ -183,11 +172,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             let node = doc.absorb(incoming)?;
             let value = doc.required(node, "value")?;
             super::super::opaque::preserve_carrier_collision(doc, value)?;
-            if let Some(id) = doc.member(value, "id")?
-                && !self.id.adopts(doc, id, self.sequence > 0)?
-            {
-                doc.remove(value, "id")?;
-            }
+            // The snapshot's own id never replaces the exchange id.
+            doc.remove(value, "id")?;
             super::super::merge(doc, doc.root(), value)?;
             // Every snapshot carries the native identity, so the owed `response.created` follows
             // its merge rather than a synthesized start.

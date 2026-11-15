@@ -199,29 +199,25 @@ pub(crate) fn apply_summary_config_for_provider(
     match format.as_str() {
         "openai" => {
             if is_openrouter(provider) || json::get(&body, "reasoning.exclude").is_bool() {
-                body = with_bool(&body, "reasoning.exclude", !enabled);
+                body = with_bool(body, "reasoning.exclude", !enabled);
             }
             if json::get(&body, "include_reasoning").is_bool() {
-                body = with_bool(&body, "include_reasoning", enabled);
+                body = with_bool(body, "include_reasoning", enabled);
             }
         }
         "claude" => {
             if enabled && !json::get(&body, "thinking.type").exists() {
-                body = enable_claude_thinking_for_summary(&body, model, info);
+                body = enable_claude_thinking_for_summary(body, model, info);
             }
             if !claude_accepts_display(&body) {
                 return body;
             }
-            body = with_str(
-                &body,
-                "thinking.display",
-                if enabled { "summarized" } else { "omitted" },
-            );
+            body = with_str(body, "thinking.display", if enabled { "summarized" } else { "omitted" });
         }
         "gemini" | "antigravity" => {
             let prefix = if format == "antigravity" { "request." } else { "" };
             body = with_bool(
-                &body,
+                body,
                 &format!("{prefix}generationConfig.thinkingConfig.includeThoughts"),
                 enabled,
             );
@@ -239,26 +235,26 @@ pub(crate) fn apply_summary_config_for_provider(
                 ]
             };
             for path in aliases {
-                body = without(&body, path);
+                body = without(body, path);
             }
         }
         "interactions" => {
             body = with_str(
-                &body,
+                body,
                 "generation_config.thinking_summaries",
                 if enabled { "auto" } else { "none" },
             );
-            body = without(&body, "generation_config.thinkingSummaries");
+            body = without(body, "generation_config.thinkingSummaries");
         }
         "openai-response" | "codex" => {
             if enabled {
-                body = with_str(&body, "reasoning.summary", normalized_detail(&config.detail));
-                body = without(&body, "reasoning.generate_summary");
+                body = with_str(body, "reasoning.summary", normalized_detail(&config.detail));
+                body = without(body, "reasoning.generate_summary");
             } else {
-                body = without(&body, "reasoning.summary");
-                body = without(&body, "reasoning.generate_summary");
+                body = without(body, "reasoning.summary");
+                body = without(body, "reasoning.generate_summary");
                 if is_empty_object(&body, "reasoning") {
-                    body = without(&body, "reasoning");
+                    body = without(body, "reasoning");
                 }
             }
         }
@@ -366,63 +362,62 @@ fn responses_summary(body: &[u8], path: &str) -> Option<SummaryConfig> {
 
 /// Removes adaptive Claude thinking that only a summary-only request activated, when
 /// the bound model supports manual extended thinking only.
-pub(crate) fn strip_inferred_claude_summary_activation(body: &[u8], info: Option<&ModelCaps>) -> Vec<u8> {
+pub(crate) fn strip_inferred_claude_summary_activation(mut body: Vec<u8>, info: Option<&ModelCaps>) -> Vec<u8> {
     let Some(support) = info.and_then(|i| i.thinking.as_ref()) else {
-        return body.to_vec();
+        return body;
     };
     if !support.levels.is_empty() || support.min <= 0 {
-        return body.to_vec();
+        return body;
     }
-    if !json::get(body, "thinking.type").str().trim().go_eq_fold("adaptive") {
-        return body.to_vec();
+    if !json::get(&body, "thinking.type").str().trim().go_eq_fold("adaptive") {
+        return body;
     }
-    let mut body = body.to_vec();
     for path in [
         "thinking.type",
         "thinking.budget_tokens",
         "thinking.display",
         "output_config.effort",
     ] {
-        body = without(&body, path);
+        body = without(body, path);
     }
     for path in ["thinking", "output_config"] {
         if is_empty_object(&body, path) {
-            body = without(&body, path);
+            body = without(body, path);
         }
     }
     body
 }
 
-fn enable_claude_thinking_for_summary(body: &[u8], model: &str, resolved: Option<&ModelCaps>) -> Vec<u8> {
+fn enable_claude_thinking_for_summary(body: Vec<u8>, model: &str, resolved: Option<&ModelCaps>) -> Vec<u8> {
     let looked_up;
     let info = match resolved {
         Some(info) => Some(info),
         None => {
             let mut base = parse_suffix(model).model_name;
             if base.is_empty() {
-                base = parse_suffix(&json::get(body, "model").str()).model_name;
+                base = parse_suffix(&json::get(&body, "model").str()).model_name;
             }
             looked_up = lookup_model_info(&base, "claude");
             looked_up.as_ref()
         }
     };
     let Some(support) = info.and_then(|i| i.thinking.as_ref()) else {
-        return body.to_vec();
+        return body;
     };
     if !support.levels.is_empty() {
         let body = with_str(body, "thinking.type", "adaptive");
-        return without(&body, "thinking.budget_tokens");
+        return without(body, "thinking.budget_tokens");
     }
     let budget = support.min;
     if budget <= 0 {
-        return body.to_vec();
+        return body;
     }
-    let max_tokens = json::get(body, "max_tokens");
+    let max_tokens = json::get(&body, "max_tokens");
     if max_tokens.exists() && max_tokens.int() <= budget {
-        return body.to_vec();
+        return body;
     }
     let body = with_str(body, "thinking.type", "enabled");
-    with_int(&body, "thinking.budget_tokens", budget)
+    with_int(body, "thinking.budget_tokens", budget)
 }
 
 fn normalized_detail(detail: &str) -> &'static str {

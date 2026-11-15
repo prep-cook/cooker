@@ -108,7 +108,6 @@ pub enum ErrorCode {
     InvalidSuffix,
     UnknownLevel,
     ThinkingNotSupported,
-    LevelNotSupported,
     BudgetOutOfRange,
     ProviderMismatch,
 }
@@ -119,7 +118,6 @@ impl ErrorCode {
             Self::InvalidSuffix => "INVALID_SUFFIX",
             Self::UnknownLevel => "UNKNOWN_LEVEL",
             Self::ThinkingNotSupported => "THINKING_NOT_SUPPORTED",
-            Self::LevelNotSupported => "LEVEL_NOT_SUPPORTED",
             Self::BudgetOutOfRange => "BUDGET_OUT_OF_RANGE",
             Self::ProviderMismatch => "PROVIDER_MISMATCH",
         }
@@ -336,9 +334,9 @@ pub fn get_thinking_text(part: &json::Res<'_>) -> Vec<u8> {
 }
 
 /// `StripThinkingConfig`: removes the provider's thinking fields.
-pub fn strip_thinking_config(body: &[u8], provider: &str) -> Vec<u8> {
-    if body.is_empty() || !json::valid(body) {
-        return body.to_vec();
+pub fn strip_thinking_config(mut body: Vec<u8>, provider: &str) -> Vec<u8> {
+    if body.is_empty() || !json::valid(&body) {
+        return body;
     }
     let paths: &[&str] = match provider {
         "claude" => &["thinking", "output_config.effort"],
@@ -357,44 +355,39 @@ pub fn strip_thinking_config(body: &[u8], provider: &str) -> Vec<u8> {
         "openai" => &["reasoning_effort", "reasoning"],
         "kimi" | "kimi-ai" | "kimi.ai" | "kimi.com" => &["reasoning_effort", "thinking"],
         "codex" | "xai" => &["reasoning"],
-        _ => return body.to_vec(),
+        _ => return body,
     };
-    let mut result = body.to_vec();
     for path in paths {
-        json::delete(&mut result, path);
+        json::delete(&mut body, path);
     }
-    if provider == "claude" && is_empty_object(&result, "output_config") {
-        json::delete(&mut result, "output_config");
+    if provider == "claude" && is_empty_object(&body, "output_config") {
+        json::delete(&mut body, "output_config");
     }
-    result
+    body
 }
 
-/// `sjson.SetBytes(body, path, string)` on a copy, keeping `body` when sjson errors.
-pub(crate) fn with_str(body: &[u8], path: &str, value: &str) -> Vec<u8> {
-    let mut out = body.to_vec();
-    json::set_str(&mut out, path, value);
-    out
+/// `sjson.SetBytes(body, path, string)`, edited in place; the body is kept when sjson errors.
+pub(crate) fn with_str(mut body: Vec<u8>, path: &str, value: &str) -> Vec<u8> {
+    json::set_str(&mut body, path, value);
+    body
 }
 
 /// `sjson.SetBytes(body, path, int)`.
-pub(crate) fn with_int(body: &[u8], path: &str, value: i64) -> Vec<u8> {
-    let mut out = body.to_vec();
-    json::set_int(&mut out, path, value);
-    out
+pub(crate) fn with_int(mut body: Vec<u8>, path: &str, value: i64) -> Vec<u8> {
+    json::set_int(&mut body, path, value);
+    body
 }
 
 /// `sjson.SetBytes(body, path, bool)`.
-pub(crate) fn with_bool(body: &[u8], path: &str, value: bool) -> Vec<u8> {
-    let mut out = body.to_vec();
-    json::set_bool(&mut out, path, value);
-    out
+pub(crate) fn with_bool(mut body: Vec<u8>, path: &str, value: bool) -> Vec<u8> {
+    json::set_bool(&mut body, path, value);
+    body
 }
 
 /// `sjson.DeleteBytes(body, path)`.
-pub(crate) fn without(body: &[u8], path: &str) -> Vec<u8> {
-    let mut out = body.to_vec();
-    json::delete(&mut out, path);
-    out
+pub(crate) fn without(mut body: Vec<u8>, path: &str) -> Vec<u8> {
+    json::delete(&mut body, path);
+    body
 }
 
 /// `result.Exists() && result.IsObject() && len(result.Map()) == 0` at `path`.
@@ -471,14 +464,14 @@ pub(crate) fn strip_responses_effort(body: Vec<u8>) -> Vec<u8> {
     if body.is_empty() || !json::valid(&body) || !json::get(&body, "reasoning.effort").exists() {
         return body;
     }
-    let Ok(mut result) = json::try_delete(&body, "reasoning.effort") else {
-        return body;
-    };
-    if is_empty_object(&result, "reasoning") {
-        json::delete(&mut result, "reasoning");
+    let mut body = body;
+    if json::delete(&mut body, "reasoning.effort") && is_empty_object(&body, "reasoning") {
+        json::delete(&mut body, "reasoning");
     }
-    result
+    body
 }
 
+#[cfg(test)]
+mod alloc_tests;
 #[cfg(test)]
 mod tests;

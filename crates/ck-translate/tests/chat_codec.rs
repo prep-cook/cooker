@@ -28,6 +28,8 @@ mod request_media;
 #[path = "semantic/request_reader.rs"]
 mod request_reader;
 
+#[path = "semantic/openai_boundary.rs"]
+mod openai_boundary;
 #[path = "semantic/ownership.rs"]
 mod ownership;
 #[path = "semantic/provenance.rs"]

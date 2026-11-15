@@ -15,6 +15,12 @@ use super::{
 };
 use decode::string_eq;
 
+/// True when `error` says scanned text is not JSON, as opposed to a storage, position or
+/// size failure. Model-generated tool arguments may be such text.
+pub(crate) fn not_json(error: &Error) -> bool {
+    matches!(error, Error::Json | Error::DuplicateKey | Error::Truncated)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
     Object,

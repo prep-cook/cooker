@@ -46,7 +46,8 @@ fn recorded_buffered_responses_preserve_items_usage_and_terminal_status() {
                         .unwrap()["response"]
                         .clone()
                 };
-                assert_eq!(projected["id"], body["id"], "{} id", fixture["name"]);
+                // The exchange id replaces the recorded one.
+                assert_eq!(projected["id"], "resp_test", "{} id", fixture["name"]);
                 assert_eq!(
                     projected.get("usage"),
                     body.get("usage").map(super::sdk::official_usage).as_ref(),

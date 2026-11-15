@@ -253,7 +253,10 @@ fn recursive_unknowns_keep_stable_parents_and_literal_controls_stay_data() {
 #[test]
 fn trusted_session_provider_and_server_controls_fail_generic_chat_fence() {
     for key in ["session", "provider_parameters", "tools"] {
-        let (mut mapped, mut doc, _) = canonical(&json!({"model":"m","messages":[]}), &ChatCapability);
+        let (mut mapped, mut doc, _) = canonical(
+            &json!({"model":"m","messages":[{"role":"user","content":"hi"}]}),
+            &ChatCapability,
+        );
         let x = doc.required(doc.root(), "x_ck").unwrap();
         let container = doc
             .set(x, key, if key == "tools" { Value::Array } else { Value::Object })
@@ -326,8 +329,7 @@ fn late_cache_policy_rejection_never_publishes_success() {
 
 #[test]
 fn legacy_cache_pointer_and_custom_text_history_keep_native_spelling() {
-    let legacy =
-        json!({"model":"m","messages":[],"functions":[{"name":"f","cache_control":{"type":"ephemeral","ttl":"1h"}}]});
+    let legacy = json!({"model":"m","messages":[{"role":"user","content":"hi"}],"functions":[{"name":"f","cache_control":{"type":"ephemeral","ttl":"1h"}}]});
     let (mut mapped, doc, _) = canonical(&legacy, &ChatCapability);
     let x = doc.required(doc.root(), "x_ck").unwrap();
     let cache = doc.required(x, "cache_control").unwrap();

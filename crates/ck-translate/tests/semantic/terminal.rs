@@ -72,10 +72,9 @@ fn malformed_transport_json_and_provider_errors_never_finish_successfully() {
 }
 
 #[test]
-fn incomplete_successful_tool_json_and_identity_contradictions_are_rejected() {
+fn tool_identity_contradictions_are_rejected() {
     let start = "data: {\"id\":\"r\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n";
     for delta in [
-        serde_json::json!({}),
         serde_json::json!({"tool_calls":[{"index":0,"id":"call-b","function":{"arguments":"}"}}]}),
         serde_json::json!({"tool_calls":[{"index":0,"function":{"name":"g","arguments":"}"}}]}),
         serde_json::json!({"tool_calls":[{"index":0,"type":"custom","function":{"arguments":"}"}}]}),
@@ -87,8 +86,6 @@ fn incomplete_successful_tool_json_and_identity_contradictions_are_rejected() {
             false,
         );
     }
-    let incomplete = serde_json::json!({"id":"r","model":"m","created":1,"choices":[{"index":0,"message":{"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{"}}]},"finish_reason":"tool_calls"}]});
-    rejected(incomplete.to_string().as_bytes(), BodyMode::Buffered, false);
 }
 
 /// The data of the first `kind` event; frames carry an `id:` line before `data:`.

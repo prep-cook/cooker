@@ -1,7 +1,8 @@
 //! Differential tests against `tests/fixtures/gemini_go.json`, produced by the real Go
 //! Gemini and Interactions executors (tests/reference/gemini). Each scenario replays the
 //! scripted upstream answer to the Rust executor and compares the raw upstream request,
-//! the output, the client stream bytes and errors. Expected values come only from Go.
+//! the output, the client stream bytes and errors. Unsupported effort expectations follow
+//! the 2026-11-15 owner ruling instead of Go's rejection.
 
 use std::sync::{Arc, Mutex};
 
