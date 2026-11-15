@@ -173,13 +173,26 @@ async fn a_responses_client_matches_the_old_path() {
 }
 
 /// String input and string message content reach Meta as the old path sent them: a Responses
-/// client's string `input` as one `input_text` part and its own messages as sent; every other
-/// client's string content as one text part (`output_text` for the assistant).
+/// client's string `input`, however long, as one `input_text` part and its own messages as
+/// sent, a one-message untyped array included; every other client's string content as one
+/// text part (`output_text` for the assistant).
 // The old path's Chat and Anthropic translators also default `reasoning.effort` to `medium`;
 // only the input is compared for them.
 #[tokio::test]
 async fn string_input_and_content_match_the_old_path() {
+    let long = format!(r#"{{"model":"client-model","input":"{}"}}"#, "a".repeat(30_000));
     let bodies = [
+        ("responses", Format::OpenAIResponse, long.as_str()),
+        (
+            "responses",
+            Format::OpenAIResponse,
+            r#"{"model":"client-model","input":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "responses",
+            Format::OpenAIResponse,
+            r#"{"model":"client-model","input":[{"role":"user","content":"hi","input":"x"}]}"#,
+        ),
         (
             "responses",
             Format::OpenAIResponse,
@@ -373,6 +386,17 @@ fn apply_patch_is_found_only_where_it_is_declared_chosen_or_called() {
         format!(r#"{{"model":"m","input":"hi","tools":[{lookup}]}}"#),
         // An unknown request field.
         format!(r#"{{"model":"m","input":"hi","x_extra":{patch}}}"#),
+        // A custom tool's own extension member.
+        format!(
+            r#"{{"model":"m","input":"hi","tools":[{{"type":"custom","name":"lookup","format":{{"type":"text"}},"tools":[{patch}]}}]}}"#
+        ),
+        // A function tool's, and a named choice's.
+        format!(
+            r#"{{"model":"m","input":"hi","tools":[{{"type":"function","name":"lookup","parameters":{{}},"children":[{patch}]}}]}}"#
+        ),
+        format!(
+            r#"{{"model":"m","input":"hi","tools":[{{"type":"custom","name":"lookup"}}],"tool_choice":{{"type":"custom","name":"lookup","tools":[{patch}]}}}}"#
+        ),
     ];
     for body in &not_patch {
         assert_eq!(
@@ -408,6 +432,16 @@ fn apply_patch_is_found_only_where_it_is_declared_chosen_or_called() {
             format!(r#"{{"model":"m","input":[{{"type":"additional_tools","tools":[{custom}]}},{{"role":"user","content":"hi"}}]}}"#),
         ),
         ("responses", format!(r#"{{"model":"m","input":"hi","tool_choice":{patch}}}"#)),
+        (
+            "responses",
+            format!(r#"{{"model":"m","input":"hi","tools":[{{"type":"namespace","name":"fs","children":[{custom}]}}]}}"#),
+        ),
+        (
+            "responses",
+            format!(
+                r#"{{"model":"m","input":"hi","tools":[{{"type":"function","name":"lookup","parameters":{{}}}}],"tool_choice":{{"type":"allowed_tools","mode":"auto","tools":[{patch}]}}}}"#
+            ),
+        ),
         (
             "chat",
             r#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"c1","type":"custom","custom":{"name":"apply_patch","input":"*** Begin Patch"}}]},{"role":"tool","tool_call_id":"c1","content":"ok"}]}"#.into(),

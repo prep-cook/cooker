@@ -190,32 +190,21 @@ fn encode(
 }
 
 /// `prepareResponsesRequest` on the encoded upload, whose `stream` the egress already wrote:
-/// true for generation, false for the body a count measures.
+/// true for generation, false for the body a count measures. The upload is the one body, edited
+/// in place.
 fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
     let document = request.validated.view().document;
     let source = source(document).map_err(encoding)?;
-    let mut original = crate::codex_upload::require(upload);
-    content_parts(&mut original, document, source).map_err(encoding)?;
-    let requested = gj::get(&original, "model").str().trim().to_owned();
+    let mut body = crate::codex_upload::require(upload);
+    if source != Format::OpenAIResponse || string_input(document).map_err(encoding)? {
+        text_parts(&mut body);
+    }
+    let requested = gj::get(&body, "model").str().trim().to_owned();
     let rules = ck_wire::payload::Rules::from_config(attempt.cfg);
     let base_model = parse_suffix(attempt.model).model_name;
     let caps = attempt.resolved_model.map(|r| ModelCaps::from(&r.info));
-    let mut body = apply_request_thinking(
-        &RequestThinking {
-            payload: Some(&original[..]),
-            original: Some(&original[..]),
-            model: attempt.model,
-            from: Format::Codex.as_str(),
-            to: Format::Codex.as_str(),
-            provider: PROVIDER,
-            resolved: caps.as_ref().map(Some),
-            has_request_transformer: false,
-            updates_changed: false,
-        },
-        original.clone(),
-    )
-    .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
-    let original = baseline(&rules, original);
+    let original = baseline(&rules, &body);
+    let mut body = think(attempt.model, caps.as_ref(), body)?;
     meta::set_string_if_different(&mut body, "model", &base_model);
     for key in [
         "generate",
@@ -253,78 +242,131 @@ fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Resul
     ))
 }
 
-/// The upload before thinking, kept only for the payload rules that read it (`default` and
-/// `default-raw`); otherwise it is released before the rest of the shaping.
-fn baseline(rules: &ck_wire::payload::Rules, original: Vec<u8>) -> Option<Vec<u8>> {
-    rules.has_defaults().then_some(original)
+/// The model suffix's thinking on the upload, which is also the request it reads: the upload
+/// comes back edited, or as it was in the same allocation.
+fn think(model: &str, caps: Option<&ModelCaps>, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
+    let request = RequestThinking {
+        payload: None,
+        original: None,
+        model,
+        from: Format::Codex.as_str(),
+        to: Format::Codex.as_str(),
+        provider: PROVIDER,
+        resolved: caps.map(Some),
+        has_request_transformer: false,
+        updates_changed: false,
+    };
+    apply_request_thinking(&request, upload).map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))
 }
 
-/// The old path's content parts (its request translators): every message's string content
-/// becomes one text part, `output_text` for the assistant and `input_text` otherwise. A
-/// Responses client's own messages stay as sent; only its string `input` became a part.
-fn content_parts(body: &mut Vec<u8>, doc: &Document, source: Format) -> codec::Result<()> {
-    if source == Format::OpenAIResponse && !string_input(doc)? {
-        return Ok(());
-    }
-    let mut parts = Vec::new();
-    for (i, item) in gj::get(body, "input").array().iter().enumerate() {
-        let content = item.get("content");
-        if content.kind != gj::Kind::String || !matches!(&*item.get("type").bytes(), b"message" | b"") {
-            continue;
-        }
-        let kind = if &*item.get("role").bytes() == b"assistant" {
-            "output_text"
+/// The upload before thinking, for the payload rules that read it (`default` and
+/// `default-raw`); without them there is none.
+// ponytail: a heap copy, because the rules look its paths up in one contiguous body and a
+// scratch lease is split at `FRAME_BYTES`. Keeping it in the pool needs a segmented reader in
+// ck_wire::json.
+fn baseline(rules: &ck_wire::payload::Rules, body: &[u8]) -> Option<Vec<u8>> {
+    rules.has_defaults().then(|| body.to_vec())
+}
+
+/// The old path's content parts (its request translators): every message item's string content
+/// becomes one text part, `output_text` for the assistant and `input_text` otherwise. The body
+/// grows once and its bytes move back to front; only the contents' offsets are collected.
+fn text_parts(body: &mut Vec<u8>) {
+    const CLOSE: &[u8] = b"}]";
+    let open = |assistant: bool| -> &'static [u8] {
+        if assistant {
+            br#"[{"type":"output_text","text":"#
         } else {
-            "input_text"
-        };
-        let mut part = format!(r#"[{{"type":"{kind}","text":""}}]"#).into_bytes();
-        gj::set_str(&mut part, "0.text", content.bytes());
-        parts.push((format!("input.{i}.content"), part));
-    }
-    for (path, part) in parts {
-        gj::set_raw(body, &path, part);
-    }
-    Ok(())
-}
-
-/// Whether a Responses client sent `input` as a string: its one message besides the
-/// instructions is the user's string, which no item `type` was kept for.
-// ponytail: an untyped one-item `input` array holding the user's string has the same canonical
-// form, so it gets the part too; the old path kept it a string, which Meta reads the same.
-fn string_input(doc: &Document) -> codec::Result<bool> {
-    let root = doc.root();
-    let (mut typed, mut instructions) = (Vec::new(), Vec::new());
-    if let Some(x) = doc.member(root, "x_ck")?
-        && let Some(original) = doc.member(x, "original")?
-    {
-        for entry in doc.children(original)? {
-            // An entry names the member it keeps with a pointer into its message.
-            if let Some((target, _)) = doc.origin(entry)?
-                && let Some(pointer) = doc.member(entry, "pointer")?
-            {
-                if doc.string_is(pointer, "/type")? {
-                    typed.push(target);
+            br#"[{"type":"input_text","text":"#
+        }
+    };
+    let base = body.as_ptr().addr();
+    let mut contents = Vec::new();
+    gj::get(body, "input").each(|_, item| {
+        if let Some((content, assistant)) = string_content(item.raw()) {
+            let start = content.as_ptr().addr() - base;
+            contents.push((start, start + content.len(), assistant));
+        }
+        true
+    });
+    let mut read = body.len();
+    let grown: usize = contents.iter().map(|&(.., a)| open(a).len() + CLOSE.len()).sum();
+    body.resize(read + grown, 0);
+    let mut write = body.len();
+    for &(start, end, assistant) in contents.iter().rev() {
+        write -= read - end;
+        body.copy_within(end..read, write);
+        for piece in [Err(CLOSE), Ok(start..end), Err(open(assistant))] {
+            match piece {
+                Ok(text) => {
+                    write -= text.len();
+                    body.copy_within(text, write);
                 }
-                if doc.string_is(pointer, "/instructions")? {
-                    instructions.push(target);
+                Err(literal) => {
+                    write -= literal.len();
+                    body[write..write + literal.len()].copy_from_slice(literal);
                 }
             }
         }
+        read = start;
     }
-    let messages = objects(doc, doc.member(root, "messages")?)?;
-    let rest: Vec<usize> = messages.into_iter().filter(|m| !instructions.contains(m)).collect();
-    let [message] = rest[..] else {
+    debug_assert_eq!(read, write);
+}
+
+/// The string content of message item `item`, untyped or of type `message`, and whether the
+/// assistant sent it; read in place.
+fn string_content(item: &[u8]) -> Option<(&[u8], bool)> {
+    let (mut kind, mut role, mut content) = (None, None, None);
+    gj::object_members(item, |key, escaped, value| {
+        let key: std::borrow::Cow<'_, [u8]> = if escaped { gj::unescape(key).into() } else { key.into() };
+        // The first of duplicate members wins, as the old path's reads.
+        let slot = match &*key {
+            b"type" => &mut kind,
+            b"role" => &mut role,
+            b"content" => &mut content,
+            _ => return true,
+        };
+        slot.get_or_insert(value);
+        true
+    });
+    let message = kind.is_none_or(|k| k == b"null" || text_is_raw(k, b"message") || text_is_raw(k, b""));
+    let content = content.filter(|c| c.first() == Some(&b'"'))?;
+    message.then(|| (content, role.is_some_and(|r| text_is_raw(r, b"assistant"))))
+}
+
+/// Whether the raw JSON value `raw` is the string `want`.
+fn text_is_raw(raw: &[u8], want: &[u8]) -> bool {
+    let Some(inner) = raw.strip_prefix(b"\"").and_then(|r| r.strip_suffix(b"\"")) else {
+        return false;
+    };
+    if inner.contains(&b'\\') {
+        gj::unescape(inner) == want
+    } else {
+        inner == want
+    }
+}
+
+/// Whether a Responses client sent `input` as a string: Responses ingress marks the content
+/// that string became with an `/input` original bound to it.
+fn string_input(doc: &Document) -> codec::Result<bool> {
+    let Some(x) = doc.member(doc.root(), "x_ck")? else {
         return Ok(false);
     };
-    let user = match doc.member(message, "role")? {
-        Some(role) => doc.string_is(role, "user")?,
-        None => false,
+    let Some(original) = doc.member(x, "original")? else {
+        return Ok(false);
     };
-    let string = match doc.member(message, "content")? {
-        Some(content) => matches!(doc.node(content)?.value, Value::String(_) | Value::Text(_)),
-        None => false,
-    };
-    Ok(user && string && !typed.contains(&message))
+    for entry in doc.children(original)? {
+        if let Some((target, _)) = doc.origin(entry)?
+            && let (Some(protocol), Some(pointer)) = (doc.member(entry, "protocol")?, doc.member(entry, "pointer")?)
+            && doc.string_is(protocol, "responses")?
+            && doc.string_is(pointer, "/input")?
+            && let Some(name) = doc.node(target)?.name
+            && doc.name_is(name, "content")?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `body` captured as it arrives, through Meta's event rules, with the failure that ends it
@@ -356,8 +398,9 @@ fn observed(body: Body, usage: &UsageSink, rules: Events) -> Body {
 /// Whether the request declares, chooses or replays Codex's freeform `apply_patch` tool. Only
 /// the carriers the old bridge rewrites are read: tool declarations (top level, the native
 /// tools a Responses client keeps, `additional_tools` items, and namespace children), the tool
-/// choice (and the tools it allows), and earlier calls. Other data, such as call arguments or a
-/// schema `default`, may hold the same object without declaring anything.
+/// choice (and the tools an allowed-tools choice lists), and earlier calls. Other data, such as
+/// call arguments, a schema `default` or a tool's own extension members, may hold the same
+/// object without declaring anything.
 fn custom_apply_patch(doc: &Document) -> codec::Result<bool> {
     let root = doc.root();
     let mut tools = Vec::new();
@@ -387,22 +430,61 @@ fn custom_apply_patch(doc: &Document) -> codec::Result<bool> {
             return Ok(true);
         }
     }
-    // Declarations: a list of tools, a tool, or a namespace's children.
-    let mut pending = tools;
-    pending.extend(doc.member(root, "tool_choice")?);
-    while let Some(index) = pending.pop() {
+    let mut pending: Vec<_> = tools.into_iter().map(|t| (t, Carrier::Declaration)).collect();
+    pending.extend(doc.member(root, "tool_choice")?.map(|c| (c, Carrier::Choice)));
+    while let Some((index, carrier)) = pending.pop() {
         match doc.node(index)?.value {
-            Value::Array => pending.extend(doc.children(index)?),
+            Value::Array => pending.extend(doc.children(index)?.map(|child| (child, carrier))),
             Value::Object if custom_patch(doc, index)? => return Ok(true),
-            Value::Object => {
-                for key in ["tools", "children"] {
-                    pending.extend(doc.member(index, key)?);
-                }
-            }
+            Value::Object => pending.extend(carrier.lists(doc, index)?.into_iter().map(|list| (list, carrier))),
             _ => {}
         }
     }
     Ok(false)
+}
+
+/// What a fenced object stands for, which decides the lists it holds.
+#[derive(Clone, Copy)]
+enum Carrier {
+    Declaration,
+    Choice,
+}
+
+impl Carrier {
+    /// The lists of tools `object` holds by its type: a namespace declaration's `tools` or,
+    /// without that array, its `children` (as the old bridge reads them), and an allowed-tools
+    /// choice's tools, flat (Responses) or under `allowed_tools` (Chat).
+    fn lists(self, doc: &Document, object: usize) -> codec::Result<Vec<usize>> {
+        let Some(kind) = doc.member(object, "type")? else {
+            return Ok(Vec::new());
+        };
+        let array = |list: Option<usize>| -> codec::Result<Option<usize>> {
+            Ok(match list {
+                Some(list) if matches!(doc.node(list)?.value, Value::Array) => Some(list),
+                _ => None,
+            })
+        };
+        let mut lists = Vec::new();
+        match self {
+            Carrier::Declaration if text_is(doc, kind, "namespace", false)? => {
+                let tools = array(doc.member(object, "tools")?)?;
+                lists.extend(match tools {
+                    Some(tools) => Some(tools),
+                    None => array(doc.member(object, "children")?)?,
+                });
+            }
+            Carrier::Choice if text_is(doc, kind, "allowed_tools", false)? => {
+                lists.extend(doc.member(object, "tools")?);
+                if let Some(allowed) = doc.member(object, "allowed_tools")?
+                    && matches!(doc.node(allowed)?.value, Value::Object)
+                {
+                    lists.extend(doc.member(allowed, "tools")?);
+                }
+            }
+            _ => {}
+        }
+        Ok(lists)
+    }
 }
 
 /// The object elements of array `list`, if it is one.
@@ -469,17 +551,5 @@ fn text_is(doc: &Document, index: usize, want: &str, trim: bool) -> codec::Resul
 }
 
 #[cfg(test)]
-mod tests {
-    /// The upload before thinking outlives it only for the payload rules that read it.
-    #[test]
-    fn the_baseline_stays_only_for_default_rules() {
-        let rules = |yaml: &str| ck_wire::payload::Rules::from_config(&ck_core::config::Config::parse(yaml).unwrap());
-        let overrides =
-            rules("requests:\n  payload:\n    override:\n      - models: [{name: \"m\"}]\n        params: {a: 1}\n");
-        assert_eq!(super::baseline(&overrides, b"{}".to_vec()), None);
-        assert_eq!(super::baseline(&rules(""), b"{}".to_vec()), None);
-        let defaults =
-            rules("requests:\n  payload:\n    default:\n      - models: [{name: \"m\"}]\n        params: {a: 1}\n");
-        assert_eq!(super::baseline(&defaults, b"{}".to_vec()), Some(b"{}".to_vec()));
-    }
-}
+#[path = "meta_exec_tests.rs"]
+mod tests;
