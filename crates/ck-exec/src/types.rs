@@ -54,6 +54,10 @@ pub struct Client<'a> {
     /// `request`, `upstream_model`, `claude_cache`, `round_trip_started`, `first_byte` and the
     /// capture calls; response usage comes from the canonical stream, never `response_*`.
     pub usage: &'a UsageSink,
+    /// The client's request body as the server received it (contract G5). Only the Claude
+    /// executor reads it, and only for an Anthropic request the OAuth cloak or the Claude
+    /// Code identity shapes; every other executor encodes the fenced view.
+    pub original: &'a [u8],
 }
 
 /// The request handle an attempt executes. `validated` is this attempt's fence: the client

@@ -7,9 +7,10 @@
 //! `anthropic::response::Ingress` chunk by chunk. Messages has no native compact, so the
 //! capability refuses one (owner question 7).
 //!
-//! Requests the OAuth cloak or the Claude Code identity would shape stay on the old route
-//! ([`ClaudeExecutor::old_route_only`]): the cloak must not change until owner question 13
-//! settles how `Execute` sees the client's own body.
+//! Contract G5: an Anthropic request the OAuth cloak or the Claude Code identity shapes is
+//! prepared from the client's own body ([`crate::types::Client::original`]) exactly as the old
+//! route prepares it, because detection reads the client's member order and `cch` signs the
+//! bytes the cloak built from them. The fence still validates it first.
 
 use std::borrow::Cow;
 
@@ -23,8 +24,8 @@ use ck_translate::codec::{self, BodyMode, Operation, RequestEgress, RequestFence
 use futures_util::StreamExt;
 
 use super::{
-    ClaudeExecutor, Ctx, Delegation, Input, Prepared, RawResponse, base_model, cloak, fast_request_error, header_value,
-    rebuild_mid_system, replay, stream, telemetry,
+    ClaudeExecutor, Ctx, Delegation, Input, Prepared, RawResponse, base_model, cloak, detect, fast_request_error,
+    header_value, rebuild_mid_system, replay, sanitize_for_upstream, stream, telemetry,
 };
 use crate::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
 
@@ -110,20 +111,25 @@ pub(super) fn capability(model: &str, resolved: Option<&ResolvedModel>) -> Anthr
 }
 
 impl ClaudeExecutor {
-    /// Whether `attempt` stays on the old route: a request carrying any Claude Code client
-    /// signal (contract G6), see [`Ctx::old_route_only`], and every credential thinking
-    /// replay serves. Replay stores a response only once it is known
-    /// complete, which `Execute` cannot see: the producer validates the body after the
-    /// executor returned. The selector answers no destination for it, so the server keeps
-    /// the old `claude` arm (Q1).
+    /// Whether `attempt` stays on the old route: every credential thinking replay serves.
+    /// Replay stores a response only once it is known complete, which `Execute` cannot see:
+    /// the producer validates the body after the executor returned. The selector answers no
+    /// destination for it, so the server keeps the old `claude` arm (Q1).
     pub fn old_route_only(&self, attempt: &Attempt<'_>) -> bool {
-        if super::detect::claude_code_signals(attempt.headers) {
-            return true;
+        replay::eligible(&gate(&attempt_ctx(self, attempt, &scoped(attempt))))
+    }
+
+    /// Whether the fenced `view` keeps the old relay (contract G5): an Anthropic generation
+    /// the cloak may shape whose upstream answers in one JSON body. Restoring its tool aliases
+    /// and recording its session continuity read the complete body, which contract §3 forbids
+    /// collecting. The selector's fence and re-fence refuse it with `Destination`.
+    pub fn buffered_cloak(&self, attempt: &Attempt<'_>, view: RequestView<'_>) -> bool {
+        if view.operation != Operation::Generate {
+            return false;
         }
-        let cfg = scoped(attempt);
-        let facts = (attempt.model, attempt.resolved_model, None);
-        let ctx = Ctx::new(self, attempt.credential, facts, &cfg, Delegation::default());
-        ctx.old_route_only() || replay::eligible(&gate(&ctx))
+        let buffered = Facts::of(view.document)
+            .and_then(|facts| Ok(facts.client_format == Format::Claude && !streaming(view.document, Format::Claude)?));
+        buffered.unwrap_or(false) && attempt_ctx(self, attempt, &scoped(attempt)).wire_policy(false).0
     }
 
     async fn messages(
@@ -135,13 +141,19 @@ impl ClaudeExecutor {
         let doc = request.validated.view().document;
         let facts = Facts::of(doc).map_err(encoding)?;
         let stream = streaming(doc, facts.client_format).map_err(encoding)?;
-        let default_max_tokens = capability(attempt.model, attempt.resolved_model).default_max_tokens;
-        let upload = encode(&request.validated, streams.request, stream, default_max_tokens)?;
         let cfg = scoped(attempt);
-        let ctx = context(self, attempt, request, &cfg);
+        let mut ctx = context(self, attempt, request, &cfg);
+        let encoded;
+        let body = match shaped(&mut ctx, request, facts.client_format, false) {
+            Some(original) => original,
+            None => {
+                let default_max_tokens = capability(attempt.model, attempt.resolved_model).default_max_tokens;
+                encoded = encode(&request.validated, streams.request, stream, default_max_tokens)?;
+                &encoded[..]
+            }
+        };
         let usage = request.client.usage;
-        let input = facts.input(request, attempt, &upload, stream);
-        let body: &[u8] = &upload;
+        let input = facts.input(request, attempt, body, stream);
         // As the old path: a foreign client's upstream always streams.
         let upstream_stream = stream || facts.client_format != Format::Claude;
         let mut prepared = ctx.prepare_messages(&input, body, body, upstream_stream).await?;
@@ -182,8 +194,17 @@ impl ClaudeExecutor {
         streams: Streams<'_>,
     ) -> Result<Counted<Ingress>, ExecError> {
         let cfg = scoped(attempt);
-        let ctx = context(self, attempt, request, &cfg);
+        let mut ctx = context(self, attempt, request, &cfg);
         let facts = Facts::of(request.validated.view().document).map_err(encoding)?;
+        if let Some(original) = shaped(&mut ctx, request, facts.client_format, true) {
+            let input = facts.input(request, attempt, original, false);
+            if ctx.api_key.trim().is_empty() || !ctx.first_party {
+                let input_tokens = local_count(&ctx, &input, original)?;
+                return Ok(Counted::Local { input_tokens });
+            }
+            let prepared = ctx.prepare_count(&input, original, original).await?;
+            return self.count_upstream(&ctx, attempt, request, streams, prepared).await;
+        }
         if ctx.api_key.trim().is_empty() || !ctx.first_party {
             let view = RequestView {
                 operation: Operation::Generate,
@@ -196,12 +217,24 @@ impl ClaudeExecutor {
             let upload = encode(&generate, streams.request, false, capability.default_max_tokens)?;
             let input = facts.input(request, attempt, &upload, false);
             return Ok(Counted::Local {
-                input_tokens: local_count(&ctx, &input)?,
+                input_tokens: local_count(&ctx, &input, &upload)?,
             });
         }
         let upload = encode(&request.validated, streams.request, false, None)?;
         let input = facts.input(request, attempt, &upload, false);
-        let mut prepared = ctx.prepare_count(&input, &upload, &upload).await?;
+        let prepared = ctx.prepare_count(&input, &upload, &upload).await?;
+        self.count_upstream(&ctx, attempt, request, streams, prepared).await
+    }
+
+    /// Sends a prepared count to Anthropic's origin.
+    async fn count_upstream(
+        &self,
+        ctx: &Ctx<'_>,
+        attempt: &Attempt<'_>,
+        request: &Request<'_>,
+        streams: Streams<'_>,
+        mut prepared: Prepared,
+    ) -> Result<Counted<Ingress>, ExecError> {
         let limit = stream::MAX_LINE as u64;
         let ingress = Ingress::new(
             streams.response,
@@ -213,7 +246,7 @@ impl ClaudeExecutor {
         .map_err(encoding)?;
         let capture = request.client.usage.capture();
         let raw = self
-            .send(&ctx, &mut prepared, "/v1/messages/count_tokens", None, capture, None)
+            .send(ctx, &mut prepared, "/v1/messages/count_tokens", None, capture, None)
             .await?;
         Ok(Counted::Upstream(Upstream {
             status: raw.status,
@@ -224,17 +257,21 @@ impl ClaudeExecutor {
     }
 }
 
-/// The local count of what the contract path would send: the generation projection, the
-/// operator's thinking suffix, mid-system rebuild and count rules.
-fn local_count(ctx: &Ctx<'_>, input: &Input<'_>) -> Result<u64, ExecError> {
-    let mut body = super::utf8(input.body).into_owned();
+/// The local count of what the request would send, `translated` being its Messages body: the
+/// operator's thinking suffix, mid-system rebuild, the old sanitizing for a request prepared as
+/// on the old path, and count rules.
+fn local_count(ctx: &Ctx<'_>, input: &Input<'_>, translated: &[u8]) -> Result<u64, ExecError> {
+    let mut body = super::utf8(translated).into_owned();
     if ctx.legacy_thinking(input) {
         body = ctx.apply_thinking(input, body)?;
     }
     if ctx.rebuild_mid_system() {
         body = rebuild_mid_system(&body);
     }
-    let body = cloak::strip_prompt_cache_options(ctx.count_rules(input, body, input.body));
+    if ctx.legacy_body() {
+        body = sanitize_for_upstream(body, &ctx.base_model, ctx.is_compat);
+    }
+    let body = cloak::strip_prompt_cache_options(ctx.count_rules(input, body, translated));
     let counted = crate::tokens::count(body.as_bytes())?;
     let count = crate::rawjson::get(&super::utf8(&counted), "input_tokens").i64();
     Ok(u64::try_from(count).unwrap_or_default())
@@ -309,6 +346,32 @@ fn context<'a>(
     let mut ctx = Ctx::new(exec, attempt.credential, facts, cfg, Delegation::default());
     ctx.contract = true;
     ctx
+}
+
+/// The attempt's context for a routing decision, before any request exists.
+fn attempt_ctx<'a>(exec: &ClaudeExecutor, attempt: &Attempt<'a>, cfg: &ck_core::config::Config) -> Ctx<'a> {
+    let facts = (attempt.model, attempt.resolved_model, None);
+    Ctx::new(exec, attempt.credential, facts, cfg, Delegation::default())
+}
+
+/// Contract G5. A request the cloak or the Claude Code identity shapes is prepared as the old
+/// route prepares it, so this clears `ctx.contract`; for an Anthropic client it returns the
+/// client's own body, which detection, session identity and the cloak read. A foreign
+/// client's shaped request is prepared from its encoded Messages body. `None` for any other
+/// request, which goes upstream as the fence accepted it.
+fn shaped<'r>(ctx: &mut Ctx<'_>, request: &Request<'r>, client: Format, count_tokens: bool) -> Option<&'r [u8]> {
+    let (headers, original) = (request.client.headers, request.client.original);
+    let anthropic = client == Format::Claude;
+    // Confirmation needs the `x-app` header, so a request without a Claude Code header
+    // signal skips the body scan.
+    let confirmed = anthropic
+        && detect::claude_code_signals(headers)
+        && detect::detect(headers, &super::utf8(original), count_tokens, &ctx.settings).confirmed;
+    if !confirmed && !ctx.may_cloak() {
+        return None;
+    }
+    ctx.contract = false;
+    anthropic.then_some(original)
 }
 
 fn gate<'a>(ctx: &'a Ctx<'_>) -> replay::Gate<'a> {

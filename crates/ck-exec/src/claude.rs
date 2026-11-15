@@ -964,8 +964,9 @@ struct Ctx<'a> {
     kimi: bool,
     /// `upstreamRequestLogProvider`: the provider request logs name.
     log_provider: &'static str,
-    /// The execution contract's path (`execute.rs`): the fence refuses what the old path
-    /// rewrote, and nothing collects a response body.
+    /// An execution contract request the cloak and the Claude Code identity leave alone
+    /// (`execute.rs`): the fence refuses what the old path rewrote. A request they shape is
+    /// prepared as on the old path (contract G5).
     contract: bool,
     /// Normalized execution-session ID (websocket executions), or empty.
     execution: String,
@@ -1413,10 +1414,12 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// Whether the old content normalizers run: only on the old path. The contract path sends
-    /// the client's content as the fence accepted it, and the official API judges the rest:
-    /// no forced-tool or sampling rewrite, no signature sanitizing, no proxy-owned prefix
-    /// recovery and no Kimi attribution stripping. The cache rewrites, which change only the caller's cost, run on both
+    /// Whether the old content normalizers run: on the old path, and on the contract path for
+    /// a request the cloak or the Claude Code identity shapes (contract G5), which is prepared
+    /// as the old path prepares it. Any other contract request goes upstream as the fence
+    /// accepted it, and the official API judges the rest: no forced-tool or sampling rewrite,
+    /// no signature sanitizing, no proxy-owned prefix recovery and no Kimi attribution
+    /// stripping. The cache rewrites, which change only the caller's cost, run on both
     /// (owner question 14; P8 removes the old path).
     pub(super) fn legacy_body(&self) -> bool {
         !self.contract
@@ -1430,11 +1433,10 @@ impl<'a> Ctx<'a> {
         !self.contract || ck_wire::thinking::parse_suffix(req.model).has_suffix
     }
 
-    /// Whether the old route keeps this credential: the cloak would shape a request the
-    /// detection does not confirm as Claude Code, or the Claude Code identity applies.
-    /// Confirmation reads the client's own body, which `Execute` does not see (owner question
-    /// 13 removes this split).
-    pub(crate) fn old_route_only(&self) -> bool {
+    /// Whether the cloak may shape this credential's requests (one the detection does not
+    /// confirm as Claude Code), or the Claude Code identity applies. Such a request is
+    /// prepared from the client's own body on the execution contract too (contract G5).
+    pub(crate) fn may_cloak(&self) -> bool {
         self.cli_profile || self.wire_policy(false).0
     }
 
