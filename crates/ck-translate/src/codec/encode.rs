@@ -249,9 +249,17 @@ pub(super) fn publish_record(
 }
 
 /// Bytes for a caller that keeps them outside the stream, such as a provider's replay cache.
-/// They take no stream storage, so keeping them cannot cost the response its quota.
-pub fn owned(encode: impl Fn(&mut Encoder<'_, '_>) -> Result<()>) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(measure(&encode)?);
+/// They take no stream storage, so keeping them cannot cost the response its quota. `admit`
+/// sees their length before anything is allocated; `None` when it refuses them.
+pub fn owned(
+    encode: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
+    admit: impl FnOnce(usize) -> bool,
+) -> Result<Option<Vec<u8>>> {
+    let length = measure(&encode)?;
+    if !admit(length) {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(length);
     let mut encoder = Encoder {
         reservation: None,
         scratch: None,
@@ -260,7 +268,7 @@ pub fn owned(encode: impl Fn(&mut Encoder<'_, '_>) -> Result<()>) -> Result<Vec<
         quoted: false,
     };
     encode(&mut encoder)?;
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 /// External bytes remain unpublished, charged to the canonical writer's stream.

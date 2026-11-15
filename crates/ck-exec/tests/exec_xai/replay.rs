@@ -4,7 +4,7 @@
 use super::*;
 
 /// Grok's encrypted reasoning, as the Go recording has it (other blobs are sanitized away).
-const ENC: &str = "TKwE++a7qP4CXIXITJIj2DYyQCSyR3JuUSrOe758M0CwwzrC2cbGVuOaEQaBqIrN6dvHWTX7FJ0iqroON2AsUyUnrtPc/TZpMRjPoWUeMN4m8PpoZ7WEOcq9ouGU9GXp1dV2okgnwdVvFfliii45xpY2Vr+czC4aqEgQFOmfOkP/1/2QzRooWeLd0i2AVLOOckBWoRQ1jCCa1racBhwpsfYf7Ax5lb393La7xuA7EJm6/n9nslYW3GJXW4GKnsKysoL7Ml0tLwoN1m+lBumus/5uivtkjccC5s5Jrf6Q41NADO7Q4yeiDfkUs7Ro4NVGD/ehf4+8qBtI28X3Gx54Fw";
+pub(super) const ENC: &str = "TKwE++a7qP4CXIXITJIj2DYyQCSyR3JuUSrOe758M0CwwzrC2cbGVuOaEQaBqIrN6dvHWTX7FJ0iqroON2AsUyUnrtPc/TZpMRjPoWUeMN4m8PpoZ7WEOcq9ouGU9GXp1dV2okgnwdVvFfliii45xpY2Vr+czC4aqEgQFOmfOkP/1/2QzRooWeLd0i2AVLOOckBWoRQ1jCCa1racBhwpsfYf7Ax5lb393La7xuA7EJm6/n9nslYW3GJXW4GKnsKysoL7Ml0tLwoN1m+lBumus/5uivtkjccC5s5Jrf6Q41NADO7Q4yeiDfkUs7Ro4NVGD/ehf4+8qBtI28X3Gx54Fw";
 
 /// One completed Responses turn with encrypted reasoning and a message.
 fn reasoning_turn() -> String {
@@ -24,7 +24,7 @@ fn turn_ending(kind: &str, status: &str) -> String {
     .concat()
 }
 
-const TURN: &str =
+pub(super) const TURN: &str =
     r#"{"model":"grok-4.3","stream":true,"prompt_cache_key":"k1","input":[{"role":"user","content":"hi"}]}"#;
 const NEXT: &str = r#"{"model":"grok-4.3","stream":true,"prompt_cache_key":"k1","input":[{"role":"user","content":"hi"},{"role":"user","content":"more"}]}"#;
 
@@ -191,12 +191,14 @@ async fn replay_takes_no_storage_from_delivery() {
     assert!(completions > 0, "no pool size completed");
 }
 
-/// Only a successful `response.completed` caches: an incomplete response, and a completion
-/// whose response failed, which the ingress ends as a failure, cache nothing.
+/// Only a successful `response.completed` caches: an incomplete response, under either event,
+/// and a completion whose response failed, which the ingress ends as a failure, cache nothing.
 #[tokio::test]
 async fn only_a_successful_completion_caches() {
     let incomplete = turn_ending("response.incomplete", "incomplete");
     assert_eq!(replayed(incomplete).await, (true, false));
+    let unfinished = turn_ending("response.completed", "incomplete");
+    assert_eq!(replayed(unfinished).await, (true, false));
     let failed = turn_ending("response.completed", "failed");
     assert_eq!(replayed(failed).await, (false, false));
 }

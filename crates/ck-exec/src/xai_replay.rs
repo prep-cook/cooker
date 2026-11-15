@@ -32,12 +32,12 @@ impl ReplayScope {
     }
 }
 
-pub(crate) use crate::xai_replay_store::Store;
+pub(crate) use crate::xai_replay_store::{Reservation, Store};
 
 /// `StoreXAIReasoningReplayItems`: false when the items hold no replay anchor or exceed an
 /// entry.
-fn store(store: &Store, scope: &ReplayScope, items: &[Vec<u8>]) -> bool {
-    normalize_items(items).is_some_and(|normalized| store.put(scope, normalized))
+fn store(store: &Store, scope: &ReplayScope, items: &[Vec<u8>], held: Reservation<'_>) -> bool {
+    normalize_items(items).is_some_and(|normalized| store.put(scope, normalized, held))
 }
 
 /// `strings.TrimSpace(r.String())`.
@@ -112,7 +112,7 @@ pub(crate) fn cache_completed(store: &Store, scope: &ReplayScope, completed: &[u
         .filter(|item| kept(item))
         .map(|item| item.raw().to_vec())
         .collect();
-    cache_items(store, scope, &items);
+    cache_items(store, scope, &items, store.reserve());
 }
 
 /// Whether replay keeps an output item: reasoning, assistant messages and tool calls.
@@ -123,10 +123,10 @@ pub(crate) fn kept(item: &Res<'_>) -> bool {
     )
 }
 
-/// Caches the kept output `items` of a completed turn; a turn without replayable state
-/// clears the session.
-pub(crate) fn cache_items(store: &Store, scope: &ReplayScope, items: &[Vec<u8>]) {
-    if scope.valid() && !self::store(store, scope, items) {
+/// Caches the kept output `items` of a completed turn, built under `held`; a turn without
+/// replayable state clears the session.
+pub(crate) fn cache_items(store: &Store, scope: &ReplayScope, items: &[Vec<u8>], held: Reservation<'_>) {
+    if scope.valid() && !self::store(store, scope, items, held) {
         store.delete(scope);
     }
 }

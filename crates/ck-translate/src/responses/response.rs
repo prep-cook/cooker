@@ -19,7 +19,8 @@ mod tools;
 pub(super) use tools::Server;
 
 /// Receives a streamed `response.completed` event's `response` object once the ingress has
-/// accepted it as the successful end of the stream; no failure ended the stream before it.
+/// accepted it as the successful end of the stream; no failure ended the stream before it,
+/// and its `status`, when present, is `completed`.
 /// The document is the ingress's own parse and lives only for the call, so an observer adds
 /// no stream storage of its own.
 pub type Completed = Box<dyn FnMut(&Document, usize) + Send>;

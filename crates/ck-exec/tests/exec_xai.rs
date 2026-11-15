@@ -283,6 +283,8 @@ fn sse() -> String {
 mod failures;
 #[path = "exec_xai/flow.rs"]
 mod flow;
+#[path = "exec_xai/heap.rs"]
+mod heap;
 #[path = "exec_xai/parity.rs"]
 mod parity;
 #[path = "exec_xai/replay.rs"]

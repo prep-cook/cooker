@@ -294,8 +294,14 @@ impl State {
         let response = doc.required(doc.root(), "response")?;
         self.start(owner, Some((doc, response)))?;
         self.unknown(owner, doc, &["type", "response", "sequence_number"], source, event)?;
-        // A failed response ends in `Err`, so only an accepted completion is observed.
+        // A failed response ends in `Err`, so only an accepted completion is observed; an
+        // incomplete one is not a completion, whichever event carries it.
         self.complete(owner, doc, response)?;
+        let completed = completed
+            && match doc.member(response, "status")? {
+                Some(status) => doc.string_is(status, "completed")?,
+                None => true,
+            };
         if completed && let Some(observer) = &mut self.completed {
             observer(doc, response);
         }
