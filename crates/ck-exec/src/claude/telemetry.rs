@@ -68,8 +68,6 @@ pub(super) fn collect(ctx: &Ctx<'_>, req: &Input<'_>, prepared: &Prepared) -> Op
     let declared = detect::header(req.headers, "x-cliproxy-request-type");
     let kind = if matches!(declared, "main" | "helper" | "subagent" | "compaction") {
         declared
-    } else if ctx.compaction_summary {
-        "compaction"
     } else if signals::subagent(req.headers, &prepared.body) {
         "subagent"
     } else if signals::probe_or_helper(&prepared.body)

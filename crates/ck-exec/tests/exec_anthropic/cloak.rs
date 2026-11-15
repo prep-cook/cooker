@@ -1,0 +1,437 @@
+//! Contract G5: a request the OAuth cloak or the Claude Code identity shapes is prepared from
+//! the client's own bytes and reaches the upstream exactly as the old route sent it: URL,
+//! headers in wire order, and body, `cch` signature and cache markers included. Each route
+//! sends to Anthropic's origin through a proxy that refuses every connection, so the capture
+//! sink records the request and nothing leaves the host.
+
+use std::path::Path;
+
+use ck_core::credential::Credential;
+
+use ck_exec::types::Attempt;
+
+use super::*;
+
+const OPUS_4_7: &str = "claude-opus-4-7";
+const HAIKU: &str = "claude-haiku-4-5-20251001";
+const SESSION: &str = "11111111-2222-4333-8444-555555555555";
+const ORIGIN: &str = "https://api.anthropic.com";
+
+/// A fake, local-only OAuth credential (the harness fixture), which the cloak serves.
+fn oauth() -> Credential {
+    let metadata = json!({
+        "type": "claude", "access_token": "sk-ant-oat01-FAKE-LOCAL-ONLY",
+        "refresh_token": "sk-ant-ort01-FAKE-LOCAL-ONLY", "id_token": "",
+        "email": "local-fixture@example.invalid", "account_uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "organization_uuid": "12345678-1234-4234-8234-123456789abc", "organization_name": "Local fixture",
+        "claude_device_ids": ["0123456789abcdef".repeat(4)],
+        "expired": "2099-01-01T00:00:00Z", "last_refresh": "2026-10-01T00:00:00Z",
+    });
+    let metadata = metadata.as_object().unwrap().clone();
+    Credential::from_file(Path::new("/auth"), Path::new("/auth/fixture.json"), metadata).unwrap()
+}
+
+/// The measured Claude Code headers of a Haiku Title280 session-title helper.
+fn title_helper() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("user-agent", "claude-cli/2.1.280 (external, cli)"),
+        ("x-app", "cli"),
+        ("accept", "application/json"),
+        ("content-type", "application/json"),
+        ("x-stainless-lang", "js"),
+        ("x-stainless-runtime", "node"),
+        ("x-stainless-retry-count", "0"),
+        ("x-stainless-timeout", "600"),
+        ("x-stainless-os", "MacOS"),
+        ("x-stainless-arch", "arm64"),
+        ("x-stainless-package-version", "0.112.1"),
+        ("x-stainless-runtime-version", "v26.3.0"),
+        ("anthropic-version", "2023-06-01"),
+        ("anthropic-dangerous-direct-browser-access", "true"),
+        ("accept-encoding", "gzip, deflate, br, zstd"),
+        (
+            "anthropic-beta",
+            "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             structured-outputs-2025-12-15,server-side-fallback-2026-06-01,fallback-credit-2026-06-01,\
+             cache-diagnosis-2026-04-07",
+        ),
+        ("x-claude-code-session-id", SESSION),
+    ]
+}
+
+/// A Title280 helper body: Claude Code's member order and shape.
+fn title_body() -> Value {
+    let user_id = format!(
+        r#"{{"device_id":"{}","account_uuid":"","session_id":"{SESSION}"}}"#,
+        "a".repeat(64)
+    );
+    json!({"model": HAIKU, "max_tokens": 80, "messages": [{"role": "user", "content": "title"}],
+        "metadata": {"user_id": user_id},
+        "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}}})
+}
+
+/// The measured headers of a Claude Code main turn: the helper's, with the Claude Code beta.
+fn main_turn() -> Vec<(&'static str, &'static str)> {
+    let mut headers = title_helper();
+    for (name, value) in &mut headers {
+        if *name == "anthropic-beta" {
+            *value = "claude-code-20250219,interleaved-thinking-2025-05-14";
+        }
+    }
+    headers
+}
+
+/// A key the cloak shapes on every request; a cached user id keeps its device id stable.
+fn always() -> Credential {
+    let mut always = credential("claude", ORIGIN, "sk-ant-api03-test");
+    always.attributes.insert("cloak_mode".into(), "always".into());
+    always.attributes.insert("cloak_cache_user_id".into(), "true".into());
+    always
+}
+
+/// One upstream request as the executor sent it.
+#[derive(Debug, PartialEq)]
+struct Wire {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+#[derive(Default)]
+struct Recorder(Mutex<Vec<Wire>>);
+
+impl CaptureObserver for Recorder {
+    fn record(&self, event: CaptureEvent<'_>) {
+        if let CaptureEvent::Request(request) = event {
+            // Both routes draw a fresh request id for every request.
+            let id = |(k, v): &(String, String)| {
+                let fresh = k == "x-client-request-id" && uuid::Uuid::parse_str(v).is_ok();
+                (k.clone(), if fresh { "<fresh uuid>".into() } else { v.clone() })
+            };
+            self.0.lock().unwrap().push(Wire {
+                url: request.url.to_owned(),
+                headers: request.headers.iter().map(id).collect(),
+                body: String::from_utf8_lossy(request.body).into_owned(),
+            });
+        }
+    }
+}
+
+/// `credential` at `origin` behind the refusing proxy, with the client's `headers`.
+fn at(origin: &str, credential: &Credential, model: &str, headers: &[(&str, &str)]) -> (Fixture, Arc<Recorder>) {
+    let mut credential = credential.clone();
+    credential
+        .attributes
+        .insert("proxy_url".into(), "http://127.0.0.1:1".into());
+    let mut fixture = Fixture::with(credential, origin, model);
+    for (name, value) in headers {
+        let name: http::HeaderName = name.parse().unwrap();
+        fixture.exchange.headers.append(name, value.parse().unwrap());
+    }
+    let recorder = Arc::new(Recorder::default());
+    fixture.exchange.usage = UsageSink::default().with_capture(CaptureSink::new(recorder.clone()));
+    (fixture, recorder)
+}
+
+/// The request `body` sends upstream on the old route; a count when `count`.
+async fn old_wire(credential: &Credential, model: &str, headers: &[(&str, &str)], body: &Value, count: bool) -> Wire {
+    let (fixture, recorder) = at(ORIGIN, credential, model, headers);
+    let operation = if count {
+        OldOperation::CountTokens
+    } else {
+        OldOperation::Generate
+    };
+    let usage = fixture.exchange.usage.clone();
+    let req = fixture.old_request(&serde_json::to_vec(body).unwrap(), operation, usage);
+    let (credential, cfg) = (&fixture.exchange.credential, &fixture.exchange.cfg);
+    let answer = fixture.executors.claude.execute(credential, req, cfg).await;
+    assert!(answer.is_err(), "the proxy refuses every connection");
+    recorder.0.lock().unwrap().pop().expect("the old route's request")
+}
+
+/// The request `body` sends upstream on the contract path; a count when `count`.
+async fn new_wire(credential: &Credential, model: &str, headers: &[(&str, &str)], body: &Value, count: bool) -> Wire {
+    let (fixture, recorder) = at(ORIGIN, credential, model, headers);
+    let attempt = fixture.exchange.attempt(&fixture.streams.store);
+    assert_eq!(fixture.executors.destination(&attempt), Some("anthropic"));
+    let operation = if count {
+        Operation::CountTokens
+    } else {
+        Operation::Generate
+    };
+    let (started, _, _request) = fixture.anthropic(&serde_json::to_vec(body).unwrap(), operation).await;
+    assert!(started.is_err(), "the proxy refuses every connection");
+    recorder.0.lock().unwrap().pop().expect("the contract path's request")
+}
+
+#[tokio::test]
+async fn shaped_requests_reach_the_upstream_byte_for_byte_as_on_the_old_route() {
+    let tools = json!([{"name": "read", "description": "Read a file", "input_schema": {"type": "object"}}]);
+    let messages = json!([{"role": "user", "content": "Summarise the plan in one line"}]);
+    let cases = [
+        (
+            "plain",
+            SONNET,
+            json!({"model": SONNET, "max_tokens": 1024, "system": "Be brief.", "messages": messages}),
+        ),
+        (
+            "client-model",
+            SONNET,
+            json!({"model": "client-model", "max_tokens": 1024, "messages": messages}),
+        ),
+        (
+            "sampling",
+            SONNET,
+            json!({"model": SONNET, "max_tokens": 1024, "temperature": 0.5, "top_p": 0.9, "messages": messages}),
+        ),
+        (
+            "adaptive-forced-tool",
+            OPUS_4_7,
+            json!({"model": OPUS_4_7, "max_tokens": 4096, "thinking": {"type": "adaptive"}, "tools": tools,
+                "tool_choice": {"type": "tool", "name": "read"}, "messages": messages}),
+        ),
+        (
+            "disabled-effort",
+            OPUS_4_7,
+            json!({"model": OPUS_4_7, "max_tokens": 4096, "thinking": {"type": "disabled"},
+                "output_config": {"effort": "low"}, "messages": messages}),
+        ),
+    ];
+    for (name, model, body) in cases {
+        let mut streamed = body.clone();
+        streamed["stream"] = json!(true);
+        for credential in [oauth(), always()] {
+            let new = new_wire(&credential, model, &[], &streamed, false).await;
+            assert_eq!(new, old_wire(&credential, model, &[], &streamed, false).await, "{name}");
+            if name == "plain" {
+                // The cloak ran: the old route's automatic cache marker (`cpa_owns_cache`).
+                assert!(new.body.contains("cache_control"), "{}", new.body);
+            }
+            let new = new_wire(&credential, model, &[], &body, true).await;
+            assert_eq!(
+                new,
+                old_wire(&credential, model, &[], &body, true).await,
+                "{name}: count"
+            );
+        }
+    }
+    // The OAuth token signs `cch` over the body the cloak built from the client's bytes.
+    let new = new_wire(
+        &oauth(),
+        SONNET,
+        &[],
+        &json!({"model": SONNET, "max_tokens": 1024, "stream": true,
+        "messages": messages}),
+        false,
+    )
+    .await;
+    assert!(
+        new.body.contains("cch=") && !new.body.contains("cch=00000"),
+        "{}",
+        new.body
+    );
+    for credential in [oauth(), always()] {
+        let new = new_wire(&credential, HAIKU, &title_helper(), &title_body(), true).await;
+        assert_eq!(
+            new,
+            old_wire(&credential, HAIKU, &title_helper(), &title_body(), true).await
+        );
+    }
+}
+
+/// Claude Code on a plain key: detection reads the client's own member order, so the helper
+/// goes up without cache markers or `stream`, and both keep the client's session.
+#[tokio::test]
+async fn claude_code_requests_on_a_key_reach_the_upstream_as_on_the_old_route() {
+    let key = credential("claude", ORIGIN, "sk-ant-api03-test");
+    let new = new_wire(&key, HAIKU, &title_helper(), &title_body(), false).await;
+    assert_eq!(new, old_wire(&key, HAIKU, &title_helper(), &title_body(), false).await);
+    let sent: Value = serde_json::from_str(&new.body).unwrap();
+    assert!(
+        sent.get("stream").is_none() && !new.body.contains("cache_control"),
+        "{sent}"
+    );
+    let mut main = title_body();
+    main["stream"] = json!(true);
+    main["system"] = json!("You are Claude Code.");
+    let new = new_wire(&key, HAIKU, &main_turn(), &main, false).await;
+    assert_eq!(new, old_wire(&key, HAIKU, &main_turn(), &main, false).await);
+    let session = new
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-claude-code-session-id"));
+    assert_eq!(session.map(|(_, v)| v.as_str()), Some(SESSION), "{:?}", new.headers);
+}
+
+/// A count away from Anthropic is local; a shaped one counts what the old route sanitized.
+#[tokio::test]
+async fn a_shaped_local_count_matches_the_old_route() {
+    let thinking = "Weighing every option in turn before answering. ".repeat(40);
+    let assistant = json!({"role": "assistant", "content": [
+        {"type": "thinking", "thinking": thinking, "signature": "c2lnbmVk"}, {"type": "text", "text": "ok"}]});
+    let body = json!({"model": OPUS_4_7, "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"},
+        assistant, {"role": "user", "content": "more"}]});
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let local = "http://127.0.0.1:1";
+    let (fixture, _) = at(local, &oauth(), OPUS_4_7, &[]);
+    let req = fixture.old_request(&bytes, OldOperation::CountTokens, UsageSink::default());
+    let (credential, cfg) = (&fixture.exchange.credential, &fixture.exchange.cfg);
+    let answer = fixture.executors.claude.execute(credential, req, cfg).await.unwrap();
+    let ck_core::exec::ResponseBody::Buffered(old) = answer.body else {
+        panic!("a local count is buffered")
+    };
+    let old: Value = serde_json::from_slice(&old).unwrap();
+    let (fixture, _) = at(local, &oauth(), OPUS_4_7, &[]);
+    let (started, id, _request) = fixture.anthropic(&bytes, Operation::CountTokens).await;
+    started.unwrap().producer.await.unwrap().unwrap();
+    let (records, _) = events(&fixture.streams, id).await;
+    let new = records.iter().find(|(name, _)| name == "x_ck.count_tokens");
+    assert_eq!(
+        new.map(|(_, data)| &data["input_tokens"]),
+        Some(&old["input_tokens"]),
+        "{records:?}"
+    );
+}
+
+/// A buffered generation the cloak may shape keeps the old relay: restoring its tool aliases
+/// and recording its continuity read the whole body, which contract §3 forbids collecting.
+/// Streamed, the same request runs on the contract path.
+#[tokio::test]
+async fn a_buffered_generation_the_cloak_may_shape_keeps_the_old_arm() {
+    let body = json!({"model": SONNET, "max_tokens": 1024, "messages": [{"role": "user", "content": "hi"}]});
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let mut streamed = body.clone();
+    streamed["stream"] = json!(true);
+    let streamed = serde_json::to_vec(&streamed).unwrap();
+    let op = Operation::Generate;
+    for credential in [oauth(), always()] {
+        let (cloak, recorder) = at(ORIGIN, &credential, SONNET, &[]);
+        let store = &cloak.streams.store;
+        let attempt = cloak.exchange.attempt(store);
+        assert_eq!(cloak.executors.destination(&attempt), Some("anthropic"));
+        let fence = |body: &[u8]| {
+            let mut request = cloak.streams.request();
+            let id = identity(Direction::Request);
+            let mut ingress = anthropic::request::Ingress::new(&mut request, store, id, op, LIMIT).unwrap();
+            cloak.fence(&mut ingress, &mut request, body)
+        };
+        assert!(matches!(fence(&bytes), Err(codec::Error::Destination)));
+        assert!(fence(&streamed).is_ok());
+        // A plain key's attempt fences the request on the same store, so the cloak attempt
+        // can re-fence and start it.
+        let key = credential_for_fence();
+        let key_attempt = Attempt {
+            credential: &key,
+            ..cloak.exchange.attempt(store)
+        };
+        let mut request = cloak.streams.request();
+        let id = identity(Direction::Request);
+        let mut ingress = anthropic::request::Ingress::new(&mut request, store, id, op, LIMIT).unwrap();
+        for byte in bytes.chunks(1) {
+            ingress.advance(&mut request, byte).unwrap();
+        }
+        let view = cloak
+            .executors
+            .fence(&key_attempt, &mut ingress, &mut request)
+            .unwrap()
+            .view();
+        let refenced = cloak.executors.refence(&attempt, view);
+        assert!(matches!(refenced, Err(codec::Error::Destination)));
+        let validated = cloak.executors.refence(&key_attempt, view).unwrap();
+        let handle = cloak.exchange.request_with(validated, &bytes);
+        let response = cloak.streams.response(&request);
+        assert!(
+            cloak
+                .executors
+                .start(&attempt, &handle, &mut request, response)
+                .await
+                .is_err()
+        );
+        assert!(recorder.0.lock().unwrap().is_empty(), "start sends nothing");
+    }
+}
+
+/// A key the cloak never shapes, behind the refusing proxy.
+fn credential_for_fence() -> Credential {
+    let mut key = credential("claude", ORIGIN, "sk-ant-api03-test");
+    key.attributes.insert("proxy_url".into(), "http://127.0.0.1:1".into());
+    key
+}
+
+/// Claude Code header signals no longer pick the old arm (contract G6): the executor reads the
+/// client's own body instead (G5).
+#[tokio::test]
+async fn claude_code_header_signals_take_the_contract_path() {
+    let signals = [
+        ("user-agent", "claude-cli/2.1.280 (external, cli)"),
+        ("x-app", "cli"),
+        ("x-claude-code-session-id", SESSION),
+        ("x-stainless-lang", "js"),
+        ("anthropic-beta", "claude-code-20250219"),
+        ("anthropic-beta", "oauth-2025-04-20"),
+    ];
+    let mut fixture = Fixture::new(&StreamUpstream::start([]).await, HAIKU);
+    for (name, value) in signals {
+        fixture.exchange.headers = http::HeaderMap::from_iter([(name.parse().unwrap(), value.parse().unwrap())]);
+        let attempt = fixture.exchange.attempt(&fixture.streams.store);
+        assert_eq!(fixture.executors.destination(&attempt), Some("anthropic"), "{name}");
+    }
+}
+
+/// A Codex client's integer tool parameters are rewritten before the cloak renames the tools,
+/// as on the old route (`normalize_codex_tool_integer_types`).
+#[tokio::test]
+async fn a_codex_clients_tool_integers_are_rewritten_before_the_cloak() {
+    let tools = json!([{"name": "exec_command", "description": "Run a command", "input_schema":
+        {"type": "object", "properties": {"yield_time_ms": {"type": "number"}}}}]);
+    let mut body = json!({"model": SONNET, "max_tokens": 1024, "tools": tools,
+        "messages": [{"role": "user", "content": "run ls"}]});
+    let codex = [("user-agent", "codex_cli_rs/0.99")];
+    let new = new_wire(&oauth(), SONNET, &codex, &body, true).await;
+    assert_eq!(new, old_wire(&oauth(), SONNET, &codex, &body, true).await, "count");
+    body["stream"] = json!(true);
+    let new = new_wire(&oauth(), SONNET, &codex, &body, false).await;
+    assert_eq!(new, old_wire(&oauth(), SONNET, &codex, &body, false).await);
+    assert!(new.body.contains("\"integer\""), "{}", new.body);
+}
+
+/// Thread aliases and session continuity are recorded only for a response the canonical
+/// ingress completed: a continuation of a rejected turn finds no thread state, one of a
+/// completed turn reaches the upstream.
+#[tokio::test]
+async fn only_a_completed_turn_records_thread_state() {
+    // `message_stop` without the finishing `message_delta`: the ingress rejects it.
+    const CUT: &str = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"msg_cut","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        "\n\nevent: message_stop\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    let tools = json!([{"name": "Read", "description": "Read a file", "input_schema": {"type": "object"}}]);
+    let messages = json!([{"role": "user", "content": "read it"}]);
+    let create = serde_json::to_vec(&json!({"model": SONNET, "max_tokens": 1024, "stream": true,
+        "thread": {"type": "create"}, "tools": tools, "messages": messages}))
+    .unwrap();
+    let after = |id: &str| {
+        let thread = json!({"type": "continue", "previous_message_id": id});
+        let body = json!({"model": SONNET, "max_tokens": 1024, "stream": true, "thread": thread, "messages": messages});
+        serde_json::to_vec(&body).unwrap()
+    };
+    let upstream = StreamUpstream::start([Reply::sse(CUT), Reply::sse(SSE), Reply::sse(SSE)]).await;
+    let fixture = Fixture::with(oauth(), &upstream.url(), SONNET);
+    let (started, _, _request) = fixture.anthropic(&create, Operation::Generate).await;
+    assert!(
+        started.unwrap().producer.await.unwrap().is_err(),
+        "the ingress rejects the cut turn"
+    );
+    let (started, _, _request) = fixture.anthropic(&after("msg_cut"), Operation::Generate).await;
+    assert!(started.is_err(), "no thread state for a rejected turn");
+    assert_eq!(upstream.requests(), 1);
+    let (started, _, _request) = fixture.anthropic(&create, Operation::Generate).await;
+    started.unwrap().producer.await.unwrap().unwrap();
+    let (started, _, _request) = fixture.anthropic(&after("msg_1"), Operation::Generate).await;
+    started.unwrap().producer.await.unwrap().unwrap();
+    assert_eq!(upstream.requests(), 3);
+}

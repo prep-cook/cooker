@@ -307,6 +307,7 @@ impl Fixture {
             execution_session: None,
             derived_session: None,
             usage: &self.usage,
+            original: &[],
         }
     }
 
