@@ -2,7 +2,7 @@ use crate::codec::{
     self, Capability, Error, Operation, RequestFence, RequestView, Result, ValidatedRequest,
     document::{Document, Name, Value, pending::Pending},
     encode::{self, Encoder},
-    event::{Emitter, Identity, Kind, Scope},
+    event::{Emitter, Identity, Scope},
     json,
     media::{self, Registry},
 };
@@ -444,7 +444,7 @@ pub(super) fn originals(doc: &Document, parent: usize, carrier: Option<&str>, e:
         let Value::String(text) = doc.node(pointer)?.value else {
             return Err(Error::Schema);
         };
-        let name = Name::Pointer(text);
+        let name = doc.pointer_name(text)?;
         let mut shadowed = false;
         for child in doc.children(parent)? {
             if let Some(current) = doc.node(child)?.name {
@@ -487,43 +487,23 @@ fn fields(
             return Ok(());
         }
     } else {
-        emitter.emit(
+        let (record, spans) = emitter.emit_field(
             owner,
-            Kind::RequestField,
-            Scope::default(),
             |e| {
-                e.bytes(b",\"pointer\":\"")?;
+                e.bytes(b"\"")?;
                 for component in path[..depth].iter().flatten() {
                     e.bytes(b"/")?;
                     match component {
                         Component::Index(index) => e.unsigned(*index)?,
-                        Component::Name(name) => {
-                            let mut chars = doc.name_chars(*name)?;
-                            while let Some(c) = chars.next_scalar()? {
-                                match c {
-                                    '~' => e.bytes(b"~0")?,
-                                    '/' => e.bytes(b"~1")?,
-                                    c => e.escaped(c.encode_utf8(&mut [0; 4]))?,
-                                }
-                            }
-                        }
+                        Component::Name(name) => codec::provenance::write_pointer_segment(doc, *name, e)?,
                     }
                 }
-                e.bytes(b"\",\"value\":")?;
-                if let Some(media) = registered {
-                    media::write_reference(media, e)
-                } else {
-                    match doc.node(node)?.value {
-                        Value::Object => e.bytes(b"{}"),
-                        Value::Array => e.bytes(b"[]"),
-                        _ => doc.write(node, e),
-                    }
-                }
+                e.bytes(b"\"")
             },
-            |_| Ok(()),
+            |e| codec::event::write_field_value(doc, node, registered, e),
         )?;
-        let (_, event) = codec::internal::next(owner, reader)?;
-        doc.bind_field(node, event)?;
+        let lease = codec::internal::committed(reader, record)?;
+        doc.bind_field(owner, node, lease, spans)?;
         doc.mark_published(node);
     }
     if registered.is_some() {

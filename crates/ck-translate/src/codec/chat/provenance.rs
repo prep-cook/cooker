@@ -1,6 +1,6 @@
 use crate::codec::{
     Error, Result,
-    document::{Document, Name, Value},
+    document::{Document, Value},
     encode::Encoder,
     provenance::{Segment, pointer, segment, write_segment},
 };
@@ -64,7 +64,8 @@ pub(super) fn restore(doc: &mut Document, x: usize) -> Result<bool> {
         let parent = insertion_parent(doc, x, pointer, &mut restored, &mut consumed)?;
         if let Some(parent) = parent {
             let value = doc.remove(entry, "value")?.ok_or(Error::Schema)?;
-            let target = doc.add(Some(Name::Pointer(text)), Value::Null)?;
+            let name = doc.pointer_name(text)?;
+            let target = doc.add(Some(name), Value::Null)?;
             doc.transplant(target, value)?;
             doc.append(parent, target)?;
             consumed = true;

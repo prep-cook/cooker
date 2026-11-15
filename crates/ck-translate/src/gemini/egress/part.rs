@@ -3,7 +3,7 @@
 use super::{Diagnostic, Egress, Table, local, mapped, native};
 use crate::codec::{
     Error, Result,
-    document::{Document, Name, Value},
+    document::{Document, Value},
     encode,
     event::{Kind, LocalId},
 };
@@ -529,7 +529,7 @@ fn restore_originals(doc: &mut Document, event: Document) -> Result<()> {
         let Value::String(text) = doc.node(doc.required(entry, "pointer")?)?.value else {
             return Err(Error::Schema);
         };
-        let name = Name::Pointer(text);
+        let name = doc.pointer_name(text)?;
         // A nested pointer names a member of the part's call or inline data.
         let mut parent = part;
         for (prefix, member) in [("/functionCall/", "functionCall"), ("/inlineData/", "inlineData")] {

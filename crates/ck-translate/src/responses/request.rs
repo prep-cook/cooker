@@ -2,7 +2,7 @@ use crate::codec::{
     self, Capability, Error, Operation, RequestFence, RequestView, Result, ValidatedRequest,
     document::{Document, Name, Value},
     encode,
-    event::{Emitter, Identity, Kind, Scope},
+    event::{Emitter, Identity, Scope},
     media::Registry,
 };
 use ck_stream::{ScratchLease, Writer};
@@ -270,46 +270,27 @@ fn publish_field(
         return Ok(());
     }
     let registered = media.get(doc, node)?;
-    emitter.emit(
+    let (record, spans) = emitter.emit_field(
         owner,
-        Kind::RequestField,
-        Scope::default(),
         |e| {
-            e.bytes(b",\"pointer\":\"")?;
+            e.bytes(b"\"")?;
             for part in path.iter().flatten() {
                 e.bytes(b"/")?;
                 match part {
                     Component::Index(i) => e.unsigned(*i)?,
-                    Component::Name(name) => {
-                        let mut chars = doc.name_chars(*name)?;
-                        while let Some(c) = chars.next_scalar()? {
-                            match c {
-                                '~' => e.bytes(b"~0")?,
-                                '/' => e.bytes(b"~1")?,
-                                _ => e.escaped(c.encode_utf8(&mut [0; 4]))?,
-                            }
-                        }
-                    }
+                    Component::Name(name) => codec::provenance::write_pointer_segment(doc, *name, e)?,
                 }
             }
-            e.bytes(b"\",\"value\":")?;
-            if let Some(media) = registered {
-                return codec::media::write_reference(media, e);
-            }
-            match doc.node(node)?.value {
-                Value::Object => e.bytes(b"{}"),
-                Value::Array => e.bytes(b"[]"),
-                _ => doc.write(node, e),
-            }
+            e.bytes(b"\"")
         },
-        |_| Ok(()),
+        |e| codec::event::write_field_value(doc, node, registered, e),
     )?;
-    let (_, event) = codec::internal::next(owner, reader)?;
+    let lease = codec::internal::committed(reader, record)?;
     // Binding a nameless object or array keeps no text of its record, neither a pointer name
     // nor a value, so adopting the record would only hold its lease until the request ends.
     let bound = doc.node(node)?;
     if bound.name.is_some() || !matches!(bound.value, Value::Object | Value::Array) {
-        doc.bind_field(node, event)?;
+        doc.bind_field(owner, node, lease, spans)?;
     }
     doc.mark_published(node);
     Ok(())

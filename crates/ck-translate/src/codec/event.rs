@@ -2,7 +2,10 @@ use ck_stream::{Position, Record, Writer};
 
 use super::{
     Error, Result, ValidatedRequest,
+    document::{Document, Value},
     encode::{self, Encoder},
+    media::{self, Media},
+    source::Span,
 };
 
 /// Trusted gateway identity. Provider IDs remain position-backed provenance.
@@ -130,6 +133,38 @@ impl Kind {
     }
 }
 
+/// Writes a `request.field` value: the registered media reference, an empty container whose
+/// children follow as their own fields, or the node's scalar. Returns whether it wrote the
+/// scalar, the only value a field binding rebinds.
+pub(crate) fn write_field_value(
+    doc: &Document,
+    node: usize,
+    registered: Option<Media>,
+    e: &mut Encoder<'_, '_>,
+) -> Result<bool> {
+    if let Some(media) = registered {
+        media::write_reference(media, e)?;
+        return Ok(false);
+    }
+    match doc.node(node)?.value {
+        Value::Object => e.bytes(b"{}")?,
+        Value::Array => e.bytes(b"[]")?,
+        _ => {
+            doc.write(node, e)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Where a published `request.field` wrote its pointer string and its scalar value, as offsets
+/// from the record's start.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FieldSpans {
+    pub(crate) pointer: Span,
+    pub(crate) value: Option<Span>,
+}
+
 /// Writes the trusted envelope and complete SSE records without heap payloads.
 ///
 /// One emitter owns one fresh canonical Writer. Raw framing scratch must never
@@ -173,6 +208,38 @@ impl Emitter {
             return Err(Error::Schema);
         }
         self.publish(output, kind, scope, payload, provenance)
+    }
+
+    /// Publishes one `request.field` and returns its record with the record-relative spans of
+    /// its pointer and value, so ingress binds the field without reading the record back.
+    /// `value` returns whether it wrote the node's own scalar; an empty container or a media
+    /// reference leaves no value span.
+    pub(crate) fn emit_field(
+        &mut self,
+        output: &mut Writer,
+        pointer: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
+        value: impl Fn(&mut Encoder<'_, '_>) -> Result<bool>,
+    ) -> Result<(Record, FieldSpans)> {
+        let spans = std::cell::Cell::new(None);
+        let record = self.emit(
+            output,
+            Kind::RequestField,
+            Scope::default(),
+            |e| {
+                e.bytes(b",\"pointer\":")?;
+                let start = e.mark();
+                pointer(e)?;
+                let pointer = Span { start, end: e.mark() };
+                e.bytes(b",\"value\":")?;
+                let start = e.mark();
+                let scalar = value(e)?;
+                let value = scalar.then(|| Span { start, end: e.mark() });
+                spans.set(Some(FieldSpans { pointer, value }));
+                Ok(())
+            },
+            |_| Ok(()),
+        )?;
+        Ok((record, spans.get().ok_or(Error::Schema)?))
     }
 
     pub fn request_start(&mut self, output: &mut Writer, request: super::RequestView<'_>) -> Result<Record> {

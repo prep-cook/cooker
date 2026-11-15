@@ -6,9 +6,10 @@ use crate::codec::{
 };
 
 /// Writes `,"reasoning":{...}` from the thinking options. Another protocol's budget, switch and
-/// native config are not Responses members, and its `include` is a summary setting only as a
-/// string; a Chat `reasoning` object, which the fence limits to these two, gives its `effort`
-/// and `summary`.
+/// native config are not Responses members; its `include` is a summary setting as a string,
+/// and Gemini's `includeThoughts: true` asks for `auto` summaries unless thinking is off. A
+/// Chat `reasoning` object, which the fence limits to these two, gives its `effort` and
+/// `summary`.
 pub(super) fn write_reasoning_options(
     doc: &Document,
     x: usize,
@@ -16,12 +17,17 @@ pub(super) fn write_reasoning_options(
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
     let native = is(doc, x, "original_protocol", "responses")?;
+    let off = match doc.member(thinking, "enabled")? {
+        Some(n) => matches!(doc.node(n)?.value, Value::Bool(false)),
+        None => false,
+    };
     let mut open = false;
     for f in doc.children(thinking)? {
         let name = doc.node(f)?.name.ok_or(Error::Schema)?;
         let include = doc.name_is(name, "include")?;
         let summary = include && matches!(doc.node(f)?.value, Value::String(_) | Value::Text(_));
-        if !native && !summary && !doc.name_is(name, "effort")? {
+        let auto = include && !native && !off && matches!(doc.node(f)?.value, Value::Bool(true));
+        if !native && !summary && !auto && !doc.name_is(name, "effort")? {
             continue;
         }
         key(&mut open, e)?;
@@ -31,7 +37,11 @@ pub(super) fn write_reasoning_options(
             doc.write_name(name, e)?;
         }
         e.bytes(b":")?;
-        doc.write(f, e)?;
+        if auto {
+            e.string("auto")?;
+        } else {
+            doc.write(f, e)?;
+        }
     }
     if let Some(effort) = chat_effort(doc, x, thinking)? {
         key(&mut open, e)?;
