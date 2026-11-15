@@ -33,8 +33,7 @@ use serde_json::Value;
 use crate::codex_response::OutputItems;
 use crate::codex_tokens::count_input_tokens;
 use crate::kimi_http::{
-    DeferredUsage, UsageRule, credential_headers, defer_usage, payload_rules, read_all_strict, refresh_due,
-    report_model, rfc3339_local_now,
+    DeferredUsage, UsageRule, defer_usage, payload_rules, read_all_strict, refresh_due, report_model, rfc3339_local_now,
 };
 use crate::meta_auth::{DEFAULT_API_BASE_URL, MetaAuth, MintedKey};
 use crate::meta_codex::go_trim_space;
@@ -51,11 +50,12 @@ pub const USER_AGENT: &str =
 /// `metaNotFoundCooldown`: a 404 without `resets_at` cools the model for five minutes.
 const NOT_FOUND_COOLDOWN: Duration = Duration::from_secs(300);
 /// Go's bufio.Scanner limit for the upstream stream.
-const LINE_LIMIT: usize = 52_428_800;
-const DISCONNECTED: &str = "meta stream error: stream disconnected before response.completed or response.incomplete";
+pub(crate) const LINE_LIMIT: usize = 52_428_800;
+pub const DISCONNECTED: &str =
+    "meta stream error: stream disconnected before response.completed or response.incomplete";
 
 pub struct MetaExecutor {
-    clients: GoClients,
+    pub(crate) clients: GoClients,
     mint_url: Option<String>,
 }
 
@@ -142,7 +142,7 @@ impl MetaExecutor {
     /// ensureAuth + enrichAuth: a usable key (minting inline from the DCA token when
     /// missing), `base_url`/`api_key` attributes, and Meta's User-Agent as a default
     /// custom header.
-    async fn ensure_auth(&self, credential: &Credential, cfg: &Config) -> Result<Credential, ExecError> {
+    pub(crate) async fn ensure_auth(&self, credential: &Credential, cfg: &Config) -> Result<Credential, ExecError> {
         let mut c = credential.clone();
         if creds(&c).1.is_empty() && dca_token(&c).is_some() {
             let patch = self.refresh(&c, cfg).await?;
@@ -209,7 +209,7 @@ impl MetaExecutor {
         // so its first body byte only records the first-packet fallback.
         use crate::kimi_http::{capture_chunk, capture_error, capture_metadata, capture_request};
         let capture = req.capture();
-        let request_headers = headers(&enriched, &req, &token);
+        let request_headers = headers(&enriched, &req.headers, req.session.as_deref(), &token);
         // recordMetaRequest: the enriched credential's account info.
         let (auth_type, auth_value) = ck_core::registry::dynamic::account_info(&enriched);
         capture_request(
@@ -396,18 +396,20 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
     let original_translated = crate::translate::baseline_or_working(original_translated, &body);
     // Go `cliproxyauth.ResolvedModelInfo`: capabilities bound to this attempt.
     let caps = req.resolved_model.as_ref().map(|r| ModelCaps::from(&r.info));
-    let thinking = apply_request_thinking(&RequestThinking {
-        body: &body,
-        payload: &req.body,
-        original: original(req),
-        model: &req.model,
-        from: req.source_format.as_str(),
-        to: "codex",
-        provider: PROVIDER,
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer,
-        updates_changed: false,
-    })
+    let thinking = apply_request_thinking(
+        &RequestThinking {
+            payload: Some(&req.body[..]),
+            original: Some(&original(req)[..]),
+            model: &req.model,
+            from: req.source_format.as_str(),
+            to: "codex",
+            provider: PROVIDER,
+            resolved: caps.as_ref().map(Some),
+            has_request_transformer,
+            updates_changed: false,
+        },
+        body.to_vec(),
+    )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
     body = thinking;
     set_string_if_different(&mut body, "model", &base_model);
@@ -438,7 +440,7 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
 }
 
 /// `SetStringIfDifferent`.
-fn set_string_if_different(body: &mut Vec<u8>, path: &str, value: &str) {
+pub(crate) fn set_string_if_different(body: &mut Vec<u8>, path: &str, value: &str) {
     let current = gj::get(body, path);
     if current.kind == Kind::String && *current.bytes() == *value.as_bytes() {
         return;
@@ -457,7 +459,7 @@ fn set_bool_if_different(body: &mut Vec<u8>, path: &str, value: bool) {
 
 /// `SanitizeMetaWebSearchTools`: Meta rejects `search_content_types` on `web_search` tools,
 /// top level or inside a namespace.
-fn sanitize_web_search_tools(body: &mut Vec<u8>) {
+pub(crate) fn sanitize_web_search_tools(body: &mut Vec<u8>) {
     let tools = gj::get(body, "tools");
     if !tools.is_array() {
         return;
@@ -483,7 +485,9 @@ fn sanitize_web_search_tools(body: &mut Vec<u8>) {
     }
 }
 
-fn headers(c: &Credential, req: &ExecRequest, token: &str) -> GoHeaders {
+/// The upstream request headers; `client` and `session` are the client's request headers
+/// and its bound session, for the credential's custom headers.
+pub(crate) fn headers(c: &Credential, client: &http::HeaderMap, session: Option<&str>, token: &str) -> GoHeaders {
     let mut h = GoHeaders::new();
     h.set("Content-Type", "application/json");
     if !token.trim().is_empty() {
@@ -494,7 +498,8 @@ fn headers(c: &Credential, req: &ExecRequest, token: &str) -> GoHeaders {
     // Meta always streams upstream.
     h.set("Accept", "text/event-stream");
     h.set("Cache-Control", "no-cache");
-    for (name, value) in credential_headers(c, req, original(req)) {
+    let session = ck_wire::session::cpa_session_id(session);
+    for (name, value) in ck_wire::headers::custom_headers(&c.attributes, client, session.as_deref()) {
         h.set(&name, value);
     }
     h
@@ -502,7 +507,7 @@ fn headers(c: &Credential, req: &ExecRequest, token: &str) -> GoHeaders {
 
 /// `wrapMetaUpstreamError`, with Go's cooldown semantics as scopes: a 429 or 404 cools
 /// the model on this credential, a subscription-quota 429 the whole credential.
-fn upstream_error(status: u16, body: &[u8]) -> ExecError {
+pub(crate) fn upstream_error(status: u16, body: &[u8]) -> ExecError {
     let mut retry_after = None;
     let scope = match status {
         429 => {
@@ -558,7 +563,7 @@ fn subscription_quota(body: &[u8]) -> bool {
 
 /// `metaStreamEventError`: an `error` or `response.failed` event ends the response with
 /// `error.code` as status when it is an HTTP error code, else 502.
-fn stream_event_error(event: &[u8]) -> Option<ExecError> {
+pub(crate) fn stream_event_error(event: &[u8]) -> Option<ExecError> {
     let kind = gj::get(event, "type").bytes();
     if &*kind != b"error" && &*kind != b"response.failed" {
         return None;

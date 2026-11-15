@@ -209,18 +209,20 @@ pub(crate) fn apply_thinking(
     provider: &str,
     resolved: Option<&Resolved>,
 ) -> Result<Vec<u8>, ExecError> {
-    thinking::apply_request_thinking(&RequestThinking {
-        body: &body,
-        payload: &req.body,
-        original: &req.original_body,
-        model: &req.model,
-        from: from.as_str(),
-        to: to.as_str(),
-        provider,
-        resolved: resolved.map(|r| Some(&r.caps)),
-        has_request_transformer: ck_translate::pair(from, to).is_some(),
-        updates_changed: false,
-    })
+    thinking::apply_request_thinking(
+        &RequestThinking {
+            payload: Some(&req.body[..]),
+            original: Some(&req.original_body[..]),
+            model: &req.model,
+            from: from.as_str(),
+            to: to.as_str(),
+            provider,
+            resolved: resolved.map(|r| Some(&r.caps)),
+            has_request_transformer: ck_translate::pair(from, to).is_some(),
+            updates_changed: false,
+        },
+        body.to_vec(),
+    )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))
 }
 

@@ -2,6 +2,7 @@
 //! (executor/helps/model_capabilities.go, helps/thinking.go).
 
 use super::providers::applier;
+use super::source::SourceReads;
 use super::summary::{
     SummaryConfig, SummaryMode, apply_summary_config_for_model, apply_summary_config_for_provider,
     extract_explicit_summary_config, extract_summary_config, extract_translated_summary_config,
@@ -20,7 +21,17 @@ use crate::json;
 /// `ApplyThinking`: summary intent comes from the target body itself.
 pub fn apply_thinking(body: &[u8], model: &str, from: &str, to: &str, provider: &str) -> Result<Vec<u8>, Error> {
     let summary = extract_summary_config(body, to);
-    run(body, b"", model, from, to, provider, None, summary, false)
+    run(
+        body.to_vec(),
+        Some(b""),
+        model,
+        from,
+        to,
+        provider,
+        None,
+        summary,
+        false,
+    )
 }
 
 /// `ApplyThinkingWithSummary`.
@@ -32,7 +43,17 @@ pub fn apply_thinking_with_summary(
     provider: &str,
     summary: SummaryConfig,
 ) -> Result<Vec<u8>, Error> {
-    run(body, b"", model, from, to, provider, None, summary, false)
+    run(
+        body.to_vec(),
+        Some(b""),
+        model,
+        from,
+        to,
+        provider,
+        None,
+        summary,
+        false,
+    )
 }
 
 /// `ApplyThinkingWithSourceAndSummary`.
@@ -47,7 +68,17 @@ pub fn apply_thinking_with_source_and_summary(
     summary: SummaryConfig,
     updates_changed: bool,
 ) -> Result<Vec<u8>, Error> {
-    run(body, source, model, from, to, provider, None, summary, updates_changed)
+    run(
+        body.to_vec(),
+        Some(source),
+        model,
+        from,
+        to,
+        provider,
+        None,
+        summary,
+        updates_changed,
+    )
 }
 
 /// `ApplyThinkingWithModelInfo`: the exact model definition bound to this attempt.
@@ -82,8 +113,8 @@ pub fn apply_thinking_with_model_info_and_summary(
     updates_changed: bool,
 ) -> Result<Vec<u8>, Error> {
     run(
-        body,
-        source,
+        body.to_vec(),
+        Some(source),
         model,
         from,
         to,
@@ -94,14 +125,13 @@ pub fn apply_thinking_with_model_info_and_summary(
     )
 }
 
-/// Inputs to `helps.ApplyRequestThinking`.
+/// Inputs to `helps.ApplyRequestThinking` besides the translated provider body.
 pub struct RequestThinking<'a> {
-    /// Translated provider body.
-    pub body: &'a [u8],
-    /// The request payload that was translated (`req.Payload`).
-    pub payload: &'a [u8],
-    /// The inbound body before interceptors (`opts.OriginalRequest`).
-    pub original: &'a [u8],
+    /// The request payload that was translated (`req.Payload`); `None` when it is the body.
+    pub payload: Option<&'a [u8]>,
+    /// The inbound body before interceptors (`opts.OriginalRequest`); `None` when it is the
+    /// body.
+    pub original: Option<&'a [u8]>,
     /// Requested model, possibly with a `(suffix)`.
     pub model: &'a str,
     pub from: &'a str,
@@ -116,50 +146,35 @@ pub struct RequestThinking<'a> {
     pub updates_changed: bool,
 }
 
-/// `helps.ApplyRequestThinking`.
-pub fn apply_request_thinking(req: &RequestThinking<'_>) -> Result<Vec<u8>, Error> {
-    let original = if req.original.is_empty() {
-        req.payload
-    } else {
-        req.original
-    };
-    let source = if req.payload.is_empty() {
-        req.original
-    } else {
-        req.payload
+/// `helps.ApplyRequestThinking` on the translated provider `body`, which it edits and returns:
+/// unchanged, in the same allocation, when the thinking leaves it as is.
+pub fn apply_request_thinking(req: &RequestThinking<'_>, body: Vec<u8>) -> Result<Vec<u8>, Error> {
+    let payload = req.payload.unwrap_or(&body);
+    let original = match req.original.unwrap_or(&body) {
+        [] => payload,
+        original => original,
     };
     let summary = translated_request_summary_config(
-        req.body,
-        req.payload,
+        &body,
+        payload,
         original,
         req.model,
         req.from,
         req.to,
         req.has_request_transformer,
     );
-    match req.resolved {
-        Some(info) => apply_thinking_with_model_info_and_summary(
-            req.body,
-            source,
-            req.model,
-            req.from,
-            req.to,
-            req.provider,
-            info,
-            summary,
-            req.updates_changed,
-        ),
-        None => apply_thinking_with_source_and_summary(
-            req.body,
-            source,
-            req.model,
-            req.from,
-            req.to,
-            req.provider,
-            summary,
-            req.updates_changed,
-        ),
-    }
+    let source = if payload.is_empty() { req.original } else { req.payload };
+    run(
+        body,
+        source,
+        req.model,
+        req.from,
+        req.to,
+        req.provider,
+        req.resolved,
+        summary,
+        req.updates_changed,
+    )
 }
 
 /// `helps.ApplyThinkingWithSourcePayload`.
@@ -223,10 +238,11 @@ pub fn translated_request_summary_config(
     current
 }
 
+/// The thinking pipeline on an owned `body`; `source` is `None` when it is the body itself.
 #[allow(clippy::too_many_arguments)]
-fn run(
-    body: &[u8],
-    source: &[u8],
+pub(super) fn run(
+    body: Vec<u8>,
+    source: Option<&[u8]>,
     model: &str,
     from: &str,
     to: &str,
@@ -259,34 +275,26 @@ fn run(
         }
     };
 
-    let mut source_config = Config::default();
-    if is_responses_format(&from) {
-        let request = if !updates_changed && !source.is_empty() {
-            source
-        } else {
-            body
-        };
-        if !updates_changed || target == "codex" || target == "xai" {
-            source_config = extract_codex_usage_config(request);
-        }
+    let apply_fn = applier(&target);
+    let reads = SourceReads {
+        source: source.unwrap_or(&body),
+        body: &body,
+        from: &from,
+        target: &target,
     }
+    .read(&suffix, updates_changed, resolved_flag, info, apply_fn.is_some());
     let response_target = target == "codex" || target == "xai";
     let supports_updates = info.is_some_and(|i| i.support_configuration_update);
-    let mut body = body.to_vec();
+    let mut body = body;
     if response_target && !supports_updates {
-        body = strip_configuration_updates(&body);
+        body = strip_configuration_updates(body);
     }
     let native_responses = response_target && is_responses_format(&from) && supports_updates;
 
-    let Some(apply_fn) = applier(&target) else {
+    let Some(apply_fn) = apply_fn else {
         return Ok(body);
     };
-    if !suffix.has_suffix
-        && !source.is_empty()
-        && is_responses_format(&from)
-        && !json::valid(&body)
-        && extract_configuration_update_config(source).is_set()
-    {
+    if reads.keeps_update {
         return Ok(body);
     }
     if native_responses && !suffix.has_suffix {
@@ -294,13 +302,13 @@ fn run(
     }
     if is_user_defined_model(info) {
         return apply_user_defined_model(
-            &body,
+            body,
             info,
             &from,
             &target,
             &provider,
             &suffix,
-            source_config,
+            reads.config,
             native_responses,
             summary,
         );
@@ -310,7 +318,7 @@ fn run(
         let config = extract_thinking_config(&body, &target);
         if config.is_set() || summary.mode != SummaryMode::Unspecified {
             return Ok(if response_target {
-                strip_responses_effort(&body)
+                strip_responses_effort(body)
             } else {
                 strip_thinking_config(&body, &target)
             });
@@ -321,9 +329,9 @@ fn run(
     let mut config = if suffix.has_suffix {
         parse_suffix_to_config(&suffix.raw_suffix)
     } else {
-        let mut config = source_config;
-        if !config.is_set() && !updates_changed && resolved_flag && !source.is_empty() {
-            config = extract_source_thinking_config(source, &from);
+        let mut config = reads.config;
+        if !config.is_set() {
+            config = reads.thinking;
         }
         if !config.is_set() {
             config = extract_thinking_config(&body, &target);
@@ -335,15 +343,11 @@ fn run(
         if native_responses {
             return Ok(body);
         }
-        if resolved_flag
-            && target == "claude"
-            && from != target
-            && extract_summary_config(source, &from).mode == SummaryMode::Enabled
-        {
+        if reads.summary_enabled {
             body = strip_inferred_claude_summary_activation(&body, Some(info));
         }
         return Ok(apply_summary_config_for_provider(
-            &body,
+            body,
             &target,
             &base,
             &provider,
@@ -377,7 +381,7 @@ fn run(
         };
     }
     Ok(apply_summary_config_for_provider(
-        &applied,
+        applied,
         &target,
         &base,
         &provider,
@@ -416,7 +420,7 @@ fn map_configured_high_intent(level: &str, info: &ModelCaps) -> String {
         .map_or(level.clone(), |c| (*c).to_owned())
 }
 
-fn extract_source_thinking_config(body: &[u8], provider: &str) -> Config {
+pub(super) fn extract_source_thinking_config(body: &[u8], provider: &str) -> Config {
     let provider = provider.trim().go_lower();
     if provider == "openai-response" {
         return extract_codex_config(body);
@@ -443,7 +447,7 @@ fn parse_suffix_to_config(raw: &str) -> Config {
 
 #[allow(clippy::too_many_arguments)]
 fn apply_user_defined_model(
-    body: &[u8],
+    body: Vec<u8>,
     info: Option<&ModelCaps>,
     from: &str,
     to: &str,
@@ -459,10 +463,10 @@ fn apply_user_defined_model(
     } else {
         let mut config = source_config;
         if !config.is_set() {
-            config = extract_thinking_config(body, from);
+            config = extract_thinking_config(&body, from);
         }
         if !config.is_set() && from != to {
-            config = extract_thinking_config(body, to);
+            config = extract_thinking_config(&body, to);
         }
         config
     };
@@ -472,15 +476,15 @@ fn apply_user_defined_model(
         ));
     }
     let Some(apply_fn) = applier(to) else {
-        return Ok(body.to_vec());
+        return Ok(body);
     };
     let config = normalize_user_defined_config(config, to);
-    let applied = apply_fn(body, &config, info)?;
+    let applied = apply_fn(&body, &config, info)?;
     if fully_disabled(&config) || native_responses {
         return Ok(applied);
     }
     Ok(apply_summary_config_for_provider(
-        &applied, to, &model_id, provider, info, summary,
+        applied, to, &model_id, provider, info, summary,
     ))
 }
 
@@ -541,13 +545,13 @@ pub fn has_thinking_suffix(model: &str) -> bool {
 
 /// `StripConfigurationUpdates`: drops `configuration_update` input items, reasoning untouched.
 pub fn strip_configuration_update_items(body: &[u8]) -> Vec<u8> {
-    strip_configuration_updates(body)
+    strip_configuration_updates(body.to_vec())
 }
 
 /// `CollapseConfigurationUpdates`: drops `configuration_update` input items and, unless
 /// `keep_top_level_effort`, sets the last item's effort as the top-level `reasoning.effort`.
 pub fn collapse_configuration_updates(body: &[u8], keep_top_level_effort: bool) -> Vec<u8> {
-    let updated = strip_configuration_updates(body);
+    let updated = strip_configuration_updates(body.to_vec());
     if keep_top_level_effort {
         return updated;
     }
@@ -744,7 +748,7 @@ fn extract_codex_config(body: &[u8]) -> Config {
     }
 }
 
-fn extract_codex_usage_config(body: &[u8]) -> Config {
+pub(super) fn extract_codex_usage_config(body: &[u8]) -> Config {
     if body.is_empty() || !json::valid(body) {
         return Config::default();
     }
