@@ -158,7 +158,7 @@ fn normalize_items(items: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
     anchor.then_some(normalized)
 }
 
-fn normalize_item(item: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn normalize_item(item: &[u8]) -> Option<Vec<u8>> {
     let r = gj::parse(item);
     match text(&r.get("type")).as_str() {
         "reasoning" => {

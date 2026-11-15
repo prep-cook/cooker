@@ -82,7 +82,7 @@ fn cache_key(scope: &ReplayScope) -> Option<String> {
 }
 
 impl Store {
-    fn with_limits(entry: usize, total: usize) -> Self {
+    pub(crate) fn with_limits(entry: usize, total: usize) -> Self {
         Self {
             entries: Mutex::default(),
             limits: (entry, total),
@@ -156,6 +156,18 @@ pub(crate) struct Reservation<'a> {
 }
 
 impl Reservation<'_> {
+    /// Runs `check` with `bytes` charged; `None`, without running it, when the charge is
+    /// refused. What `check` allocates is freed when it returns, so the charge ends then.
+    pub(crate) fn scratch<T>(&mut self, bytes: usize, check: impl FnOnce() -> T) -> Option<T> {
+        if !self.charge(bytes) {
+            return None;
+        }
+        let result = check();
+        self.bytes -= bytes;
+        self.store.lock().reserved -= bytes;
+        Some(result)
+    }
+
     /// Charges `bytes` more before they are allocated, evicting the oldest entries to make
     /// room; false, charging nothing, when the turn would outgrow an entry or reservations
     /// would outgrow the cache.

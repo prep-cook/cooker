@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 use ck_stream::{ScratchLease, Writer};
 use ck_translate::apply_patch_responses as apply_patch;
-use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::encode::{self, Encoder};
 use ck_translate::codec::{self, ResponseIngress};
 use ck_translate::responses::response::Ingress;
@@ -32,8 +31,8 @@ use ck_wire::gostr::trim_space;
 use ck_wire::json::{self as gj, Kind};
 
 use crate::xai::MAX_LINE;
-use crate::xai_exec::{object_member, text_is};
-use crate::xai_replay::{self as replay, ReplayScope, Reservation};
+use crate::xai_replay::{self as replay, ReplayScope};
+use crate::xai_replay_items;
 use crate::xai_request::Prepared;
 use crate::xai_response::{self as response, NamespaceRefs, NamespaceRestorer, XSearchFilter, text};
 
@@ -117,15 +116,7 @@ impl Events {
         let scope = prepared.replay_scope;
         if scope.valid() {
             inner.on_completed(Box::new(move |doc, response| {
-                // A turn replay does not keep clears the session; the response is unaffected.
-                let mut held = store.reserve();
-                match replay_items(doc, response, &mut held) {
-                    Ok(Some(items)) => replay::cache_items(&store, &scope, &items, held),
-                    _ => {
-                        drop(held);
-                        replay::clear(&store, &scope);
-                    }
-                }
+                xai_replay_items::cache_completion(&store, &scope, doc, response);
             }));
         }
         Self {
@@ -346,43 +337,6 @@ impl Events {
     fn feed(&mut self, owner: &mut Writer, bytes: &[u8]) -> codec::Result<()> {
         self.inner.advance(owner, bytes)
     }
-}
-
-/// The output item types replay keeps; all but `message` can anchor a replayed turn.
-const KEPT: [&str; 4] = ["reasoning", "function_call", "custom_tool_call", "message"];
-
-/// The output items of completed `response` that replay keeps, each written out on its own
-/// once `held` took its measured size; `None` when replay keeps nothing of the turn: it has
-/// no output array or no item that can anchor a replay, or the next item would outgrow an
-/// entry or the cache. Nothing is written out for a turn without an anchor.
-fn replay_items(doc: &Document, response: usize, held: &mut Reservation<'_>) -> codec::Result<Option<Vec<Vec<u8>>>> {
-    let Some(output) = object_member(doc, response, "output")? else {
-        return Ok(None);
-    };
-    if !matches!(doc.node(output)?.value, Value::Array) {
-        return Ok(None);
-    }
-    let (mut kept, mut anchor) = (Vec::new(), false);
-    for item in doc.children(output)? {
-        for (i, kind) in KEPT.into_iter().enumerate() {
-            if text_is(doc, item, "type", kind)? {
-                kept.push(item);
-                anchor |= i < 3;
-                break;
-            }
-        }
-    }
-    if !anchor {
-        return Ok(None);
-    }
-    let mut items = Vec::with_capacity(kept.len());
-    for item in kept {
-        match encode::owned(|e| doc.write(item, e), |len| held.charge(len))? {
-            Some(bytes) => items.push(bytes),
-            None => return Ok(None),
-        }
-    }
-    Ok(Some(items))
 }
 
 /// Where a terminal event's `output` takes the collected items: `event[at..end]` becomes

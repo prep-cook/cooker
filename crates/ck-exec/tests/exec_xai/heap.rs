@@ -72,25 +72,28 @@ async fn allocated(principal: &str, body: &str) -> usize {
     BYTES.with(Cell::get) - before
 }
 
-/// A completion of 32 messages of 300,000 characters, after `lead` output items.
-fn long_turn(lead: &[Value]) -> String {
+/// A completion of `count` messages of 300,000 characters, after `lead` output items.
+fn long_turn(lead: &[Value], count: usize) -> String {
     let text = "x".repeat(300_000);
     let mut output = lead.to_vec();
-    output.extend((0..32).map(|_| message(&text)));
+    output.extend((0..count).map(|_| message(&text)));
     event(json!({"type":"response.completed","response":response("completed", Value::Array(output))}))
 }
 
-/// Without an item that can anchor a replay, replay writes nothing out; with one, it stops
-/// before the turn outgrows an entry rather than after.
+/// Without an item that can anchor a replay, replay writes nothing out. With one, a turn
+/// that fits an entry (27 messages, about 8.1 MB) is written out once, in its normalized
+/// form, and a larger one (32 messages) stops before it outgrows the entry.
 #[tokio::test]
 async fn replay_allocates_within_an_entry() {
-    let plain = long_turn(&[]);
+    let plain = long_turn(&[], 32);
     let (on, off) = (allocated("sk-a", &plain).await, allocated("", &plain).await);
     let extra = on.saturating_sub(off);
     assert!(extra < LARGE, "no anchor: {extra} bytes");
     let reasoning = json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":ENC});
-    let anchored = long_turn(&[reasoning]);
-    let (on, off) = (allocated("sk-a", &anchored).await, allocated("", &anchored).await);
-    let extra = on.saturating_sub(off);
-    assert!(extra <= ENTRY, "anchored: {extra} bytes");
+    for count in [27, 32] {
+        let anchored = long_turn(std::slice::from_ref(&reasoning), count);
+        let (on, off) = (allocated("sk-a", &anchored).await, allocated("", &anchored).await);
+        let extra = on.saturating_sub(off);
+        assert!(extra <= ENTRY, "{count} anchored messages: {extra} bytes");
+    }
 }

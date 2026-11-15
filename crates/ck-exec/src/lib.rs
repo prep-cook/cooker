@@ -112,6 +112,7 @@ mod xai_events;
 pub mod xai_exec;
 mod xai_media;
 mod xai_replay;
+mod xai_replay_items;
 mod xai_replay_key;
 mod xai_replay_store;
 mod xai_request;
