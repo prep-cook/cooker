@@ -965,11 +965,9 @@ async fn exchange(
             None => {
                 let next = current.join(&location).map_err(|_| {
                     local(
-                        ExecError::local(
-                            500,
-                            FailureScope::Transport,
-                            format!("failed to parse Location header {location:?}"),
-                        ),
+                        // The text names no part of the location, which may carry
+                        // credentials in its userinfo or query, as every capture would.
+                        ExecError::local(500, FailureScope::Transport, "failed to parse Location header"),
                         &hop_url,
                     )
                 })?;

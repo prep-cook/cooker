@@ -200,8 +200,8 @@ impl Rules {
         cfg.derived(Rules::from_config)
     }
 
-    /// Whether `default` or `default-raw` rules exist: only they read [`Request::original`].
-    pub fn reads_original(&self) -> bool {
+    /// Whether any default rule is configured: only defaults read the request's baseline.
+    pub fn has_defaults(&self) -> bool {
         !(self.default.is_empty() && self.default_raw.is_empty())
     }
 
@@ -459,7 +459,7 @@ pub fn apply_tracked(
 fn edit(rules: &Rules, req: &Request<'_>, mut out: Vec<u8>, mark: &mut dyn FnMut(&str)) -> Vec<u8> {
     // Go: defaults check the original request, else the body as it entered (after the
     // Codex normalization, before image-generation stripping).
-    let needs_source = rules.reads_original();
+    let needs_source = rules.has_defaults();
     let entered = (needs_source && req.original.is_empty()).then(|| out.clone());
     let source: &[u8] = entered.as_deref().unwrap_or(req.original);
     if strip_image_generation(rules.image_generation, req.request_path) {

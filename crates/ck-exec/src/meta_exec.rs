@@ -256,7 +256,7 @@ fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Resul
 /// The upload before thinking, kept only for the payload rules that read it (`default` and
 /// `default-raw`); otherwise it is released before the rest of the shaping.
 fn baseline(rules: &ck_wire::payload::Rules, original: Vec<u8>) -> Option<Vec<u8>> {
-    rules.reads_original().then_some(original)
+    rules.has_defaults().then_some(original)
 }
 
 /// The old path's content parts (its request translators): every message's string content
