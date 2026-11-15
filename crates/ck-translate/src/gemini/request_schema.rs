@@ -25,11 +25,12 @@ fn messages(view: RequestView<'_>) -> Result<()> {
     let messages = doc.required(root, "messages")?;
     super::array(doc, messages)?;
     let mut system = false;
-    let mut calls = None;
+    let (mut run, mut last) = (None, None);
     for message in doc.children(messages)? {
+        let previous = last.replace(message);
         let role = doc.required(message, "role")?;
         if doc.string_is(role, "tool")? {
-            tool_message(doc, message, calls)?;
+            tool_message(doc, message, run)?;
             continue;
         }
         // Gemini has one system instruction; `developer` (Responses `instructions`) is one too.
@@ -44,9 +45,18 @@ fn messages(view: RequestView<'_>) -> Result<()> {
         if let Some(content) = doc.member(message, "content")? {
             match doc.node(content)?.value {
                 Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
+                // Egress orders a message's results by their calls, which keeps the place of
+                // its other parts only while the results stand together.
                 Value::Array => {
+                    let (mut blocks, mut inside) = (0, false);
                     for part in doc.children(content)? {
-                        validate_part(view, part, calls)?;
+                        validate_part(view, part, run)?;
+                        let result = is_result(doc, part)?;
+                        blocks += usize::from(result && !inside);
+                        inside = result;
+                    }
+                    if blocks > 1 {
+                        return Err(Error::Unsupported);
                     }
                 }
                 // OpenAI sends a tool-call message's empty content as null.
@@ -79,25 +89,68 @@ fn messages(view: RequestView<'_>) -> Result<()> {
                 }
             }
         }
-        calls = doc.member(message, "tool_calls")?;
+        run = match previous {
+            Some(p) if continues(doc, p, message)? => run,
+            _ => Some(message),
+        };
     }
     Ok(())
 }
+/// Whether assistant `message` adds its calls to the model turn of assistant `previous`. A
+/// Responses client sends each parallel call as its own item, which ingress wraps in its own
+/// message; Gemini states them as one turn. Both carry a call, so a joined turn already has a
+/// part. Gemini's own turns stay as sent.
+pub(super) fn continues(doc: &Document, previous: usize, message: usize) -> Result<bool> {
+    for m in [previous, message] {
+        let calls = doc.member(m, "tool_calls")?;
+        if !super::is(doc, m, "role", "assistant")?
+            || calls.map(|c| doc.node(c)).transpose()?.and_then(|c| c.first).is_none()
+            || super::origin(doc, m, "parts")?.is_some()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+/// The one call with `id` in the model turn starting at message `run`; none when no call or
+/// several carry it.
+pub(super) fn answered(doc: &Document, run: Option<usize>, id: usize) -> Result<Option<usize>> {
+    let (mut found, mut count, mut message) = (None, 0, run);
+    while let Some(m) = message {
+        for call in doc
+            .member(m, "tool_calls")?
+            .map(|c| doc.children(c))
+            .transpose()?
+            .into_iter()
+            .flatten()
+        {
+            if doc.equal_strings(doc.required(call, "id")?, id)? {
+                (found, count) = (Some(call), count + 1);
+            }
+        }
+        message = next_in_turn(doc, m)?;
+    }
+    Ok(found.filter(|_| count == 1))
+}
+/// Whether `node` is a Chat tool message or a tool result part without Gemini's `result`: both
+/// answer a call of the preceding model turn by id.
+pub(super) fn is_result(doc: &Document, node: usize) -> Result<bool> {
+    Ok(super::is(doc, node, "role", "tool")?
+        || (super::is(doc, node, "type", "tool_result")? && doc.member(node, "result")?.is_none()))
+}
+/// The message after `message` in its model turn.
+pub(super) fn next_in_turn(doc: &Document, message: usize) -> Result<Option<usize>> {
+    Ok(match doc.node(message)?.next {
+        Some(n) if continues(doc, message, n)? => Some(n),
+        _ => None,
+    })
+}
 /// A Chat tool message, or a tool result without Gemini's `result`, answers a call of the
-/// preceding message and carries only text.
-fn tool_message(doc: &Document, message: usize, calls: Option<usize>) -> Result<()> {
+/// preceding model turn and carries only text.
+fn tool_message(doc: &Document, message: usize, run: Option<usize>) -> Result<()> {
     let id = doc.required(message, "tool_call_id")?;
     super::string(doc, id)?;
-    let mut answered = false;
-    for call in calls
-        .map(|calls| doc.children(calls))
-        .transpose()?
-        .into_iter()
-        .flatten()
-    {
-        answered |= doc.equal_strings(doc.required(call, "id")?, id)?;
-    }
-    if !answered {
+    if answered(doc, run, id)?.is_none() {
         return Err(Error::Unsupported);
     }
     match doc.member(message, "content")? {
@@ -278,7 +331,7 @@ fn anthropic_parameters(doc: &Document, native: usize) -> Result<()> {
     }
     Ok(())
 }
-fn validate_part(view: RequestView<'_>, part: usize, calls: Option<usize>) -> Result<()> {
+fn validate_part(view: RequestView<'_>, part: usize, run: Option<usize>) -> Result<()> {
     let doc = view.document;
     let kind = doc.required(part, "type")?;
     if doc.string_is(kind, "text")? || doc.string_is(kind, "reasoning")? {
@@ -291,7 +344,7 @@ fn validate_part(view: RequestView<'_>, part: usize, calls: Option<usize>) -> Re
     }
     if doc.string_is(kind, "tool_result")? {
         if doc.member(part, "result")?.is_none() {
-            return tool_message(doc, part, calls);
+            return tool_message(doc, part, run);
         }
         super::string(doc, doc.required(part, "tool_call_id")?)?;
         return Ok(());

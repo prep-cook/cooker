@@ -102,6 +102,7 @@ pub mod types;
 mod upstream;
 pub mod vertex;
 pub mod vertex_auth;
+mod vertex_exec;
 mod vertex_openapi;
 mod wire;
 pub mod wsrelay;
@@ -190,6 +191,7 @@ impl Executors {
             p if openai_compat::handles(p) => Some(pipeline::destination(&self.openai.compat, attempt)),
             gemini_exec::PROVIDER => Some(pipeline::destination(&self.google.gemini, attempt)),
             xai::PROVIDER => Some(pipeline::destination(&self.openai.xai, attempt)),
+            p if vertex::handles(p) => vertex_exec::destination(&self.google.vertex, attempt),
             _ => None,
         }
     }
@@ -209,6 +211,7 @@ impl Executors {
             p if openai_compat::handles(p) => pipeline::fence(&self.openai.compat, attempt, ingress, request),
             gemini_exec::PROVIDER => pipeline::fence(&self.google.gemini, attempt, ingress, request),
             xai::PROVIDER => pipeline::fence(&self.openai.xai, attempt, ingress, request),
+            p if vertex::handles(p) => pipeline::fence(&self.google.vertex, attempt, ingress, request),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -225,6 +228,7 @@ impl Executors {
             p if openai_compat::handles(p) => pipeline::refence(&self.openai.compat, attempt, view),
             gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
             xai::PROVIDER => pipeline::refence(&self.openai.xai, attempt, view),
+            p if vertex::handles(p) => pipeline::refence(&self.google.vertex, attempt, view),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -248,6 +252,7 @@ impl Executors {
             }
             gemini_exec::PROVIDER => pipeline::start(&self.google.gemini, attempt, request, upload, response).await,
             xai::PROVIDER => pipeline::start(&self.openai.xai, attempt, request, upload, response).await,
+            p if vertex::handles(p) => pipeline::start(&self.google.vertex, attempt, request, upload, response).await,
             provider => {
                 response.finish(ck_stream::Terminal::Gone);
                 Err(no_executor(provider))

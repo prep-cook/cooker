@@ -24,9 +24,16 @@ use crate::openai_compat::{self as compat, OpenAICompatExecutor};
 use crate::openai_compat_http as wire;
 use crate::openai_compat_payload as payload;
 use crate::types::{Attempt, Counted, Execute, Request, Streams, Upstream};
+use crate::upstream::{record_answer, record_failure, record_send};
 
 /// The capability key of OpenAI-compatible relays.
 pub const DESTINATION: &str = "openai-compat";
+
+/// The Chat generation path under a relay's base URL.
+pub(crate) const CHAT_PATH: &str = "/chat/completions";
+
+/// The native compact path under a relay's base URL.
+const COMPACT_PATH: &str = "/responses/compact";
 
 /// Chat generation, its token count, and the Responses native compact.
 pub struct RelayCapability;
@@ -107,34 +114,12 @@ impl Execute for OpenAICompatExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<RelayIngress>, ExecError> {
-        let document = request.validated.view().document;
-        let stream = streaming(document).map_err(encoding)?;
-        let egress = ChatEgress {
-            destination: DESTINATION,
-            upstream_stream: stream,
-        };
-        let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
-        let body = Relay::new(attempt, request)?.chat(upload, stream)?;
-        let mode = if stream {
-            BodyMode::Streaming
-        } else {
-            BodyMode::Buffered
-        };
-        let ingress = ChatIngress::new(
-            streams.response,
-            attempt.store,
-            attempt.identity,
-            Operation::Generate,
-            mode,
-            compat::MAX_LINE as u64,
-        )
-        .map_err(encoding)?;
-        let upstream = self.send(attempt, request, "/chat/completions", body, stream).await?;
+        let upstream = chat(attempt, request, streams, self.route(attempt)?).await?;
         Ok(Upstream {
             status: upstream.status,
             headers: upstream.headers,
             body: upstream.body,
-            ingress: RelayIngress::Chat(Box::new(ingress)),
+            ingress: RelayIngress::Chat(Box::new(upstream.ingress)),
         })
     }
 
@@ -144,27 +129,8 @@ impl Execute for OpenAICompatExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<RelayIngress>, ExecError> {
-        let view = RequestView {
-            operation: Operation::Generate,
-            ..request.validated.view()
-        };
-        let generate = RequestFence::default().end(view, &RelayCapability).map_err(encoding)?;
-        let egress = ChatEgress {
-            destination: DESTINATION,
-            upstream_stream: false,
-        };
-        let upload = copy(&egress.encode(&generate, streams.request).map_err(encoding)?)?;
-        let relay = Relay::new(attempt, request)?;
-        let body = relay.count(upload)?;
-        let count = payload::count_chat_tokens(&relay.base_model, &body).map_err(|e| {
-            ExecError::local(
-                500,
-                FailureScope::Request,
-                format!("openai compat executor: token counting failed: {e}"),
-            )
-        })?;
         Ok(Counted::Local {
-            input_tokens: u64::try_from(count).unwrap_or_default(),
+            input_tokens: count(attempt, request, streams)?,
         })
     }
 
@@ -174,12 +140,14 @@ impl Execute for OpenAICompatExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<RelayIngress>, ExecError> {
+        let route = self.route(attempt)?;
         let egress = ResponsesEgress {
             destination: DESTINATION,
             upstream_stream: false,
         };
         let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
-        let body = Relay::new(attempt, request)?.compact(upload)?;
+        let relay = Relay::new(attempt, request)?;
+        let body = relay.compact(upload, route.compat.as_ref())?;
         let ingress = ResponsesIngress::new(
             streams.response,
             attempt.identity,
@@ -188,7 +156,7 @@ impl Execute for OpenAICompatExecutor {
             compat::MAX_LINE as u64,
         )
         .map_err(encoding)?;
-        let upstream = self.send(attempt, request, "/responses/compact", body, false).await?;
+        let upstream = send(&route, attempt, request, COMPACT_PATH, &relay.base_model, body, false).await?;
         Ok(Upstream {
             status: upstream.status,
             headers: upstream.headers,
@@ -199,47 +167,159 @@ impl Execute for OpenAICompatExecutor {
 }
 
 impl OpenAICompatExecutor {
-    /// Posts `body` to `path` under the credential's base URL with its key and custom
-    /// headers; a non-2xx answer is the attempt's failure with the upstream's status.
-    async fn send(
-        &self,
-        attempt: &Attempt<'_>,
-        request: &Request<'_>,
-        path: &str,
-        body: Vec<u8>,
-        stream: bool,
-    ) -> Result<wire::Upstream, ExecError> {
+    /// The relay's own route: the credential's base URL and key, and its compatibility config.
+    fn route(&self, attempt: &Attempt<'_>) -> Result<Route, ExecError> {
         let credential = attempt.credential;
-        let (base_url, api_key) = compat::credentials(credential);
+        let (base_url, key) = compat::credentials(credential);
         if base_url.is_empty() {
             return Err(compat::missing_base_url());
         }
-        let mut headers = compat::base_headers(&api_key, "application/json");
-        let session = ck_wire::session::cpa_session_id(request.client.session);
-        for (name, value) in
-            ck_wire::headers::custom_headers(&credential.attributes, request.client.headers, session.as_deref())
-        {
-            headers.set(&name, value);
-        }
-        if stream {
-            headers.set("Accept", "text/event-stream");
-            headers.set("Cache-Control", "no-cache");
-        }
-        let url = compat::endpoint(&base_url, path);
-        // Refused before anything is sent, so the key never reaches a host the url crate
-        // reads differently from Go (`openai_compat::chat_with`).
-        crate::xai_url::new_request(&url)?;
-        if let Some(error) = crate::xai_url::transport_refusal(&url) {
-            return Err(error);
-        }
-        let client = self.client(credential, attempt.cfg);
-        let upstream = wire::send(&client, &url, headers, Bytes::from(body)).await?;
-        if (200..300).contains(&upstream.status) {
-            return Ok(upstream);
-        }
-        let (status, headers, body) = wire::read_error_body(upstream).await;
-        Err(compat::status_error(status, headers, &body, true))
+        Ok(Route {
+            client: self.client(credential, attempt.cfg),
+            base_url,
+            key,
+            compat: payload::resolve_compat(credential, attempt.cfg),
+        })
     }
+}
+
+/// Where a relay request goes: the HTTP client, the base URL and bearer key, and the
+/// compatibility config, which another executor's route (Vertex `endpoints/openapi`) has not.
+pub(crate) struct Route {
+    pub client: wreq::Client,
+    pub base_url: String,
+    pub key: String,
+    pub compat: Option<payload::Compat>,
+}
+
+/// A Chat generation on `route`, encoded with the Chat request egress for [`DESTINATION`].
+pub(crate) async fn chat(
+    attempt: &Attempt<'_>,
+    request: &Request<'_>,
+    streams: Streams<'_>,
+    route: Route,
+) -> Result<Upstream<ChatIngress>, ExecError> {
+    let document = request.validated.view().document;
+    let stream = streaming(document).map_err(encoding)?;
+    let egress = ChatEgress {
+        destination: DESTINATION,
+        upstream_stream: stream,
+    };
+    let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
+    let relay = Relay::new(attempt, request)?;
+    let body = relay.chat(upload, stream, route.compat.as_ref())?;
+    let mode = if stream {
+        BodyMode::Streaming
+    } else {
+        BodyMode::Buffered
+    };
+    let ingress = ChatIngress::new(
+        streams.response,
+        attempt.store,
+        attempt.identity,
+        Operation::Generate,
+        mode,
+        compat::MAX_LINE as u64,
+    )
+    .map_err(encoding)?;
+    let upstream = send(&route, attempt, request, CHAT_PATH, &relay.base_model, body, stream).await?;
+    Ok(Upstream {
+        status: upstream.status,
+        headers: upstream.headers,
+        body: upstream.body,
+        ingress,
+    })
+}
+
+/// The local token count of a count request: the Chat body its generation would send,
+/// before the relay's compatibility rewrites.
+pub(crate) fn count(attempt: &Attempt<'_>, request: &Request<'_>, streams: Streams<'_>) -> Result<u64, ExecError> {
+    let view = RequestView {
+        operation: Operation::Generate,
+        ..request.validated.view()
+    };
+    let generate = RequestFence::default().end(view, &RelayCapability).map_err(encoding)?;
+    let egress = ChatEgress {
+        destination: DESTINATION,
+        upstream_stream: false,
+    };
+    let upload = copy(&egress.encode(&generate, streams.request).map_err(encoding)?)?;
+    let relay = Relay::new(attempt, request)?;
+    let body = relay.count(upload)?;
+    let count = payload::count_chat_tokens(&relay.base_model, &body).map_err(|e| {
+        ExecError::local(
+            500,
+            FailureScope::Request,
+            format!("openai compat executor: token counting failed: {e}"),
+        )
+    })?;
+    Ok(u64::try_from(count).unwrap_or_default())
+}
+
+/// Posts `body` to `path` under the route's base URL with its key and the credential's custom
+/// headers, recording the request-side facts of `model`'s call (contract G4); a non-2xx answer
+/// is the attempt's failure with the upstream's status and body as received.
+async fn send(
+    route: &Route,
+    attempt: &Attempt<'_>,
+    request: &Request<'_>,
+    path: &str,
+    model: &str,
+    body: Vec<u8>,
+    stream: bool,
+) -> Result<wire::Upstream, ExecError> {
+    let mut headers = compat::base_headers(&route.key, "application/json");
+    let session = ck_wire::session::cpa_session_id(request.client.session);
+    for (name, value) in ck_wire::headers::custom_headers(
+        &attempt.credential.attributes,
+        request.client.headers,
+        session.as_deref(),
+    ) {
+        headers.set(&name, value);
+    }
+    if stream {
+        headers.set("Accept", "text/event-stream");
+        headers.set("Cache-Control", "no-cache");
+    }
+    let url = compat::endpoint(&route.base_url, path);
+    // Refused before anything is sent, so the key never reaches a host the url crate
+    // reads differently from Go (`openai_compat::chat_with`).
+    crate::xai_url::new_request(&url)?;
+    if let Some(error) = crate::xai_url::transport_refusal(&url) {
+        return Err(error);
+    }
+    let usage = request.client.usage;
+    if usage.enabled() {
+        let target = if path == CHAT_PATH {
+            Format::OpenAI
+        } else {
+            Format::OpenAIResponse
+        };
+        usage.request(target, &body);
+    }
+    usage.upstream_model(model);
+    let body = Bytes::from(body);
+    let provider = &attempt.credential.provider;
+    record_send(
+        usage,
+        true,
+        attempt.credential,
+        provider,
+        &url,
+        (headers.pairs(), &body),
+    );
+    let upstream = wire::send(&route.client, &url, headers, body)
+        .await
+        .inspect_err(|error| record_failure(usage, error))?;
+    let upstream = wire::Upstream {
+        body: record_answer(usage, true, upstream.status, &upstream.headers, upstream.body),
+        ..upstream
+    };
+    if (200..300).contains(&upstream.status) {
+        return Ok(upstream);
+    }
+    let (status, headers, body) = wire::read_error_body(upstream).await;
+    Err(compat::status_error(status, headers, body, true))
 }
 
 /// What the upload adjustments read besides the upload itself.
@@ -263,10 +343,8 @@ impl<'r> Relay<'r> {
     }
 
     /// A `/chat/completions` body.
-    fn chat(&self, upload: Vec<u8>, stream: bool) -> Result<Vec<u8>, ExecError> {
+    fn chat(&self, upload: Vec<u8>, stream: bool, compat: Option<&payload::Compat>) -> Result<Vec<u8>, ExecError> {
         let (mut body, original, requested) = self.prepare(upload, Format::OpenAI)?;
-        let compat = payload::resolve_compat(self.attempt.credential, self.attempt.cfg);
-        let compat = compat.as_ref();
         if payload::excludes_images(compat, &self.base_model, &requested) {
             body = payload::normalize_tool_results_text_only(body);
         }
@@ -280,10 +358,9 @@ impl<'r> Relay<'r> {
     }
 
     /// A `/responses/compact` body.
-    fn compact(&self, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
+    fn compact(&self, upload: Vec<u8>, compat: Option<&payload::Compat>) -> Result<Vec<u8>, ExecError> {
         let (mut body, original, requested) = self.prepare(upload, Format::OpenAIResponse)?;
-        let compat = payload::resolve_compat(self.attempt.credential, self.attempt.cfg);
-        if payload::excludes_images(compat.as_ref(), &self.base_model, &requested) {
+        if payload::excludes_images(compat, &self.base_model, &requested) {
             body = payload::normalize_tool_results_text_only(body);
         }
         body = payload::sanitize_reasoning_encrypted_content(body);
