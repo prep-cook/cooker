@@ -284,7 +284,11 @@ impl State {
                 |_| Ok(()),
             )?;
         }
-        let finish = doc.member(candidate, "finishReason")?;
+        // An empty reason means the candidate has not stopped generating.
+        let finish = match doc.member(candidate, "finishReason")? {
+            Some(n) if doc.string_is(n, "")? => None,
+            finish => finish,
+        };
         let known = if finish.is_some() {
             FINISHED_KNOWN
         } else {

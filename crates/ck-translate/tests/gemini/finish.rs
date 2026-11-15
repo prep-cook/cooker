@@ -108,3 +108,29 @@ fn foreign_finish_reasons_reach_gemini_as_gemini_reasons() {
         assert_eq!(out["candidates"][0]["finishReason"], native, "{chat}");
     }
 }
+
+/// An empty `finishReason` means the candidate has not stopped: its later chunks stay
+/// accepted, and only the real reason finishes it, once.
+#[test]
+fn empty_finish_reason_keeps_the_candidate_open() {
+    let rows = [
+        json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"a"}]},"finishReason":""}]}),
+        json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"b"}]},"finishReason":"STOP"}]}),
+    ];
+    let (out, canonical) = response(&sse(&rows), Framing::Sse, Framing::Json, Operation::Generate);
+    let finishes: Vec<_> = canonical
+        .iter()
+        .filter(|v| v["choices"][0]["finish_reason"].is_string())
+        .collect();
+    assert_eq!(finishes.len(), 1);
+    assert_eq!(finishes[0]["x_ck"]["native_finish_reason"], "STOP");
+    let out: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(out["candidates"][0]["finishReason"], "STOP");
+    let text: String = out["candidates"][0]["content"]["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["text"].as_str())
+        .collect();
+    assert_eq!(text, "ab");
+}
