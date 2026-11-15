@@ -211,7 +211,7 @@ impl MetaExecutor {
         // so its first body byte only records the first-packet fallback.
         use crate::kimi_http::{capture_chunk, capture_error, capture_metadata, capture_request};
         let capture = req.capture();
-        let request_headers = headers(&enriched, &req.headers, req.session.as_deref(), &token);
+        let request_headers = headers(credential, &req.headers, req.session.as_deref(), &token);
         // recordMetaRequest: the enriched credential's account info.
         let (auth_type, auth_value) = ck_core::registry::dynamic::account_info(&enriched);
         capture_request(
@@ -328,6 +328,9 @@ pub(crate) fn headers(c: &Credential, client: &http::HeaderMap, session: Option<
     let session = ck_wire::session::cpa_session_id(session);
     for (name, value) in ck_wire::headers::custom_headers(&c.attributes, client, session.as_deref()) {
         h.set(&name, value);
+    }
+    if ck_core::registry::dynamic::is_api_key(c) {
+        h.set("User-Agent", "cooker");
     }
     h
 }

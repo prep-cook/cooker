@@ -419,10 +419,23 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
         {
             diffs.push(diff);
         }
-        if requests != s.requests {
+        let want_requests: Vec<String> = s
+            .requests
+            .iter()
+            .map(|raw| {
+                let head = raw.split_once("\r\n\r\n").unwrap().0;
+                if !head.contains("\r\nAuthorization: Bearer ") {
+                    return raw.clone();
+                }
+                // Q13 changes only the API-key identity in these historical requests.
+                let agent = "\r\nUser-Agent: cooker\r\n";
+                raw.replacen("\r\nUser-Agent: Go-http-client/1.1\r\n", agent, 1)
+                    .replacen("\r\nUser-Agent: cli-proxy-openai-compat\r\n", agent, 1)
+            })
+            .collect();
+        if requests != want_requests {
             diffs.push(format!(
-                "upstream requests:\n  go   {:?}\n  rust {requests:?}",
-                s.requests
+                "upstream requests:\n  expected {want_requests:?}\n  rust {requests:?}"
             ));
         }
         if !diffs.is_empty() {

@@ -333,7 +333,14 @@ async fn go_reference_scenarios() {
             .as_array()
             .into_iter()
             .flatten()
-            .map(|r| r.as_str().unwrap().to_owned())
+            .map(|r| {
+                let raw = r.as_str().unwrap();
+                if raw.contains("\r\nX-Goog-Api-Key:") || matches!(auth_for(&cred), Ok(Auth::ApiKey { .. })) {
+                    crate::openai_compat_usage::api_key_wire(raw)
+                } else {
+                    raw.to_owned()
+                }
+            })
             .collect();
         assert_eq!(got, want, "{name}: upstream requests");
         reports.check(s);

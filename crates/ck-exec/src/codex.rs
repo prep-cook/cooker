@@ -599,6 +599,9 @@ impl CodexExecutor {
                 headers.insert(name, value);
             }
         }
+        if view.api_key {
+            headers.insert(http::header::USER_AGENT, http::HeaderValue::from_static("cooker"));
+        }
         let wire = Wire::new(capture, credential);
         wire.request(&url, &headers, &body);
         let upstream = match self.post(&view, &url, &headers, Bytes::from(body), None).await {

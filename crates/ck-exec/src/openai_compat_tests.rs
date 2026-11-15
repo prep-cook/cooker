@@ -247,10 +247,11 @@ fn error_json(e: &ExecError) -> Value {
 }
 
 fn want_bytes(s: &Value) -> Option<Vec<u8>> {
-    match s["request_b64"].as_str() {
+    let raw = match s["request_b64"].as_str() {
         Some(b64) => Some(base64::engine::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap()),
         None => s["request"].as_str().map(|r| r.as_bytes().to_vec()),
-    }
+    };
+    raw.map(|r| crate::openai_compat_usage::api_key_request(&r))
 }
 
 #[tokio::test]
@@ -319,12 +320,7 @@ async fn go_reference_scenarios() {
             },
         }
         if let Some(mock) = &mock {
-            let want = match s["request_b64"].as_str() {
-                Some(b64) => {
-                    Some(base64::engine::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap())
-                }
-                None => s["request"].as_str().map(|r| r.as_bytes().to_vec()),
-            };
+            let want = want_bytes(s);
             assert_eq!(
                 mock.request().map(|r| String::from_utf8_lossy(&r).into_owned()),
                 want.map(|r| String::from_utf8_lossy(&r).into_owned()),

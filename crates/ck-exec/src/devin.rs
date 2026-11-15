@@ -635,6 +635,9 @@ fn headers(credential: &Credential, req: &ExecRequest, key: &str) -> GoHeaders {
     for (name, value) in crate::kimi_http::credential_headers(credential, req, original(req)) {
         h.set(&name, value);
     }
+    if ck_core::registry::dynamic::is_api_key(credential) {
+        h.set("User-Agent", "cooker");
+    }
     h
 }
 

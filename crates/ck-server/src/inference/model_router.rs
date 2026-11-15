@@ -658,6 +658,7 @@ async fn ask_system_one(
     });
     let mut headers = ck_exec::proxy::GoHeaders::new();
     headers.set("content-type", "application/json");
+    headers.set("user-agent", "cooker");
     let key = attribute("api_key");
     if !key.is_empty() {
         headers.set("authorization", format!("Bearer {key}"));
@@ -1281,6 +1282,7 @@ mod tests {
             body: String,
         ) -> axum::response::Response {
             use axum::response::IntoResponse;
+            assert_eq!(headers.get("user-agent").unwrap(), "cooker");
             let auth = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())

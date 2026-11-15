@@ -50,7 +50,7 @@ async fn every_client_protocol_goes_out_as_meta_and_comes_back() {
         );
         for (name, value) in [
             ("authorization", "Bearer sk-up"),
-            ("user-agent", ck_exec::meta::USER_AGENT),
+            ("user-agent", "cooker"),
             ("x-client-id", "tbh:tui"),
             ("accept", "text/event-stream"),
             ("cache-control", "no-cache"),

@@ -373,6 +373,10 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
         if rawjson::get(p.body, "thinking.block_binding").exists() {
             h.set("Anthropic-Beta", betas::with_thinking_binding(h.get("Anthropic-Beta")));
         }
+        // This branch excludes cloaked and confirmed Claude Code requests, even on API keys.
+        if !p.bearer {
+            h.set("User-Agent", "cooker");
+        }
         return h;
     }
 
@@ -698,13 +702,20 @@ mod tests {
         );
     }
 
+    // Header contract verified against origin/feat/s1-execution at 57d14e8f.
     #[test]
-    fn harness_unconfirmed_oauth_messages_headers_match_go_capture() {
+    fn fingerprinted_credentials_keep_their_wire_headers() {
         let settings = Settings::default();
+        let request_id = "9b6a3f8e-1c2d-4e5f-8a9b-0c1d2e3f4a5b";
+        let session_id = "dd01238e-cdb5-5572-8f27-a28d98fe9075";
         let incoming: HeaderMap = [
             ("authorization", "Bearer fixture-client-key"),
             ("content-type", "application/json"),
             ("anthropic-version", "2023-06-01"),
+            ("user-agent", "claude-cli/2.1.280 (external, cli)"),
+            ("x-stainless-os", "MacOS"),
+            ("x-stainless-arch", "arm64"),
+            ("x-client-request-id", request_id),
             ("x-claude-code-session-id", "11111111-2222-4333-8444-555555555555"),
         ]
         .into_iter()
@@ -712,60 +723,94 @@ mod tests {
         .collect();
         let attributes = Default::default();
         let body = r#"{"model":"claude-sonnet-4-6","diagnostics":{"previous_message_id":null}}"#;
-        let h = build(&Plan {
-            api_key: "sk-ant-oat01-FAKE",
-            bearer: true,
-            first_party: true,
-            count_tokens: false,
-            stream: false,
-            extra_betas: &[],
-            body,
-            incoming: &incoming,
-            confirmed: false,
-            helper: false,
-            cli_fingerprint: true,
-            use_oauth_betas: true,
-            session_id: "dd01238e-cdb5-5572-8f27-a28d98fe9075",
-            settings: &settings,
-            attributes: &attributes,
-            cpa_session: "",
-            device_profile: None,
-            cached_session_id: "",
-            official: false,
-        });
-        let (pairs, order) = wire(h, true, false);
-        let names: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "Accept",
-                "Authorization",
-                "Content-Type",
-                "User-Agent",
-                "X-Claude-Code-Session-Id",
-                "X-Stainless-Arch",
-                "X-Stainless-Lang",
-                "X-Stainless-OS",
-                "X-Stainless-Package-Version",
-                "X-Stainless-Retry-Count",
-                "X-Stainless-Runtime",
-                "X-Stainless-Runtime-Version",
-                "X-Stainless-Timeout",
-                "anthropic-beta",
-                "anthropic-dangerous-direct-browser-access",
-                "anthropic-version",
-                "x-app",
-                "x-client-request-id",
-                "Connection",
-                "Accept-Encoding"
-            ]
+        let common_betas = concat!(
+            "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,",
+            "thinking-token-count-2026-05-13,context-management-2025-06-27,",
+            "prompt-caching-scope-2026-01-05,effort-2025-11-24,"
         );
-        assert_eq!(order[19], "Host");
-        assert_eq!(order[21], "Content-Length");
-        let get = |n: &str| pairs.iter().find(|(k, _)| k == n).unwrap().1.clone();
-        assert_eq!(get("User-Agent"), "claude-cli/2.1.280 (external, cli)");
-        assert_eq!(get("X-Stainless-OS"), "MacOS");
-        assert_eq!(get("Accept-Encoding"), "gzip, deflate, br, zstd");
+        let oauth_betas = format!(
+            "claude-code-20250219,oauth-2025-04-20,{common_betas}extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07"
+        );
+        let api_key_betas = format!("claude-code-20250219,{common_betas}cache-diagnosis-2026-04-07");
+        for (name, api_key, bearer, cli_fingerprint, confirmed, expected_betas) in [
+            ("OAuth cloak", "sk-ant-oat01-FAKE", true, true, false, &oauth_betas),
+            ("API-key cloak", "sk-ant-api03-FAKE", false, true, false, &api_key_betas),
+            ("OAuth native", "sk-ant-oat01-FAKE", true, false, true, &oauth_betas),
+            (
+                "API-key native",
+                "sk-ant-api03-FAKE",
+                false,
+                false,
+                true,
+                &api_key_betas,
+            ),
+        ] {
+            let h = build(&Plan {
+                api_key,
+                bearer,
+                first_party: true,
+                count_tokens: false,
+                stream: false,
+                extra_betas: &[],
+                body,
+                incoming: &incoming,
+                confirmed,
+                helper: false,
+                cli_fingerprint,
+                use_oauth_betas: bearer,
+                session_id,
+                settings: &settings,
+                attributes: &attributes,
+                cpa_session: "",
+                device_profile: None,
+                cached_session_id: "",
+                official: false,
+            });
+            let (mut pairs, order) = wire(h, true, false);
+            // Unconfirmed callers get a fresh UUID; all other header bytes are fixed.
+            if !confirmed {
+                let id = &mut pairs.iter_mut().find(|(k, _)| k == "x-client-request-id").unwrap().1;
+                assert_eq!(
+                    uuid::Uuid::parse_str(id).unwrap().get_version_num(),
+                    4,
+                    "{name}: request ID"
+                );
+                *id = request_id.into();
+            }
+            let mut expected = vec![
+                ("Accept", "application/json"),
+                ("Content-Type", "application/json"),
+                ("User-Agent", "claude-cli/2.1.280 (external, cli)"),
+                ("X-Claude-Code-Session-Id", session_id),
+                ("X-Stainless-Arch", "arm64"),
+                ("X-Stainless-Lang", "js"),
+                ("X-Stainless-OS", "MacOS"),
+                ("X-Stainless-Package-Version", "0.112.1"),
+                ("X-Stainless-Retry-Count", "0"),
+                ("X-Stainless-Runtime", "node"),
+                ("X-Stainless-Runtime-Version", "v26.3.0"),
+                ("X-Stainless-Timeout", "600"),
+                ("anthropic-beta", expected_betas.as_str()),
+                ("anthropic-dangerous-direct-browser-access", "true"),
+                ("anthropic-version", "2023-06-01"),
+                ("x-app", "cli"),
+                ("x-client-request-id", request_id),
+                ("Connection", "keep-alive"),
+                ("Accept-Encoding", "gzip, deflate, br, zstd"),
+            ];
+            if bearer {
+                expected.insert(1, ("Authorization", "Bearer sk-ant-oat01-FAKE"));
+            } else {
+                expected.push(("X-Api-Key", "sk-ant-api03-FAKE"));
+            }
+            let expected_pairs: Vec<_> = expected.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect();
+            assert_eq!(pairs, expected_pairs, "{name}: header bytes and casing");
+            let mut expected_order: Vec<_> = expected.iter().map(|(k, _)| *k).collect();
+            let encoding = expected_order.iter().position(|k| *k == "Accept-Encoding").unwrap();
+            expected_order.insert(encoding, "Host");
+            expected_order.insert(encoding + 2, "Content-Length");
+            assert_eq!(order, expected_order, "{name}: wire order");
+        }
     }
 }
 

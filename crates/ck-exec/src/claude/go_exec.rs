@@ -653,6 +653,26 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         count_upstream: kind == "count_tokens_upstream",
         ..Default::default()
     };
+    let api_key_identity = {
+        let scoped = cfg.for_api_key();
+        let config = if ck_core::registry::dynamic::auth_kind(&credential) == Some("apikey") {
+            &scoped
+        } else {
+            &cfg
+        };
+        let ctx = super::Ctx::new(
+            &executor,
+            &credential,
+            (
+                &req.model,
+                req.resolved_model.as_ref(),
+                req.execution_session.as_deref(),
+            ),
+            config,
+            delegation,
+        );
+        super::tests::api_key_identity(&ctx, &req, kind.starts_with("count_tokens"))
+    };
     let result = executor.execute_delegated(&credential, req, &cfg, delegation).await;
     drop(pins);
     let recorded = &record["result"];
@@ -735,6 +755,9 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         let mut want = Headers::new();
         for (k, v) in header_pairs(&go["headers"]) {
             want.entry(k.go_lower()).or_default().push(value(&v));
+        }
+        if api_key_identity {
+            want.insert("user-agent".into(), vec!["cooker".into()]);
         }
         let mut got = Headers::new();
         for (k, v) in &rust.headers {

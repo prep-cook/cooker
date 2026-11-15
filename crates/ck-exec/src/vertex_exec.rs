@@ -253,6 +253,9 @@ impl VertexExecutor {
         {
             headers.set(&name, value);
         }
+        if matches!(target.auth, Auth::ApiKey { .. }) {
+            headers.set("User-Agent", "cooker");
+        }
         // A count is not generation usage (contract §3).
         let (usage, generation) = (client_side.usage, method != Method::CountTokens);
         if generation {
@@ -293,11 +296,13 @@ impl VertexExecutor {
             return Err(error);
         }
         let client = self.client(attempt.credential, attempt.cfg);
+        let api_auth = matches!(key, vertex::OpenApiKey::Key(_));
         let key = self.openapi_key(&client, key).await?;
         let route = Route {
             client,
             base_url,
             key,
+            api_auth,
             compat: None,
         };
         let model = openapi_model(attempt.model);

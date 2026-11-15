@@ -9,7 +9,6 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ck_core::config::Config;
@@ -296,6 +295,9 @@ pub(crate) fn request_headers(
         h.set("x-authenticateresponse", "authenticate-response");
     }
     apply_custom(&mut h, c, client.0, client.1);
+    if ck_core::registry::dynamic::is_api_key(c) {
+        h.set("User-Agent", "cooker");
+    }
     h
 }
 
@@ -350,16 +352,6 @@ fn translate_non_stream(req: &ExecRequest, p: &Prepared, to: Format, data: &[u8]
     } else {
         out
     }))
-}
-
-/// `xaiInputHasItemType`.
-pub(crate) fn input_has_item_type(body: &[u8], item_type: &str) -> bool {
-    let input = gj::get(body, "input");
-    input.is_array()
-        && input
-            .array()
-            .iter()
-            .any(|item| &*item.get("type").bytes() == item_type.as_bytes())
 }
 
 /// `xaiRemoveInputItemsByType`: the input array is always rebuilt.
@@ -440,11 +432,6 @@ impl XaiExecutor {
                 return Err(status_err(400, "streaming not supported for /responses/compact"));
             }
             return self.compact(credential, &req, cfg, downstream_websocket).await;
-        }
-        if req.stream && input_has_item_type(&req.body, "compaction_trigger") {
-            return self
-                .compaction_trigger(credential, &req, cfg, downstream_websocket)
-                .await;
         }
         self.chat(credential, req, cfg, downstream_websocket).await
     }
@@ -569,32 +556,6 @@ impl XaiExecutor {
             status: 200,
             headers,
             body: ResponseBody::Buffered(out),
-        })
-    }
-
-    /// `executeCompactionTriggerStream`: a streaming turn carrying `compaction_trigger`
-    /// runs compact and answers with the six SSE frames of a completed response.
-    async fn compaction_trigger(
-        &self,
-        credential: &Credential,
-        req: &ExecRequest,
-        cfg: &Config,
-        downstream_websocket: bool,
-    ) -> Result<ExecResponse, ExecError> {
-        let (p, data, mut headers) = self.compact_request(credential, req, cfg, downstream_websocket).await?;
-        req.usage.publish();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("text/event-stream"),
-        );
-        let frames: Vec<Result<Bytes, ExecError>> = compaction_frames(&p, &data, SystemTime::now())
-            .into_iter()
-            .map(|f| Ok(Bytes::from(f)))
-            .collect();
-        Ok(ExecResponse {
-            status: 200,
-            headers,
-            body: ResponseBody::Stream(futures_util::stream::iter(frames).boxed()),
         })
     }
 
@@ -933,158 +894,6 @@ impl Pipeline {
         })
         .boxed()
     }
-}
-
-// --- compaction trigger stream (xaiBuildCompactionTriggerStreamChunks) -------------------
-
-/// `xaiCompactionResponseID`.
-pub(crate) fn compaction_response_id(data: &[u8], now: SystemTime) -> String {
-    let id = text(&gj::get(data, "id"));
-    if !id.is_empty() {
-        if id.starts_with("resp_") {
-            return id;
-        }
-        return format!("resp_{}", id.strip_prefix("cmp_").unwrap_or(&id));
-    }
-    let nanos = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    format!("resp_xai_compaction_{nanos}")
-}
-
-/// `xaiCompactionItemID`.
-fn compaction_item_id(response_id: &str) -> String {
-    match response_id.strip_prefix("resp_") {
-        Some(suffix) if !suffix.is_empty() => format!("cmp_{suffix}"),
-        _ => format!("cmp_{response_id}"),
-    }
-}
-
-/// `xaiCompactionOutputItem`.
-pub(crate) fn compaction_item(data: &[u8], response_id: &str) -> Vec<u8> {
-    let first = gj::get(data, "output.0");
-    let mut item = if first.exists() && first.kind == Kind::Json {
-        first.raw().to_vec()
-    } else {
-        br#"{"type":"compaction"}"#.to_vec()
-    };
-    if !gj::get(&item, "type").exists() {
-        gj::set_str(&mut item, "type", "compaction");
-    }
-    if !gj::get(&item, "id").exists() {
-        gj::set_str(&mut item, "id", compaction_item_id(response_id));
-    }
-    item
-}
-
-/// `xaiBuildCompactionBaseResponse`.
-fn compaction_base(p: &Prepared, data: &[u8], response_id: &str, created_at: i64, status: &str) -> Vec<u8> {
-    let mut out = br#"{"id":"","object":"response","created_at":0,"status":"","background":false,"error":null,"incomplete_details":null,"output":[]}"#.to_vec();
-    gj::set_str(&mut out, "id", response_id);
-    gj::set_int(&mut out, "created_at", created_at);
-    gj::set_str(&mut out, "status", status);
-    let model = gj::get(data, "model").str().into_owned();
-    if !model.is_empty() {
-        gj::set_str(&mut out, "model", model);
-    } else if !p.base_model.is_empty() {
-        gj::set_str(&mut out, "model", &p.base_model);
-    }
-    for field in [
-        "instructions",
-        "max_output_tokens",
-        "max_tool_calls",
-        "parallel_tool_calls",
-        "previous_response_id",
-        "prompt_cache_key",
-        "reasoning",
-        "text",
-        "tool_choice",
-        "tools",
-        "top_logprobs",
-        "top_p",
-        "truncation",
-        "user",
-        "metadata",
-    ] {
-        let value = gj::get(&p.body, field);
-        if value.exists() {
-            gj::set_raw(&mut out, field, value.raw());
-        }
-    }
-    out
-}
-
-/// `xaiBuildSSEFrame`.
-fn sse_frame(name: &str, data: &[u8]) -> Vec<u8> {
-    [b"event: ", name.as_bytes(), b"\ndata: ", data, b"\n\n"].concat()
-}
-
-/// `xaiBuildCompactionTriggerStreamChunks`.
-pub(crate) fn compaction_frames(p: &Prepared, data: &[u8], now: SystemTime) -> Vec<Vec<u8>> {
-    let response_id = compaction_response_id(data, now);
-    let unix = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let or_now = |v: i64| if v == 0 { unix } else { v };
-    let created_at = or_now(gj::get(data, "created_at").int());
-    let completed_at = or_now(gj::get(data, "completed_at").int());
-    let item = compaction_item(data, &response_id);
-    let output = [&b"["[..], &item, b"]"].concat();
-    let mut created = compaction_base(p, data, &response_id, created_at, "in_progress");
-    let mut in_progress = compaction_base(p, data, &response_id, created_at, "in_progress");
-    let mut completed = compaction_base(p, data, &response_id, created_at, "completed");
-    let mut model = gj::get(&p.original_payload, "model").str().into_owned();
-    if model.is_empty() {
-        model = p.base_model.clone();
-    }
-    if model.is_empty() {
-        model = gj::get(data, "model").str().into_owned();
-    }
-    if !model.is_empty() {
-        gj::set_str(&mut created, "model", &model);
-        gj::set_str(&mut in_progress, "model", &model);
-    }
-    gj::set_int(&mut completed, "completed_at", completed_at);
-    gj::set_raw(&mut completed, "output", &output);
-    let usage = gj::get(data, "usage");
-    if usage.exists() {
-        gj::set_raw(&mut completed, "usage", usage.raw());
-    }
-    let with = |template: &[u8], key: &str, raw: &[u8]| {
-        let mut out = template.to_vec();
-        gj::set_raw(&mut out, key, raw);
-        out
-    };
-    let created = with(
-        br#"{"type":"response.created","sequence_number":0}"#,
-        "response",
-        &created,
-    );
-    let in_progress = with(
-        br#"{"type":"response.in_progress","sequence_number":1}"#,
-        "response",
-        &in_progress,
-    );
-    let added = with(
-        br#"{"type":"response.output_item.added","sequence_number":2,"output_index":0}"#,
-        "item",
-        &item,
-    );
-    let keepalive = br#"{"type":"keepalive","sequence_number":3}"#;
-    let done = with(
-        br#"{"type":"response.output_item.done","sequence_number":4,"output_index":0}"#,
-        "item",
-        &item,
-    );
-    let completed = ensure_responses_usage_details(&with(
-        br#"{"type":"response.completed","sequence_number":5}"#,
-        "response",
-        &completed,
-    ));
-    vec![
-        sse_frame("response.created", &created),
-        sse_frame("response.in_progress", &in_progress),
-        sse_frame("response.output_item.added", &added),
-        sse_frame("keepalive", keepalive),
-        sse_frame("response.output_item.done", &done),
-        sse_frame("response.completed", &completed),
-    ]
 }
 
 // --- token counting (xai_executor_tokens.go) ----------------------------------------------

@@ -1923,8 +1923,8 @@ impl<'a> Ctx<'a> {
         cloak: bool,
     ) -> Result<(Vec<(String, String)>, Vec<String>), ExecError> {
         let cpa_session = ck_wire::session::cpa_session_id(req.session).unwrap_or_default();
-        // Only a fingerprinted request replaces the caller's identity; an API key without
-        // cloaking forwards the caller's own User-Agent, refused or not.
+        // Only a fingerprinted request replaces the caller's Claude identity.
+        // Ordinary API-key requests use cooker and do not consult the refused-version policy.
         if self.cli_profile || cloak {
             profile::note_refused(self.credential, req.headers, &self.settings);
         }
