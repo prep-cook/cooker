@@ -2,6 +2,9 @@
 //! scanner builds or decline, records that straddle a frame boundary decode like any other,
 //! and an egress binding checks identity once and `seq` on every record.
 
+#[allow(dead_code)]
+#[path = "../src/boundary.rs"]
+pub mod boundary;
 #[path = "../src/codec/mod.rs"]
 pub mod codec;
 #[allow(dead_code, reason = "these tests use only the mapped store and writer")]
