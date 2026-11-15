@@ -12,7 +12,9 @@ impl State {
             return Err(Error::Truncated);
         }
         let scope = self.scope(position);
-        let incomplete = doc.string_is(finish, "length")? || doc.string_is(finish, "content_filter")?;
+        let incomplete = (self.glm && doc.string_is(finish, "network_error")?)
+            || doc.string_is(finish, "length")?
+            || doc.string_is(finish, "content_filter")?;
         // Finish every parser before publishing any close for this choice. Arguments that are
         // not JSON still close: `tool.end` reports them with `valid_json: false`.
         for tool in self.choices[position].tools.iter_mut() {
@@ -68,6 +70,7 @@ impl State {
             },
         )?;
         self.choices[position].finished = true;
+        self.network_error |= self.glm && doc.string_is(finish, "network_error")?;
         Ok(())
     }
     /// Publishes ToolEnd for every call of a finishing choice and drops its argument parsers.

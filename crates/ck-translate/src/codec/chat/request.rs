@@ -18,6 +18,10 @@ mod index;
 mod records;
 pub use records::read_request;
 
+#[path = "request_glm.rs"]
+mod glm;
+pub use glm::GlmCapability;
+
 #[path = "request_gemini.rs"]
 pub(crate) mod gemini;
 #[path = "request_json_schema.rs"]

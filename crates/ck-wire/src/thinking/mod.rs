@@ -10,6 +10,7 @@
 
 use crate::gostr::GoStr;
 mod apply;
+pub mod glm;
 mod providers;
 mod source;
 mod summary;
@@ -210,17 +211,19 @@ pub struct SuffixResult {
 
 /// `ParseSuffix`: `model(value)` splits at the last `(` when the name ends with `)`.
 pub fn parse_suffix(model: &str) -> SuffixResult {
-    match model.rfind('(') {
-        Some(open) if model.ends_with(')') => SuffixResult {
-            model_name: model[..open].to_owned(),
-            has_suffix: true,
-            raw_suffix: model[open + 1..model.len() - 1].to_owned(),
-        },
-        _ => SuffixResult {
-            model_name: model.to_owned(),
-            has_suffix: false,
-            raw_suffix: String::new(),
-        },
+    let (model, suffix) = split_suffix(model);
+    SuffixResult {
+        model_name: model.to_owned(),
+        has_suffix: suffix.is_some(),
+        raw_suffix: suffix.unwrap_or_default().to_owned(),
+    }
+}
+
+/// Borrows the same suffix split for capability checks that need no owned strings.
+pub fn split_suffix(model: &str) -> (&str, Option<&str>) {
+    match model.strip_suffix(')').and_then(|model| model.rsplit_once('(')) {
+        Some((model, suffix)) => (model, Some(suffix)),
+        None => (model, None),
     }
 }
 
