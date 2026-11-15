@@ -59,6 +59,7 @@ impl CaptureObserver for Observed {
             CaptureEvent::Request(request) => format!("capture request {} {}", request.provider, request.url),
             CaptureEvent::ResponseMetadata(status, _) => format!("capture metadata {status}"),
             CaptureEvent::ResponseChunk(_) => "capture chunk".into(),
+            CaptureEvent::ResponseError(text) => format!("capture error {text}"),
             _ => "capture other".into(),
         };
         self.push(call);
@@ -147,4 +148,25 @@ async fn the_openapi_route_reports_its_request_side_facts() {
             "capture chunk".into(),
         ],
     );
+}
+
+/// A redirect `Location` may carry credentials; neither the failure nor its capture names it.
+const LEAKY_REDIRECT: &str = "http://user:sk-review-secret@127.0.0.1:bad/?api_key=sk-review-secret";
+
+#[tokio::test]
+async fn a_redirect_location_never_reaches_the_failure_or_its_capture() {
+    let streams = Streams::new();
+    let redirect = Reply::status(302, "text/plain", "").header("location", LEAKY_REDIRECT);
+    let upstream = StreamUpstream::start([redirect]).await;
+    let mut exchange = exchange(&upstream);
+    let observed = observed(&mut exchange);
+    let run = run_on(&streams, &exchange, Client::Gemini, Operation::Generate, GEMINI, 64).await;
+    let error = run.started.err().expect("the redirect fails the attempt");
+    assert!(
+        !String::from_utf8_lossy(&error.body).contains("sk-review-secret"),
+        "{error:?}"
+    );
+    let calls = observed.calls();
+    assert!(calls.iter().any(|c| c.starts_with("capture error")), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.contains("sk-review-secret")), "{calls:?}");
 }

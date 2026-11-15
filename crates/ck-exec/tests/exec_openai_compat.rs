@@ -369,6 +369,41 @@ async fn a_refusal_keeps_the_error_body_as_received() {
     }
 }
 
+/// Every capture event's text.
+#[derive(Default)]
+struct Capture(std::sync::Mutex<Vec<String>>);
+
+impl ck_core::exec::CaptureObserver for Capture {
+    fn record(&self, event: ck_core::exec::CaptureEvent<'_>) {
+        let text = match event {
+            ck_core::exec::CaptureEvent::Request(request) => format!("request {}", request.url),
+            ck_core::exec::CaptureEvent::ResponseError(text) => format!("error {text}"),
+            _ => "other".into(),
+        };
+        self.0.lock().unwrap().push(text);
+    }
+}
+
+/// A redirect `Location` may carry credentials; neither the failure nor its capture names it.
+#[tokio::test]
+async fn a_redirect_location_never_reaches_the_failure_or_its_capture() {
+    let location = "http://user:sk-review-secret@127.0.0.1:bad/?api_key=sk-review-secret";
+    let upstream = StreamUpstream::start([Reply::status(302, "text/plain", "").header("location", location)]).await;
+    let (streams, mut exchange) = (Streams::new(), exchange(&upstream));
+    let captured = std::sync::Arc::new(Capture::default());
+    exchange.usage =
+        ck_core::exec::UsageSink::default().with_capture(ck_core::exec::CaptureSink::new(captured.clone()));
+    let (started, _, _request) = run(&streams, &exchange, "chat", Operation::Generate, CHAT, 64).await;
+    let error = started.err().expect("the redirect fails the attempt");
+    assert!(
+        !String::from_utf8_lossy(&error.body).contains("sk-review-secret"),
+        "{error:?}"
+    );
+    let events = captured.0.lock().unwrap().clone();
+    assert!(events.iter().any(|e| e.starts_with("error ")), "{events:?}");
+    assert!(!events.iter().any(|e| e.contains("sk-review-secret")), "{events:?}");
+}
+
 /// A count is local: nothing goes upstream, and the stream carries the canonical result.
 #[tokio::test]
 async fn a_count_is_local() {

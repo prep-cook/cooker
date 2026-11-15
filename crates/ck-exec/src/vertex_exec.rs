@@ -358,12 +358,14 @@ fn count_body(call: &Call<'_>, upload: Vec<u8>) -> Vec<u8> {
         projected.push(b'}');
     }
     drop(upload);
-    let original = vertex::strip_call_ids(projected);
-    let mut body = original.clone();
+    let mut body = vertex::strip_call_ids(projected);
     if gj::get(&body, "model").exists() {
         call.name_model(&mut body, "model");
     }
-    call.rules("", &original, body)
+    // No separate baseline: default rules then check the body as it enters, which differs
+    // from the projection only in the value of an existing `model`, never in which members
+    // exist, so the rules decide alike; the engine copies it only when a default rule exists.
+    call.rules("", &[], body)
 }
 
 /// Whether the request names cached content: a Gemini client's `cachedContent`, kept as its
