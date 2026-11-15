@@ -21,6 +21,10 @@ fn log_lines_hide_url_credentials() {
         let proxy = "http://u:sk-review-secret@127.0.0.1:9/?code=sk-review-secret#sk-review-secret";
         tracing::warn!(proxy = %proxy, "proxy client failed");
         tracing::warn!("request to {proxy} failed");
+        // A relative reference, a backtick and a quoted space.
+        tracing::warn!("upstream redirect: next#sk-review-secret");
+        tracing::warn!("request failed for `http://u:sk-review-secret@127.0.0.1/path`");
+        tracing::warn!("request failed for \"http://127.0.0.1/?code=prefix sk-review-secret\"");
     });
     let written = String::from_utf8(written.lock().unwrap().clone()).unwrap();
     assert!(!written.contains("sk-review-secret"), "{written}");

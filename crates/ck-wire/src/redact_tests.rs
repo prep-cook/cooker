@@ -51,7 +51,7 @@ fn credentials_never_print() {
     }
 }
 
-/// Query and fragment bytes never become the host (review of #127, finding 1).
+/// Query and fragment bytes never become the host.
 #[test]
 fn the_authority_ends_before_the_query_and_fragment() {
     for raw in [
@@ -90,7 +90,7 @@ fn malformed_urls_print_the_placeholder() {
         "https://host:sk-review-secret/v1",
         "https://[::1/sk-review-secret",
         "https://sk review secret/v1",
-        // Review of #127, finding 7: a bracketed host that is not IPv6, and escapes that
+        // A bracketed host that is not IPv6, and escapes that
         // decode to delimiters.
         "http://[sk-review-secret]/",
         "http://[v1.sk-review-secret]/",
@@ -152,7 +152,7 @@ fn the_scan_is_linear() {
     }
 }
 
-/// Review of #127, finding 2: a quoted URL runs to its closing quote, and a
+/// A quoted URL runs to its closing quote, and a
 /// scheme-relative URL is a URL too.
 #[test]
 fn quoted_and_scheme_relative_urls_are_whole() {
@@ -185,7 +185,7 @@ fn quoted_and_scheme_relative_urls_are_whole() {
     }
 }
 
-/// Round 3, findings 2 to 4: single quotes, a space after the opening quote, a reference
+/// Single quotes, a space after the opening quote, a reference
 /// after `=`, path-absolute references, and URL-bearing header values whatever the
 /// header's name or grammar.
 #[test]
@@ -253,6 +253,38 @@ fn every_reference_shape_is_redacted() {
             "don't use http://h/?k=sk-review-secret, it's bad",
             "don't use http://h/?k=*** it's bad",
         ),
+        // Relative references carrying a fragment, and URLs after a
+        // backtick or non-ASCII text.
+        ("Location: #sk-review-secret", "Location: <redacted url>"),
+        (
+            "Content-Location: next#sk-review-secret",
+            "Content-Location: <redacted url>",
+        ),
+        (
+            r#"Link: <next#sk-review-secret>; rel="next""#,
+            r#"Link: <<redacted url> rel="next""#,
+        ),
+        (
+            "upstream redirect: next#sk-review-secret",
+            "upstream redirect: <redacted url>",
+        ),
+        ("Location: next?sk-review-secret", "Location: <redacted url>"),
+        ("issue #1", "issue <redacted url>"),
+        // A token starts at an ASCII byte, so the cut never splits a character.
+        ("请#sk-review-secret", "请<redacted url>"),
+        (
+            "request failed for `http://u:sk-review-secret@127.0.0.1/path`",
+            "request failed for `http://127.0.0.1/path`",
+        ),
+        (
+            "see `http://127.0.0.1/?code=prefix sk-review-secret`",
+            "see `http://127.0.0.1/?code=***`",
+        ),
+        (
+            "请访问http://127.0.0.1/?k=sk-review-secret",
+            "请访问http://127.0.0.1/?k=***",
+        ),
+        ("**http://127.0.0.1/?k=sk-review-secret**", "**http://127.0.0.1/?k=***"),
     ] {
         let got = urls_in(text);
         assert_eq!(got, want, "{text}");
@@ -264,7 +296,7 @@ fn every_reference_shape_is_redacted() {
         "Content-Type: application/json; charset=utf-8",
         "User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
         "open /etc/hosts: permission denied",
-        "and/or what? #1",
+        "and/or what? C# ## heading",
         r#"{"image":"/9j/4AAQSkZJRgABAQ=="}"#,
     ] {
         assert_eq!(urls_in(unchanged), unchanged);
@@ -273,13 +305,15 @@ fn every_reference_shape_is_redacted() {
     assert_eq!(bytes(b"\xff\xfe http://h/?k=v"), &b"\xff\xfe http://h/?k=***"[..]);
 }
 
-/// The line writer redacts what is split across writes, and a line past the limit.
+/// The writer keeps a reference whole however the writes split it,
+/// line breaks included, and prints one longer than the hold limit as the placeholder.
 #[test]
-fn the_writer_redacts_whole_lines() {
+fn the_writer_keeps_references_whole_across_writes() {
     use std::io::Write as _;
     let mut writer = Writer::new(Vec::new());
     for part in [
-        "Location: http://127.0.0.1/?co",
+        "Post \"http://127.0.0.1/?code=prefix\n",
+        "sk-review-secret\": EOF\nLocation: http://127.0.0.1/?co",
         "de=sk-review",
         "-secret\nBody: \"/cb?code=sk-",
         "review-secret\"",
@@ -287,15 +321,98 @@ fn the_writer_redacts_whole_lines() {
         writer.write_all(part.as_bytes()).unwrap();
     }
     let out = String::from_utf8(writer.finish().unwrap()).unwrap();
-    assert_eq!(out, "Location: http://127.0.0.1/?code=***\nBody: \"/cb?code=***\"");
-    let mut writer = Writer::new(Vec::new());
-    // The reference straddles the limit, so the cut must fall at the space before it.
-    let filler = "a".repeat(LINE_LIMIT - 8);
-    writer
-        .write_all(format!("{filler} http://h/?k=sk-review-secret").as_bytes())
-        .unwrap();
-    let out = String::from_utf8(writer.finish().unwrap()).unwrap();
-    assert!(out.ends_with(" http://h/?k=***") && !out.contains(SECRET));
+    assert_eq!(
+        out,
+        "Post \"<redacted url>\": EOF\nLocation: http://127.0.0.1/?code=***\nBody: \"/cb?code=***\""
+    );
+    for (open, close, want) in [
+        ("see ", " after", "see <redacted url> after"),
+        ("see \"", "\" after", "see \"<redacted url>\" after"),
+    ] {
+        let mut writer = Writer::new(Vec::new());
+        writer
+            .write_all(format!("{open}http://127.0.0.1/?code=").as_bytes())
+            .unwrap();
+        for _ in 0..HOLD_LIMIT / 4096 + 1 {
+            writer.write_all(&[b'x'; 4096]).unwrap();
+        }
+        writer.write_all(format!("{SECRET}{close}").as_bytes()).unwrap();
+        let out = String::from_utf8(writer.finish().unwrap()).unwrap();
+        assert_eq!(out, want);
+    }
+}
+
+/// Past the hold limit a token that is no reference is written, not replaced, and a
+/// later `?` or `#` in it still prints as the placeholder.
+#[test]
+fn long_tokens_that_are_no_reference_are_written() {
+    use std::io::Write as _;
+    for (word, rest, want) in [
+        ("x", " http://h/?k=sk-review-secret", " http://h/?k=***"),
+        ("x", "?code=sk-review-secret tail", "<redacted url> tail"),
+        ("a_", "#sk-review-secret tail", "<redacted url> tail"),
+    ] {
+        let long = word.repeat((HOLD_LIMIT + 10) / word.len());
+        let mut writer = Writer::new(Vec::new());
+        for piece in long.as_bytes().chunks(4096) {
+            writer.write_all(piece).unwrap();
+        }
+        writer.write_all(rest.as_bytes()).unwrap();
+        let out = String::from_utf8(writer.finish().unwrap()).unwrap();
+        assert_eq!(out, format!("{long}{want}"));
+    }
+}
+
+/// A stream gives what [`bytes`] gives for the whole text, however the text is split.
+#[test]
+fn the_stream_matches_bytes_at_every_split() {
+    for text in [
+        "Post \"http://127.0.0.1/?code=prefix\r\nsk-review-secret\": EOF",
+        "Post 'http://127.0.0.1/?code=prefix sk-review-secret': EOF and \"a\\\"b\" /x?k=v",
+        r#"{"error":{"message":"request failed for http://u:sk-review-secret@127.0.0.1/?code=s#f"}}"#,
+        r#"Link: <https://h.example/p?key=s>; rel="next", </p?page=2>; anchor="/cb?code=s""#,
+        "Refresh: 0; url = http://127.0.0.1/?code=s url=//u:p@h/?x redirect_uri=callback?code=s",
+        "Location: #s next#s what? C# ## `http://h/?k=s` 请访问http://h/?k=s a/b//c",
+        "x=1\n\"  http://h/?k=s\" '' <> \"\" ``",
+    ] {
+        let whole = bytes(text.as_bytes()).into_owned();
+        let mut splits: Vec<Vec<usize>> = (0..=text.len()).map(|cut| vec![cut]).collect();
+        splits.push((1..text.len()).collect());
+        for cuts in splits {
+            let (mut stream, mut out, mut from) = (Stream::default(), Vec::new(), 0);
+            for cut in cuts.into_iter().chain([text.len()]) {
+                stream.push(&text.as_bytes()[from..cut], &mut out);
+                from = cut;
+            }
+            stream.finish(&mut out);
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&whole),
+                "{text:?}"
+            );
+        }
+    }
+}
+
+/// Small writes do not make a held reference quadratic.
+#[test]
+fn the_stream_is_linear_in_small_writes() {
+    let n = 1 << 17;
+    for text in [
+        format!("\"http://h/?a={}\"", "\\\"".repeat(n)),
+        format!("\"{}\"", "a".repeat(2 * n)),
+        format!("see {} x", "a".repeat(2 * n)),
+        format!("see http://h/?a={} x", "a".repeat(2 * n)),
+        format!("see {}", "a,".repeat(n)),
+    ] {
+        let started = std::time::Instant::now();
+        let (mut stream, mut out) = (Stream::default(), Vec::new());
+        for piece in text.as_bytes().chunks(64) {
+            stream.push(piece, &mut out);
+        }
+        stream.finish(&mut out);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{}", &text[..12]);
+    }
 }
 
 #[test]

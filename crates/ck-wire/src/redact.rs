@@ -5,6 +5,10 @@
 
 use std::borrow::Cow;
 
+#[path = "redact_stream.rs"]
+mod stream;
+pub use stream::{HOLD_LIMIT, Stream, Writer};
+
 /// What each query value and a fragment print as.
 pub const MASK: &str = "***";
 
@@ -36,14 +40,15 @@ pub fn urls_in(text: &str) -> Cow<'_, str> {
 /// `text` (any bytes) with every URL reference rendered by [`url`], for errors, captures
 /// and logs. A reference is found two ways:
 ///
-/// - A span delimited by `"…"`, `'…'` or `<…>` whose contents, after leading spaces,
+/// - A span delimited by `"…"`, `'…'`, `<…>` or `` `…` `` whose contents, after leading spaces,
 ///   start with `scheme://`, `//` or `/`: the whole contents are the reference, so a
 ///   quoted URL holding spaces is redacted whole, and one holding a line break prints as
 ///   [`UNPRINTABLE`].
-/// - Otherwise a token running to the next whitespace or `"` that starts after whitespace
-///   or a delimiter (`"'(<[{=,;:`) with `scheme://`, `://`, `//` or `/`. A token that is
-///   none of these but holds `?` followed by `=` (`callback?code=…`) is ambiguous and
-///   prints as [`UNPRINTABLE`] from the last delimiter before its `?`.
+/// - Otherwise a token running to the next whitespace or `"` that starts after whitespace,
+///   non-ASCII text or a delimiter (`` "'`(<[{=,;: ``) with `scheme://`, `://`, `//` or `/`. A token that is
+///   none of these but carries a query or fragment (`callback?code=…`, `next#…`, `#…`)
+///   is a relative reference and prints as [`UNPRINTABLE`] from the last delimiter
+///   before its `?` or `#`.
 ///
 /// A reference that is not UTF-8 prints as [`UNPRINTABLE`]; other bytes are unchanged.
 /// The scan is linear in `text`, and a reference is passed over whole, so text that is
@@ -52,177 +57,12 @@ pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
     if !text.iter().any(|b| matches!(b, b'/' | b'?' | b'#')) {
         return Cow::Borrowed(text);
     }
-    let mut out = Vec::new();
-    let (mut copied, mut i) = (0, 0);
-    let mut next = Next::default();
-    while i < text.len() {
-        let found = match DELIMITERS.iter().position(|(open, _)| *open == text[i]) {
-            Some(kind) => next.span(text, i, kind),
-            None if boundary(text, i) => next.token(text, i),
-            None => None,
-        };
-        let Some((start, end, rendered)) = found else {
-            i += 1;
-            continue;
-        };
-        if rendered.as_bytes() != &text[start..end] {
-            out.extend_from_slice(&text[copied..start]);
-            out.extend_from_slice(rendered.as_bytes());
-            copied = end;
-        }
-        i = end;
-    }
-    if copied == 0 {
-        return Cow::Borrowed(text);
-    }
-    out.extend_from_slice(&text[copied..]);
-    Cow::Owned(out)
-}
-
-const DELIMITERS: [(u8, u8); 3] = [(b'"', b'"'), (b'\'', b'\''), (b'<', b'>')];
-
-/// The next position at or after the scan of each byte [`bytes`] looks for, so every
-/// search covers its bytes once and the scan stays linear.
-#[derive(Default)]
-struct Next {
-    closers: [Option<usize>; 3],
-    stop: Option<usize>,
-    query: Option<usize>,
-    equals: Option<usize>,
-}
-
-impl Next {
-    /// The reference delimited by the opener at `i`: its contents' range and rendering.
-    fn span(&mut self, text: &[u8], i: usize, kind: usize) -> Option<(usize, usize, String)> {
-        // A closer found for an earlier opener also closes this one: the opener lies
-        // inside that span, so it is escaped there and the escape parity matches.
-        let close = match self.closers[kind] {
-            Some(at) if at > i => at,
-            _ => {
-                let at = closing(&text[i + 1..], DELIMITERS[kind].1).map_or(text.len(), |n| i + 1 + n);
-                *self.closers[kind].insert(at)
-            }
-        };
-        if close == text.len() {
-            return None;
-        }
-        let start = i + 1 + text[i + 1..close].iter().take_while(|b| **b == b' ').count();
-        starts_reference(&text[start..close]).then(|| (start, close, render_bytes(&text[start..close])))
-    }
-
-    /// The reference or ambiguous query starting at `i`: its range and rendering.
-    fn token(&mut self, text: &[u8], i: usize) -> Option<(usize, usize, String)> {
-        let stop = seek(text, i, &mut self.stop, |b| b.is_ascii_whitespace() || b == b'"');
-        if starts_reference(&text[i..stop]) {
-            return Some((i, stop, render_bytes(&text[i..stop])));
-        }
-        let query = seek(text, i, &mut self.query, |b| b == b'?');
-        // A later delimiter before the `?` starts the token that is checked instead, so a
-        // reference such as `url=//…` keeps its name.
-        if query >= stop || (i + 1..query).any(|j| boundary(text, j)) {
-            return None;
-        }
-        let equals = seek(text, query, &mut self.equals, |b| b == b'=');
-        (equals < stop).then(|| (i, stop, UNPRINTABLE.to_owned()))
-    }
-}
-
-/// The first position at or after `from` holding a byte that `hit`s, or `text.len()`.
-/// `cache` holds an earlier answer, which stays right while it is not before `from`.
-fn seek(text: &[u8], from: usize, cache: &mut Option<usize>, hit: impl Fn(u8) -> bool) -> usize {
-    match *cache {
-        Some(at) if at >= from => at,
-        _ => *cache.insert(
-            text[from..]
-                .iter()
-                .position(|b| hit(*b))
-                .map_or(text.len(), |n| from + n),
-        ),
-    }
-}
-
-/// The length of a delimited span's contents: up to `close`, a backslash escaping the
-/// next byte in a quoted span.
-fn closing(text: &[u8], close: u8) -> Option<usize> {
-    let mut i = 0;
-    while i < text.len() {
-        match text[i] {
-            b'\\' if close != b'>' => i += 2,
-            b if b == close => return Some(i),
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn boundary(text: &[u8], i: usize) -> bool {
-    i == 0 || text[i - 1].is_ascii_whitespace() || b"\"'(<[{=,;:".contains(&text[i - 1])
-}
-
-/// `scheme://`, `://`, `//` or `/` at the start of `text`.
-fn starts_reference(text: &[u8]) -> bool {
-    let scheme = text.iter().take_while(|b| scheme_byte(**b)).count();
-    text.starts_with(b"/") || (text[scheme..].starts_with(b"://") && (scheme == 0 || text[0].is_ascii_alphabetic()))
-}
-
-fn render_bytes(reference: &[u8]) -> String {
-    std::str::from_utf8(reference).map_or_else(|_| UNPRINTABLE.to_owned(), url)
-}
-
-/// A [`std::io::Write`] that passes every line through [`bytes`] before `out`. A line
-/// longer than [`LINE_LIMIT`] is cut at its last whitespace or quote before the limit.
-// ponytail: a reference longer than LINE_LIMIT with no whitespace or quote is redacted in
-// LINE_LIMIT pieces, so its later pieces lose their context; a streaming tokenizer would
-// lift that ceiling.
-pub struct Writer<W: std::io::Write> {
-    out: W,
-    line: Vec<u8>,
-}
-
-/// The longest line [`Writer`] holds before redacting part of it.
-pub const LINE_LIMIT: usize = 1 << 20;
-
-impl<W: std::io::Write> Writer<W> {
-    pub fn new(out: W) -> Self {
-        Self { out, line: Vec::new() }
-    }
-
-    /// Redacts and writes what is buffered, and returns the inner writer.
-    pub fn finish(mut self) -> std::io::Result<W> {
-        self.drain(self.line.len())?;
-        Ok(self.out)
-    }
-
-    fn drain(&mut self, end: usize) -> std::io::Result<()> {
-        let rest = self.line.split_off(end);
-        self.out.write_all(&bytes(&self.line))?;
-        self.line = rest;
-        Ok(())
-    }
-}
-
-impl<W: std::io::Write> std::io::Write for Writer<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut rest = buf;
-        while let Some(newline) = rest.iter().position(|b| *b == b'\n') {
-            self.line.extend_from_slice(&rest[..=newline]);
-            self.drain(self.line.len())?;
-            rest = &rest[newline + 1..];
-        }
-        self.line.extend_from_slice(rest);
-        while self.line.len() > LINE_LIMIT {
-            let cut = self.line[..LINE_LIMIT]
-                .iter()
-                .rposition(|b| b.is_ascii_whitespace() || matches!(b, b'"' | b'\''))
-                .filter(|i| *i > 0)
-                .unwrap_or(LINE_LIMIT);
-            self.drain(cut)?;
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.out.flush()
+    let mut out = Vec::with_capacity(text.len());
+    stream::whole(text, &mut out);
+    if out == text {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(out)
     }
 }
 
