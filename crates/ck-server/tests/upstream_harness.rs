@@ -7,7 +7,7 @@ mod stream_upstream;
 
 use std::time::{Duration, Instant};
 
-use stream_upstream::{Reply, StreamUpstream};
+use stream_upstream::{Delivery, Reply, StreamUpstream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -161,8 +161,7 @@ async fn byte_cadence_frames_every_byte() {
     assert_eq!(response.chunks.concat(), FIXTURE);
 }
 
-/// A response read chunk by chunk as the bytes arrive, so a test can assert that the next
-/// chunk has not arrived yet.
+/// A response read chunk by chunk as the bytes arrive.
 struct Live {
     socket: TcpStream,
     buffer: Vec<u8>,
@@ -217,41 +216,73 @@ impl Live {
             }
         }
     }
+}
 
-    /// Asserts that no chunk arrives within `quiet`, then returns the next one.
-    async fn chunk_after(&mut self, quiet: Duration) -> Option<Vec<u8>> {
+/// Asserts the pacing from the upstream's own write times: the first body write starts at
+/// least `first_byte` after the head was written, and each later one at least `pause` after
+/// the previous one began. A delayed reader cannot shift these times.
+fn assert_paced(delivery: &Delivery, first_byte: Duration, pause: Duration) {
+    let head = delivery.head.expect("the head was written");
+    let first = delivery.writes[0] - head;
+    assert!(
+        first >= first_byte,
+        "first body write {first:?} after the head, want {first_byte:?}"
+    );
+    for (i, pair) in delivery.writes.windows(2).enumerate() {
+        let gap = pair[1] - pair[0];
         assert!(
-            tokio::time::timeout(quiet, self.chunk()).await.is_err(),
-            "a chunk arrived within {quiet:?}"
+            gap >= pause,
+            "body write {} began {gap:?} after the previous, want {pause:?}",
+            i + 1
         );
-        self.chunk().await
     }
 }
 
-/// The margins are half the configured pauses: a busy host only lengthens a pause.
+const PIECES: [&[u8]; 5] = [b"01", b"23", b"45", b"67", b"89"];
+
 #[tokio::test]
 async fn first_byte_delay_holds_the_body_after_the_head() {
-    let upstream =
-        StreamUpstream::start([Reply::sse(&b"0123456789"[..]).first_byte_after(Duration::from_millis(400))]).await;
-    let mut live = Live::open(&upstream).await;
-    assert_eq!(
-        live.chunk_after(Duration::from_millis(200)).await.unwrap(),
-        b"0123456789"
-    );
-    assert_eq!(live.chunk().await, None);
-    assert!(upstream.delivered(0).await.complete);
+    let delay = Duration::from_millis(100);
+    let upstream = StreamUpstream::start([Reply::sse(&b"0123456789"[..]).first_byte_after(delay)]).await;
+    let response = raw(&upstream, POST).await;
+    assert_eq!(response.chunks, [b"0123456789"]);
+    let delivery = upstream.delivered(0).await;
+    assert!(delivery.complete);
+    assert_eq!(delivery.writes.len(), 1);
+    assert_paced(&delivery, delay, Duration::ZERO);
 }
 
 #[tokio::test]
 async fn throttle_paces_every_chunk() {
-    let upstream =
-        StreamUpstream::start([Reply::sse(&b"0123456789"[..]).throttle(2, Duration::from_millis(200))]).await;
+    let pause = Duration::from_millis(100);
+    let upstream = StreamUpstream::start([Reply::sse(&b"0123456789"[..]).throttle(2, pause)]).await;
+    let response = raw(&upstream, POST).await;
+    assert_eq!(response.chunks, PIECES, "the body arrives in pieces");
+    let delivery = upstream.delivered(0).await;
+    assert_eq!(delivery.writes.len(), PIECES.len());
+    assert_paced(&delivery, Duration::ZERO, pause);
+}
+
+/// A reader whose thread stalls (250 ms before the first chunk, 150 ms mid-body) while the
+/// upstream runs on another worker still sees every piece, and the pacing checks pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pacing_checks_survive_a_stalled_reader() {
+    let (delay, pause) = (Duration::from_millis(200), Duration::from_millis(100));
+    let upstream = StreamUpstream::start([Reply::sse(&b"0123456789"[..])
+        .first_byte_after(delay)
+        .throttle(2, pause)])
+    .await;
     let mut live = Live::open(&upstream).await;
-    assert_eq!(live.chunk().await.unwrap(), b"01");
-    for expected in [b"23", b"45", b"67", b"89"] {
-        assert_eq!(live.chunk_after(Duration::from_millis(100)).await.unwrap(), expected);
+    std::thread::sleep(Duration::from_millis(250));
+    let mut chunks = vec![live.chunk().await.unwrap()];
+    std::thread::sleep(Duration::from_millis(150));
+    while let Some(chunk) = live.chunk().await {
+        chunks.push(chunk);
     }
-    assert_eq!(live.chunk().await, None);
+    assert_eq!(chunks, PIECES);
+    let delivery = upstream.delivered(0).await;
+    assert!(delivery.complete);
+    assert_paced(&delivery, delay, pause);
 }
 
 /// Dropping the upstream ends its open exchanges: a client mid-body sees the connection

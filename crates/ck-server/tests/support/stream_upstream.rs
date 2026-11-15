@@ -153,7 +153,20 @@ pub struct Delivery {
     pub complete: bool,
     /// The write error, if the client went away first.
     pub error: Option<String>,
+    /// When the response head was written; `None` for a reset or a failed head write.
+    pub head: Option<Instant>,
+    /// When each body chunk's write began, in order. Pacing checks compare these server-side
+    /// times, which a slow client cannot shift.
+    pub writes: Vec<Instant>,
     pub finished: Instant,
+}
+
+/// What `respond` wrote before it returned.
+#[derive(Default)]
+struct Log {
+    written: usize,
+    head: Option<Instant>,
+    writes: Vec<Instant>,
 }
 
 #[derive(Default)]
@@ -253,7 +266,13 @@ async fn serve(socket: TcpStream, replies: Arc<[Reply]>, state: watch::Sender<St
         )
     });
     let Some(body) = read_body(&mut socket, &headers, reply.slow_read).await else {
-        finish(&state, index, 0, false, Some("request body ended early".into()));
+        finish(
+            &state,
+            index,
+            Log::default(),
+            false,
+            Some("request body ended early".into()),
+        );
         return;
     };
     state.send_modify(|s| {
@@ -266,55 +285,59 @@ async fn serve(socket: TcpStream, replies: Arc<[Reply]>, state: watch::Sender<St
         })
     });
     let mut socket = socket.into_inner();
+    let mut log = Log::default();
     if reply.reset {
         let _ = socket.shutdown().await;
-        finish(&state, index, 0, false, None);
+        finish(&state, index, log, false, None);
         return;
     }
-    let (written, complete, error) = match respond(&mut socket, &reply).await {
-        Ok((written, complete)) => (written, complete, None),
-        Err((written, error)) => (written, false, Some(error.to_string())),
+    let (complete, error) = match respond(&mut socket, &reply, &mut log).await {
+        Ok(complete) => (complete, None),
+        Err(error) => (false, Some(error.to_string())),
     };
     let _ = socket.shutdown().await;
-    finish(&state, index, written, complete, error);
+    finish(&state, index, log, complete, error);
 }
 
-fn finish(state: &watch::Sender<State>, index: usize, written: usize, complete: bool, error: Option<String>) {
+fn finish(state: &watch::Sender<State>, index: usize, log: Log, complete: bool, error: Option<String>) {
     let delivery = Delivery {
-        written,
+        written: log.written,
         complete,
         error,
+        head: log.head,
+        writes: log.writes,
         finished: Instant::now(),
     };
     state.send_modify(|s| s.delivered[index] = Some(delivery));
 }
 
-/// Writes the head and the body; returns body bytes written and whether the body completed.
-async fn respond(socket: &mut TcpStream, reply: &Reply) -> Result<(usize, bool), (usize, std::io::Error)> {
+/// Writes the head and the body into `log`; returns whether the body completed.
+async fn respond(socket: &mut TcpStream, reply: &Reply, log: &mut Log) -> std::io::Result<bool> {
     let mut head = format!("HTTP/1.1 {} \r\n", reply.status);
     for (name, value) in &reply.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
-    write(socket, head.as_bytes()).await.map_err(|e| (0, e))?;
+    write(socket, head.as_bytes()).await?;
+    log.head = Some(Instant::now());
     tokio::time::sleep(reply.first_byte_delay).await;
     let end = reply.cut_after.unwrap_or(reply.body.len());
     let (step, interval) = reply.cadence.unwrap_or((end.max(1), Duration::ZERO));
-    let mut written = 0;
-    while written < end {
-        let piece = &reply.body[written..end.min(written + step)];
+    while log.written < end {
+        let piece = &reply.body[log.written..end.min(log.written + step)];
         let mut chunk = format!("{:x}\r\n", piece.len()).into_bytes();
         chunk.extend_from_slice(piece);
         chunk.extend_from_slice(b"\r\n");
-        write(socket, &chunk).await.map_err(|e| (written, e))?;
-        written += piece.len();
+        log.writes.push(Instant::now());
+        write(socket, &chunk).await?;
+        log.written += piece.len();
         tokio::time::sleep(interval).await;
     }
     if reply.cut_after.is_some() {
-        return Ok((written, false));
+        return Ok(false);
     }
-    write(socket, b"0\r\n\r\n").await.map_err(|e| (written, e))?;
-    Ok((written, true))
+    write(socket, b"0\r\n\r\n").await?;
+    Ok(true)
 }
 
 async fn write(socket: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
