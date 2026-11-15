@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ck_core::exec::ExecRequest;
 use ck_core::format::Format;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Kind, Res};
@@ -20,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::meta_codex::go_trim_space;
 use crate::replay::{claude_code_session, header_session, payload_session};
+use crate::xai_shape::Inbound;
 
 /// `XAIReasoningReplayCacheTTL`.
 const TTL: Duration = Duration::from_secs(3600);
@@ -36,7 +36,7 @@ pub(crate) struct ReplayScope {
 }
 
 impl ReplayScope {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         !self.model_name.trim().is_empty() && !self.session_key.trim().is_empty()
     }
 }
@@ -116,54 +116,33 @@ fn text(r: &Res<'_>) -> String {
 
 /// `xaiReasoningReplayScopeFromRequest`: Claude and OpenAI Responses clients only, and
 /// not for a downstream WebSocket turn that continues upstream state.
-pub(crate) fn scope(req: &ExecRequest, body: &[u8], downstream_websocket: bool) -> ReplayScope {
-    if !matches!(req.source_format, Format::Claude | Format::OpenAIResponse) {
+pub(crate) fn scope(inbound: &Inbound<'_>, body: &[u8]) -> ReplayScope {
+    if !matches!(inbound.source, Format::Claude | Format::OpenAIResponse) {
         return ReplayScope::default();
     }
-    if downstream_websocket && !text(&gj::get(&req.body, "previous_response_id")).is_empty() {
+    if inbound.downstream_websocket && !text(&gj::get(inbound.payload, "previous_response_id")).is_empty() {
         return ReplayScope::default();
     }
     ReplayScope {
-        model_name: parse_suffix(&req.model).model_name,
-        session_key: isolate(req, &session_key(req, body)),
+        model_name: parse_suffix(inbound.model).model_name,
+        session_key: inbound.isolate(&session_key(inbound, body)),
     }
 }
 
 /// `codexReasoningReplaySessionKey` for the sources replay serves.
-fn session_key(req: &ExecRequest, body: &[u8]) -> String {
-    if req.source_format == Format::Claude
-        && let Some(key) = claude_code_session(&req.body, &req.headers)
+fn session_key(inbound: &Inbound<'_>, body: &[u8]) -> String {
+    if inbound.source == Format::Claude
+        && let Some(key) = claude_code_session(inbound.payload, inbound.headers)
     {
         return key;
     }
-    if let Some(execution) = req
-        .execution_session
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(execution) = inbound.execution_session.map(str::trim).filter(|s| !s.is_empty()) {
         return format!("execution:{execution}");
     }
     payload_session(body)
-        .or_else(|| payload_session(&req.body))
-        .or_else(|| header_session(&req.headers))
+        .or_else(|| payload_session(inbound.payload))
+        .or_else(|| header_session(inbound.headers))
         .unwrap_or_default()
-}
-
-/// `xaiReasoningReplayIsolateSessionKey`: client-controlled keys are namespaced by the
-/// caller's API key, and disabled without one.
-fn isolate(req: &ExecRequest, key: &str) -> String {
-    let key = key.trim();
-    if key.is_empty() || key.starts_with("execution:") {
-        return key.to_owned();
-    }
-    let api_key = req.caller.principal.trim();
-    if api_key.is_empty() {
-        return String::new();
-    }
-    let digest = Sha256::digest(api_key.as_bytes());
-    let prefix: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    format!("caller:{prefix}:{key}")
 }
 
 /// `applyXAIReasoningReplayCacheRequired` after the scope is known.

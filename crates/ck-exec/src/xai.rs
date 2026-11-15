@@ -36,7 +36,7 @@ pub const PROVIDER: &str = "xai";
 
 pub(crate) const COMPACT_ALT: &str = "responses/compact";
 /// `scanner.Buffer(nil, 52_428_800)`.
-const MAX_LINE: usize = 52_428_800;
+pub(crate) const MAX_LINE: usize = 52_428_800;
 const DISCONNECTED: &str = "xai stream error: stream disconnected before response.completed or response.incomplete";
 /// Keep in sync with the Grok CLI version the chat proxy expects (`xaiClientVersionValue`).
 const CLIENT_VERSION: &str = "1.0.44";
@@ -262,35 +262,40 @@ fn default_headers(token: &str, stream: bool, session: &str) -> GoHeaders {
 
 /// `applyXAICustomHeaders`: `header:*` attributes with the client headers and the
 /// canonical session for `$CPA-SESSION-ID`.
-fn apply_custom(h: &mut GoHeaders, credential: &Credential, req: &ExecRequest) {
-    let session = ck_wire::session::cpa_session_id(req.session.as_deref());
-    for (name, value) in ck_wire::headers::custom_headers(&credential.attributes, &req.headers, session.as_deref()) {
+fn apply_custom(h: &mut GoHeaders, credential: &Credential, client: &HeaderMap, session: Option<&str>) {
+    let session = ck_wire::session::cpa_session_id(session);
+    for (name, value) in ck_wire::headers::custom_headers(&credential.attributes, client, session.as_deref()) {
         h.set(&name, value);
     }
 }
 
 /// `applyXAIHeaders`.
 pub(crate) fn plain_headers(c: &Credential, token: &str, stream: bool, session: &str, req: &ExecRequest) -> GoHeaders {
-    let mut h = default_headers(token, stream, session);
-    apply_custom(&mut h, c, req);
-    h
+    request_headers(
+        c,
+        (token, stream, session),
+        (&req.headers, req.session.as_deref()),
+        false,
+    )
 }
 
-/// `applyXAIChatHeaders`: the Grok CLI identity when an OAuth credential talks to the
-/// chat proxy.
-fn chat_headers(c: &Credential, token: &str, stream: bool, session: &str, req: &ExecRequest) -> GoHeaders {
-    if using_api(c) {
-        return plain_headers(c, token, stream, session, req);
-    }
+/// `applyXAIChatHeaders` when `chat` (the Grok CLI identity when an OAuth credential talks to
+/// the chat proxy), else `applyXAIHeaders`. `client` is the client's headers and session.
+pub(crate) fn request_headers(
+    c: &Credential,
+    (token, stream, session): (&str, bool, &str),
+    client: (&HeaderMap, Option<&str>),
+    chat: bool,
+) -> GoHeaders {
     let mut h = default_headers(token, stream, session);
-    if is_cli_chat_proxy(&chat_base_url(c)) {
+    if chat && !using_api(c) && is_cli_chat_proxy(&chat_base_url(c)) {
         h.set("X-XAI-Token-Auth", "xai-grok-cli");
         h.set("x-grok-client-version", CLIENT_VERSION);
         h.set("User-Agent", format!("xai-grok-workspace/{CLIENT_VERSION}"));
         h.set("x-grok-client-identifier", "grok-shell");
         h.set("x-authenticateresponse", "authenticate-response");
     }
-    apply_custom(&mut h, c, req);
+    apply_custom(&mut h, c, client.0, client.1);
     h
 }
 
@@ -461,7 +466,8 @@ impl XaiExecutor {
         req.usage.usage_required();
         req.usage.request_for(PROVIDER, &prepared.body);
         prepared.finalize_body(cfg, &req);
-        let headers = chat_headers(credential, &token, true, &prepared.session_id, &req);
+        let client_headers = (&req.headers, req.session.as_deref());
+        let headers = request_headers(credential, (&token, true, &prepared.session_id), client_headers, true);
         let client = self.clients.for_credential(credential, cfg);
         let url = self.url(endpoint(&base, "/responses"));
         let capture = capture_request(&req, credential, "POST", &url, &headers, &prepared.body);
@@ -512,18 +518,8 @@ impl XaiExecutor {
                 downstream_websocket,
             ),
         )?;
-        let mut body = std::mem::take(&mut p.body);
-        gj::delete(&mut body, "stream");
-        gj::delete(&mut body, "tools");
-        body = request::normalize_tool_choice_for_tools(body);
-        for field in ["max_output_tokens", "temperature", "top_p", "top_k", "stop"] {
-            gj::delete(&mut body, field);
-        }
-        body = remove_input_items(body, "compaction_trigger");
         let previous = text(&gj::get(&req.body, "previous_response_id"));
-        if !previous.is_empty() {
-            gj::set_str(&mut body, "previous_response_id", previous);
-        }
+        let body = crate::xai_shape::compact_body(std::mem::take(&mut p.body), &previous);
         req.usage.request_for(PROVIDER, &body);
         p.body = p.finalize(cfg, req, body);
         let headers = plain_headers(credential, &token, false, &p.session_id, req);
@@ -1095,7 +1091,7 @@ pub(crate) fn compaction_frames(p: &Prepared, data: &[u8], now: SystemTime) -> V
 
 /// `countXAIInputTokens`: O200kBase over instructions, input, function tools and the
 /// text format, joined by newlines.
-fn count_input_tokens(body: &[u8]) -> Result<i64, String> {
+pub(crate) fn count_input_tokens(body: &[u8]) -> Result<i64, String> {
     let encoder = crate::tokenizer::encoder(crate::tokenizer::Encoding::O200kBase)?;
     if body.is_empty() {
         return Ok(0);
