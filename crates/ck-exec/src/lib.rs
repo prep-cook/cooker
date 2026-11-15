@@ -194,7 +194,6 @@ impl Executors {
     pub fn destination(&self, attempt: &types::Attempt<'_>) -> Option<&'static str> {
         match attempt.credential.provider.as_str() {
             "codex" => Some(pipeline::destination(&self.codex, attempt)),
-            // A buffered generation the cloak may shape is known only at the fence (G5).
             "claude" if !self.claude.old_route_only(attempt) => Some(pipeline::destination(&self.claude, attempt)),
             p if openai_compat::handles(p) => Some(pipeline::destination(&self.openai.compat, attempt)),
             gemini_exec::PROVIDER => Some(pipeline::destination(&self.google.gemini, attempt)),
@@ -216,11 +215,7 @@ impl Executors {
         match attempt.credential.provider.as_str() {
             "codex" => pipeline::fence(&self.codex, attempt, ingress, request),
             "claude" if !self.claude.old_route_only(attempt) => {
-                let validated = pipeline::fence(&self.claude, attempt, ingress, request)?;
-                if self.claude.buffered_cloak(attempt, validated.view()) {
-                    return Err(ck_translate::codec::Error::Destination);
-                }
-                Ok(validated)
+                pipeline::fence(&self.claude, attempt, ingress, request)
             }
             p if openai_compat::handles(p) => pipeline::fence(&self.openai.compat, attempt, ingress, request),
             gemini_exec::PROVIDER => pipeline::fence(&self.google.gemini, attempt, ingress, request),
@@ -240,9 +235,7 @@ impl Executors {
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
             "codex" => pipeline::refence(&self.codex, attempt, view),
-            "claude" if !self.claude.old_route_only(attempt) && !self.claude.buffered_cloak(attempt, view) => {
-                pipeline::refence(&self.claude, attempt, view)
-            }
+            "claude" if !self.claude.old_route_only(attempt) => pipeline::refence(&self.claude, attempt, view),
             p if openai_compat::handles(p) => pipeline::refence(&self.openai.compat, attempt, view),
             gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
             xai::PROVIDER => pipeline::refence(&self.openai.xai, attempt, view),
@@ -264,10 +257,7 @@ impl Executors {
     ) -> Result<pipeline::Started, ExecError> {
         match attempt.credential.provider.as_str() {
             "codex" => pipeline::start(&self.codex, attempt, request, upload, response).await,
-            "claude"
-                if !self.claude.old_route_only(attempt)
-                    && !self.claude.buffered_cloak(attempt, request.validated.view()) =>
-            {
+            "claude" if !self.claude.old_route_only(attempt) => {
                 pipeline::start(&self.claude, attempt, request, upload, response).await
             }
             p if openai_compat::handles(p) => {

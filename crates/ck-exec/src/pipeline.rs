@@ -301,7 +301,7 @@ async fn storage(writer: &mut Writer, error: ck_stream::Error) -> Result<(), Exe
 }
 
 /// The attempt failure of a storage error.
-fn stored(error: &ck_stream::Error) -> ExecError {
+pub(crate) fn stored(error: &ck_stream::Error) -> ExecError {
     match error {
         ck_stream::Error::StorageExhausted | ck_stream::Error::Io(_) => {
             ExecError::local(503, FailureScope::Request, "stream.storage_exhausted")

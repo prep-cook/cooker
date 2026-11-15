@@ -122,19 +122,6 @@ impl ClaudeExecutor {
         replay::eligible(&gate(&attempt_ctx(self, attempt, &scoped(attempt))))
     }
 
-    /// Whether the fenced `view` keeps the old relay (contract G5): an Anthropic generation
-    /// the cloak may shape whose upstream answers in one JSON body. Restoring its tool aliases
-    /// and recording its session continuity read the complete body, which contract §3 forbids
-    /// collecting. The selector's fence and re-fence refuse it with `Destination`.
-    pub fn buffered_cloak(&self, attempt: &Attempt<'_>, view: RequestView<'_>) -> bool {
-        if view.operation != Operation::Generate {
-            return false;
-        }
-        let buffered = Facts::of(view.document)
-            .and_then(|facts| Ok(facts.client_format == Format::Claude && !streaming(view.document, Format::Claude)?));
-        buffered.unwrap_or(false) && attempt_ctx(self, attempt, &scoped(attempt)).wire_policy(false).0
-    }
-
     async fn messages(
         &self,
         attempt: &Attempt<'_>,
@@ -182,7 +169,7 @@ impl ClaudeExecutor {
         }
         let raw = sent?;
         let (status, headers) = (raw.status, raw.headers.clone());
-        let (body, pending) = relay(&ctx, &mut prepared, raw, usage);
+        let (body, pending) = relay(&ctx, &mut prepared, raw, usage, streams.response);
         Ok(Upstream {
             status,
             headers,
@@ -291,13 +278,21 @@ fn local_count(ctx: &Ctx<'_>, input: &Input<'_>, translated: &[u8]) -> Result<u6
 }
 
 /// The prepared request's response body: whole native events after alias restore when the
-/// upstream streams, with the completion its `message_stop` arms; the bytes as read otherwise.
-/// Request logs record every chunk.
-fn relay(ctx: &Ctx<'_>, prepared: &mut Prepared, raw: RawResponse, usage: &UsageSink) -> (Body, Option<Pending>) {
+/// upstream streams, with the completion its `message_stop` arms; a buffered cloaked body
+/// collected and restored (owner ruling Q20); the bytes as read otherwise. Request logs record
+/// every chunk.
+fn relay(
+    ctx: &Ctx<'_>,
+    prepared: &mut Prepared,
+    raw: RawResponse,
+    usage: &UsageSink,
+    response: &mut Writer,
+) -> (Body, Option<Pending>) {
     let fast = ctx.first_party && prepared.fast;
     let capture = usage.capture().clone();
     let body = body_of(raw.body);
-    if !prepared.stream {
+    let cloaked = ctx.wire_policy(false).0;
+    if !prepared.stream && !cloaked {
         let body = recorded(body, capture).map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)));
         return (body.boxed(), None);
     }
@@ -307,22 +302,27 @@ fn relay(ctx: &Ctx<'_>, prepared: &mut Prepared, raw: RawResponse, usage: &Usage
         message_id: Arc::default(),
     };
     let seen = pending.message_id.clone();
-    let done: stream::OnComplete = Box::new(move |message_id| *seen.lock().expect("message id") = Some(message_id));
-    let body = stream::relay(body, prepared.reverse.clone(), done, None, capture)
-        .map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)));
+    let body = if prepared.stream {
+        let done: stream::OnComplete = Box::new(move |message_id| *seen.lock().expect("message id") = Some(message_id));
+        stream::relay(body, prepared.reverse.clone(), done, None, capture)
+    } else {
+        stream::collected(recorded(body, capture), response, prepared.reverse.clone(), seen)
+    };
+    let body = body.map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)));
     (body.boxed(), Some(pending))
 }
 
-/// The Anthropic response ingress of a Claude attempt. A streamed turn records its thread
-/// aliases and session continuity only once this ingress published `done`: the relay sees
-/// `message_stop` before the canonical ingress judges the response, which it may still reject.
+/// The Anthropic response ingress of a Claude attempt. A streamed or buffered cloaked turn
+/// records its thread aliases and session continuity only once this ingress published `done`:
+/// the relay reads the message ID before the canonical ingress judges the response, which it
+/// may still reject.
 pub struct ClaudeIngress {
     inner: Ingress,
     pending: Option<Pending>,
 }
 
 /// A completion waiting for the canonical verdict; the relay sets the message ID at
-/// `message_stop`, before it passes that event on.
+/// `message_stop`, or once it collected a buffered body, before it passes the bytes on.
 struct Pending {
     completion: Completion,
     request_id: String,

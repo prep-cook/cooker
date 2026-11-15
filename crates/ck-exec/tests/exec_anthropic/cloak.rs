@@ -8,8 +8,6 @@ use std::path::Path;
 
 use ck_core::credential::Credential;
 
-use ck_exec::types::Attempt;
-
 use super::*;
 
 const OPUS_4_7: &str = "claude-opus-4-7";
@@ -208,6 +206,12 @@ async fn shaped_requests_reach_the_upstream_byte_for_byte_as_on_the_old_route() 
                 // The cloak ran: the old route's automatic cache marker (`cpa_owns_cache`).
                 assert!(new.body.contains("cache_control"), "{}", new.body);
             }
+            let new = new_wire(&credential, model, &[], &body, false).await;
+            assert_eq!(
+                new,
+                old_wire(&credential, model, &[], &body, false).await,
+                "{name}: buffered"
+            );
             let new = new_wire(&credential, model, &[], &body, true).await;
             assert_eq!(
                 new,
@@ -294,37 +298,17 @@ async fn a_shaped_local_count_matches_the_old_route() {
     );
 }
 
-/// A buffered generation the cloak may shape keeps the old relay: restoring its tool aliases
-/// and recording its continuity read the whole body, which contract §3 forbids collecting.
-/// Streamed, the same request runs on the contract path.
+/// A buffered generation the cloak may shape runs on the contract path (owner ruling Q20):
+/// the fence, the re-fence and the start accept it, and start sends it upstream.
 #[tokio::test]
-async fn a_buffered_generation_the_cloak_may_shape_keeps_the_old_arm() {
+async fn a_buffered_generation_the_cloak_may_shape_takes_the_contract_path() {
     let body = json!({"model": SONNET, "max_tokens": 1024, "messages": [{"role": "user", "content": "hi"}]});
     let bytes = serde_json::to_vec(&body).unwrap();
-    let mut streamed = body.clone();
-    streamed["stream"] = json!(true);
-    let streamed = serde_json::to_vec(&streamed).unwrap();
     let op = Operation::Generate;
     for credential in [oauth(), always()] {
         let (cloak, recorder) = at(ORIGIN, &credential, SONNET, &[]);
         let store = &cloak.streams.store;
         let attempt = cloak.exchange.attempt(store);
-        assert_eq!(cloak.executors.destination(&attempt), Some("anthropic"));
-        let fence = |body: &[u8]| {
-            let mut request = cloak.streams.request();
-            let id = identity(Direction::Request);
-            let mut ingress = anthropic::request::Ingress::new(&mut request, store, id, op, LIMIT).unwrap();
-            cloak.fence(&mut ingress, &mut request, body)
-        };
-        assert!(matches!(fence(&bytes), Err(codec::Error::Destination)));
-        assert!(fence(&streamed).is_ok());
-        // A plain key's attempt fences the request on the same store, so the cloak attempt
-        // can re-fence and start it.
-        let key = credential_for_fence();
-        let key_attempt = Attempt {
-            credential: &key,
-            ..cloak.exchange.attempt(store)
-        };
         let mut request = cloak.streams.request();
         let id = identity(Direction::Request);
         let mut ingress = anthropic::request::Ingress::new(&mut request, store, id, op, LIMIT).unwrap();
@@ -333,30 +317,16 @@ async fn a_buffered_generation_the_cloak_may_shape_keeps_the_old_arm() {
         }
         let view = cloak
             .executors
-            .fence(&key_attempt, &mut ingress, &mut request)
+            .fence(&attempt, &mut ingress, &mut request)
             .unwrap()
             .view();
-        let refenced = cloak.executors.refence(&attempt, view);
-        assert!(matches!(refenced, Err(codec::Error::Destination)));
-        let validated = cloak.executors.refence(&key_attempt, view).unwrap();
+        let validated = cloak.executors.refence(&attempt, view).unwrap();
         let handle = cloak.exchange.request_with(validated, &bytes);
         let response = cloak.streams.response(&request);
-        assert!(
-            cloak
-                .executors
-                .start(&attempt, &handle, &mut request, response)
-                .await
-                .is_err()
-        );
-        assert!(recorder.0.lock().unwrap().is_empty(), "start sends nothing");
+        let started = cloak.executors.start(&attempt, &handle, &mut request, response).await;
+        assert!(started.is_err(), "the proxy refuses every connection");
+        assert_eq!(recorder.0.lock().unwrap().len(), 1, "start sends the request");
     }
-}
-
-/// A key the cloak never shapes, behind the refusing proxy.
-fn credential_for_fence() -> Credential {
-    let mut key = credential("claude", ORIGIN, "sk-ant-api03-test");
-    key.attributes.insert("proxy_url".into(), "http://127.0.0.1:1".into());
-    key
 }
 
 /// Claude Code header signals no longer pick the old arm (contract G6): the executor reads the
@@ -434,4 +404,88 @@ async fn only_a_completed_turn_records_thread_state() {
     let (started, _, _request) = fixture.anthropic(&after("msg_1"), Operation::Generate).await;
     started.unwrap().producer.await.unwrap().unwrap();
     assert_eq!(upstream.requests(), 3);
+}
+
+/// A buffered cloaked turn (owner ruling Q20): the client reads its own tool names, and a
+/// continuation of the turn finds the thread the completed response recorded. A name that
+/// cannot be restored fails the attempt.
+#[tokio::test]
+async fn a_buffered_cloaked_turn_restores_tool_names_and_records_its_thread() {
+    let schema = json!({"type": "object"});
+    let tools = json!([{"name": "lookup_file", "input_schema": schema}, {"name": "Bash", "input_schema": schema},
+        {"name": "mcp__a__query", "input_schema": schema}, {"name": "mcp__b__query", "input_schema": schema}]);
+    let messages = json!([{"role": "user", "content": "read it"}]);
+    let create = serde_json::to_vec(&json!({"model": SONNET, "max_tokens": 1024,
+        "thread": {"type": "create"}, "tools": tools, "messages": messages}))
+    .unwrap();
+    // The alias the cloak sends for `lookup_file`, learnt from a first upstream.
+    let learn = StreamUpstream::start([Reply::json(MESSAGE)]).await;
+    let fixture = Fixture::with(oauth(), &learn.url(), SONNET);
+    let (started, _, _request) = fixture.anthropic(&create, Operation::Generate).await;
+    started.unwrap().producer.await.unwrap().unwrap();
+    let sent_tools = sent(&learn).0["tools"].clone();
+    let alias = sent_tools[0]["name"].as_str().unwrap().to_owned();
+    assert_ne!(alias, "lookup_file");
+    // The server part of an alias the cloak minted: `mcp__<server>__query` matches both
+    // declared `query` tools, which the old route refuses to restore.
+    let server = sent_tools[1]["name"].as_str().unwrap()["mcp__".len()..]
+        .split("__")
+        .next()
+        .unwrap()
+        .to_owned();
+    let ambiguous = json!({"id": "msg_x", "type": "message", "role": "assistant", "model": SONNET,
+        "content": [{"type": "tool_use", "id": "toolu_2", "name": format!("mcp__{server}__query"), "input": {}}],
+        "stop_reason": "tool_use", "stop_sequence": null, "usage": {"input_tokens": 3, "output_tokens": 2}});
+    let reply = json!({"id": "msg_t", "type": "message", "role": "assistant", "model": SONNET,
+        "content": [{"type": "tool_use", "id": "toolu_1", "name": alias, "input": {}}],
+        "stop_reason": "tool_use", "stop_sequence": null, "usage": {"input_tokens": 3, "output_tokens": 2}});
+    let replies = [
+        Reply::json(reply.to_string()),
+        Reply::sse(SSE),
+        Reply::json(ambiguous.to_string()),
+    ];
+    let upstream = StreamUpstream::start(replies).await;
+    let fixture = Fixture::with(oauth(), &upstream.url(), SONNET);
+    let (started, id, _request) = fixture.anthropic(&create, Operation::Generate).await;
+    let mut started = started.unwrap();
+    started.producer.await.unwrap().unwrap();
+    let native = fixture.egress(id, &mut started.stream, BodyMode::Buffered).await;
+    let native: Value = serde_json::from_slice(&native).unwrap();
+    assert_eq!(native["content"][0]["name"], "lookup_file", "{native}");
+    let thread = json!({"type": "continue", "previous_message_id": "msg_t"});
+    let after = json!({"model": SONNET, "max_tokens": 1024, "stream": true, "thread": thread, "messages": messages});
+    let (started, _, _request) = fixture
+        .anthropic(&serde_json::to_vec(&after).unwrap(), Operation::Generate)
+        .await;
+    started.unwrap().producer.await.unwrap().unwrap();
+    let (started, _, _request) = fixture.anthropic(&create, Operation::Generate).await;
+    let error = started.unwrap().producer.await.unwrap().unwrap_err();
+    let message = String::from_utf8_lossy(&error.body);
+    assert!(
+        message.starts_with("restore Claude OAuth tool name from response: "),
+        "{message}"
+    );
+    assert_eq!(upstream.requests(), 3);
+}
+
+/// The collected body charges the exchange's stream quota; past it the response stream ends
+/// with `StorageExhausted` and the attempt fails, before any of the body is published.
+#[tokio::test]
+async fn a_buffered_cloaked_body_over_the_stream_quota_fails_visibly() {
+    let text = "a".repeat(300_000);
+    let reply = json!({"id": "msg_big", "type": "message", "role": "assistant", "model": SONNET,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn", "stop_sequence": null, "usage": {"input_tokens": 3, "output_tokens": 2}});
+    let upstream = StreamUpstream::start([Reply::json(reply.to_string())]).await;
+    let mut fixture = Fixture::with(oauth(), &upstream.url(), SONNET);
+    fixture.streams = Streams::with_metadata(256 * 1024);
+    let body = json!({"model": SONNET, "max_tokens": 1024, "messages": [{"role": "user", "content": "hi"}]});
+    let (started, id, _request) = fixture
+        .anthropic(&serde_json::to_vec(&body).unwrap(), Operation::Generate)
+        .await;
+    let error = started.unwrap().producer.await.unwrap().unwrap_err();
+    assert_eq!((error.status, &error.body[..]), (503, &b"stream.storage_exhausted"[..]));
+    let published = fixture.streams.published(id);
+    assert_eq!(published.terminal, Some(Terminal::StorageExhausted));
+    assert!(published.records.is_empty(), "nothing of the body is published");
 }

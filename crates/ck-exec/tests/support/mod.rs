@@ -42,11 +42,20 @@ impl Streams {
 
     /// A pool of `frames` frames, for storage-exhaustion cases.
     pub fn with_frames(frames: usize) -> Self {
+        Self::with_limits(frames, 4 * 1024 * 1024)
+    }
+
+    /// An exchange metadata quota of `bytes`, for metadata-exhaustion cases.
+    pub fn with_metadata(bytes: usize) -> Self {
+        Self::with_limits(64, bytes)
+    }
+
+    fn with_limits(frames: usize, metadata: usize) -> Self {
         let directory = std::env::temp_dir().join(format!("ck-exec-{}", uuid::Uuid::new_v4()));
         let mut config = ck_stream::Config::new(directory.clone());
         config.pool_bytes = Some(frames * ck_stream::FRAME_BYTES);
         config.max_event_bytes = 16 * ck_stream::FRAME_BYTES;
-        config.max_metadata_bytes = 4 * 1024 * 1024;
+        config.max_metadata_bytes = metadata;
         config.header_slots = 8;
         config.workers = 1;
         let clock = Arc::new(ManualClock::default());
