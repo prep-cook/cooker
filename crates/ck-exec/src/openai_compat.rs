@@ -28,7 +28,7 @@ const COMPACT_ALT: &str = "responses/compact";
 const IMAGES_GENERATIONS: &str = "/images/generations";
 const IMAGES_EDITS: &str = "/images/edits";
 /// `scanner.Buffer(nil, 52_428_800)`.
-const MAX_LINE: usize = 52_428_800;
+pub(crate) const MAX_LINE: usize = 52_428_800;
 /// helps.ApplyPatchUpstreamErrorMessage: Go's error for an empty or rejected translation.
 const EMPTY_TRANSLATION: &str = ck_translate::APPLY_PATCH_UPSTREAM_ERROR;
 
@@ -92,7 +92,7 @@ async fn images_error(upstream: wire::Upstream, with_retry: bool, capture: &wire
     }
 }
 
-fn status_error(status: u16, headers: http::HeaderMap, body: &[u8], with_retry: bool) -> ExecError {
+pub(crate) fn status_error(status: u16, headers: http::HeaderMap, body: &[u8], with_retry: bool) -> ExecError {
     let mut error = status_err(status, String::from_utf8_lossy(body));
     if with_retry {
         error.retry_after = payload::retry_after(status, &headers, body, SystemTime::now());
@@ -101,7 +101,7 @@ fn status_error(status: u16, headers: http::HeaderMap, body: &[u8], with_retry: 
     error
 }
 
-fn credentials(credential: &Credential) -> (String, String) {
+pub(crate) fn credentials(credential: &Credential) -> (String, String) {
     let attr = |k: &str| {
         credential
             .attributes
@@ -112,12 +112,12 @@ fn credentials(credential: &Credential) -> (String, String) {
     (attr("base_url"), attr("api_key"))
 }
 
-fn missing_base_url() -> ExecError {
+pub(crate) fn missing_base_url() -> ExecError {
     ExecError::local(401, FailureScope::Credential, "missing provider baseURL")
 }
 
 /// `strings.TrimSuffix(baseURL, "/") + path`: one slash only, like Go.
-fn endpoint(base_url: &str, path: &str) -> String {
+pub(crate) fn endpoint(base_url: &str, path: &str) -> String {
     format!("{}{path}", base_url.strip_suffix('/').unwrap_or(base_url))
 }
 
@@ -223,7 +223,7 @@ fn apply_thinking(
     .map_err(|e| ExecError::local(400, FailureScope::Request, e.message))
 }
 
-fn base_headers(api_key: &str, content_type: &str) -> GoHeaders {
+pub(crate) fn base_headers(api_key: &str, content_type: &str) -> GoHeaders {
     let mut headers = GoHeaders::new();
     headers.set("Content-Type", content_type);
     if !api_key.is_empty() {
@@ -247,6 +247,11 @@ impl OpenAICompatExecutor {
         Self {
             clients: Clients::new(client),
         }
+    }
+
+    /// The HTTP client of `credential`'s effective proxy.
+    pub(crate) fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
+        self.clients.for_credential(credential, cfg)
     }
 
     pub async fn execute(
@@ -635,27 +640,38 @@ fn prompt_cache_key(
         payload::set_str_if_different(&mut body, "prompt_cache_key", &key);
         return body;
     }
-    let Some(session) = provider_session_uuid(provider, req) else {
-        return body;
-    };
-    let provider = provider.trim().go_lower();
-    let identity = format!(
-        "cli-proxy-api:openai-compat:prompt-cache\0{provider}\0{}\0{}\0{session}",
-        model.go_lower(),
-        req.source_format.as_str().trim().go_lower()
-    );
-    let key = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.as_bytes()).to_string();
-    payload::set_str_if_different(&mut body, "prompt_cache_key", &key);
+    let sessions = (req.execution_session.as_deref(), req.derived_session.as_deref());
+    if let Some(key) = session_cache_key(provider, &model, req.source_format.as_str(), sessions) {
+        payload::set_str_if_different(&mut body, "prompt_cache_key", &key);
+    }
     body
+}
+
+/// The prompt cache key of a provider session: a stable UUID over the provider, the model, the
+/// client protocol and [`provider_session_uuid`]; `None` without a session.
+pub(crate) fn session_cache_key(
+    provider: &str,
+    model: &str,
+    source: &str,
+    sessions: (Option<&str>, Option<&str>),
+) -> Option<String> {
+    let session = provider_session_uuid(provider, sessions)?;
+    let identity = format!(
+        "cli-proxy-api:openai-compat:prompt-cache\0{}\0{}\0{}\0{session}",
+        provider.trim().go_lower(),
+        model.go_lower(),
+        source.trim().go_lower()
+    );
+    Some(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.as_bytes()).to_string())
 }
 
 /// `helps.ProviderSessionUUID`: the execution session, else the derived session identity,
 /// as a provider-scoped stable UUID.
-fn provider_session_uuid(provider: &str, req: &ExecRequest) -> Option<String> {
-    let nonempty = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
-    let (kind, value) = match nonempty(&req.execution_session) {
+fn provider_session_uuid(provider: &str, (execution, derived): (Option<&str>, Option<&str>)) -> Option<String> {
+    let nonempty = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let (kind, value) = match nonempty(execution) {
         Some(execution) => ("execution-session", execution),
-        None => ("derived-session", nonempty(&req.derived_session)?),
+        None => ("derived-session", nonempty(derived)?),
     };
     let provider = provider.trim().go_lower();
     if provider.is_empty() {
