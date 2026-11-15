@@ -10,9 +10,12 @@
 //! 2. the attempt's usage reader drains to that terminal and the tracker settles once;
 //! 3. the stream is discarded with `Terminal::Gone`.
 //!
-//! A committed attempt settles the same way on a stream task once its producer ends. The
-//! finalizer prevents duplicate accounting in cooker; it cannot stop an upstream from
-//! billing a request whose response failed before commitment.
+//! Step 2 runs on the attempt's own stream task from the moment the attempt starts, so a
+//! client that goes away before commitment neither drops the usage record nor loses its
+//! final usage; that task then discards the abandoned streams itself. A committed attempt
+//! settles on the same task once its producer ends. The finalizer prevents duplicate
+//! accounting in cooker; it cannot stop an upstream from billing a request whose response
+//! failed before commitment.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -26,14 +29,14 @@ use ck_exec::types::{Attempt, Client, Request};
 use ck_stream::{Terminal, Writer};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
 use ck_translate::codec::{self, RequestView, ValidatedRequest};
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
 
 use super::{Call, Fault, Trace};
 use crate::http::egress::{self, Failed};
 use crate::http::respond;
 use crate::inference::streams::{Exchange, Uncommitted};
 use crate::observability::usage_record::{Facts, Tracker};
-use crate::observability::usage_snapshot::{self, CanonicalUsage, ResponseFacts};
+use crate::observability::usage_snapshot;
 use crate::runtime::state::{Lease, Outcome, Runtime};
 
 /// The contract arm's executor selector: [`ck_exec::Executors`] in the server.
@@ -99,6 +102,17 @@ impl<'v, 'x, X: Arms> Arm<'v, 'x, X> {
             view: codec.view,
             request_id: codec.request_id,
             started: 0,
+        }
+    }
+}
+
+/// An exchange that ends without commitment discards its request stream (contract §7). The
+/// loop settles and discards every attempt before it returns, so no attempt still depends
+/// on the request stream here.
+impl<X> Drop for Arm<'_, '_, X> {
+    fn drop(&mut self) {
+        if let Some(mut exchange) = self.exchange.take() {
+            exchange.request.finish(Terminal::Gone);
         }
     }
 }
@@ -183,18 +197,19 @@ pub(super) async fn run<X: Arms>(
         }
     };
     arm.started += 1;
-    // Attached before the upstream call, so every attempt, failed ones included, accounts.
-    let mut handle = response.allocator();
-    let reading = rt.streams().spawn(usage_snapshot::read(response.allocator(), reader));
-    let mut tracker = usage.map(|facts| {
-        let mut tracker = Tracker::start(rt, facts, &lease.credential, upstream);
-        if let Some(m) = &lease.lcp {
-            tracker.lcp_session(m);
-        }
-        tracker
-    });
-    let sink = match &tracker {
-        Some(tracker) => tracker.sink().with_capture(req.capture().clone()),
+    // From here the attempt's settlement runs on its own stream task, so a client that goes
+    // away before commitment cannot drop the record or lose its final usage.
+    let (begun, settlement) = settle_spawn(
+        rt,
+        usage,
+        lease,
+        upstream,
+        response.allocator(),
+        exchange.request.allocator(),
+        reader,
+    );
+    let sink = match &settlement.sink {
+        Some(sink) => sink.clone().with_capture(req.capture().clone()),
         None => req.usage.clone(),
     };
     let request = Request {
@@ -212,6 +227,7 @@ pub(super) async fn run<X: Arms>(
             original: &call.body,
         },
     };
+    let mut handle = response.allocator();
     lease.redispatch();
     let started = arm
         .arms
@@ -226,15 +242,17 @@ pub(super) async fn run<X: Arms>(
         Ok(started) => started,
         Err(error) => {
             arm.exchange = Some(exchange);
-            settle(reading, tracker, Err(&error)).await;
+            let _ = begun.send(Begun::Refused(error.clone()));
+            let _ = settlement.done.await;
             handle.finish(Terminal::Gone);
             return failed(error);
         }
     };
-    if let Some(tracker) = tracker.as_mut() {
-        tracker.arrived(&headers);
-    }
     drop(handle);
+    let _ = begun.send(Begun::Started {
+        producer,
+        headers: headers.clone(),
+    });
     let mut sent = HeaderMap::new();
     if let Some(value) = trace.header() {
         sent.insert("x-ck-trace-id", value);
@@ -245,87 +263,125 @@ pub(super) async fn run<X: Arms>(
     match egress::deliver(rt.streams(), exchange, &stream, identity, arm.view, sent).await {
         Ok(response) => Ran::Committed(Box::new(Committed {
             response,
-            producer,
-            reading,
-            tracker,
+            done: settlement.done,
         })),
         Err(uncommitted) => {
             let Failed { exchange, reason } = *uncommitted;
             arm.exchange = Some(exchange);
             let mut stream = stream;
-            let error = uncommitted_error(&mut stream, reason, producer).await;
-            settle(reading, tracker, Err(&error)).await;
+            // An egress defect stops the producer, which would otherwise run on unread.
+            if matches!(reason, Uncommitted::Codec(_)) {
+                stream.finish(Terminal::Cancelled);
+            }
+            let error = uncommitted_error(reason, settlement.done.await);
             stream.finish(Terminal::Gone);
             failed(error)
         }
     }
 }
 
-/// A committed attempt, settled once its producer ends.
+/// A committed attempt; its settlement reports the producer's outcome.
 pub(super) struct Committed {
     response: Response,
-    producer: Producer,
-    reading: JoinHandle<(Option<CanonicalUsage>, ResponseFacts)>,
-    tracker: Option<Tracker>,
+    done: oneshot::Receiver<Result<(), ExecError>>,
 }
 
 impl Committed {
-    /// Settles the attempt on a stream task, so shutdown waits for it, and returns the
-    /// client's response. Failover ended at commitment, so the producer's outcome only
-    /// reports to the scheduler and the usage record.
+    /// Completes the lease with the producer's outcome on a stream task, so shutdown waits
+    /// for it, and returns the client's response. Failover ended at commitment, so the
+    /// outcome only reports to the scheduler; the usage record is already settled by then.
     pub(super) fn spawn(self, rt: &Runtime, lease: Lease) -> Response {
-        let Self {
-            response,
-            producer,
-            reading,
-            tracker,
-        } = self;
+        let Self { response, done } = self;
         lease.accepted();
         rt.streams().spawn(async move {
-            let outcome = match producer.await {
-                Ok(outcome) => outcome,
-                Err(_) => Err(producer_lost()),
-            };
-            settle(reading, tracker, outcome.as_ref().map(|_| ())).await;
-            lease.complete(match outcome {
-                Ok(()) => Outcome::Success,
-                Err(error) => Outcome::Failure(error),
+            lease.complete(match done.await {
+                Ok(Ok(())) => Outcome::Success,
+                Ok(Err(error)) => Outcome::Failure(error),
+                Err(_) => Outcome::Failure(producer_lost()),
             });
         });
         response
     }
 }
 
-/// §5.2 step 2: drains the usage reader to the stream's terminal and settles the tracker
-/// exactly once. Every caller's stream already has a terminal: `pipeline::start` sets
-/// `UpstreamError` on an executor error, and an ended producer set its own.
-async fn settle(
-    reading: JoinHandle<(Option<CanonicalUsage>, ResponseFacts)>,
-    tracker: Option<Tracker>,
-    outcome: Result<(), &ExecError>,
-) {
-    let read = reading.await;
-    let Some(mut tracker) = tracker else { return };
-    if let Ok((usage, facts)) = &read {
-        tracker.canonical(usage.as_ref(), facts);
-    }
-    match outcome {
-        Ok(()) => tracker.succeed(),
-        Err(error) => tracker.fail(error),
-    }
+/// What the request side hands an attempt's settlement once `start` returned.
+enum Begun {
+    /// The executor failed; `pipeline::start` ended the stream with `UpstreamError`.
+    Refused(ExecError),
+    /// The producer runs; its outcome is the attempt's.
+    Started { producer: Producer, headers: HeaderMap },
 }
 
-/// The failure of an attempt whose egress returned before its first deliverable byte. An
-/// egress defect stops the producer, which would otherwise run on with no reader.
-async fn uncommitted_error(stream: &mut Writer, reason: Uncommitted, producer: Producer) -> ExecError {
-    if matches!(reason, Uncommitted::Codec(_)) {
-        stream.finish(Terminal::Cancelled);
-    }
-    let produced = producer.await;
-    match (reason, produced) {
+/// The request side's end of an attempt's settlement.
+struct Settlement {
+    /// The tracker's usage sink, when the attempt is tracked.
+    sink: Option<ck_core::exec::UsageSink>,
+    /// The attempt's outcome, sent once its usage record is settled.
+    done: oneshot::Receiver<Result<(), ExecError>>,
+}
+
+/// §5.2 step 2 on a stream task: waits for the attempt's outcome, drains the usage reader to
+/// the stream's terminal, settles the tracker exactly once and then reports the outcome.
+/// When nobody receives it, the client went away before commitment: the task then discards
+/// the attempt's stream and the exchange's request stream (§5.2 step 3) itself.
+fn settle_spawn(
+    rt: &Arc<Runtime>,
+    usage: Option<&Arc<Facts>>,
+    lease: &Lease,
+    upstream: &str,
+    mut response: Writer,
+    mut request: Writer,
+    reader: ck_stream::Reader,
+) -> (oneshot::Sender<Begun>, Settlement) {
+    let mut tracker = usage.map(|facts| {
+        let mut tracker = Tracker::start(rt, facts, &lease.credential, upstream);
+        if let Some(m) = &lease.lcp {
+            tracker.lcp_session(m);
+        }
+        tracker
+    });
+    let sink = tracker.as_ref().map(Tracker::sink);
+    let (begun, started) = oneshot::channel();
+    let (report, done) = oneshot::channel();
+    rt.streams().spawn(async move {
+        let outcome = match started.await {
+            Ok(Begun::Refused(error)) => Err(error),
+            Ok(Begun::Started { producer, headers }) => {
+                if let Some(tracker) = tracker.as_mut() {
+                    tracker.arrived(&headers);
+                }
+                producer.await.unwrap_or_else(|_| Err(producer_lost()))
+            }
+            // The request went away inside `start`; the dropped writer ended the stream.
+            Err(_) => Err(abandoned()),
+        };
+        // Every outcome above left the stream with a terminal, so the reader ends.
+        let (usage, facts) = usage_snapshot::read(response.allocator(), reader).await;
+        if let Some(mut tracker) = tracker {
+            tracker.canonical(usage.as_ref(), &facts);
+            match &outcome {
+                Ok(()) => tracker.succeed(),
+                Err(error) => tracker.fail(error),
+            }
+        }
+        if report.send(outcome).is_err() {
+            response.finish(Terminal::Gone);
+            request.finish(Terminal::Gone);
+        }
+    });
+    (begun, Settlement { sink, done })
+}
+
+/// The failure of an attempt whose egress returned before its first deliverable byte, from
+/// the reason and the settled outcome.
+fn uncommitted_error(
+    reason: Uncommitted,
+    settled: Result<Result<(), ExecError>, oneshot::error::RecvError>,
+) -> ExecError {
+    match (reason, settled) {
         (Uncommitted::Codec(codec::Error::Storage(error)), _) => stored(&error),
         (Uncommitted::Codec(_), _) => defect(),
-        (_, Err(_)) => producer_lost(),
+        (_, Err(_)) => defect(),
         (_, Ok(Err(error))) => error,
         (Uncommitted::Terminal(terminal), Ok(Ok(()))) => ended(terminal),
         (Uncommitted::Error, Ok(Ok(()))) => defect(),
@@ -407,6 +463,12 @@ fn defect() -> ExecError {
 /// A gateway defect: 500, never failed over.
 fn defective() -> ExecError {
     ExecError::local(500, FailureScope::Request, "stream.producer_lost")
+}
+
+/// The client went away while the executor ran: the attempt's record fails with the cancel
+/// status.
+fn abandoned() -> ExecError {
+    ExecError::local(499, FailureScope::Request, "stream.cancelled")
 }
 
 /// A producer panic: 502, an attempt failure that may fail over (contract §9).

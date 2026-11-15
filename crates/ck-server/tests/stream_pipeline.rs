@@ -310,7 +310,14 @@ enum Script {
     Answers,
     /// One content chunk, then the body fails once the test releases it.
     FailsAfterContent,
+    /// One content chunk and a body error, both ready at once.
+    FailsAtOnce,
+    /// The whole answer with 7 input tokens of usage, once the test releases it.
+    Held,
 }
+
+/// A usage-only Chat chunk: 7 input tokens.
+const USAGE: &str = "data: {\"id\":\"r\",\"model\":\"m\",\"created\":1,\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n";
 
 /// One `start` call, recorded on entry.
 struct Begun {
@@ -446,16 +453,26 @@ impl Execute for Executor<'_> {
                 return Err(ExecError::local(503, FailureScope::Request, "stream.storage_exhausted"));
             }
             Script::UsageThenRefused => {
-                let usage = r#"data: {"id":"r","model":"m","created":1,"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#;
-                ingress
-                    .advance(streams.response, format!("{usage}\n\n").as_bytes())
-                    .unwrap();
+                ingress.advance(streams.response, USAGE.as_bytes()).unwrap();
                 if ingress.flush_deadline().is_some() {
                     ingress.flush(streams.response).unwrap();
                 }
                 return Err(refused());
             }
             Script::BodyFails => stream::iter([Err(broken())]).boxed(),
+            Script::FailsAtOnce => stream::iter([Ok(content()), Err(broken())]).boxed(),
+            Script::Held => {
+                let release = self.release.lock().unwrap().take().unwrap();
+                let answer = [
+                    content(),
+                    Bytes::from_static(USAGE.as_bytes()),
+                    chunk("{}", r#""stop""#),
+                    done(),
+                ];
+                stream::once(release)
+                    .flat_map(move |_| stream::iter(answer.clone().map(Ok)))
+                    .boxed()
+            }
             Script::Answers => stream::iter(
                 [
                     content(),
@@ -564,6 +581,9 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         Commits { clean: bool },
         /// No candidate committed: the call's status.
         Status(u16),
+        /// The client goes away while the egress waits for the first byte; the upstream
+        /// then completes.
+        Gone,
     }
     struct Row {
         case: &'static str,
@@ -784,6 +804,30 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 1,
             cooled: &["a"],
         },
+        Row {
+            case: "a producer failure ready with the first output does not commit",
+            scripts: [Script::FailsAtOnce, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["a", "b"],
+            settled: &[0, 1],
+            failed: &[true, false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a client gone before the first byte still accounts the final usage",
+            scripts: [Script::Held, Script::Answers],
+            request: None,
+            ends: Ends::Gone,
+            started: &["a"],
+            settled: &[0],
+            failed: &[false],
+            input_tokens: Some(7),
+            old: 0,
+            cooled: &[],
+        },
     ];
     let (upstream, sends) = refusing_upstream().await;
     let usage = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
@@ -801,6 +845,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         };
         let mut exchange = exchange(&fixture, owner(KEY), output(Protocol::Chat, Framing::Sse), CLIENT);
         let (document, media) = request_view(&fixture, &mut exchange);
+        let request = exchange.request.id();
         if let Some(terminal) = row.request {
             exchange.request.finish(terminal);
         }
@@ -815,30 +860,43 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         };
         let sent = sends.load(Ordering::SeqCst);
         let trace = Trace::with_request_id(Some("trace".into()));
-        let served = tokio::time::timeout(
-            Duration::from_secs(5),
-            dispatch::run_exchange(&fixture.rt, &fake, call(), &trace, codec),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("{case}: the call finishes"));
-        match (served, row.ends) {
-            (Ok(Served::Committed(response)), Ends::Commits { clean }) => {
-                let _ = release.send(());
-                let (text, ended) = tokio::time::timeout(Duration::from_secs(5), body(response))
-                    .await
-                    .unwrap_or_else(|_| panic!("{case}: the body ends"));
-                assert!(text.contains("hel"), "{case}: {text}");
-                if clean {
-                    assert!(
-                        ended && text.contains("lo") && !text.contains("error"),
-                        "{case}: only the committed attempt reaches the client: {text}"
-                    );
+        let mut run = Box::pin(dispatch::run_exchange(&fixture.rt, &fake, call(), &trace, codec));
+        if let Ends::Gone = row.ends {
+            let started = async {
+                while fake.begun.lock().unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
+                tokio::time::sleep(SETTLE).await;
+            };
+            tokio::select! {
+                _ = &mut run => panic!("{case}: answered before the upstream did"),
+                () = started => {}
             }
-            (Err(error), Ends::Status(status)) => assert_eq!(error.failure.status(), status, "{case}"),
-            (Ok(Served::Old(_)), _) => panic!("{case}: the old arm answered"),
-            (Ok(Served::Committed(_)), ends) => panic!("{case}: committed, expected {ends:?}"),
-            (Err(error), ends) => panic!("{case}: status {}, expected {ends:?}", error.failure.status()),
+            drop(run);
+            let _ = release.send(());
+        } else {
+            let served = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap_or_else(|_| panic!("{case}: the call finishes"));
+            match (served, row.ends) {
+                (Ok(Served::Committed(response)), Ends::Commits { clean }) => {
+                    let _ = release.send(());
+                    let (text, ended) = tokio::time::timeout(Duration::from_secs(5), body(response))
+                        .await
+                        .unwrap_or_else(|_| panic!("{case}: the body ends"));
+                    assert!(text.contains("hel"), "{case}: {text}");
+                    if clean {
+                        assert!(
+                            ended && text.contains("lo") && !text.contains("error"),
+                            "{case}: only the committed attempt reaches the client: {text}"
+                        );
+                    }
+                }
+                (Err(error), Ends::Status(status)) => assert_eq!(error.failure.status(), status, "{case}"),
+                (Ok(Served::Old(_)), _) => panic!("{case}: the old arm answered"),
+                (Ok(Served::Committed(_)), ends) => panic!("{case}: committed, expected {ends:?}"),
+                (Err(error), ends) => panic!("{case}: status {}, expected {ends:?}", error.failure.status()),
+            }
         }
         let records = fake.records(row.failed.len()).await;
         let failed: Vec<bool> = records
@@ -849,8 +907,24 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         if let Some(tokens) = row.input_tokens {
             assert_eq!(
                 records[0]["tokens"]["input_tokens"], tokens,
-                "{case}: the snapshot before the failure is kept"
+                "{case}: the record carries the attempt's last usage snapshot"
             );
+        }
+        // An exchange that ends without commitment discards its request stream; a committed
+        // one keeps it for resume.
+        let kept = fixture
+            .rt
+            .streams()
+            .with_store(|store| store.reader(request, 0).map(drop))
+            .unwrap();
+        match row.ends {
+            Ends::Commits { .. } => assert!(kept.is_ok(), "{case}: the committed request stays"),
+            Ends::Status(_) | Ends::Gone => {
+                assert!(
+                    matches!(kept, Err(ck_stream::Error::Gone)),
+                    "{case}: the request stream is discarded"
+                )
+            }
         }
         assert_eq!(sends.load(Ordering::SeqCst) - sent, row.old, "{case}: old-arm sends");
         let cooled: Vec<&str> = ["a", "b"]
