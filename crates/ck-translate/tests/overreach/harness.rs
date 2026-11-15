@@ -46,6 +46,7 @@ pub(crate) fn drive(
         P::Anthropic => {
             let capability = anthropic::request::AnthropicCapability {
                 default_max_tokens: Some(4096),
+                ..Default::default()
             };
             let ready = ingress.finish(&mut m.writer, &capability)?;
             anthropic::request::Egress {

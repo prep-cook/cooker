@@ -119,13 +119,19 @@ pub(crate) fn header_session(headers: &HeaderMap) -> Option<String> {
 /// `codexReasoningReplaySessionKey` for a Claude-format request, isolated per caller key
 /// (`xaiReasoningReplayIsolateSessionKey`). Empty when no session or no client key.
 pub(crate) fn session_key(req: &ExecRequest, payload: &[u8]) -> String {
-    let key = claude_code_session(payload, &req.headers)
+    let execution = req.execution_session.as_deref();
+    session_key_of(&req.headers, execution, &req.caller.principal, payload)
+}
+
+/// [`session_key`] from the request facts it reads.
+pub(crate) fn session_key_of(headers: &HeaderMap, execution: Option<&str>, caller: &str, payload: &[u8]) -> String {
+    let key = claude_code_session(payload, headers)
         .or_else(|| {
-            let execution = req.execution_session.as_deref().map(str::trim).unwrap_or_default();
+            let execution = execution.map(str::trim).unwrap_or_default();
             (!execution.is_empty()).then(|| format!("execution:{execution}"))
         })
         .or_else(|| payload_session(payload))
-        .or_else(|| header_session(&req.headers))
+        .or_else(|| header_session(headers))
         .unwrap_or_default();
     let key = key.trim();
     if key.is_empty() {
@@ -134,7 +140,7 @@ pub(crate) fn session_key(req: &ExecRequest, payload: &[u8]) -> String {
     if key.starts_with("execution:") {
         return key.to_owned();
     }
-    let api_key = req.caller.principal.trim();
+    let api_key = caller.trim();
     if api_key.is_empty() {
         return String::new();
     }

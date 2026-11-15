@@ -17,7 +17,7 @@ use super::alias::{self, Reverse};
 use crate::rawjson;
 
 /// Go `bufio.Scanner` buffer limit (50 MB).
-const MAX_LINE: usize = 52_428_800;
+pub(super) const MAX_LINE: usize = 52_428_800;
 
 /// `observeClaudeStreamLine`.
 fn observe(line: &[u8], message_id: &mut String, completed: &mut bool) {
@@ -80,8 +80,9 @@ struct Relay {
     /// translated loop does, instead of waiting for the event's blank line.
     eager_terminal: bool,
     done: Option<OnComplete>,
-    /// Go's usage reporter: every upstream line, before alias restore.
-    usage: ck_core::exec::UsageSink,
+    /// Go's usage reporter: every upstream line, before alias restore. Kimi's old path only
+    /// (P8 removes it); the contract accounts from the canonical stream.
+    usage: Option<ck_core::exec::UsageSink>,
     /// Request logs: every scanner line before restore (`AppendAPIResponseChunk`) and
     /// the error that ends the stream (`RecordAPIResponseError`).
     capture: ck_core::exec::CaptureSink,
@@ -95,7 +96,9 @@ impl Relay {
         }
         observe(line, &mut self.message_id, &mut self.completed);
         // reporter.ObserveResponseModel and StreamUsageBuffer.ObserveClaudeStream.
-        self.usage.response_line(ck_core::format::Format::Claude, line);
+        if let Some(usage) = &self.usage {
+            usage.response_line(ck_core::format::Format::Claude, line);
+        }
         self.capture.record(ck_core::exec::CaptureEvent::ResponseChunk(line));
         let restored = match restore_line(line, &self.reverse) {
             Ok(restored) => restored,
@@ -215,7 +218,7 @@ pub(crate) fn relay(
     body: ExecStream,
     reverse: Arc<Reverse>,
     done: OnComplete,
-    usage: ck_core::exec::UsageSink,
+    usage: Option<ck_core::exec::UsageSink>,
     capture: ck_core::exec::CaptureSink,
 ) -> ExecStream {
     relay_with(body, reverse, done, false, usage, capture)
@@ -226,7 +229,7 @@ pub(crate) fn relay_translated(
     body: ExecStream,
     reverse: Arc<Reverse>,
     done: OnComplete,
-    usage: ck_core::exec::UsageSink,
+    usage: Option<ck_core::exec::UsageSink>,
     capture: ck_core::exec::CaptureSink,
 ) -> ExecStream {
     relay_with(body, reverse, done, true, usage, capture)
@@ -237,7 +240,7 @@ fn relay_with(
     reverse: Arc<Reverse>,
     done: OnComplete,
     eager_terminal: bool,
-    usage: ck_core::exec::UsageSink,
+    usage: Option<ck_core::exec::UsageSink>,
     capture: ck_core::exec::CaptureSink,
 ) -> ExecStream {
     let relay = Relay {
@@ -500,7 +503,7 @@ mod tests {
             body,
             Arc::new(reverse),
             Box::new(|_| {}),
-            ck_core::exec::UsageSink::new(usage.clone()),
+            Some(ck_core::exec::UsageSink::new(usage.clone())),
             Default::default(),
         )
         .map(Result::unwrap)

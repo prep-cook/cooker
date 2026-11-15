@@ -388,7 +388,17 @@ async fn pipeline_reproduces_go_upstream_captures() {
     for case in captures["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let req = enrich(request(case));
-        let mut ctx = Ctx::new(&executor, &credential, &req, &cfg, Default::default());
+        let mut ctx = Ctx::new(
+            &executor,
+            &credential,
+            (
+                req.model.as_str(),
+                req.resolved_model.as_ref(),
+                req.execution_session.as_deref(),
+            ),
+            &cfg,
+            Default::default(),
+        );
         ctx.today = "2026-10-02".into();
         let translated =
             translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
@@ -402,7 +412,9 @@ async fn pipeline_reproduces_go_upstream_captures() {
                 ctx.tool_search(),
             )
             .unwrap();
-            ctx.prepare_count(&req, &translated, &baseline).await.unwrap()
+            ctx.prepare_count(&Input::of(&req), &translated, &baseline)
+                .await
+                .unwrap()
         } else {
             let original = translate::original(
                 &req,
@@ -413,7 +425,7 @@ async fn pipeline_reproduces_go_upstream_captures() {
                 ctx.tool_search(),
             )
             .unwrap();
-            ctx.prepare_messages(&req, &translated, &original, req.stream)
+            ctx.prepare_messages(&Input::of(&req), &translated, &original, req.stream)
                 .await
                 .unwrap()
         };
@@ -1249,7 +1261,17 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             },
         };
         let mut req = enrich(req);
-        let mut ctx = Ctx::new(&executor, &credential, &req, &cfg, Default::default());
+        let mut ctx = Ctx::new(
+            &executor,
+            &credential,
+            (
+                req.model.as_str(),
+                req.resolved_model.as_ref(),
+                req.execution_session.as_deref(),
+            ),
+            &cfg,
+            Default::default(),
+        );
         ctx.today = scenario["date"].as_str().unwrap().into();
         if let (true, true, Some(output)) = (count, scenario["upstream"].is_null(), scenario["output"].as_array()) {
             // Counted locally: Go answered without an upstream request.
@@ -1279,7 +1301,7 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
                 ctx.tool_search(),
             )
             .unwrap();
-            ctx.prepare_count(&req, &translated, &baseline).await
+            ctx.prepare_count(&Input::of(&req), &translated, &baseline).await
         } else {
             // generate(): translated clients always stream upstream.
             let original = translate::original(
@@ -1291,8 +1313,13 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
                 ctx.tool_search(),
             )
             .unwrap();
-            ctx.prepare_messages(&req, &translated, &original, stream || source != Format::Claude)
-                .await
+            ctx.prepare_messages(
+                &Input::of(&req),
+                &translated,
+                &original,
+                stream || source != Format::Claude,
+            )
+            .await
         };
         if scenario["upstream"].as_array().is_none_or(Vec::is_empty) {
             // Go failed before sending (thinking validation and the like).

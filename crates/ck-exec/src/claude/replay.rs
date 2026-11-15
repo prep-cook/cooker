@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ck_core::credential::Credential;
-use ck_core::exec::{ExecRequest, ExecStream};
+use ck_core::exec::ExecStream;
 use ck_wire::json as gj;
 use sha2::{Digest, Sha256};
 
@@ -355,20 +355,28 @@ pub(crate) struct Gate<'a> {
 }
 
 /// `prepareClaudeThinkingReplayRequest` when `claudeThinkingReplayEnabled`: Claude
-/// clients of an is-compat Claude API-key model. Restores every cached turn into
-/// `req.body`. `None` when replay does not apply or no session identity exists.
-pub(crate) fn prepare(cache: &Arc<ReplayCache>, gate: &Gate<'_>, req: &mut ExecRequest) -> Option<Scope> {
-    let enabled = req.source_format == ck_core::format::Format::Claude
-        && gate.credential.provider.trim().eq_ignore_ascii_case("claude")
+/// clients of an is-compat Claude API-key model. Restores every cached turn into the
+/// request's Messages body and returns the body when a turn was restored. `None` when
+/// replay does not apply or no session identity exists.
+/// Whether thinking replay serves this credential and model, whatever the request.
+pub(super) fn eligible(gate: &Gate<'_>) -> bool {
+    gate.credential.provider.trim().eq_ignore_ascii_case("claude")
         && auth_kind_is_api_key(gate.credential)
         && gate.is_compat
         && !gate.api_key.trim().is_empty()
-        && !gate.oauth_token;
-    if !enabled {
+        && !gate.oauth_token
+}
+
+pub(super) fn prepare(
+    cache: &Arc<ReplayCache>,
+    gate: &Gate<'_>,
+    req: &super::Input<'_>,
+) -> Option<(Scope, Option<Bytes>)> {
+    if req.client_format != ck_core::format::Format::Claude || !eligible(gate) {
         return None;
     }
     let family = model_family(gate.credential, gate.api_key, gate.base_url, gate.base_model);
-    let session = crate::replay::session_key(req, &req.body);
+    let session = crate::replay::session_key_of(req.headers, req.execution_session, req.principal, req.body);
     if family.is_empty() || session.trim().is_empty() {
         return None;
     }
@@ -376,21 +384,18 @@ pub(crate) fn prepare(cache: &Arc<ReplayCache>, gate: &Gate<'_>, req: &mut ExecR
     let (contents, snapshot) = cache.get(&key, Instant::now());
     let mut body: Option<Vec<u8>> = None;
     for cached in &contents {
-        if let Some(updated) = crate::replay::restore_turn(body.as_deref().unwrap_or(&req.body), cached) {
+        if let Some(updated) = crate::replay::restore_turn(body.as_deref().unwrap_or(req.body), cached) {
             body = Some(updated);
         }
     }
-    let applied = body.is_some();
-    if let Some(body) = body {
-        req.body = Bytes::from(body);
-    }
-    Some(Scope {
+    let scope = Scope {
         cache: cache.clone(),
         key,
         snapshot,
-        applied,
+        applied: body.is_some(),
         recovered: AtomicBool::new(false),
-    })
+    };
+    Some((scope, body.map(Bytes::from)))
 }
 
 /// `Auth.AuthKind() == AuthKindAPIKey`.

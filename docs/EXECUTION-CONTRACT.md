@@ -43,6 +43,10 @@ Every provider module implements `Execute` once. The selector in `crates/ck-exec
 - `count_tokens` returns `Counted`: `Counted::Upstream` when the upstream counts, or `Counted::Local { input_tokens }` for a tokenizer count. A local count re-fences the request view with `operation: Generate` (`RequestView` fields are public) and counts what request egress encodes for it; the provider's capability accepts `CountTokens` exactly when that `Generate` projection is valid. The producer publishes the canonical `count_tokens` result for a local count. A count is never generation usage.
 - `compact` runs only a native compact. The capability refuses compact where the destination has none; a summary is never substituted.
 
+`Client::usage` carries request-side facts only (§8, G4).
+
+**G6, routing headers.** `Attempt::headers` is the client's request headers, which the server fills on every attempt. The selector reads them only to decide whether an attempt stays on a provider's old arm (`destination` answers `None`, `fence` and `refence` refuse with `Destination`, `start` refuses), before any byte of the attempt is sent. Request execution reads `Client::headers`. Claude uses them to keep a request carrying any Claude Code client signal on the old route until owner question 13 settles how `Execute` sees the client's own body.
+
 `Request<'a>`, `Attempt<'a>` and `Store` are `Sync`, so a server task may hold them across an await.
 
 ## 4. Fences and failover
@@ -94,6 +98,8 @@ Resume looks up the handle, authorizes the caller against `StreamHandle::owner` 
 
 The tracker's input is `CanonicalUsage` and `ResponseFacts`, read from the attempt's response stream by a runtime-owned reader, independently of client delivery, so a resumed or second reader never accounts again. `CanonicalUsage` is the latest canonical `x_ck.usage` snapshot: a later snapshot replaces the earlier one, and `None` is an absent count, not zero. `ResponseFacts` carries the `response.start` model and the last chunk `service_tier`. The Go breakdown is derived from the counts. D3 deletes `parse_body`, `StreamUsage` and the `Tracker::body`/`event` byte parsers.
 
+**G4, request-side facts.** `Client::usage` is the attempt's `UsageSink`. An executor reports through it only what the canonical stream does not carry: `request` (the body sent upstream, for the reasoning effort), `upstream_model`, `claude_cache`, `round_trip_started`, `first_byte`, and upstream request and response capture through its `CaptureSink`. It never calls a `response_*` method; response usage is the canonical snapshot above.
+
 ## 9. Errors and commitment
 
 Commitment is the first deliverable byte the client's `ResponseEgress` emits. Before it the client receives nothing: no status, success header or keepalive. From it on, failover is disabled even if the socket write fails.
@@ -137,5 +143,4 @@ Phase E extends this contract; it does not change it. It reuses `Attempt`, `Clie
 ## 13. Open for an owner
 
 - **Q2, failover across capabilities.** §4 step 3 fixes where the policy applies; the policy itself needs the ruling.
-- **Claude compact.** `claude.rs:246-250` answers `responses/compact` with a generated summary, which §3 forbids. P1 needs a ruling or must refuse it through the capability.
 - **Q7, Interactions and legacy completions.** No codec exists, so no module is declared for them.
