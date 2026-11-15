@@ -90,10 +90,25 @@ fn malformed_urls_print_the_placeholder() {
         "https://host:sk-review-secret/v1",
         "https://[::1/sk-review-secret",
         "https://sk review secret/v1",
+        // Review of #127, finding 7: a bracketed host that is not IPv6, and escapes that
+        // decode to delimiters.
+        "http://[sk-review-secret]/",
+        "http://[v1.sk-review-secret]/",
+        "http://sk-review-secret%40127.0.0.1/",
+        "http://sk-review-secret%2f127.0.0.1/",
+        "http://sk-review-secret%/",
+        "http://[::1%sk-review-secret]/",
     ] {
         let got = url(raw);
         assert_eq!(got, UNPRINTABLE, "{raw:?}");
         assert_no_secret(&got, raw);
+    }
+    for raw in [
+        "http://[::1%25eth0]:1/x",
+        "https://%61pi.example/x",
+        "http://xn--r8j.example/",
+    ] {
+        assert_eq!(url(raw), raw);
     }
 }
 
@@ -115,6 +130,39 @@ fn urls_inside_text_are_rendered_in_place() {
         urls_in(&wreq),
         "error sending request for uri (http://h/?api_key=*** client error"
     );
+}
+
+/// Review of #127, finding 2: a quoted URL runs to its closing quote, and a
+/// scheme-relative URL is a URL too.
+#[test]
+fn quoted_and_scheme_relative_urls_are_whole() {
+    for (text, want) in [
+        (
+            format!(r#"Post "http://127.0.0.1/?code=prefix {SECRET}": EOF"#),
+            r#"Post "http://127.0.0.1/?code=***": EOF"#,
+        ),
+        (
+            format!("Post \"http://127.0.0.1/?code=prefix\r\n{SECRET}\": EOF"),
+            r#"Post "<redacted url>": EOF"#,
+        ),
+        (
+            format!(r#"Post "http://127.0.0.1/?code=a\"{SECRET}": EOF"#),
+            r#"Post "http://127.0.0.1/?code=***": EOF"#,
+        ),
+        (
+            format!(r#"Post "//user:{SECRET}@127.0.0.1/?code={SECRET}": unsupported protocol scheme """#),
+            r#"Post "//127.0.0.1/?code=***": unsupported protocol scheme """#,
+        ),
+        (
+            format!("see //user:{SECRET}@127.0.0.1/ or (//127.0.0.1/?k={SECRET})"),
+            "see //127.0.0.1/ or (//127.0.0.1/?k=***",
+        ),
+        ("a/b//c and path//x".to_owned(), "a/b//c and path//x"),
+    ] {
+        let got = urls_in(&text);
+        assert_eq!(got, want, "{text:?}");
+        assert_no_secret(&got, &text);
+    }
 }
 
 #[test]
@@ -143,12 +191,30 @@ fn url_headers_are_rendered_for_logs() {
             r#"<https://h.example/p?key=sk-review-secret>; rel="next", </p?page=2>; rel="last""#,
             r#"<https://h.example/p?key=***>; rel="next", </p?page=***>; rel="last""#,
         ),
-        ("link", "</p?key=sk-review-secret", UNPRINTABLE),
+        ("link", "</p?key=sk-review-secret", "<<redacted url>"),
+        // Review of #127, finding 1: URL parameters, and spaces around `url =`.
+        (
+            "link",
+            r#"</next>; anchor="/callback?code=sk-review-secret"; rel="next""#,
+            r#"</next>; anchor="/callback?code=***"; rel="next""#,
+        ),
+        (
+            "link",
+            "</next>; anchor = /cb?code=sk-review-secret; title=\"a\\\"sk-review-secret\"",
+            "</next>; anchor = /cb?code=***; title=\"<redacted url>",
+        ),
         (
             "refresh",
             "0; URL='https://h.example/?key=sk-review-secret'",
-            "0; URL=https://h.example/?key=***",
+            "0; url=https://h.example/?key=***",
         ),
+        (
+            "refresh",
+            "0; url = http://127.0.0.1/?code=sk-review-secret",
+            "0; url=http://127.0.0.1/?code=***",
+        ),
+        ("refresh", "5", "5"),
+        ("refresh", "http://127.0.0.1/?code=sk-review-secret", UNPRINTABLE),
     ] {
         let got = url_header(name, value.as_bytes()).unwrap();
         assert_eq!(got, want, "{name}: {value}");

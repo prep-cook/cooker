@@ -40,9 +40,19 @@ pub struct GoUrl {
 
 /// `url.Parse`. The error is Go's `*url.Error` text with the URL redacted
 /// ([`ck_wire::redact::url`]) and no rejected port or fragment escape echoed: it reaches
-/// returned errors and captures, and the URL can carry credentials.
+/// returned errors and captures, and the URL can carry credentials. When the URL is too
+/// malformed to print, every quoted part of the cause (an escape, a character, an
+/// IP literal) prints as `"***"` too.
 pub fn parse(raw: &str) -> Result<GoUrl, String> {
-    let error = |u: &str, cause: String| format!("parse {}: {cause}", quote(ck_wire::redact::url(u)));
+    let error = |u: &str, cause: String| {
+        let shown = ck_wire::redact::url(u);
+        let cause = if shown == ck_wire::redact::UNPRINTABLE {
+            masked_quotes(&cause)
+        } else {
+            cause
+        };
+        format!("parse {}: {cause}", quote(shown))
+    };
     let (u, frag) = raw.split_once('#').unwrap_or((raw, ""));
     let mut url = parse_inner(u).map_err(|cause| {
         // An authority without '@' whose "port" is the start of a password.
@@ -60,6 +70,30 @@ pub fn parse(raw: &str) -> Result<GoUrl, String> {
     }
     url.fragment = frag.to_owned();
     Ok(url)
+}
+
+/// `cause` with each Go-quoted string's contents replaced by the mask.
+fn masked_quotes(cause: &str) -> String {
+    let mut out = String::with_capacity(cause.len());
+    let mut chars = cause.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c != '"' {
+            continue;
+        }
+        out.push_str(ck_wire::redact::MASK);
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => break,
+                _ => {}
+            }
+        }
+        out.push('"');
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

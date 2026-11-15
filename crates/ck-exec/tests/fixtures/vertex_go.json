@@ -1585,7 +1585,7 @@
       ],
       "error": {
         "status": 0,
-        "message": "parse \"<redacted url>\": invalid character \" \" in host name"
+        "message": "parse \"<redacted url>\": invalid character \"***\" in host name"
       },
       "usage": {
         "input_tokens": 0,
@@ -1648,7 +1648,7 @@
       ],
       "error": {
         "status": 0,
-        "message": "parse \"<redacted url>\": invalid character \" \" in host name"
+        "message": "parse \"<redacted url>\": invalid character \"***\" in host name"
       }
     },
     {

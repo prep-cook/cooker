@@ -235,7 +235,7 @@
     [
       "https://auth.x.ai%2f.evil.com/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai%2f.evil.com/t\": invalid URL escape \"%2f\""
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid URL escape \"***\""
     ],
     [
       "https://auth.x.ai:80:90/t",
@@ -250,7 +250,7 @@
     [
       "https://[1.2.3.4]/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://[1.2.3.4]/t\": invalid IP-literal"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid IP-literal"
     ],
     [
       "https://[::ffff:1.2.3.4]/t",
@@ -320,12 +320,12 @@
     [
       "https://auth.x.ai%",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai%\": invalid URL escape \"%\""
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid URL escape \"***\""
     ],
     [
       "https://auth.x.ai%4",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai%4\": invalid URL escape \"%4\""
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid URL escape \"***\""
     ],
     [
       "https://u:p@w@auth.x.ai/t",
@@ -335,7 +335,7 @@
     [
       "https://auth.x.ai /t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid character \" \" in host name"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid character \"***\" in host name"
     ],
     [
       "https://x.ai:443",

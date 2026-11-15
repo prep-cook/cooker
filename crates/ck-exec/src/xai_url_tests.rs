@@ -81,6 +81,19 @@ fn refusals_never_print_url_credentials() {
             format!("http://u:%{SECRET}@h/"),
             r#"parse "http://h/": net/url: invalid userinfo"#,
         ),
+        // A refused authority's contents stay out of the cause (second review, finding 7).
+        (
+            format!("http://[{SECRET}]/"),
+            r#"parse "<redacted url>": invalid host: ParseAddr("***"): unable to parse IP"#,
+        ),
+        (
+            format!("http://{SECRET}%zz@127.0.0.1/"),
+            r#"parse "http://127.0.0.1/": net/url: invalid userinfo"#,
+        ),
+        (
+            format!("http://h%zz{SECRET}/"),
+            r#"parse "<redacted url>": invalid URL escape "***""#,
+        ),
         // Go quotes the invalid escape, here the masked fragment (review of #127, finding 4).
         (
             "http://127.0.0.1/v1#access_token=%ZZ".to_owned(),
