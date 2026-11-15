@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     hash::{BuildHasherDefault, Hasher},
     io,
     ops::Bound::{Excluded, Unbounded},
@@ -21,6 +21,7 @@ use crate::{
 };
 
 mod clock;
+mod evict;
 mod stats;
 use clock::checked_add;
 pub use clock::{Clock, ManualClock, MonotonicClock};
@@ -194,87 +195,6 @@ impl Drop for RetentionGuard<'_> {
 }
 
 impl Inner {
-    /// Invalidate the least recently read streams whose `gain` (what invalidation returns now)
-    /// together covers `wanted`. Streams that would return nothing stay cached; if every
-    /// candidate together cannot cover the request, nothing is invalidated and this returns false.
-    /// A request stream and its dependents are one unit: it is chosen when the walk has reached
-    /// every member, for what invalidating all of them returns, so dependents that return
-    /// nothing themselves do not keep their request.
-    fn evict(&self, exclude: Option<u64>, wanted: usize, gain: fn(&Stream, &State) -> usize) -> bool {
-        let _retention = self.retention.retain();
-        let mut cache = self.cache.lock();
-        let mut victims = Vec::new();
-        let mut chosen = HashSet::new();
-        // The dependents reached so far per request stream, and what they return.
-        let mut units = HashMap::<u64, (Vec<u64>, usize)>::new();
-        let mut found = 0;
-        let mut refreshed = HashSet::new();
-        let mut cursor = None;
-        while found < wanted {
-            let next = match cursor {
-                None => cache.order.first(),
-                Some(key) => cache.order.range((Excluded(key), Unbounded)).next(),
-            };
-            let Some(&key) = next else {
-                break;
-            };
-            cursor = Some(key);
-            if Some(key.1) == exclude || chosen.contains(&key.1) {
-                continue;
-            }
-            let stream = cache.streams[&key.1].stream.clone();
-            let state = stream.state.lock();
-            // Queue timestamps are lower bounds. Once maintenance has observed a stream, the
-            // fence holds off new leases, so one requeue at the real value is exact except for
-            // an acknowledgement racing this pass, which then counts as arriving after it.
-            let last_read = stream.last_read();
-            if last_read != key.0 && refreshed.insert(key.1) {
-                drop(state);
-                cache.requeue(key, last_read);
-                continue;
-            }
-            let own = if stream.is_held() { 0 } else { gain(&stream, &state) };
-            let invalidated = stream.is_invalidated();
-            drop(state);
-            let request = stream.request().filter(|request| {
-                !invalidated && Some(request.id) != exclude && cache.streams.contains_key(&request.id)
-            });
-            let (returned, members) = match request {
-                Some(request) => {
-                    let unit = units.entry(request.id).or_default();
-                    unit.0.push(key.1);
-                    unit.1 += own;
-                    if unit.0.len() < request.holders() {
-                        continue;
-                    }
-                    let (mut members, returned) = units.remove(&request.id).unwrap();
-                    members.push(request.id);
-                    (returned + gain(request, &request.state.lock()), members)
-                }
-                None => (own, vec![key.1]),
-            };
-            if returned > 0 {
-                found += returned;
-                chosen.extend(members.iter().copied());
-                victims.extend(members);
-            }
-        }
-        if found < wanted {
-            return false;
-        }
-        #[cfg(test)]
-        if let Some(hook) = self.evict_hook.lock().take() {
-            hook();
-        }
-        cache.evictions += victims.len() as u64;
-        for id in victims {
-            let stream = cache.remove(id).unwrap();
-            stream.invalidate_locked(&mut stream.state.lock());
-            cache.retire(&stream);
-        }
-        true
-    }
-
     fn tick(&self) -> io::Result<()> {
         let now = self.retention.clock.now();
         {
