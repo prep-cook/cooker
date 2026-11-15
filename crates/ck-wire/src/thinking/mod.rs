@@ -108,7 +108,6 @@ pub enum ErrorCode {
     InvalidSuffix,
     UnknownLevel,
     ThinkingNotSupported,
-    LevelNotSupported,
     BudgetOutOfRange,
     ProviderMismatch,
 }
@@ -119,7 +118,6 @@ impl ErrorCode {
             Self::InvalidSuffix => "INVALID_SUFFIX",
             Self::UnknownLevel => "UNKNOWN_LEVEL",
             Self::ThinkingNotSupported => "THINKING_NOT_SUPPORTED",
-            Self::LevelNotSupported => "LEVEL_NOT_SUPPORTED",
             Self::BudgetOutOfRange => "BUDGET_OUT_OF_RANGE",
             Self::ProviderMismatch => "PROVIDER_MISMATCH",
         }

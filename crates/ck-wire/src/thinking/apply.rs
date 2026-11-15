@@ -8,12 +8,12 @@ use super::summary::{
     extract_explicit_summary_config, extract_summary_config, extract_translated_summary_config,
     strip_inferred_claude_summary_activation,
 };
-use super::validate::{is_budget_capable_provider, is_level_supported, is_same_provider_family, validate_config};
+use super::validate::{is_budget_capable_provider, validate_config};
 use super::{
-    Config, Error, LEVEL_AUTO, LEVEL_HIGH, LEVEL_MAX, LEVEL_NONE, LEVEL_XHIGH, Mode, ModelCaps, SuffixResult,
-    convert_budget_to_level, convert_level_to_budget, extract_configuration_update_config, is_responses_format,
-    is_user_defined_model, lookup_model_info, parse_level_suffix, parse_numeric_suffix, parse_special_suffix,
-    parse_suffix, strip_configuration_updates, strip_responses_effort, strip_thinking_config, with_str,
+    Config, Error, LEVEL_AUTO, LEVEL_NONE, Mode, ModelCaps, SuffixResult, convert_budget_to_level,
+    convert_level_to_budget, extract_configuration_update_config, is_responses_format, is_user_defined_model,
+    lookup_model_info, parse_level_suffix, parse_numeric_suffix, parse_special_suffix, parse_suffix,
+    strip_configuration_updates, strip_responses_effort, strip_thinking_config, with_str,
 };
 use crate::gostr::GoStr;
 use crate::json;
@@ -326,7 +326,7 @@ pub(super) fn run(
         return Ok(body);
     }
 
-    let mut config = if suffix.has_suffix {
+    let config = if suffix.has_suffix {
         parse_suffix_to_config(&suffix.raw_suffix)
     } else {
         let mut config = reads.config;
@@ -355,10 +355,6 @@ pub(super) fn run(
             summary,
         ));
     }
-    if resolved_flag && config.mode == Mode::Level && should_map_configured_high_intent(&from, &target, info) {
-        config.level = map_configured_high_intent(&config.level, info);
-    }
-
     let requested_off = config.mode == Mode::None || (config.mode == Mode::Budget && config.budget == 0);
     let validated = validate_config(config, Some(info), &from, &target, suffix.has_suffix).map_err(|mut e| {
         e.body = Some(body.clone());
@@ -392,32 +388,6 @@ pub(super) fn run(
 
 fn fully_disabled(config: &Config) -> bool {
     config.mode == Mode::None && config.budget == 0 && config.level.is_empty()
-}
-
-fn should_map_configured_high_intent(from: &str, to: &str, info: &ModelCaps) -> bool {
-    let from = from.trim().go_lower();
-    let to = to.trim().go_lower();
-    if from != to {
-        return true;
-    }
-    let kind = info.kind.trim().go_lower();
-    !kind.is_empty() && !is_same_provider_family(&to, &kind)
-}
-
-fn map_configured_high_intent(level: &str, info: &ModelCaps) -> String {
-    let Some(support) = info.thinking.as_ref().filter(|s| !s.levels.is_empty()) else {
-        return level.to_owned();
-    };
-    let level = level.trim().go_lower();
-    let candidates: &[&str] = match level.as_str() {
-        LEVEL_XHIGH => &[LEVEL_XHIGH, LEVEL_MAX, LEVEL_HIGH],
-        LEVEL_MAX => &[LEVEL_MAX, LEVEL_XHIGH, LEVEL_HIGH],
-        _ => return level,
-    };
-    candidates
-        .iter()
-        .find(|c| is_level_supported(c, &support.levels))
-        .map_or(level.clone(), |c| (*c).to_owned())
 }
 
 pub(super) fn extract_source_thinking_config(body: &[u8], provider: &str) -> Config {
