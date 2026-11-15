@@ -155,6 +155,19 @@ fn controls(doc: &Document) -> Result<()> {
             return Err(Error::Unsupported);
         }
     }
+    // Chat and Responses log probabilities have no mapping to `responseLogprobs` and back,
+    // so a request for them is refused rather than dropped. A Gemini client's own controls
+    // stay in its native `generationConfig`.
+    if let Some(n) = doc.member(root, "logprobs")?
+        && !matches!(doc.node(n)?.value, Value::Null | Value::Bool(false))
+    {
+        return Err(Error::Unsupported);
+    }
+    if let Some(n) = doc.member(root, "top_logprobs")?
+        && !matches!(doc.node(n)?.value, Value::Null)
+    {
+        return Err(Error::Unsupported);
+    }
     // Gemini runs parallel calls and stores nothing, so only the opposite settings are refused.
     for (key, default) in [("parallel_tool_calls", true), ("store", false)] {
         if let Some(n) = doc.member(root, key)?

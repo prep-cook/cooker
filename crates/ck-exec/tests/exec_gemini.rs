@@ -285,17 +285,31 @@ async fn anthropic_and_responses_clients_send_the_official_gemini_body() {
 }
 
 #[tokio::test]
-async fn a_gemini_client_body_reaches_the_upstream_unchanged() {
+async fn a_gemini_client_body_reaches_the_upstream_json_equal() {
     let streams = Streams::new();
     let upstream = StreamUpstream::start([Reply::sse(SSE).byte_at_a_time()]).await;
-    let body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"temperature":0.5}}"#;
+    let body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"temperature":0.5,"responseLogprobs":true,"logprobs":3}}"#;
     let run = run(&streams, &upstream, Client::Gemini, Operation::Generate, body, 1).await;
     let (outcome, published, _) = produce(&streams, run.started.unwrap()).await;
     outcome.unwrap();
     assert_eq!(published.terminal, Some(Terminal::Done));
     let captured = &upstream.captured()[0];
     assert_api_key_request(captured, "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse");
-    assert_eq!(captured.body, body.as_bytes());
+    assert_eq!(json_body(captured), serde_json::from_str::<Value>(body).unwrap());
+}
+
+/// Conversion at ingress and egress may change whitespace and member order, never a value,
+/// an array order or a member's presence.
+#[tokio::test]
+async fn a_reordered_gemini_body_reaches_the_upstream_json_equal() {
+    let streams = Streams::new();
+    let upstream = StreamUpstream::start([Reply::sse(SSE)]).await;
+    let body = "{ \"generationConfig\" : { \"temperature\": 0.5 },\n  \"contents\": [ { \"parts\": [ {\"text\": \"hi\"} ], \"role\": \"user\" },\n {\"parts\":[{\"text\":\"ok\"}],\"role\":\"model\"}, {\"role\":\"user\",\"parts\":[{\"text\":\"more\"}]} ] }";
+    let run = run(&streams, &upstream, Client::Gemini, Operation::Generate, body, 3).await;
+    produce(&streams, run.started.unwrap()).await.0.unwrap();
+    let captured = &upstream.captured()[0];
+    assert_ne!(captured.body, body.as_bytes());
+    assert_eq!(json_body(captured), serde_json::from_str::<Value>(body).unwrap());
 }
 
 #[tokio::test]
@@ -322,7 +336,7 @@ async fn a_gemini_count_with_contents_only_is_sent_as_is() {
     assert_eq!(published.terminal, Some(Terminal::Done));
     let captured = &upstream.captured()[0];
     assert_api_key_request(captured, "/v1beta/models/gemini-2.5-pro:countTokens");
-    assert_eq!(captured.body, body.as_bytes());
+    assert_eq!(json_body(captured), serde_json::from_str::<Value>(body).unwrap());
 }
 
 /// A native `countTokens` answer with every member the count response has.
@@ -341,14 +355,18 @@ async fn counted(streams: &Streams, client: Client, body: &str) -> Writer {
 }
 
 #[tokio::test]
-async fn a_gemini_client_receives_the_count_byte_for_byte() {
+async fn a_gemini_client_receives_the_count_json_equal() {
     let streams = Streams::new();
     let body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
     let mut owner = counted(&streams, Client::Gemini, body).await;
     let id = identity(Direction::Response);
     let mut egress =
         gemini::egress::Egress::new(&mut owner, id, Operation::CountTokens, BodyMode::Buffered, |_| {}).unwrap();
-    assert_eq!(deliver(&streams, &mut owner, &mut egress), COUNT);
+    let delivered = deliver(&streams, &mut owner, &mut egress);
+    assert_eq!(
+        serde_json::from_str::<Value>(&delivered).unwrap(),
+        serde_json::from_str::<Value>(COUNT).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -558,4 +576,130 @@ async fn claude_signed_thinking_is_not_sent_to_gemini() {
         "{upload}"
     );
     assert!(upload.contains(r#"{"text":"ok"}"#), "{upload}");
+}
+
+/// Closes the client fence for the Gemini destination, without an upstream.
+fn fenced<I: RequestIngress>(
+    streams: &Streams,
+    mut writer: Writer,
+    mut ingress: I,
+    body: &str,
+) -> Result<(), codec::Error> {
+    let exchange = Exchange::new(credential("gemini", "http://127.0.0.1:1", KEY), MODEL, "/client");
+    ingress.advance(&mut writer, body.as_bytes())?;
+    executors()
+        .fence(&exchange.attempt(&streams.store), &mut ingress, &mut writer)
+        .map(drop)
+}
+
+fn chat_fence(body: &str) -> Result<(), codec::Error> {
+    let streams = Streams::new();
+    let mut writer = streams.request();
+    let id = identity(Direction::Request);
+    let ingress = chat::request::Ingress::new(&mut writer, &streams.store, id, Operation::Generate, LIMIT).unwrap();
+    fenced(&streams, writer, ingress, body)
+}
+
+/// Gemini's log probabilities have no Chat mapping yet, so a request for them is refused.
+#[test]
+fn chat_log_probabilities_are_refused() {
+    let messages = r#""messages":[{"role":"user","content":"hi"}]"#;
+    for controls in [
+        r#""logprobs":true"#,
+        r#""logprobs":true,"top_logprobs":3"#,
+        r#""top_logprobs":0"#,
+    ] {
+        let refused = chat_fence(&format!(r#"{{"model":"m",{controls},{messages}}}"#));
+        assert!(matches!(refused, Err(codec::Error::Unsupported)), "{controls}");
+    }
+    for controls in [r#""logprobs":false"#, r#""logprobs":null"#, r#""top_logprobs":null"#] {
+        chat_fence(&format!(r#"{{"model":"m",{controls},{messages}}}"#)).expect(controls);
+    }
+}
+
+/// A Responses client asks for log probabilities through `include`, which has no Gemini form.
+#[test]
+fn responses_log_probabilities_are_refused() {
+    let streams = Streams::new();
+    let mut writer = streams.request();
+    let id = identity(Direction::Request);
+    let ingress =
+        responses::request::Ingress::new(&mut writer, &streams.store, id, Operation::Generate, LIMIT).unwrap();
+    let refused = fenced(
+        &streams,
+        writer,
+        ingress,
+        r#"{"model":"m","input":"hi","include":["message.output_text.logprobs"]}"#,
+    );
+    assert!(matches!(refused, Err(codec::Error::Unsupported)), "{refused:?}");
+}
+
+#[tokio::test]
+async fn an_empty_error_body_is_kept() {
+    let streams = Streams::new();
+    let upstream = StreamUpstream::start([Reply::status(400, "application/json", "")]).await;
+    let body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+    let error = run(&streams, &upstream, Client::Gemini, Operation::Generate, body, 64)
+        .await
+        .started
+        .err()
+        .unwrap();
+    assert_eq!((error.status, error.body.len()), (400, 0));
+}
+
+/// A payload rule matching the upstream model in the body applies to generation and to
+/// every count shape alike, and its own `model` override survives the count envelope.
+#[tokio::test]
+async fn count_payload_rules_see_the_upstream_model_as_generation_does() {
+    let streams = Streams::new();
+    let replies = [
+        Reply::sse(SSE),
+        Reply::json(COUNT),
+        Reply::json(COUNT),
+        Reply::sse(SSE),
+        Reply::json(COUNT),
+        Reply::json(COUNT),
+    ];
+    let upstream = StreamUpstream::start(replies).await;
+    let mut exchange = exchange(&upstream);
+    let rule = |params: &str| {
+        ck_core::config::Config::parse(&format!(
+            "requests:\n  payload:\n    override:\n      - models: [{{name: gemini-2.5-pro, protocol: gemini, match: [{{model: models/gemini-2.5-pro}}]}}]\n        params: {{{params}}}\n"
+        ))
+        .unwrap()
+    };
+    let contents = r#""contents":[{"role":"user","parts":[{"text":"hi"}]}]"#;
+    let generate = format!(r#"{{"model":"models/alias",{contents}}}"#);
+    let wrapped = format!(r#"{{"generateContentRequest":{{"model":"models/alias",{contents}}}}}"#);
+    let named = format!(r#"{{"model":"models/alias",{contents}}}"#);
+    for params in ["systemInstruction.parts.0.text: be brief", "model: models/override"] {
+        exchange.cfg = rule(params);
+        for (operation, body) in [
+            (Operation::Generate, &generate),
+            (Operation::CountTokens, &wrapped),
+            (Operation::CountTokens, &named),
+        ] {
+            let run = run_on(&streams, &exchange, Client::Gemini, operation, body, 64).await;
+            produce(&streams, run.started.unwrap()).await.0.unwrap();
+        }
+    }
+    let captured = upstream.captured();
+    let request = |i: usize| {
+        let body = json_body(&captured[i]);
+        match body.get("generateContentRequest") {
+            Some(request) => request.clone(),
+            None => body,
+        }
+    };
+    for i in 0..3 {
+        assert_eq!(
+            request(i)["systemInstruction"]["parts"][0]["text"],
+            "be brief",
+            "request {i}"
+        );
+        assert_eq!(request(i)["model"], "models/gemini-2.5-pro", "request {i}");
+    }
+    for i in 3..6 {
+        assert_eq!(request(i)["model"], "models/override", "request {i}");
+    }
 }

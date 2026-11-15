@@ -21,7 +21,7 @@ use ck_wire::thinking::{self, ModelCaps, RequestThinking, parse_suffix};
 use crate::gemini::{self, API_VERSION, GeminiExecutor, MAX_LINE};
 use crate::google_wire::{self as wire, Method};
 use crate::proxy::{self, GoHeaders};
-use crate::types::{Attempt, Counted, Execute, Request, Streams, Upstream, status_err};
+use crate::types::{Attempt, Counted, Execute, Request, Streams, Upstream};
 
 /// The provider this executor serves through the pipeline.
 pub const PROVIDER: &str = "gemini";
@@ -124,7 +124,7 @@ impl Execute for GeminiExecutor {
 
 impl GeminiExecutor {
     /// Posts `body` to the model's `method` with the credential's key and custom headers; a
-    /// non-2xx answer is the attempt's failure with the upstream's status and body.
+    /// non-2xx answer is the attempt's failure with the upstream's status and body as received.
     async fn send(&self, call: &Call<'_>, method: Method, body: Vec<u8>) -> Result<proxy::Upstream, ExecError> {
         let credential = call.attempt.credential;
         let models = format!("{}/{API_VERSION}/models", gemini::base_url(credential));
@@ -154,7 +154,16 @@ impl GeminiExecutor {
         let body = proxy::read_all(upstream.body, proxy::MAX_ERROR_BODY, true)
             .await
             .unwrap_or_default();
-        Err(status_err(status, body))
+        // The upstream's body as received, an empty one included.
+        Err(ExecError {
+            status,
+            scope: crate::upstream::scope_for(status),
+            body,
+            headers: Box::default(),
+            retry_after: None,
+            direct: false,
+            addon: None,
+        })
     }
 }
 
@@ -205,16 +214,20 @@ impl<'r> Call<'r> {
         Ok(self.rules("", &upload, body))
     }
 
-    /// A `countTokens` body. Only `contents` may stand alone; a count of anything more (a
+    /// A `countTokens` body, shaped in generation's order: the upstream model, then the
+    /// payload rules last. Only `contents` may stand alone; a count of anything more (a
     /// system instruction, tools, configuration) carries the whole generation request in
-    /// `generateContentRequest`, which names its model.
+    /// `generateContentRequest`, which names its model unless a payload rule already did.
     fn count(&self, upload: Vec<u8>) -> Vec<u8> {
+        let mut body = upload.clone();
         if gj::get(&upload, COUNT_WRAPPER).exists() {
-            let mut body = self.rules(COUNT_WRAPPER, &upload, upload.clone());
             self.name_model(&mut body, &format!("{COUNT_WRAPPER}.model"));
-            return body;
+            return self.rules(COUNT_WRAPPER, &upload, body);
         }
-        let body = self.rules("", &upload, upload.clone());
+        if gj::get(&body, "model").exists() {
+            self.name_model(&mut body, "model");
+        }
+        let mut body = self.rules("", &upload, body);
         let mut contents_only = true;
         gj::parse(&body).each(|key, _| {
             contents_only = key.str() == "contents";
@@ -223,9 +236,10 @@ impl<'r> Call<'r> {
         if contents_only {
             return body;
         }
-        let mut request = body;
-        self.name_model(&mut request, "model");
-        [format!("{{\"{COUNT_WRAPPER}\":").as_bytes(), &request, b"}"].concat()
+        if !gj::get(&body, "model").exists() {
+            self.name_model(&mut body, "model");
+        }
+        [format!("{{\"{COUNT_WRAPPER}\":").as_bytes(), &body, b"}"].concat()
     }
 
     /// Names the upstream model at `path`, as the URL does.
