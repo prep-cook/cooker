@@ -9,10 +9,9 @@
 //! - A completion whose `output` is empty or absent gets the items
 //!   `response.output_item.done` announced. They wait in scratch leases of the response
 //!   stream, never on the heap.
-//! - A completed response is cached for reasoning replay once its SSE event has ended and
-//!   the ingress accepted it, so a cut or refused completion caches nothing, nor one after
-//!   an upstream failure, whose input the ingress ignores. The kept items wait in scratch
-//!   leases and reach the replay cache one item at a time.
+//! - A completed response is cached for reasoning replay once the ingress accepted the whole
+//!   SSE event it ends, as `xai_sse` reads that event: a cut, refused or failed completion
+//!   caches nothing, nor one after an upstream failure, whose input the ingress ignores.
 //! - The body ending before the completion boundary fails with Go's 408.
 //!
 //! One SSE event goes out per upstream event, in order; the ingress decodes the result. A
@@ -33,7 +32,7 @@ use crate::xai::MAX_LINE;
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_request::Prepared;
 use crate::xai_response::{self as response, NamespaceRefs, NamespaceRestorer, XSearchFilter, text};
-use crate::xai_sse::Failures;
+use crate::xai_sse::Accepted;
 
 /// The response decoder of one xAI attempt: generation through the xAI line rules, or a
 /// buffered compact whose success clears the session's replay.
@@ -109,11 +108,8 @@ pub struct Events {
     folded: HashSet<String>,
     alias: String,
     replay: Option<(Arc<replay::Store>, ReplayScope)>,
-    /// The upstream failures the ingress was handed; it ignores what follows one.
-    failures: Failures,
-    /// The completion's output items replay keeps, waiting for the blank line that ends it;
-    /// `None` when the completion has no output array.
-    completed: Option<Vec<ScratchLease>>,
+    /// What the ingress made of the events it was handed, while replay is on.
+    accepted: Accepted,
 }
 
 impl Events {
@@ -131,8 +127,7 @@ impl Events {
             folded: HashSet::new(),
             alias: prepared.web_search_alias,
             replay: scope.valid().then_some((store, scope)),
-            failures: Failures::default(),
-            completed: None,
+            accepted: Accepted::default(),
         }
     }
 
@@ -307,11 +302,7 @@ impl Events {
                 self.put(owner, line)
             }
             b"response.completed" | b"response.incomplete" => {
-                let replay = kind == b"response.completed" && self.replay.is_some() && !self.failures.seen;
                 let Some(splice) = self.items.splice(event) else {
-                    if replay {
-                        self.completed = kept(owner, event)?;
-                    }
                     return self.put(owner, line);
                 };
                 let lease = encode::scratch(owner, |e| {
@@ -327,62 +318,31 @@ impl Events {
                     self.feed(owner, chunk)?;
                     at += chunk.len();
                 }
-                self.feed(owner, b"\n")?;
-                if replay {
-                    self.completed = Some(self.items.take());
-                }
-                Ok(())
+                self.feed(owner, b"\n")
             }
             _ => self.put(owner, line),
         }
     }
 
-    /// Passes one line and its end to the ingress. A blank line ends the event before it; when
-    /// that is the completion, the ingress has accepted it and replay caches it.
+    /// Passes one line and its end to the ingress.
     fn put(&mut self, owner: &mut Writer, content: &[u8]) -> codec::Result<()> {
         if !content.is_empty() {
             self.feed(owner, content)?;
-            return self.feed(owner, b"\n");
         }
-        self.feed(owner, b"\n")?;
-        if let (Some(leases), Some((store, scope))) = (self.completed.take(), &self.replay) {
-            let mut items = Vec::with_capacity(leases.len());
-            for lease in &leases {
-                let mut item = Vec::with_capacity(lease.len());
-                while item.len() < lease.len() {
-                    item.extend_from_slice(lease.chunk(item.len()).map_err(codec::Error::Storage)?);
-                }
-                if replay::kept(&gj::parse(&item)) {
-                    items.push(item);
-                }
-            }
+        self.feed(owner, b"\n")
+    }
+
+    /// Hands `bytes` to the ingress; once it accepted them, replay caches the completion they
+    /// ended, if `xai_sse` read one with no failure before it.
+    fn feed(&mut self, owner: &mut Writer, bytes: &[u8]) -> codec::Result<()> {
+        self.inner.advance(owner, bytes)?;
+        if let Some((store, scope)) = &self.replay
+            && let Some(items) = self.accepted.read(owner, bytes)
+        {
             replay::cache_items(store, scope, &items);
         }
         Ok(())
     }
-
-    /// Hands `bytes` to the ingress, and to the failure reader while a completion may still
-    /// be cached.
-    fn feed(&mut self, owner: &mut Writer, bytes: &[u8]) -> codec::Result<()> {
-        self.inner.advance(owner, bytes)?;
-        let keep = self.replay.is_some() && !self.failures.seen;
-        self.failures.read(bytes, keep);
-        Ok(())
-    }
-}
-
-/// The output items of a completion replay keeps, each in its own scratch lease; `None`
-/// when the completion has no output array.
-fn kept(owner: &mut Writer, event: &[u8]) -> codec::Result<Option<Vec<ScratchLease>>> {
-    let output = gj::get(event, "response.output");
-    if !output.is_array() {
-        return Ok(None);
-    }
-    let mut leases = Vec::new();
-    for item in output.array().iter().filter(|item| replay::kept(item)) {
-        leases.push(encode::scratch(owner, |e| e.bytes(item.raw()))?);
-    }
-    Ok(Some(leases))
 }
 
 /// Where a terminal event's `output` takes the collected items: `event[at..end]` becomes
@@ -445,12 +405,6 @@ impl Items {
         };
         let at = start + len - 1;
         Some(Splice { at, end: at, lead })
-    }
-
-    /// The collected items, in output order, for replay once the completion is passed on.
-    fn take(&mut self) -> Vec<ScratchLease> {
-        let indexed = std::mem::take(&mut self.by_index).into_values();
-        indexed.chain(std::mem::take(&mut self.unindexed)).collect()
     }
 
     /// The collected items as one JSON array.

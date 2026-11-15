@@ -87,22 +87,66 @@ async fn a_padded_session_is_another_session() {
     assert!(sent["input"].to_string().contains(ENC), "{sent}");
 }
 
-/// An upstream error ends the response; a completion after it in the same chunk, which the
-/// ingress ignores, caches nothing. The error is read as the ingress reads it, from the whole
-/// SSE event: named by its type, by an `event` line after its data, or split over data lines.
+/// Whether a turn whose upstream body is `body` fails, and whether the next turn of its
+/// session gets its encrypted reasoning back.
+async fn replayed(body: String) -> (bool, bool) {
+    let executors = executors();
+    let a = ("sk-a", "xai-1");
+    let (_, ok) = turn(&executors, a, TURN, Reply::sse(body)).await;
+    let (sent, _) = turn(&executors, a, NEXT, Reply::sse(sse())).await;
+    (ok, sent["input"].to_string().contains(ENC))
+}
+
+/// `body` with `error` as an event before the completion.
+fn before_completion(error: &str) -> String {
+    let at = "event: response.completed";
+    reasoning_turn().replacen(at, &format!("{error}{at}"), 1)
+}
+
+/// An upstream error ends the response; a completion after it, which the ingress ignores,
+/// caches nothing. The error is read as the ingress reads the whole SSE event: named by its
+/// type, by an `event` line after its data, split over data lines, or behind the BOM that
+/// opens the body.
 #[tokio::test]
 async fn a_completion_after_an_error_caches_nothing() {
     let typed = event(json!({"type":"error","code":"server_error","message":"boom"}));
-    let named_after = "data: {\"message\":\"boom\"}\nevent: error\n\n".to_owned();
-    let split = "data: {\"type\":\ndata: \"error\",\"message\":\"boom\"}\n\n".to_owned();
-    for error in [typed, named_after, split] {
-        let executors = executors();
-        let a = ("sk-a", "xai-1");
-        let at = "event: response.completed";
-        let body = reasoning_turn().replacen(at, &format!("{error}{at}"), 1);
-        let (_, ok) = turn(&executors, a, TURN, Reply::sse(body)).await;
-        assert!(!ok, "the error fails the attempt: {error}");
-        let (sent, _) = turn(&executors, a, NEXT, Reply::sse(sse())).await;
-        assert!(!sent["input"].to_string().contains(ENC), "{error}: {sent}");
+    let named_after = "data: {\"message\":\"boom\"}\nevent: error\n\n";
+    let split = "data: {\"type\":\ndata: \"error\",\"message\":\"boom\"}\n\n";
+    let bom_data = "\u{feff}data:{\"type\":\"error\",\"message\":\"boom\"}\n\n";
+    let bom_named = "\u{feff}event:error\ndata:{\"message\":\"boom\"}\n\n";
+    let bodies = [
+        before_completion(&typed),
+        before_completion(named_after),
+        before_completion(split),
+        format!("{bom_data}{}", reasoning_turn()),
+        format!("{bom_named}{}", reasoning_turn()),
+    ];
+    for body in bodies {
+        assert_eq!(replayed(body.clone()).await, (false, false), "{body}");
+    }
+}
+
+/// A completion object on one data line of a larger error event is no completion: the
+/// ingress reads the whole event, an error, and nothing is cached.
+#[tokio::test]
+async fn a_completion_inside_an_error_event_caches_nothing() {
+    let turn = reasoning_turn();
+    let at = turn.find("event: response.completed").unwrap();
+    let completed = turn[at..].lines().nth(1).unwrap().strip_prefix("data: ").unwrap();
+    let nested = format!("data: {{\"type\":\"error\",\"nested\":\ndata: {completed}\ndata: }}\n\n");
+    let body = format!("{}{nested}", &turn[..at]);
+    assert_eq!(replayed(body).await, (false, false));
+}
+
+/// Malformed JSON is opaque text to the ingress, not an error: the completion after it is
+/// accepted and cached.
+#[tokio::test]
+async fn malformed_json_is_no_error() {
+    for malformed in ["data:{\"type\":\"error\"}junk\n\n", "data:{\"type\":\"error\"\n\n"] {
+        assert_eq!(
+            replayed(before_completion(malformed)).await,
+            (true, true),
+            "{malformed}"
+        );
     }
 }

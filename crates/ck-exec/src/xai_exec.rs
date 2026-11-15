@@ -86,7 +86,7 @@ fn compaction_trigger(doc: &Document) -> codec::Result<bool> {
 }
 
 /// Member `name` of `node` when `node` is an object.
-fn object_member(doc: &Document, node: usize, name: &str) -> codec::Result<Option<usize>> {
+pub(crate) fn object_member(doc: &Document, node: usize, name: &str) -> codec::Result<Option<usize>> {
     if !matches!(doc.node(node)?.value, Value::Object) {
         return Ok(None);
     }
@@ -94,7 +94,7 @@ fn object_member(doc: &Document, node: usize, name: &str) -> codec::Result<Optio
 }
 
 /// Whether member `name` of `node` is the string `want`.
-fn text_is(doc: &Document, node: usize, name: &str, want: &str) -> codec::Result<bool> {
+pub(crate) fn text_is(doc: &Document, node: usize, name: &str, want: &str) -> codec::Result<bool> {
     match object_member(doc, node, name)? {
         Some(v) if matches!(doc.node(v)?.value, Value::String(_) | Value::Text(_)) => doc.string_is(v, want),
         _ => Ok(false),
