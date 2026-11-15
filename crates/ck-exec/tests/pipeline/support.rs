@@ -368,18 +368,19 @@ pub async fn finished(started: Started) -> Result<(), ExecError> {
 }
 
 /// Feeds `items` to an `answer` upstream and closes the body; the producer's outcome, the
-/// records and the terminal.
+/// records and the terminal. The items are queued before the producer starts: a producer that
+/// ends at an earlier item drops the body, and a later send would race that drop.
 pub async fn feed(
     answer: Answer,
     items: Vec<Result<Bytes, ExecError>>,
 ) -> (Result<(), ExecError>, Vec<String>, Terminal) {
     let fixture = Fixture::new(4 * 1024 * 1024);
     let (stub, upstream) = Stub::new(answer);
-    let (started, _upload, id) = fixture.launch(&stub, Operation::Generate).await;
     for item in items {
         upstream.send(item).unwrap();
     }
     drop(upstream);
+    let (started, _upload, id) = fixture.launch(&stub, Operation::Generate).await;
     let outcome = finished(started.unwrap()).await;
     let (records, terminal) = fixture.records(id).await;
     (outcome, records, terminal)

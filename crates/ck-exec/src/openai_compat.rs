@@ -75,7 +75,7 @@ pub(crate) fn status_err(status: u16, message: impl Into<String>) -> ExecError {
 async fn upstream_error(upstream: wire::Upstream, capture: &wire::Capture) -> ExecError {
     let (status, headers, body) = wire::read_error_body(upstream).await;
     capture.chunk(&body);
-    status_error(status, headers, &body, true)
+    status_error(status, headers, body, true)
 }
 
 /// An images non-2xx response: the whole body is read first and a read error is
@@ -86,18 +86,26 @@ async fn images_error(upstream: wire::Upstream, with_retry: bool, capture: &wire
     let body = wire::read_all(upstream).await;
     capture.read(&body);
     match body {
-        Ok(body) => status_error(status, headers, &body, with_retry),
+        Ok(body) => status_error(status, headers, body, with_retry),
         Err(error) => error,
     }
 }
 
-pub(crate) fn status_error(status: u16, headers: http::HeaderMap, body: &[u8], with_retry: bool) -> ExecError {
-    let mut error = status_err(status, String::from_utf8_lossy(body));
-    if with_retry {
-        error.retry_after = payload::retry_after(status, &headers, body, SystemTime::now());
+/// `newOpenAICompatStatusError`: the upstream's status and its body as received, an empty or
+/// non-UTF-8 one included; the retry hint is read from the headers and body, never rewritten.
+pub(crate) fn status_error(status: u16, headers: http::HeaderMap, body: Bytes, with_retry: bool) -> ExecError {
+    let retry_after = with_retry
+        .then(|| payload::retry_after(status, &headers, &body, SystemTime::now()))
+        .flatten();
+    ExecError {
+        status,
+        scope: scope_for(status),
+        body,
+        headers: Box::new(headers),
+        retry_after,
+        direct: false,
+        addon: None,
     }
-    error.headers = Box::new(headers);
-    error
 }
 
 pub(crate) fn credentials(credential: &Credential) -> (String, String) {
