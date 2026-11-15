@@ -177,6 +177,8 @@ pub struct DeviceExecutors {
 impl Executors {
     pub fn destination(&self, attempt: &types::Attempt<'_>) -> Option<&'static str> {
         match attempt.credential.provider.as_str() {
+            // A request the cloak may shape keeps the old route until owner question 13.
+            "claude" if !self.claude.old_route_only(attempt) => Some(pipeline::destination(&self.claude, attempt)),
             p if openai_compat::handles(p) => Some(pipeline::destination(&self.openai.compat, attempt)),
             gemini_exec::PROVIDER => Some(pipeline::destination(&self.google.gemini, attempt)),
             xai::PROVIDER => Some(pipeline::destination(&self.openai.xai, attempt)),
@@ -192,6 +194,9 @@ impl Executors {
         request: &mut ck_stream::Writer,
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
+            "claude" if !self.claude.old_route_only(attempt) => {
+                pipeline::fence(&self.claude, attempt, ingress, request)
+            }
             p if openai_compat::handles(p) => pipeline::fence(&self.openai.compat, attempt, ingress, request),
             gemini_exec::PROVIDER => pipeline::fence(&self.google.gemini, attempt, ingress, request),
             xai::PROVIDER => pipeline::fence(&self.openai.xai, attempt, ingress, request),
@@ -206,6 +211,7 @@ impl Executors {
         view: ck_translate::codec::RequestView<'a>,
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
+            "claude" if !self.claude.old_route_only(attempt) => pipeline::refence(&self.claude, attempt, view),
             p if openai_compat::handles(p) => pipeline::refence(&self.openai.compat, attempt, view),
             gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
             xai::PROVIDER => pipeline::refence(&self.openai.xai, attempt, view),
@@ -223,6 +229,9 @@ impl Executors {
         mut response: ck_stream::Writer,
     ) -> Result<pipeline::Started, ExecError> {
         match attempt.credential.provider.as_str() {
+            "claude" if !self.claude.old_route_only(attempt) => {
+                pipeline::start(&self.claude, attempt, request, upload, response).await
+            }
             p if openai_compat::handles(p) => {
                 pipeline::start(&self.openai.compat, attempt, request, upload, response).await
             }
@@ -244,6 +253,7 @@ impl Executors {
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         match credential.provider.as_str() {
+            // The old route until D2 switches the server to `start` (Q1).
             "claude" => self.claude.execute(credential, req, cfg).await,
             "codex" => self.codex.execute(credential, req, cfg).await,
             p if kimi::PROVIDERS.contains(&p) => self.devices.kimi.execute(&self.claude, credential, req, cfg).await,

@@ -137,13 +137,53 @@ pub struct AnthropicCapability {
     /// `max_tokens` for a generation request without one: the per-model setting, else the
     /// model's output maximum (owner ruling 2026-11-15). `None` refuses such a request.
     pub default_max_tokens: Option<u64>,
+    /// What the model accepts as `thinking.budget_tokens`, from the registry `thinking` data.
+    pub budget: Budget,
+}
+/// A model's manual thinking budget (`thinking.type: enabled`).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum Budget {
+    /// No registry data: the official minimum of 1024 applies.
+    #[default]
+    Unknown,
+    /// Manual thinking with a budget of at least `min`.
+    Manual { min: u64 },
+    /// Adaptive thinking only: the API refuses `type: enabled` and any budget.
+    Adaptive,
 }
 impl Capability for AnthropicCapability {
     fn destination(&self) -> &'static str {
         "anthropic"
     }
     fn validate(&self, view: RequestView<'_>) -> Result<()> {
-        super::request_schema::validate(view, self.default_max_tokens)
+        super::request_schema::validate(view, self.default_max_tokens)?;
+        self.budget(view)
+    }
+}
+impl AnthropicCapability {
+    /// Refuses a thinking budget below the minimum or sent to an adaptive-only model; nothing
+    /// is adjusted. A budget of at least `max_tokens` passes: interleaved thinking, a header
+    /// the fence does not see, allows it, so the official API judges.
+    fn budget(&self, view: RequestView<'_>) -> Result<()> {
+        let (doc, root) = (view.document, view.document.root());
+        let Some(thinking) = doc.member(doc.required(root, "x_ck")?, "thinking")? else {
+            return Ok(());
+        };
+        let enabled = doc.member(thinking, "enabled")?.map(|n| doc.node(n)).transpose()?;
+        let enabled = enabled.is_some_and(|n| matches!(n.value, Value::Bool(true)));
+        let Some(budget) = doc.member(thinking, "budget_tokens")?.filter(|_| enabled) else {
+            return Ok(());
+        };
+        let budget = doc.unsigned(budget)?;
+        let min = match self.budget {
+            Budget::Unknown => 1024,
+            Budget::Manual { min } => min.max(1024),
+            Budget::Adaptive => return Err(Error::Unsupported),
+        };
+        if budget < min {
+            return Err(Error::Schema);
+        }
+        Ok(())
     }
 }
 pub struct Egress {

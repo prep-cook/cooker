@@ -27,6 +27,7 @@ mod betas;
 mod cloak;
 mod compaction;
 mod detect;
+mod execute;
 mod headers;
 mod identity;
 mod profile;
@@ -63,6 +64,7 @@ use settings::Settings;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// The message of the executor's own 404 for a thread continuation whose state is gone.
+pub use execute::DESTINATION;
 pub use thread::NOT_FOUND as THREAD_NOT_FOUND;
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Advertised in `CLIProxyAPI/<version>` when a caller-owned request has no User-Agent.
@@ -207,6 +209,10 @@ impl ClaudeExecutor {
         }
     }
 
+    /// The old route, kept for the server's `claude` arm until D2 and for Kimi's delegation
+    /// until P8. Everything only it reaches goes with the later of the two: `run`,
+    /// `generate_with`, `count_tokens`, `compact`, the `translate` module, `ck_translate::pair`
+    /// and the `UsageSink::response_*` calls.
     pub async fn execute(
         &self,
         credential: &Credential,
@@ -328,7 +334,12 @@ impl ClaudeExecutor {
                 "Claude response translation pair is not registered",
             ));
         }
-        let mut ctx = Ctx::new(self, credential, &req, cfg, delegation);
+        let attempt = (
+            req.model.as_str(),
+            req.resolved_model.as_ref(),
+            req.execution_session.as_deref(),
+        );
+        let mut ctx = Ctx::new(self, credential, attempt, cfg, delegation);
         ctx.compaction_summary = compaction_summary;
         match req.operation {
             Operation::Generate => self.generate(ctx, req).await,
@@ -349,7 +360,12 @@ impl ClaudeExecutor {
             is_compat: ctx.is_compat,
             oauth_token: ctx.oauth_token,
         };
-        let scope = replay::prepare(&self.replay, &gate, &mut req);
+        let scope = replay::prepare(&self.replay, &gate, &Input::of(&req)).map(|(scope, body)| {
+            if let Some(body) = body {
+                req.body = body;
+            }
+            scope
+        });
         let result = self.generate_with(ctx, req, scope.as_ref()).await;
         match (result, scope) {
             // wrapClaudeThinkingReplayStream wraps the stream ExecuteStream returns,
@@ -388,7 +404,7 @@ impl ClaudeExecutor {
         )?;
         tracing::trace!(target: "cpa_latency", stage = "translated");
         let mut prepared = ctx
-            .prepare_messages(&req, &translated, &original_translated, upstream_stream)
+            .prepare_messages(&Input::of(&req), &translated, &original_translated, upstream_stream)
             .await?;
         drop(original_translated);
         // Only a translated client needs the translation again, for its response; a
@@ -405,7 +421,7 @@ impl ClaudeExecutor {
             req.usage.request(Format::Claude, prepared.body.as_bytes());
         }
         if req.usage.wants_claude_cache()
-            && let Some(telemetry) = telemetry::collect(&ctx, &req, &prepared)
+            && let Some(telemetry) = telemetry::collect(&ctx, &Input::of(&req), &prepared)
         {
             req.usage.claude_cache(telemetry);
         }
@@ -425,7 +441,7 @@ impl ClaudeExecutor {
                 req.usage.request(Format::Claude, prepared.body.as_bytes());
             }
             if req.usage.wants_claude_cache()
-                && let Some(telemetry) = telemetry::collect(&ctx, &req, &prepared)
+                && let Some(telemetry) = telemetry::collect(&ctx, &Input::of(&req), &prepared)
             {
                 req.usage.claude_cache(telemetry);
             }
@@ -453,9 +469,9 @@ impl ClaudeExecutor {
                 req.usage.usage_required();
                 let (usage, capture) = (req.usage.clone(), req.capture().clone());
                 let relayed = if req.response_format == Format::Claude {
-                    stream::relay(raw, reverse, done, usage, capture)
+                    stream::relay(raw, reverse, done, Some(usage), capture)
                 } else {
-                    stream::relay_translated(raw, reverse, done, usage, capture)
+                    stream::relay_translated(raw, reverse, done, Some(usage), capture)
                 };
                 ResponseBody::Stream(relayed.map(move |r| r.map_err(|e| fast_request_error(fast, e))).boxed())
             }
@@ -569,19 +585,19 @@ impl ClaudeExecutor {
             ctx.tool_search(),
         )?;
         if !upstream && (ctx.api_key.trim().is_empty() || !ctx.first_party) {
-            let mut body = ctx.apply_thinking(&req, String::from_utf8_lossy(&translated).into_owned())?;
+            let mut body = ctx.apply_thinking(&Input::of(&req), String::from_utf8_lossy(&translated).into_owned())?;
             if ctx.rebuild_mid_system() {
                 body = rebuild_mid_system(&body);
             }
             let body = sanitize_for_upstream(body, &ctx.base_model, ctx.is_compat);
-            let body = cloak::strip_prompt_cache_options(ctx.count_rules(&req, body, &original));
+            let body = cloak::strip_prompt_cache_options(ctx.count_rules(&Input::of(&req), body, &original));
             return Ok(ExecResponse {
                 status: 200,
                 headers: Default::default(),
                 body: ResponseBody::Buffered(render(&tokens::count(body.as_bytes())?)),
             });
         }
-        let mut prepared = ctx.prepare_count(&req, &translated, &original).await?;
+        let mut prepared = ctx.prepare_count(&Input::of(&req), &translated, &original).await?;
         let capture = req.capture();
         let response = self
             .send(&ctx, &mut prepared, "/v1/messages/count_tokens", None, capture, None)
@@ -936,6 +952,55 @@ fn fast_request_error(fast: bool, mut error: ExecError) -> ExecError {
     error
 }
 
+/// The request facts the pipeline reads: the contract's encoded Messages body
+/// (`execute.rs`), or the `ExecRequest` that Kimi delegates ([`Input::of`]).
+struct Input<'a> {
+    headers: &'a http::HeaderMap,
+    /// The client body, or the encoded Messages body; detection and session identity read it.
+    original_body: &'a [u8],
+    /// The body in `source_format`, before translation.
+    body: &'a [u8],
+    source_format: Format,
+    /// The client's protocol, which payload rules match.
+    client_format: Format,
+    /// A request translation into Messages exists (`ApplyRequestThinking`).
+    transformed: bool,
+    model: &'a str,
+    requested_model: &'a str,
+    request_path: &'a str,
+    principal: &'a str,
+    session: Option<&'a str>,
+    derived_session: Option<&'a str>,
+    execution_session: Option<&'a str>,
+    stream: bool,
+}
+
+impl<'a> Input<'a> {
+    /// Kimi's delegated `ExecRequest` (P8 removes it with Kimi's old path).
+    fn of(req: &'a ExecRequest) -> Self {
+        Self {
+            headers: &req.headers,
+            original_body: &req.original_body,
+            body: &req.body,
+            source_format: req.source_format,
+            client_format: req.source_format,
+            transformed: ck_translate::pair(req.source_format, Format::Claude).is_some(),
+            model: &req.model,
+            requested_model: &req.requested_model,
+            request_path: &req.request_path,
+            principal: &req.caller.principal,
+            session: req.session.as_deref(),
+            derived_session: req.derived_session.as_deref(),
+            execution_session: req.execution_session.as_deref(),
+            stream: req.stream,
+        }
+    }
+}
+
+/// The attempt facts [`Ctx::new`] reads: the upstream model, the bound model capabilities and
+/// the execution session.
+type AttemptFacts<'a> = (&'a str, Option<&'a ck_core::exec::ResolvedModel>, Option<&'a str>);
+
 /// Request facts shared by every stage.
 struct Ctx<'a> {
     credential: &'a Credential,
@@ -956,6 +1021,9 @@ struct Ctx<'a> {
     log_provider: &'static str,
     /// The summary turn of a Responses compaction (`claudeCompactionSummaryFromContext`).
     compaction_summary: bool,
+    /// The execution contract's path (`execute.rs`): the fence refuses what the old path
+    /// rewrote, and nothing collects a response body.
+    contract: bool,
     /// Normalized execution-session ID (websocket executions), or empty.
     execution: String,
     /// `cliproxyauth.ResolvedModelInfo`: the capabilities dispatch bound to this attempt.
@@ -997,6 +1065,8 @@ struct Prepared {
     /// Set for a thread turn whose aliases its continuation may need.
     thread: Option<thread::Thread>,
     fast: bool,
+    /// The body asks the upstream to stream.
+    stream: bool,
 }
 
 /// `config.NormalizeClaudeFingerprintProfile`: unknown values are the default ("").
@@ -1262,7 +1332,7 @@ impl<'a> Ctx<'a> {
     fn new(
         exec: &ClaudeExecutor,
         credential: &'a Credential,
-        req: &ExecRequest,
+        (model, resolved_model, execution_session): AttemptFacts<'_>,
         cfg: &Config,
         delegation: Delegation,
     ) -> Self {
@@ -1300,12 +1370,9 @@ impl<'a> Ctx<'a> {
         };
         let api_key_kind = attr("auth_kind") == "apikey";
         let bearer = oauth_token || (!api_key_kind && attr("api_key").trim().is_empty());
-        let base = base_model(&req.model);
+        let base = base_model(model);
         // Go `cliproxyauth.ResolvedModelInfo(req)`, bound by dispatch per attempt.
-        let resolved = req
-            .resolved_model
-            .as_ref()
-            .map(|r| ck_wire::thinking::ModelCaps::from(&r.info));
+        let resolved = resolved_model.map(|r| ck_wire::thinking::ModelCaps::from(&r.info));
         Self {
             credential,
             first_party: tokens::first_party(&base_url),
@@ -1315,8 +1382,9 @@ impl<'a> Ctx<'a> {
             kimi: kimi_upstream(&credential.provider, &base_url),
             log_provider: delegation.request_log_provider.unwrap_or("claude"),
             compaction_summary: false,
-            execution: session::normalize(req.execution_session.as_deref().unwrap_or_default()),
-            is_compat: req.resolved_model.as_ref().is_some_and(|r| r.is_compat()),
+            contract: false,
+            execution: session::normalize(execution_session.unwrap_or_default()),
+            is_compat: resolved_model.is_some_and(|r| r.is_compat()),
             codex: ck_wire::codex_client::Settings::from_config(cfg),
             payload_rules: ck_wire::payload::Rules::of(cfg),
             resolved,
@@ -1379,18 +1447,18 @@ impl<'a> Ctx<'a> {
     }
 
     /// `helps.ApplyRequestThinking` with provider `claude`.
-    fn apply_thinking(&self, req: &ExecRequest, body: String) -> Result<String, ExecError> {
+    fn apply_thinking(&self, req: &Input<'_>, body: String) -> Result<String, ExecError> {
         use ck_wire::thinking::{RequestThinking, apply_request_thinking};
         apply_request_thinking(&RequestThinking {
             body: body.as_bytes(),
-            payload: &req.body,
-            original: &req.original_body,
-            model: &req.model,
+            payload: req.body,
+            original: req.original_body,
+            model: req.model,
             from: req.source_format.as_str(),
             to: Format::Claude.as_str(),
             provider: "claude",
             resolved: self.resolved.as_ref().map(Some),
-            has_request_transformer: ck_translate::pair(req.source_format, Format::Claude).is_some(),
+            has_request_transformer: req.transformed,
             updates_changed: false,
         })
         .map(text)
@@ -1401,6 +1469,31 @@ impl<'a> Ctx<'a> {
                 plain_error(e.message)
             }
         })
+    }
+
+    /// Whether the old content normalizers run: only on the old path. The contract path sends
+    /// the client's content as the fence accepted it, and the official API judges the rest:
+    /// no forced-tool or sampling rewrite, no signature sanitizing, no proxy-owned prefix
+    /// recovery and no Kimi attribution stripping. The cache rewrites, which change only the caller's cost, run on both
+    /// (owner question 14; P8 removes the old path).
+    pub(super) fn legacy_body(&self) -> bool {
+        !self.contract
+    }
+
+    /// Whether the old thinking normalizer runs: always on the old path; on the contract path
+    /// only for the operator's model-name thinking suffix, such as `(8192)`. Otherwise the
+    /// client's thinking and effort go upstream as written, and the fence refused what the
+    /// API would (P8 removes the old path).
+    pub(super) fn legacy_thinking(&self, req: &Input<'_>) -> bool {
+        !self.contract || ck_wire::thinking::parse_suffix(req.model).has_suffix
+    }
+
+    /// Whether the old route keeps this credential: the cloak would shape a request the
+    /// detection does not confirm as Claude Code, or the Claude Code identity applies.
+    /// Confirmation reads the client's own body, which `Execute` does not see (owner question
+    /// 13 removes this split).
+    pub(crate) fn old_route_only(&self) -> bool {
+        self.cli_profile || self.wire_policy(false).0
     }
 
     /// `resolveClaudeWirePolicy`: (cloak, strict, sensitive words, cache user id).
@@ -1462,8 +1555,8 @@ impl<'a> Ctx<'a> {
     }
 
     /// Go `derived_session_id` metadata, as the server's `session.Enrich` set it.
-    fn derived_session(&self, req: &ExecRequest) -> String {
-        req.derived_session.clone().unwrap_or_default()
+    fn derived_session(&self, req: &Input<'_>) -> String {
+        req.derived_session.unwrap_or_default().to_owned()
     }
 
     // ponytail: every rewrite that changes the body still returns a new copy of it, so a
@@ -1473,22 +1566,22 @@ impl<'a> Ctx<'a> {
     // the 3x target.
     async fn prepare_messages(
         &self,
-        req: &ExecRequest,
+        req: &Input<'_>,
         translated: &[u8],
         original_translated: &[u8],
         upstream_stream: bool,
     ) -> Result<Prepared, ExecError> {
-        let original = utf8(&req.original_body);
-        let detection = detect::detect(&req.headers, &original, false, &self.settings);
+        let original = utf8(req.original_body);
+        let detection = detect::detect(req.headers, &original, false, &self.settings);
         let confirmed = detection.confirmed;
         let derived = self.derived_session(req);
         let translated = utf8(translated).into_owned();
         let session_id = if self.cli_profile {
             session::agent_session_uuid(
                 &session::Inputs {
-                    headers: &req.headers,
+                    headers: req.headers,
                     original: &original,
-                    translated: &utf8(&req.body),
+                    translated: &utf8(req.body),
                     derived: &derived,
                     execution: &self.execution,
                 },
@@ -1499,14 +1592,16 @@ impl<'a> Ctx<'a> {
         };
         let mut body = translated;
         body = set_string_if_different(body, "model", &self.upstream_model);
-        body = self.apply_thinking(req, body)?;
+        if self.legacy_thinking(req) {
+            body = self.apply_thinking(req, body)?;
+        }
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
         }
         let (cloak, strict, words, cache_user_id) = self.wire_policy(confirmed);
         let cch = signing::enabled(&self.api_key, self.cli_profile, self.first_party);
         // v8.0.27 (eb6a768): the caller owns every breakpoint in explicit cache mode.
-        let explicit = cloak::explicit_cache_mode(&[&original, &utf8(&req.body), &body]);
+        let explicit = cloak::explicit_cache_mode(&[&original, &utf8(req.body), &body]);
         let probe_before = signals::probe_or_helper(&body);
         let mut continuity = session::Continuity::default();
         let mut cloaked = false;
@@ -1517,13 +1612,13 @@ impl<'a> Ctx<'a> {
             let mut subagent = false;
             let (mut prev, mut prompt) = (String::new(), String::new());
             if !probe_before {
-                subagent = signals::subagent(&req.headers, &body);
+                subagent = signals::subagent(req.headers, &body);
                 let (existing_prev, existing_prompt) = signals::billing_tags(&body);
                 (prev, prompt, continuity) =
-                    self.continuity_tags(&req.headers, &body, &session_id, &existing_prev, &existing_prompt);
+                    self.continuity_tags(req.headers, &body, &session_id, &existing_prev, &existing_prompt);
             }
             let version = profile::default_version(&self.settings);
-            let workload = detect::header(&req.headers, "x-ck-claude-workload").to_owned();
+            let workload = detect::header(req.headers, "x-ck-claude-workload").to_owned();
             // 6d57ac9: a session keeps the date of its first request. Without
             // continuity (probes, helpers, no session) the date is today's.
             let date = session::pin_date(&continuity.key, &self.today);
@@ -1556,7 +1651,7 @@ impl<'a> Ctx<'a> {
             if !probe_before {
                 body = cloak_thinking_display(body);
             }
-            if !explicit && (probe_before || (subagent && !signals::subagent_requests_1h(&req.headers, &body))) {
+            if !explicit && (probe_before || (subagent && !signals::subagent_requests_1h(req.headers, &body))) {
                 body = cloak::strip_ttl(body);
             }
             if !self.cli_profile && needs_fake_user_id(&body) {
@@ -1597,18 +1692,26 @@ impl<'a> Ctx<'a> {
             }
         }
         body = self.ensure_max_tokens(body);
-        body = disable_thinking_if_tool_choice_forced(body);
+        // The contract's fence refuses a forced tool with manual thinking instead.
+        if self.legacy_body() {
+            body = disable_thinking_if_tool_choice_forced(body);
+        }
         body = cloak::reconcile_context_management(body, eligible, caller_owned_cm, injected_cm);
-        body = normalize_sampling(body, confirmed);
-        // `shouldEnsureCacheControl`.
+        // The contract path keeps the client's values; the API answers an invalid pair itself.
+        if self.legacy_body() {
+            body = normalize_sampling(body, confirmed);
+        }
+        // `shouldEnsureCacheControl`. The cache rewrites change only the caller's cost, so the
+        // contract path keeps them (owner question 14).
         let cpa_owns_cache = !explicit && !confirmed && (cloaked || cloak::count_cache_controls(&body) == 0);
         if cpa_owns_cache {
             body = cloak::ensure_cache_control(body);
         }
         body = cloak::enforce_cache_limit(body, 4);
+        // `prompt_cache_options` is the gateway's own member, never Anthropic's.
         body = cloak::strip_prompt_cache_options(body);
-        let subagent = signals::subagent(&req.headers, &body);
-        let subagent_1h = subagent && signals::subagent_requests_1h(&req.headers, &body);
+        let subagent = signals::subagent(req.headers, &body);
+        let subagent_1h = subagent && signals::subagent_requests_1h(req.headers, &body);
         if cpa_owns_cache && self.cli_profile && (!subagent || subagent_1h) && !probe {
             body = cloak::upgrade_ttl(body, "1h");
         } else if (probe || (subagent && !subagent_1h)) && !explicit {
@@ -1636,7 +1739,7 @@ impl<'a> Ctx<'a> {
             {
                 reverse = restored?;
             } else {
-                let secret = Some(req.caller.principal.trim())
+                let secret = Some(req.principal.trim())
                     .filter(|s| !s.is_empty())
                     .unwrap_or(alias::DEFAULT_SECRET);
                 let aliases;
@@ -1644,9 +1747,11 @@ impl<'a> Ctx<'a> {
                 reverse = Arc::new(aliases);
             }
         }
-        body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
-        let thinking_recovery;
-        (body, thinking_recovery) = enable_prefix_drop(body, &self.base_model);
+        let mut thinking_recovery = false;
+        if self.legacy_body() {
+            body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
+            (body, thinking_recovery) = enable_prefix_drop(body, &self.base_model);
+        }
         if self.cli_profile {
             body = self.apply_identity(&body, &session_id)?;
         }
@@ -1658,14 +1763,15 @@ impl<'a> Ctx<'a> {
         }
         if cch {
             let fallback = if !detection.helper_profile || rawjson::get(&body, "system").exists() {
-                self.fallback_billing(&req.headers, &body, &detection.entrypoint, &continuity, confirmed)
+                self.fallback_billing(req.headers, &body, &detection.entrypoint, &continuity, confirmed)
             } else {
                 String::new()
             };
             body = signing::placeholder(body, &fallback);
         }
-        if self.kimi && !self.cli_profile {
-            // stripDefaultKimiClaudeCodeAttribution: Kimi reads the block as prompt text.
+        if self.kimi && !self.cli_profile && self.legacy_body() {
+            // stripDefaultKimiClaudeCodeAttribution: Kimi reads the block as prompt text. The
+            // contract path never deletes caller content.
             body = strip_attribution_system(&body);
         }
         if self.compaction_summary {
@@ -1678,13 +1784,13 @@ impl<'a> Ctx<'a> {
             &ck_wire::payload::Request {
                 target_executor: "claude",
                 model: &self.base_model,
-                requested_model: &req.requested_model,
+                requested_model: req.requested_model,
                 protocol: Format::Claude.as_str(),
-                from_protocol: req.source_format.as_str(),
+                from_protocol: req.client_format.as_str(),
                 root: "",
                 original: original_translated,
-                request_path: &req.request_path,
-                headers: Some(&req.headers),
+                request_path: req.request_path,
+                headers: Some(req.headers),
             },
             body.into_bytes(),
             &["diagnostics"],
@@ -1729,46 +1835,42 @@ impl<'a> Ctx<'a> {
             continuity: diagnostics,
             thread,
             fast,
+            stream: upstream_stream,
         })
     }
 
     /// The payload rules on a finished count_tokens body (868e137), against the client's
     /// original request translated as the working one ([`translate::count_original`]).
-    fn count_rules(&self, req: &ExecRequest, body: String, original: &[u8]) -> String {
+    fn count_rules(&self, req: &Input<'_>, body: String, original: &[u8]) -> String {
         let edited = ck_wire::payload::apply(
             &self.payload_rules,
             &ck_wire::payload::Request {
                 target_executor: "claude",
                 model: &self.base_model,
-                requested_model: &req.requested_model,
+                requested_model: req.requested_model,
                 protocol: Format::Claude.as_str(),
-                from_protocol: req.source_format.as_str(),
+                from_protocol: req.client_format.as_str(),
                 root: "",
                 original,
-                request_path: &req.request_path,
-                headers: Some(&req.headers),
+                request_path: req.request_path,
+                headers: Some(req.headers),
             },
             body.into_bytes(),
         );
         text(edited)
     }
 
-    async fn prepare_count(
-        &self,
-        req: &ExecRequest,
-        translated: &[u8],
-        baseline: &[u8],
-    ) -> Result<Prepared, ExecError> {
-        let original = utf8(&req.original_body);
-        let detection = detect::detect(&req.headers, &original, true, &self.settings);
+    async fn prepare_count(&self, req: &Input<'_>, translated: &[u8], baseline: &[u8]) -> Result<Prepared, ExecError> {
+        let original = utf8(req.original_body);
+        let detection = detect::detect(req.headers, &original, true, &self.settings);
         let confirmed = detection.confirmed;
         let session_id = if self.cli_profile {
             let derived = self.derived_session(req);
             session::agent_session_uuid(
                 &session::Inputs {
-                    headers: &req.headers,
+                    headers: req.headers,
                     original: &original,
-                    translated: &utf8(&req.body),
+                    translated: &utf8(req.body),
                     derived: &derived,
                     execution: &self.execution,
                 },
@@ -1779,12 +1881,14 @@ impl<'a> Ctx<'a> {
         };
         let mut body = utf8(translated).into_owned();
         body = set_string_if_different(body, "model", &self.upstream_model);
-        body = self.apply_thinking(req, body)?;
+        if self.legacy_thinking(req) {
+            body = self.apply_thinking(req, body)?;
+        }
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
         }
         let (cloak, strict, words, _) = self.wire_policy(confirmed);
-        let explicit = cloak::explicit_cache_mode(&[&original, &utf8(&req.body), &body]);
+        let explicit = cloak::explicit_cache_mode(&[&original, &utf8(req.body), &body]);
         if cloak {
             if !strict && let Some(message) = cloak::invalid_system_block(&body) {
                 return Err(ExecError::local(400, FailureScope::Request, message));
@@ -1802,17 +1906,30 @@ impl<'a> Ctx<'a> {
         }
         let (mut extra_betas, stripped) = extract_betas(body);
         body = stripped;
-        extra_betas.push(betas::TOKEN_COUNTING.into());
+        // count_tokens is generally available: a caller-preserving contract request adds no
+        // beta for it.
+        if !(self.contract && !self.cli_profile && !cloak && !confirmed) {
+            extra_betas.push(betas::TOKEN_COUNTING.into());
+        }
         if self.cli_profile && cloak {
-            let secret = Some(req.caller.principal.trim())
+            let secret = Some(req.principal.trim())
                 .filter(|s| !s.is_empty())
                 .unwrap_or(alias::DEFAULT_SECRET);
             body = alias::remap(&body, secret).0;
         }
-        body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
+        if self.legacy_body() {
+            body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
+        }
         body = cloak::strip_prompt_cache_options(body);
         if self.first_party || self.cli_profile {
-            for field in ["metadata", "context_management", "diagnostics"] {
+            // count_tokens takes no metadata or diagnostics. It does take context_management
+            // and counts the edited context, so the contract path keeps the caller's.
+            let fields: &[&str] = if self.legacy_body() {
+                &["metadata", "context_management", "diagnostics"]
+            } else {
+                &["metadata", "diagnostics"]
+            };
+            for field in fields {
                 body = rawjson::delete(&body, field);
             }
         }
@@ -1845,13 +1962,14 @@ impl<'a> Ctx<'a> {
             continuity: Default::default(),
             thread: None,
             fast: false,
+            stream: false,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn headers(
         &self,
-        req: &ExecRequest,
+        req: &Input<'_>,
         body: &str,
         extra_betas: &[String],
         stream: bool,
@@ -1861,15 +1979,15 @@ impl<'a> Ctx<'a> {
         session_id: &str,
         cloak: bool,
     ) -> Result<(Vec<(String, String)>, Vec<String>), ExecError> {
-        let cpa_session = ck_wire::session::cpa_session_id(req.session.as_deref()).unwrap_or_default();
+        let cpa_session = ck_wire::session::cpa_session_id(req.session).unwrap_or_default();
         // Only a fingerprinted request replaces the caller's identity; an API key without
         // cloaking forwards the caller's own User-Agent, refused or not.
         if self.cli_profile || cloak {
-            profile::note_refused(self.credential, &req.headers, &self.settings);
+            profile::note_refused(self.credential, req.headers, &self.settings);
         }
         // Go: stabilizeDeviceProfile && confirmedClaudeCode.
         let device_profile = (self.settings.header_defaults.stabilize_device_profile && confirmed)
-            .then(|| profile::resolve(&self.credential.id, &self.api_key, &req.headers, &self.settings));
+            .then(|| profile::resolve(&self.credential.id, &self.api_key, req.headers, &self.settings));
         // Go `applyClaudeHeaders`, after the device profile and the passthrough
         // return: without a session, the key's cached session ID.
         let cached_session_id = if headers::needs_cached_session(self.cli_profile || cloak, confirmed, session_id) {
@@ -1885,7 +2003,7 @@ impl<'a> Ctx<'a> {
             stream,
             extra_betas,
             body,
-            incoming: &req.headers,
+            incoming: req.headers,
             confirmed,
             helper,
             cli_fingerprint: self.cli_profile || cloak,
@@ -1896,6 +2014,7 @@ impl<'a> Ctx<'a> {
             cpa_session: &cpa_session,
             device_profile,
             cached_session_id: &cached_session_id,
+            official: self.contract,
         });
         Ok(headers::wire(h, self.first_party, count_tokens))
     }
