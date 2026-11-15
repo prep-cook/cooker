@@ -210,7 +210,7 @@ fn assert_every_egress(streams: &Streams, owner: &mut Writer, mode: BodyMode) {
     let mut messages = anthropic::egress::Egress::new(owner, id, op, mode, |_| {}).unwrap();
     let out = deliver(streams, owner, &mut messages);
     assert!(out.contains("Hel") && out.contains("end_turn"), "anthropic: {out}");
-    let mut responses = responses::egress::Egress::new(owner, op, mode, |_, _| {}).unwrap();
+    let mut responses = crate::support::responses_egress(owner, op, mode).unwrap();
     let out = deliver(streams, owner, &mut responses);
     assert!(out.contains("Hel") && out.contains("completed"), "responses: {out}");
     let mut native = gemini::egress::Egress::new(owner, id, op, mode, |_| {}).unwrap();

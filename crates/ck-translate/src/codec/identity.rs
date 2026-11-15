@@ -1,6 +1,7 @@
 //! Response identity at egress. Ingress fills a required canonical field it could not read from
 //! the source with a generated value and names it in `x_ck.synthetic` (docs/INTERNAL-STREAM.md,
 //! §3.2). An egress never shows such a value to its client as if the source had sent it.
+//! The Responses egress shows only the exchange's own response id.
 
 use super::{Error, Result, document::Document, event::LocalId, media};
 
@@ -20,15 +21,25 @@ pub fn synthetic(doc: &Document, node: usize, field: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// The response id an egress shows its client, under one rule for every egress:
+/// The upstream account that produced a response: the committed attempt's credential provider
+/// and a digest of its credential id. It is independent of the execution arm and the
+/// destination key, so opaque items a response carries stay bound to the account that can read
+/// them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Producer {
+    pub provider: LocalId,
+    pub credential: [u8; 32],
+}
+
+/// The response id the Chat and Anthropic egress show their client. The Responses egress shows
+/// the exchange's own id instead and never a source id. The rule:
 ///
 /// - A source id, when the source supplied one, is the response id. A generated canonical id, or
 ///   an absent one, never reaches the client; the egress issues its own native id instead.
 /// - Streaming: the first id a client sees never changes, so a source id arriving after the
 ///   issued id was shown is dropped.
 /// - Buffered: nothing is sent before the body, so the body carries the source id if one arrived
-///   at any point, because a client needs the real upstream id (for example as
-///   `previous_response_id` to continue). The issued id remains only if none arrived.
+///   at any point. The issued id remains only if none arrived.
 pub struct ResponseId {
     /// This egress's own id while no source id has replaced it.
     issued: Option<LocalId>,

@@ -106,7 +106,18 @@ fn feed(m: &mut Mapped, client: Client, identity: Identity, leases: Vec<ck_strea
             leases,
         ),
         Client::Responses => run(
-            &mut responses::egress::Egress::new(w, op, mode, |_, _| {}).unwrap(),
+            &mut responses::egress::Egress::new(
+                w,
+                codec::event::LocalId::new("resp_test").unwrap(),
+                codec::identity::Producer {
+                    provider: codec::event::LocalId::new("test").unwrap(),
+                    credential: [0; 32],
+                },
+                op,
+                mode,
+                |_, _| {},
+            )
+            .unwrap(),
             w,
             leases,
         ),

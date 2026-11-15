@@ -168,7 +168,7 @@ async fn egress(streams: &Streams, protocol: &str, stream: &mut Writer, id: u64,
         }
         "responses" => {
             deliver(
-                responses::egress::Egress::new(stream, op, mode, |_, _| {}).unwrap(),
+                crate::support::responses_egress(stream, op, mode).unwrap(),
                 stream,
                 reader,
             )
@@ -503,8 +503,7 @@ async fn a_responses_client_sees_its_tools_echoed() {
     assert_eq!(sent["tools"][0]["function"]["name"], "get", "{sent}");
     let (outcome, _, mut stream) = finish(&streams, started, id).await;
     outcome.unwrap();
-    let mut egress =
-        responses::egress::Egress::new(&mut stream, Operation::Generate, BodyMode::Buffered, |_, _| {}).unwrap();
+    let mut egress = crate::support::responses_egress(&mut stream, Operation::Generate, BodyMode::Buffered).unwrap();
     egress.echo(&mut stream, handle.validated.view()).unwrap();
     let out: Value = serde_json::from_str(&deliver(egress, &mut stream, streams.reader(id)).await).unwrap();
     assert_eq!(out["tools"][0]["name"], "get", "{out}");

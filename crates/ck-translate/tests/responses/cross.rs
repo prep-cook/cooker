@@ -13,7 +13,7 @@ pub(super) fn chat_to_responses(input: &[u8], mode: BodyMode, downstream: BodyMo
     )
     .unwrap();
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-    let mut egress = responses::egress::Egress::new(&mut m.writer, Operation::Generate, downstream, |_, _| {}).unwrap();
+    let mut egress = crate::client_egress(&mut m.writer, Operation::Generate, downstream).unwrap();
     for fragment in input.chunks(37) {
         if ingress.advance(&mut m.writer, fragment).is_err() {
             break;

@@ -60,6 +60,17 @@ fn identity(direction: Direction) -> Identity {
         direction,
     }
 }
+type ClientEgress = responses::egress::Egress<fn(&'static str, u64)>;
+
+/// The Responses client egress of the test exchange, whose response id is `resp_test`.
+fn client_egress(owner: &mut ck_stream::Writer, operation: Operation, mode: BodyMode) -> codec::Result<ClientEgress> {
+    let id = LocalId::new("resp_test").unwrap();
+    let producer = codec::identity::Producer {
+        provider: LocalId::new("test").unwrap(),
+        credential: [0; 32],
+    };
+    responses::egress::Egress::new(owner, id, producer, operation, mode, |_, _| {})
+}
 fn bytes(lease: &ck_stream::ScratchLease) -> Vec<u8> {
     let mut result = Vec::new();
     while result.len() < lease.len() {
@@ -136,7 +147,7 @@ fn response_in(
     )
     .unwrap();
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-    let mut egress = responses::egress::Egress::new(&mut m.writer, operation, downstream, |_, _| {}).unwrap();
+    let mut egress = crate::client_egress(&mut m.writer, operation, downstream).unwrap();
     let mut result = Vec::new();
     for chunk in input.chunks(step) {
         ingress.advance(&mut m.writer, chunk).unwrap();

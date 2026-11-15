@@ -47,17 +47,17 @@ Every provider module implements `Execute` once. The selector in `crates/ck-exec
 
 **G5, the client's own bytes for the Claude cloak.** `Client::original` borrows the client's request body as the server received it; the server fills it on every attempt from the body it already holds, without a copy. Only the Claude executor reads it, and only for an Anthropic Messages request that the OAuth cloak or the Claude Code identity shapes: a credential the cloak may serve (an OAuth token, a fingerprint profile or a cloak setting), or a request the Claude Code detection confirms from its headers and body. That request is prepared from these bytes exactly as the old route prepares them, and the result goes upstream, because the detection reads the client's member order and `cch` signs the body the cloak built from them. This is the single exception to the no-raw-passthrough rule in `crates/AGENTS.md` (owner ruling 2026-11-16, Q14 option (a)). The fence (§4) still validates the request first, so the capability refuses what it refuses for any other client. Every other request, including a foreign client's request on a cloak credential, is encoded from the fenced view.
 
-A generation the cloak may shape whose upstream answers in one JSON body stays on the old arm: restoring its tool aliases and recording its session continuity read the complete body, which §3 forbids collecting. Only the fenced document shows the client's `stream` member, so for it `destination` answers the capability key while `fence`, `refence` and `start` refuse with `Destination`. A streamed generation and every count run on the contract path.
+A generation the cloak may shape whose upstream answers in one JSON body stays on the old arm: restoring its tool aliases and recording its session continuity read the complete body, which §3 forbids collecting. Only the fenced document shows the client's `stream` member, so for it `destination` answers the capability key while `refence` and `start` refuse with `Destination`. A streamed generation and every count run on the contract path.
 
-**G6, routing headers.** `Attempt::headers` is the client's request headers, which the server fills on every attempt. The selector reads them only to decide whether an attempt stays on a provider's old arm (`destination` answers `None`, `fence` and `refence` refuse with `Destination`, `start` refuses), before any byte of the attempt is sent. Request execution reads `Client::headers`. Claude no longer routes by them: G5 gives its executor the client's own body.
+**G6, routing headers.** `Attempt::headers` is the client's request headers, which the server fills on every attempt. The selector reads them only to decide whether an attempt stays on a provider's old arm (`destination` answers `None`, or `refence` and `start` refuse with `Destination`), before any byte of the attempt is sent. Request execution reads `Client::headers`. Claude no longer routes by them: G5 gives its executor the client's own body.
 
 `Request<'a>`, `Attempt<'a>` and `Store` are `Sync`, so a server task may hold them across an await.
 
 ## 4. Fences and failover
 
-1. **Client fence.** Request ingress `finish` validates the complete request against the first attempt's capability and publishes `request.end`. A failure is 400 with no upstream request.
-2. **Re-fence per attempt.** Every attempt, the first included, builds its `Request::validated` with `RequestFence::default().end(client_fence.view(), &capability)` for its own destination. A re-fence failure is an attempt failure with scope `Model`: nothing was sent.
-3. **Q2 policy hook.** Whether a candidate whose capability key differs from the client fence's key is attempted at all is the owner's Q2 ruling: revalidate per destination (step 2 already does this) or restrict failover to the same key. D2 applies it in one predicate in `inference/dispatch.rs`, `fn admits(fenced: &'static str, candidate: &'static str) -> bool`, before step 2, with the fenced key from `ValidatedRequest::destination` and the candidate's key from `Executors::destination`. The predicate's body is the ruling; D2 does not merge without it.
+1. **Client fence (G8).** Request ingress `finish` closes the client fence against `codec::ClientCapability`, whose key is `codec::CLIENT`, and publishes `request.end`. The fence checks the complete document and its media but no destination, so a refused fence publishes a failure for the client's own request, never for one candidate's. No request egress encodes a request validated against this key: `ValidatedRequest::for_destination` refuses it. A failure is answered before candidate selection with no upstream request: 400 for `Json`, `Utf8`, `DuplicateKey`, `Truncated`, `Schema` and `Unsupported`, 413 for `Limit` and `EventTooLarge`.
+2. **Re-fence per attempt.** Every attempt, the first included, builds its `Request::validated` with `RequestFence::default().end(client_fence.view(), &capability)` for its own destination. Only this re-fence authorizes encoding. A re-fence failure is an attempt failure with scope `Model`: nothing was sent.
+3. **Q2.** Every candidate is attempted through step 2, whatever its capability key; failover is not restricted to the client fence's key (owner ruling 2026-11-16).
 
 D1 adds these selector methods:
 
@@ -66,7 +66,8 @@ impl Executors {
     /// The attempt's capability key; `None` while its provider is not converted, in which
     /// case D2 takes the old execution path before fencing.
     pub fn destination(&self, attempt: &Attempt<'_>) -> Option<&'static str>;
-    /// Step 1: closes the client fence against the first attempt's destination.
+    /// Closes a fence against the attempt's destination. The server does not call it: the
+    /// client fence is step 1 (G8). D9 deletes it.
     pub fn fence<'a, I: RequestIngress>(&self, attempt: &Attempt<'_>, ingress: &'a mut I, request: &mut Writer)
         -> codec::Result<ValidatedRequest<'a>>;
     /// Step 2: re-fences the client view for this attempt's destination.
@@ -114,7 +115,7 @@ Commitment is the first deliverable byte the client's `ResponseEgress` emits. Be
 | --- | --- | --- | --- |
 | Client syntax or schema (`Json`, `Utf8`, `DuplicateKey`, `Truncated`, `Schema`) or unsupported semantics (`Unsupported`) at request ingress or the client fence | `codec::Error` | 400 in the client's error shape; no upstream request | not reachable |
 | Client size (`Limit`, `EventTooLarge`) at request ingress | `codec::Error` | 413; no upstream request | not reachable |
-| Re-fence refused for a later attempt | `codec::Error` | attempt failure, scope `Model`; nothing sent | not reachable |
+| Re-fence refused for an attempt | `codec::Error` | attempt failure, scope `Model`; nothing sent | not reachable |
 | `Storage(StorageExhausted)` or `Storage(Io)` while the producer runs | `stream.storage_exhausted`, 503, scope `resource` | resource error to the client; no failover | the stream's terminal, delivered as `error` |
 | `Storage(StorageExhausted)` or `Storage(Io)` in an egress or resume allocation after the producer's terminal | a failure of that one delivery; the stream keeps its terminal | 503 `stream.storage_exhausted`; no failover | that delivery ends its HTTP response with the protocol's error terminal, or with 503 if it has sent nothing yet; other readers and later resumes are unaffected |
 | `Storage(Gone)`: expiry or eviction of a stream the exchange uses | `stream.gone`, 410, scope `resource` | resource error to the client; no failover | attached readers receive `error`; resume answers 410 |
@@ -146,6 +147,5 @@ Phase E extends this contract; it does not change it. It reuses `Attempt`, `Clie
 
 ## 13. Open for an owner
 
-- **Q2, failover across capabilities.** §4 step 3 fixes where the policy applies; the policy itself needs the ruling.
 - **Q7, Interactions and legacy completions.** No codec exists, so no module is declared for them.
 - **G5, buffered cloaked generations.** They stay on the old arm until an owner decides between allowing the Claude relay to collect a buffered body for tool-alias restore and continuity, and sending every cloaked generation upstream as a stream, which changes its `stream` member.

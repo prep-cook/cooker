@@ -26,7 +26,7 @@ fn unknown_events_never_set_usage_or_identity() {
     let (body, canonical) = before_completion(&format!("data: {vendor}\n\n")).unwrap();
     assert!(!canonical.iter().any(|e| e.get("usage").is_some()), "{canonical:?}");
     assert!(body.get("usage").is_none(), "{body}");
-    assert_eq!(body["id"], "r");
+    assert_eq!(body["id"], "resp_test");
     assert!(!canonical.iter().any(|e| e["id"] == "bogus"));
     assert_eq!(opaque(&canonical)[0]["value"], vendor);
     // A type that is not a string is an unknown event, not a failure.
@@ -191,7 +191,7 @@ fn failure_and_annotation_events_follow_the_native_schemas() {
         )
         .unwrap();
         let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-        let mut egress = responses::egress::Egress::new(&mut m.writer, Operation::Generate, mode, |_, _| {}).unwrap();
+        let mut egress = crate::client_egress(&mut m.writer, Operation::Generate, mode).unwrap();
         let _ = ingress
             .advance(&mut m.writer, wire(&records).as_bytes())
             .and_then(|()| ingress.finish(&mut m.writer));
@@ -214,7 +214,7 @@ fn failure_and_annotation_events_follow_the_native_schemas() {
             }
             _ => serde_json::from_slice::<Value>(&out).unwrap(),
         };
-        assert_eq!(response["id"], "r");
+        assert_eq!(response["id"], "resp_test");
         assert_eq!(response["object"], "response");
         assert_eq!(response["status"], "failed");
         assert!(response["error"]["code"].is_string() && response["error"]["message"].is_string());

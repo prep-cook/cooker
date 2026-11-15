@@ -91,8 +91,17 @@ const LEFT_OUT: &[(&str, &str)] = &[
     ("apply_patch_folded_namespace_stream", "minimal events refused"),
 ];
 
-/// Members the Responses egress always writes, which Go passed on only when the upstream did.
+/// Members the Responses egress always writes, which Go passed on only when the upstream did,
+/// and the response id: the client sees the exchange's own id where Go passed on the upstream's.
 fn egress_defaults(got: &mut Value, want: &Value) {
+    if got["id"] == "resp_test" {
+        match want.get("id") {
+            Some(id) => got["id"] = id.clone(),
+            None => {
+                got.as_object_mut().unwrap().remove("id");
+            }
+        }
+    }
     for name in ["parallel_tool_calls", "tool_choice", "tools", "created_at"] {
         if want.get(name).is_none() {
             got.as_object_mut().unwrap().remove(name);
