@@ -2,14 +2,9 @@
 //! goes to `{base}/responses` through the Responses request egress, and a token count is
 //! local. Meta has no native compact.
 //!
-//! The executor adjusts its own encoded upload in the old path's order: the Codex backend's
-//! required members (`codex_upload`), the model suffix's thinking, the upstream model, the
-//! members Meta refuses, the Codex instructions, encrypted reasoning and web search tools, and
-//! the payload rules last, which also give a Codex client's known tool parameters their integer
-//! types. The egress writes `stream`: generation always streams upstream. Upstream events pass
-//! through the Codex event layer with Meta's failure and completion rules
-//! (`codex_events::Backend::Meta`) into the Responses response ingress. The credential
-//! enrichment, inline mint, headers and transport are the old path's.
+//! Request controls follow Meta policy, not Codex defaults. Upstream events pass through
+//! the Codex event layer with Meta's failure and completion rules. Credential enrichment,
+//! inline mint, headers and transport remain shared with the old path.
 //!
 //! A request carrying Codex's freeform `apply_patch` tool keeps the old route: only the old
 //! path's apply_patch bridge sends it as the JSON function Meta takes and turns the calls back.
@@ -19,7 +14,7 @@ use ck_core::exec::{ExecError, FailureScope, UsageSink};
 use ck_core::format::Format;
 use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::{self, BodyMode, Capability, Operation, RequestEgress, RequestFence, RequestView};
-use ck_translate::responses::request::{Egress, ResponsesCapability};
+use ck_translate::responses::request::Egress;
 use ck_translate::responses::response::Ingress;
 use ck_wire::json as gj;
 use ck_wire::thinking::{ModelCaps, RequestThinking, apply_request_thinking, parse_suffix};
@@ -52,7 +47,7 @@ impl Capability for MetaCapability {
             },
             Operation::Compact => return Err(codec::Error::Unsupported),
         };
-        ResponsesCapability.validate(generate)?;
+        ck_translate::responses::request::validate_meta(generate)?;
         if custom_apply_patch(view.document)? {
             return Err(codec::Error::Destination);
         }
@@ -195,7 +190,8 @@ fn encode(
 fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
     let document = request.validated.view().document;
     let source = source(document).map_err(encoding)?;
-    let mut body = crate::codex_upload::require(upload);
+    let mut body = crate::codex_upload::normalize(upload);
+    gj::set_bool(&mut body, "store", false);
     if source != Format::OpenAIResponse || string_input(document).map_err(encoding)? {
         text_parts(&mut body);
     }
@@ -206,13 +202,7 @@ fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Resul
     let original = rules.baseline("", &body);
     let mut body = think(attempt.model, caps.as_ref(), body)?;
     meta::set_string_if_different(&mut body, "model", &base_model);
-    for key in [
-        "generate",
-        "prompt_cache_retention",
-        "safety_identifier",
-        "stream_options",
-        "client_metadata",
-    ] {
+    for key in ["generate", "stream_options", "client_metadata"] {
         gj::delete(&mut body, key);
     }
     let client = &request.client;

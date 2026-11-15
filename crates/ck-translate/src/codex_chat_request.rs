@@ -7,10 +7,14 @@ use crate::{
 };
 use ck_wire::json::{self as gj, AnyValue, Kind, Res};
 use std::collections::{HashMap, HashSet};
+#[path = "codex_chat_input.rs"]
+mod input;
+use crate::responses_policy::{Policy, meta_controls};
+use ck_core::format::Format;
 
 pub static PAIR: Registered = registered!(
     OpenAI -> Codex,
-    request: |ctx, body| convert(ctx.model, body, ctx.stream),
+    request: |ctx, body| convert_with_policy(ctx.model, body, ctx.stream, Policy::Codex),
     non_stream: response::non_stream,
     go_stream: response::go_stream,
     token_count: None,
@@ -135,254 +139,52 @@ struct PendingCall {
     consumed: bool,
 }
 
-fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, crate::Error> {
-    let mut drops = UserTurnDrops::default();
-    let root = gj::parse(raw);
-    let tools = root.get("tools");
-    let tool_list = tools.array();
+pub(crate) fn convert_with_policy(
+    model: &str,
+    raw: &[u8],
+    stream: bool,
+    policy: Policy,
+) -> Result<Vec<u8>, crate::Error> {
     let mut out = br#"{"instructions":""}"#.to_vec();
     gj::set_bool(&mut out, "stream", stream);
+    controls(&mut out, raw, policy);
+    gj::set_str(&mut out, "model", model);
+    let declarations = gj::get(raw, "tools");
+    let tool_list = declarations.array();
+    let names = input::Names::new(raw, &tool_list);
+    let items = input::convert(raw, &names)?;
+    if items.is_empty() {
+        gj::set_raw(&mut out, "input", b"[]");
+    } else {
+        gj::set_items(&mut out, "input", &items);
+    }
+    out = text_format(out, raw);
+    out = tools(out, &declarations, &tool_list, &names);
+    out = tool_choice(out, raw, &names);
+    gj::set_bool(&mut out, "store", false);
+    Ok(out)
+}
+
+fn controls(out: &mut Vec<u8>, raw: &[u8], policy: Policy) {
     let effort = gj::get(raw, "reasoning_effort");
     if effort.exists() {
-        AnyValue::from_res(&effort).set(&mut out, "reasoning.effort");
+        AnyValue::from_res(&effort).set(out, "reasoning.effort");
+    } else if policy.codex() {
+        gj::set_str(out, "reasoning.effort", "medium");
+    }
+    if policy.codex() {
+        let tier = service_tier(&gj::get(raw, "service_tier"));
+        if !tier.is_empty() {
+            gj::set_str(out, "service_tier", tier);
+        }
+        gj::set_bool(out, "parallel_tool_calls", true);
+        gj::set_strs(out, "include", &["reasoning.encrypted_content"]);
     } else {
-        gj::set_str(&mut out, "reasoning.effort", "medium");
+        meta_controls(out, raw, Format::OpenAI);
     }
-    let tier = service_tier(&root.get("service_tier"));
-    if !tier.is_empty() {
-        gj::set_str(&mut out, "service_tier", tier);
-    }
-    gj::set_bool(&mut out, "parallel_tool_calls", true);
-    gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
-    gj::set_str(&mut out, "model", model);
+}
 
-    let mut custom_names: HashSet<Vec<u8>> = HashSet::new();
-    if tools.is_array() && !tool_list.is_empty() {
-        let mut function_names: HashSet<Vec<u8>> = HashSet::new();
-        for tool in &tool_list {
-            match tool.get("type").bytes().as_ref() {
-                b"function" => {
-                    function_names.insert(tool.get("function.name").bytes().into_owned());
-                }
-                b"custom" => {
-                    custom_names.insert(tool.get("name").bytes().into_owned());
-                }
-                _ => {}
-            }
-        }
-        custom_names.retain(|n| !function_names.contains(n));
-    }
-    let short_names = short_name_map(&request_tool_names(raw));
-    let short = |name: &[u8]| short_names.get(name).cloned().unwrap_or_else(|| shorten_name(name));
-
-    // (custom, name, input)
-    let resolve = |call: &Res<'_>| -> Option<(bool, Vec<u8>, Vec<u8>)> {
-        match call.get("type").bytes().as_ref() {
-            b"custom" => Some((
-                true,
-                call.get("custom.name").bytes().into_owned(),
-                call.get("custom.input").bytes().into_owned(),
-            )),
-            b"function" => {
-                let name = call.get("function.name").bytes().into_owned();
-                let custom = custom_names.contains(&name);
-                let mut input = call.get("function.arguments").bytes().into_owned();
-                if custom
-                    && trim_space(&name) == b"apply_patch"
-                    && let Some(unwrapped) = apply_patch::unwrap_input(&input)
-                {
-                    input = unwrapped.into_bytes();
-                }
-                Some((custom, name, input))
-            }
-            _ => None,
-        }
-    };
-
-    gj::set_raw(&mut out, "input", b"[]");
-    let mut items: Vec<Vec<u8>> = vec![];
-    let mut pending: Vec<PendingCall> = vec![];
-    let mut ambiguous: HashSet<Vec<u8>> = HashSet::new();
-    let messages = gj::get(raw, "messages");
-    if messages.is_array() {
-        for (i, m) in messages.array().iter().enumerate() {
-            let role = m.get("role").bytes().into_owned();
-            if role == b"tool" {
-                let tool_call_id = m.get("tool_call_id").bytes().into_owned();
-                if !tool_call_id.is_empty() && ambiguous.contains(&tool_call_id) {
-                    continue;
-                }
-                let Some(call) = pending.iter_mut().find(|c| {
-                    !c.consumed && (tool_call_id.is_empty() || c.source_id == tool_call_id || c.call_id == tool_call_id)
-                }) else {
-                    continue;
-                };
-                call.consumed = true;
-                let mut output = b"{}".to_vec();
-                let kind = if call.custom {
-                    "custom_tool_call_output"
-                } else {
-                    "function_call_output"
-                };
-                gj::set_str(&mut output, "type", kind);
-                gj::set_str(&mut output, "call_id", &call.call_id);
-                set_tool_output(&mut output, &m.get("content"));
-                items.push(output);
-                continue;
-            }
-            pending.clear();
-            ambiguous.clear();
-            let mut msg = b"{}".to_vec();
-            gj::set_str(&mut msg, "type", "message");
-            gj::set_str(
-                &mut msg,
-                "role",
-                if role == b"system" { &b"developer"[..] } else { &role },
-            );
-            let assistant = role == b"assistant";
-            let text_type = if assistant { "output_text" } else { "input_text" };
-            let user = role == b"user";
-            let mut parts = vec![];
-            // Counts the parts this user turn really sends; an empty text part does not.
-            let mut sendable = 0;
-            let content = m.get("content");
-            if content.kind == Kind::String && !content.s.is_empty() {
-                sendable += 1;
-                let mut part = b"{}".to_vec();
-                gj::set_str(&mut part, "type", text_type);
-                gj::set_str(&mut part, "text", &content.s);
-                parts.push(part);
-            } else if content.is_array() {
-                for it in content.array() {
-                    match it.get("type").bytes().as_ref() {
-                        b"text" => {
-                            let mut part = b"{}".to_vec();
-                            gj::set_str(&mut part, "type", text_type);
-                            gj::set_str(&mut part, "text", it.get("text").bytes());
-                            parts.push(part);
-                            if !it.get("text").bytes().is_empty() {
-                                sendable += 1;
-                            }
-                        }
-                        b"image_url" if user => {
-                            let mut part = b"{}".to_vec();
-                            gj::set_str(&mut part, "type", "input_image");
-                            let url = it.get("image_url.url");
-                            if url.exists() {
-                                gj::set_str(&mut part, "image_url", url.bytes());
-                            }
-                            parts.push(part);
-                            sendable += 1;
-                        }
-                        b"file" if user => match input_file_part(&it) {
-                            Some(part) => {
-                                parts.push(part);
-                                sendable += 1;
-                            }
-                            None => drops.drop_part("file"),
-                        },
-                        b"input_audio" if user => {
-                            let data = it.get("input_audio.data").bytes();
-                            let format = it.get("input_audio.format").bytes();
-                            if !data.is_empty() {
-                                let mut part = b"{}".to_vec();
-                                gj::set_str(&mut part, "type", "input_audio");
-                                gj::set_str(&mut part, "data", &data);
-                                if !format.is_empty() {
-                                    gj::set_str(&mut part, "format", &format);
-                                }
-                                parts.push(part);
-                                sendable += 1;
-                            } else {
-                                drops.drop_part("input_audio");
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if user {
-                drops.end_turn(sendable);
-            }
-            if !assistant || !parts.is_empty() {
-                gj::set_raw(&mut msg, "content", gj::join(&parts));
-                items.push(msg);
-            }
-            if !assistant {
-                continue;
-            }
-            let calls = m.get("tool_calls");
-            if !calls.is_array() {
-                continue;
-            }
-            let calls = calls.array();
-            let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
-            let mut used: HashSet<Vec<u8>> = HashSet::new();
-            for call in &calls {
-                let id = call.get("id").bytes().into_owned();
-                if resolve(call).is_some() && !id.is_empty() {
-                    *counts.entry(id.clone()).or_default() += 1;
-                    used.insert(id);
-                }
-            }
-            ambiguous.extend(counts.into_iter().filter(|(_, n)| *n > 1).map(|(id, _)| id));
-            for (j, call) in calls.iter().enumerate() {
-                let Some((custom, name, input)) = resolve(call) else {
-                    continue;
-                };
-                let source_id = call.get("id").bytes().into_owned();
-                if !source_id.is_empty() && ambiguous.contains(&source_id) {
-                    continue;
-                }
-                let mut call_id = source_id.clone();
-                if call_id.is_empty() {
-                    let base = format!("call_missing_{i}_{j}").into_bytes();
-                    call_id = base.clone();
-                    let mut suffix = 1;
-                    while used.contains(&call_id) {
-                        call_id = [&base[..], format!("_{suffix}").as_bytes()].concat();
-                        suffix += 1;
-                    }
-                    used.insert(call_id.clone());
-                }
-                // Codex rejects call_id values longer than 64 bytes (b0debb35).
-                let mut shortened = shorten_call_id(&call_id);
-                if shortened != call_id {
-                    // Go shortens `call_id + "_N"` until the result is unused. Every candidate
-                    // keeps the same first bytes, so `call_id` is hashed once and each attempt
-                    // only feeds its `_N`: linear however many candidates a client occupies.
-                    use sha2::Digest;
-                    let prefix = sha2::Sha256::new_with_prefix(&call_id);
-                    let mut attempt = 1;
-                    while used.contains(&shortened) {
-                        let sum = prefix.clone().chain_update(format!("_{attempt}")).finalize();
-                        shortened = with_hash_suffix(&call_id, &sum);
-                        attempt += 1;
-                    }
-                    used.insert(shortened.clone());
-                    call_id = shortened;
-                }
-                pending.push(PendingCall {
-                    call_id: call_id.clone(),
-                    source_id,
-                    custom,
-                    consumed: false,
-                });
-                let mut item = b"{}".to_vec();
-                gj::set_str(
-                    &mut item,
-                    "type",
-                    if custom { "custom_tool_call" } else { "function_call" },
-                );
-                gj::set_str(&mut item, "call_id", &call_id);
-                gj::set_str(&mut item, "name", short(&name));
-                gj::set_str(&mut item, if custom { "input" } else { "arguments" }, &input);
-                items.push(item);
-            }
-        }
-    }
-    gj::set_items(&mut out, "input", &items);
-
+fn text_format(mut out: Vec<u8>, raw: &[u8]) -> Vec<u8> {
     let format = gj::get(raw, "response_format");
     let text = gj::get(raw, "text");
     if format.exists() {
@@ -424,10 +226,15 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, crate::Erro
             AnyValue::from_res(&verbosity).set(&mut out, "text.verbosity");
         }
     }
+    out
+}
+
+fn tools(mut out: Vec<u8>, tools: &Res<'_>, tool_list: &[Res<'_>], names: &input::Names) -> Vec<u8> {
+    let short = |name: &[u8]| names.short(name);
 
     if tools.is_array() && !tool_list.is_empty() {
         let mut tool_items = vec![];
-        for t in &tool_list {
+        for t in tool_list {
             let kind = t.get("type").bytes().into_owned();
             if kind == b"custom" {
                 let mut item = t.raw.to_vec();
@@ -469,6 +276,11 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, crate::Erro
         }
         gj::set_raw(&mut out, "tools", gj::join(&tool_items));
     }
+    out
+}
+
+fn tool_choice(mut out: Vec<u8>, raw: &[u8], names: &input::Names) -> Vec<u8> {
+    let short = |name: &[u8]| names.short(name);
 
     let choice = gj::get(raw, "tool_choice");
     if choice.kind == Kind::String {
@@ -479,7 +291,7 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, crate::Erro
             let mut name = choice.get("name").bytes().into_owned();
             if kind == b"function" {
                 name = choice.get("function.name").bytes().into_owned();
-                if custom_names.contains(&name) {
+                if names.custom(&name) {
                     kind = b"custom".to_vec();
                 }
             }
@@ -496,8 +308,7 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, crate::Erro
             gj::set_raw(&mut out, "tool_choice", &choice.raw);
         }
     }
-    gj::set_bool(&mut out, "store", false);
-    drops.result().map(|()| out)
+    out
 }
 
 /// `shortenCodexCallIDIfNeeded`: an ID over 64 bytes keeps its first bytes (cut without
@@ -642,10 +453,11 @@ mod tests {
     fn over_length_call_ids_match_go() {
         let go: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/codex_chat_go.json")).unwrap();
         for case in go["requests"].as_array().unwrap() {
-            let out = super::convert(
+            let out = super::convert_with_policy(
                 case["model"].as_str().unwrap(),
                 case["in"].as_str().unwrap().as_bytes(),
                 case["stream"].as_bool().unwrap(),
+                super::Policy::Codex,
             )
             .unwrap();
             assert_eq!(
