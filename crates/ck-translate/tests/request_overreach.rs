@@ -331,9 +331,9 @@ fn every_split_gives_the_same_body() {
             an_tool_result(json!({"type":"tool_result","tool_use_id":"toolu_01B","content":"ok"})),
         ),
         (
-            P::Responses,
             P::Chat,
-            json!({"model":"gpt-x","input":"hi","top_logprobs":3}),
+            P::Chat,
+            json!({"model":"gpt-x","messages":[{"role":"user","content":"hi"}],"logprobs":true,"top_logprobs":3}),
         ),
         (
             P::Chat,
@@ -448,13 +448,14 @@ fn gemini_native_tool_groups_are_unsupported_elsewhere() {
 }
 
 /// Responses `top_logprobs` is the canonical root member Chat uses, so each destination judges
-/// it: Gemini and Anthropic have no form for it; Chat and Responses take the integer as it is.
+/// it: Gemini and Anthropic have no form for it, Chat takes it only beside `logprobs: true`,
+/// which a Responses request has no member for, and Responses takes the integer as it is.
 #[test]
 fn responses_top_logprobs_is_judged_by_each_destination() {
     let input = json!({"model":"gpt-x","input":"hi","top_logprobs":3});
-    unsupported(translate(P::Responses, P::Gemini, &input));
-    unsupported(translate(P::Responses, P::Anthropic, &input));
-    assert_eq!(translate(P::Responses, P::Chat, &input).unwrap()["top_logprobs"], 3);
+    for to in [P::Gemini, P::Anthropic, P::Chat] {
+        unsupported(translate(P::Responses, to, &input));
+    }
     assert_eq!(
         translate(P::Responses, P::Responses, &input).unwrap(),
         json!({"input":[{"type":"message","role":"user","content":"hi"}],"stream":false,"model":"gpt-x","top_logprobs":3})
@@ -492,6 +493,26 @@ fn chat_allowed_tools_reach_responses_flat() {
     let mut beside = request(json!({"mode":"auto","tools":[{"type":"function","function":{"name":"f"}}]}));
     beside["tool_choice"]["function"] = json!({"name":"f"});
     unsupported(translate(P::Chat, P::Responses, &beside));
+}
+
+/// Chat takes `top_logprobs` only beside `logprobs: true`; a Chat client's own pair passes
+/// unchanged.
+#[test]
+fn chat_top_logprobs_needs_logprobs() {
+    let input = json!({"model":"gpt-x","messages":[{"role":"user","content":"hi"}],"logprobs":true,"top_logprobs":2});
+    let out = translate(P::Chat, P::Chat, &input).unwrap();
+    assert_eq!((&out["logprobs"], &out["top_logprobs"]), (&json!(true), &json!(2)));
+    for logprobs in [json!({"logprobs":false}), json!({"logprobs":null}), json!({})] {
+        let mut input = input.clone();
+        input.as_object_mut().unwrap().remove("logprobs");
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(logprobs.as_object().unwrap().clone());
+        unsupported(translate(P::Chat, P::Chat, &input));
+    }
+    let null = json!({"model":"gpt-x","messages":[{"role":"user","content":"hi"}],"top_logprobs":null});
+    assert!(translate(P::Chat, P::Chat, &null).is_ok());
 }
 
 /// Chat `logprobs` has no Responses member: `true` needs a response translation that does not
