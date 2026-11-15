@@ -174,6 +174,14 @@ pub fn claude_to_gemini_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result
     deep_stack(levels(&[body]), || gemini_claude::request_with_compat(ctx, body))
 }
 
+/// Normalize native Gemini contents for AI Studio without changing schema dialects
+/// or replacing the API's omitted safety settings with gateway defaults.
+pub fn gemini_to_aistudio(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
+    translate_registered(Format::Gemini, Format::Gemini, ctx, body, |body| {
+        Ok(gemini_gemini::convert_aistudio(body))
+    })
+}
+
 /// ConvertClaudeRequestToInteractionsWithCompat.
 pub fn claude_to_interactions_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
     deep_stack(levels(&[body]), || interactions_claude::request_with_compat(ctx, body))
