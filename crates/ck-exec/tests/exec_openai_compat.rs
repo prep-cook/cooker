@@ -465,6 +465,32 @@ async fn a_responses_client_sees_its_tools_echoed() {
     assert_eq!(out["parallel_tool_calls"], false, "{out}");
 }
 
+/// A Responses client's flat allowed-tools choice reaches the Chat upstream in Chat's official
+/// nested form, for both modes.
+#[tokio::test]
+async fn a_flat_allowed_tools_choice_goes_out_nested() {
+    for mode in ["auto", "required"] {
+        let upstream = StreamUpstream::start([Reply::sse(sse())]).await;
+        let (streams, exchange) = (Streams::new(), exchange(&upstream));
+        let body = format!(
+            r#"{{"model":"m","stream":true,"input":"hi","tools":[{{"type":"function","name":"f","parameters":{{"type":"object"}}}},{{"type":"function","name":"g"}}],"tool_choice":{{"type":"allowed_tools","mode":"{mode}","tools":[{{"type":"function","name":"f"}}]}}}}"#
+        );
+        let (started, id, _request) = run(
+            &streams,
+            &exchange,
+            "responses",
+            Operation::Generate,
+            body.as_bytes(),
+            64,
+        )
+        .await;
+        finish(&streams, started.unwrap(), id).await.0.unwrap();
+        let sent = json_body(&upstream.captured()[0]);
+        let want = json!({"type":"allowed_tools","allowed_tools":{"mode":mode,"tools":[{"type":"function","function":{"name":"f"}}]}});
+        assert_eq!(sent["tool_choice"], want, "{sent}");
+    }
+}
+
 /// The selector sends relay credentials through this executor and leaves other providers on
 /// their old path.
 #[tokio::test]

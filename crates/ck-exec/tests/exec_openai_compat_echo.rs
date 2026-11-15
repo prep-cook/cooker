@@ -8,8 +8,9 @@ use ck_exec::openai_compat_exec::RelayCapability;
 use ck_stream::{Read, Reader, ScratchLease, Terminal, Writer};
 use ck_translate::codec::event::Direction;
 use ck_translate::codec::{
-    self, BodyMode, Capability, Operation, RequestIngress, RequestView, ResponseEgress, ResponseIngress,
+    self, BodyMode, Capability, Operation, RequestEgress, RequestIngress, RequestView, ResponseEgress, ResponseIngress,
 };
+use ck_translate::responses::request::ResponsesCapability;
 use ck_translate::{anthropic, codec::chat, gemini, responses};
 use serde_json::{Value, json};
 use support::{Streams, fence, identity};
@@ -251,4 +252,58 @@ async fn unprojectable_tools_are_refused() {
     let out = echo_for("responses", refused[2].1.as_bytes(), &Open).await.unwrap();
     assert_eq!(out["tools"], json!([{"type":"web_search"}]), "{out}");
     assert_eq!(out["tool_choice"], json!({"type":"web_search"}), "{out}");
+}
+
+const FLAT: &str = r#"{"model":"m","input":"hi","tools":[{"type":"function","name":"f","parameters":{"type":"object"}}],"tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"f"}]}}"#;
+
+/// A flat allowed-tools choice member or listed tool without a Chat equivalent is refused by
+/// the relay fence as unsupported. A Chat client's flat choice stays malformed Chat.
+#[tokio::test]
+async fn an_unprojectable_allowed_tools_member_is_unsupported() {
+    let hosted = FLAT.replace(
+        r#""tools":[{"type":"function","name":"f"}]}"#,
+        r#""tools":[{"type":"web_search"}]}"#,
+    );
+    let extra = FLAT.replace(r#""mode":"required""#, r#""mode":"required","extra":1"#);
+    let named = FLAT.replace(
+        r#"{"type":"function","name":"f"}]}"#,
+        r#"{"type":"function","name":"f","strict":true}]}"#,
+    );
+    for body in [hosted, extra, named] {
+        assert_ne!(body, FLAT);
+        let error = echo_for("responses", body.as_bytes(), &RelayCapability)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, codec::Error::Unsupported), "{body}: {error:?}");
+    }
+    let chat = chat(
+        FUNCTION,
+        r#"{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"f"}]}"#,
+    );
+    let error = echo_for("chat", chat.as_bytes(), &RelayCapability).await.unwrap_err();
+    assert!(matches!(error, codec::Error::Schema), "{error:?}");
+}
+
+/// The flat choice stays as sent on the way to a Responses upstream.
+#[tokio::test]
+async fn a_flat_allowed_tools_choice_reaches_responses_unchanged() {
+    let streams = Streams::new();
+    let mut request = streams.request();
+    let mut ingress = responses::request::Ingress::new(
+        &mut request,
+        &streams.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        LIMIT,
+    )
+    .unwrap();
+    let validated = fence(&mut ingress, &mut request, FLAT.as_bytes(), 64, &ResponsesCapability).unwrap();
+    let egress = responses::request::Egress {
+        destination: "responses",
+        upstream_stream: false,
+    };
+    let sent: Value = serde_json::from_slice(&lease_bytes(&egress.encode(&validated, &mut request).unwrap())).unwrap();
+    let flat: Value = serde_json::from_str(FLAT).unwrap();
+    assert_eq!(sent["tool_choice"], flat["tool_choice"], "{sent}");
+    assert_eq!(sent["tools"], flat["tools"], "{sent}");
 }
