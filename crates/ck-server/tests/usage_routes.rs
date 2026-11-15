@@ -17,6 +17,17 @@ const SSE: &str = "text/event-stream";
 /// on a loopback upstream that answers every request with `answer`, and returns the one usage
 /// record the attempt queued.
 async fn record(provider: &str, endpoint: &str, request: Value, content_type: &'static str, answer: String) -> Value {
+    exchange(provider, endpoint, request, content_type, answer).await.0
+}
+
+/// [`record`] and the body the client received.
+async fn exchange(
+    provider: &str,
+    endpoint: &str,
+    request: Value,
+    content_type: &'static str,
+    answer: String,
+) -> (Value, String) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let upstream = axum::Router::new().fallback(move || {
@@ -60,7 +71,10 @@ async fn record(provider: &str, endpoint: &str, request: Value, content_type: &'
     server.abort();
     let _ = server.await;
     assert_eq!(records.len(), 1);
-    serde_json::from_slice(&records[0]).unwrap()
+    (
+        serde_json::from_slice(&records[0]).unwrap(),
+        String::from_utf8(body.to_vec()).unwrap(),
+    )
 }
 
 fn messages(stream: bool) -> Value {
@@ -185,4 +199,60 @@ async fn responses_cache_write_ttls_reach_the_record() {
     assert_eq!(record["tokens"]["cache_creation_tokens"], 7);
     assert_eq!(record["tokens"]["cache_creation_30m_tokens"], 3);
     assert_eq!(record["tokens"]["cache_creation_12h_tokens"], 4);
+}
+
+/// Meta segmentation bills per image and per video frame. Each count the upstream Responses
+/// usage reports reaches the record as its own dimension, buffered or streamed; an unreported or
+/// malformed one stays absent and the token counts are the upstream's. The client still receives
+/// the native usage, and accounting records the count once: a stream that repeats the usage on
+/// a second terminal event replaces it rather than adding to it.
+#[tokio::test]
+async fn meta_segmentation_counts_reach_the_record() {
+    let tokens = json!({"input_tokens":12,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":15});
+    for (counts, dimensions) in [
+        (json!({"images_processed":2}), json!({"images_processed":2})),
+        (
+            json!({"video_frames_processed":48}),
+            json!({"video_frames_processed":48}),
+        ),
+        (
+            json!({"images_processed":1,"video_frames_processed":0}),
+            json!({"images_processed":1,"video_frames_processed":0}),
+        ),
+        (json!({}), Value::Null),
+        (
+            json!({"images_processed":null,"video_frames_processed":-1}),
+            Value::Null,
+        ),
+    ] {
+        let mut usage = tokens.clone();
+        usage
+            .as_object_mut()
+            .unwrap()
+            .extend(counts.as_object().unwrap().clone());
+        let response = json!({"id":"r","object":"response","created_at":1,"model":"up-model","status":"completed","output":[{"id":"msg","type":"message","role":"assistant","content":[{"type":"output_text","text":"mask","annotations":[]}]}],"usage":usage});
+        let completed = json!({"type":"response.completed","response":response});
+        let streamed = format!("data: {completed}\n\ndata: {completed}\n\ndata: [DONE]\n\n");
+        for (stream, content_type, answer) in [(false, JSON, response.to_string()), (true, SSE, streamed)] {
+            let request = json!({"model":"fast","input":"segment the cat","stream":stream});
+            let (record, client) = exchange("meta", "/v1/responses", request, content_type, answer).await;
+            let field = |name| record.get(name).cloned().unwrap_or(Value::Null);
+            assert_eq!(field("dimensions"), dimensions, "{counts} stream={stream}");
+            assert_eq!(
+                (
+                    &record["tokens"]["input_tokens"],
+                    &record["tokens"]["output_tokens"],
+                    &record["tokens"]["total_tokens"]
+                ),
+                (&json!(12), &json!(3), &json!(15)),
+                "{counts} stream={stream}"
+            );
+            for (name, count) in counts.as_object().unwrap() {
+                assert!(
+                    client.contains(&format!("\"{name}\":{count}")),
+                    "{name} stream={stream}: {client}"
+                );
+            }
+        }
+    }
 }

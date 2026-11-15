@@ -624,8 +624,26 @@ fn parse_openai_node(node: &Res<'_>) -> Detail {
     d
 }
 
+/// [`parse_openai_node`] of a Responses usage object, which also carries the `responses`
+/// dimension rows. `dimension_members` lists only the Chat rows' members: a Responses stream
+/// accounts its first terminal usage alone, so no later update merges into it.
+fn parse_responses_node(node: &Res<'_>) -> Detail {
+    let mut d = parse_openai_node(node);
+    d.dimensions.extend(native_dimensions("responses", node));
+    d
+}
+
 /// Go `ParseOpenAIUsage`.
 pub fn parse_openai(body: &[u8]) -> Detail {
+    parse_usage(body, parse_openai_node)
+}
+
+/// [`parse_openai`] of a buffered Responses body.
+fn parse_responses(body: &[u8]) -> Detail {
+    parse_usage(body, parse_responses_node)
+}
+
+fn parse_usage(body: &[u8], parse: fn(&Res<'_>) -> Detail) -> Detail {
     let tier = service_tier(body);
     let node = gj::parse(body).get("usage");
     if !has_openai_token_fields(&node) {
@@ -634,7 +652,7 @@ pub fn parse_openai(body: &[u8]) -> Detail {
             ..Detail::default()
         };
     }
-    let mut d = parse_openai_node(&node);
+    let mut d = parse(&node);
     d.response_service_tier = tier;
     d
 }
@@ -649,7 +667,7 @@ pub fn parse_codex(data: &[u8]) -> Option<Detail> {
             ..Detail::default()
         });
     }
-    let mut d = parse_openai_node(&node);
+    let mut d = parse_responses_node(&node);
     d.response_service_tier = tier;
     Some(d)
 }
@@ -931,7 +949,8 @@ pub fn parse_body(format: Format, body: &[u8]) -> Detail {
         Format::Claude => parse_claude(body),
         // A buffered Responses body is the completed response object: usage and
         // service_tier are top-level, as `ParseOpenAIUsage` reads them.
-        Format::OpenAI | Format::OpenAIResponse | Format::Codex => parse_openai(body),
+        Format::OpenAI => parse_openai(body),
+        Format::OpenAIResponse | Format::Codex => parse_responses(body),
         Format::Gemini => parse_gemini(body),
         Format::Antigravity => {
             let node = first(
@@ -2876,6 +2895,16 @@ mod tests {
             br#"{"usage":{"input_tokens":5,"output_tokens":2,"prompt_tokens_details":{"audio_tokens":2}}}"#,
         );
         assert_eq!(detail.dimensions, Vec::new());
+        // Meta's segmentation counts are Responses usage members, in a buffered body too.
+        let segmentation = br#"{"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7,"images_processed":2,"video_frames_processed":0}}"#;
+        assert_eq!(parse_body(Format::OpenAI, segmentation).dimensions, Vec::new());
+        assert_eq!(
+            parse_body(Format::Codex, segmentation).dimensions,
+            vec![
+                ("images_processed", Dimension::Count(2)),
+                ("video_frames_processed", Dimension::Count(0)),
+            ]
+        );
     }
 
     /// Gemini reports its tier inside `usageMetadata`, on the buffered and streamed paths.
