@@ -1,11 +1,16 @@
 mod edit;
 mod iter;
+mod name;
+#[cfg(test)]
+mod name_tests;
 #[path = "document_pending.rs"]
 pub(crate) mod pending;
 #[cfg(test)]
 mod tests;
 
 pub use iter::{Characters, Children, EncodedCharacters, FragmentCharacters};
+pub use name::Digest;
+pub(crate) use name::NameHash;
 
 use ck_stream::{MetadataPermit, Writer};
 
@@ -24,10 +29,14 @@ pub struct Text {
     pub span: Span,
 }
 
+/// A member name: a quoted JSON string, the last segment of an RFC 6901 pointer string (its
+/// stored bytes stay pointer-encoded), or a static name. A stored name carries the [`Digest`]
+/// of its decoded text, which the scanner, [`Document::mapped_name`] or
+/// [`Document::pointer_name`] computed.
 #[derive(Clone, Copy, Debug)]
 pub enum Name {
-    Mapped(Text),
-    Pointer(Text),
+    Mapped(Text, Digest),
+    Pointer(Text, Digest),
     Static(&'static str),
 }
 
@@ -175,7 +184,7 @@ impl Document {
             json::Kind::Bool => Value::Bool(self.input().equals(node.span, b"true")?),
             json::Kind::Null => Value::Null,
         };
-        let target = self.add(node.key.map(|span| Name::Mapped(Text { source: 0, span })), value)?;
+        let target = self.add(node.name(0), value)?;
         let mut child = node.first;
         while let Some(index) = child {
             child = scanner.pending_node(self.input(), index)?.next;
@@ -262,7 +271,7 @@ impl Document {
                 json::Kind::Null => Value::Null,
             };
             self.nodes.push(Node {
-                name: n.key.map(|span| Name::Mapped(Text { source: part, span })),
+                name: n.name(part),
                 value,
                 first: n.first.map(|i| i + base),
                 next: n.next.map(|i| i + base),
@@ -312,7 +321,7 @@ impl Document {
         u32::try_from(self.ids.len() + other.ids.len()).map_err(|_| Error::Limit)?;
         let id_base = self.ids.len() as u32;
         for mut node in other.nodes.drain(..) {
-            if let Some(Name::Mapped(text) | Name::Pointer(text)) = &mut node.name {
+            if let Some(Name::Mapped(text, _) | Name::Pointer(text, _)) = &mut node.name {
                 text.source += source_base;
             }
             match &mut node.value {
@@ -337,20 +346,6 @@ impl Document {
         self.sources.append(&mut other.sources);
         self.ids.append(&mut other.ids);
         Ok(base + other.root)
-    }
-
-    pub fn names_equal(&self, a: Name, b: Name) -> Result<bool> {
-        let mut a = self.name_chars(a)?;
-        let mut b = self.name_chars(b)?;
-        loop {
-            let c = a.next_scalar()?;
-            if c != b.next_scalar()? {
-                return Ok(false);
-            }
-            if c.is_none() {
-                return Ok(true);
-            }
-        }
     }
 
     pub fn stream_id(&self) -> u64 {
@@ -409,10 +404,10 @@ impl Document {
                     self.nodes[index].input_key = None;
                     continue;
                 }
-                if matches!(name, Name::Mapped(Text { source: 0, .. })) {
+                if matches!(name, Name::Mapped(Text { source: 0, .. }, _)) {
                     continue;
                 }
-                if self.names_equal(Name::Mapped(Text { source: 0, span }), name)? {
+                if name::chars_equal(self.text_chars(Text { source: 0, span })?, self.name_chars(name)?)? {
                     scanner.bind_key(span, name);
                     self.nodes[index].input_key = None;
                 }
@@ -423,7 +418,7 @@ impl Document {
 
     pub(crate) fn raw_floor(&self, index: usize, mut floor: u64) -> Result<u64> {
         let node = self.node(index)?;
-        if let Some(Name::Mapped(Text { source: 0, span })) = node.name {
+        if let Some(Name::Mapped(Text { source: 0, span }, _)) = node.name {
             floor = floor.min(span.start);
         }
         if let Value::String(Text { source: 0, span }) | Value::Number(Text { source: 0, span }) = node.value {
@@ -436,49 +431,6 @@ impl Document {
     }
     pub fn source(&self, text: Text) -> Result<&Source> {
         self.sources.get(text.source).ok_or(Error::Position)
-    }
-    pub fn name_is(&self, name: Name, value: &str) -> Result<bool> {
-        let mut chars = self.name_chars(name)?;
-        for expected in value.chars() {
-            if chars.next_scalar()? != Some(expected) {
-                return Ok(false);
-            }
-        }
-        Ok(chars.next_scalar()?.is_none())
-    }
-    pub fn name_chars(&self, name: Name) -> Result<Characters<'_>> {
-        match name {
-            Name::Static(s) => Ok(Characters::Static(s.chars())),
-            Name::Mapped(t) => Ok(Characters::Mapped(json::Decoded::new(self.source(t)?, t.span)?)),
-            Name::Pointer(t) => {
-                let mut chars = json::Decoded::new(self.source(t)?, t.span)?;
-                let mut skip = 0;
-                let mut length = 0;
-                while let Some(c) = chars.next_scalar()? {
-                    length += 1;
-                    if c == '/' {
-                        skip = length;
-                    }
-                }
-                let mut chars = json::Decoded::new(self.source(t)?, t.span)?;
-                for _ in 0..skip {
-                    chars.next_scalar()?;
-                }
-                Ok(Characters::Pointer(chars))
-            }
-        }
-    }
-
-    pub fn member(&self, parent: usize, name: &str) -> Result<Option<usize>> {
-        if !matches!(self.node(parent)?.value, Value::Object) {
-            return Err(Error::Schema);
-        }
-        for child in self.children(parent)? {
-            if self.name_is(self.node(child)?.name.ok_or(Error::Schema)?, name)? {
-                return Ok(Some(child));
-            }
-        }
-        Ok(None)
     }
     pub fn required(&self, parent: usize, name: &str) -> Result<usize> {
         self.member(parent, name)?.ok_or(Error::Schema)

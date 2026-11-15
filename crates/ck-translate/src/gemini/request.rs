@@ -444,7 +444,7 @@ pub(super) fn originals(doc: &Document, parent: usize, carrier: Option<&str>, e:
         let Value::String(text) = doc.node(pointer)?.value else {
             return Err(Error::Schema);
         };
-        let name = Name::Pointer(text);
+        let name = doc.pointer_name(text)?;
         let mut shadowed = false;
         for child in doc.children(parent)? {
             if let Some(current) = doc.node(child)?.name {

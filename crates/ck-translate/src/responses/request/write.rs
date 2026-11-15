@@ -4,7 +4,7 @@ use super::reasoning::write_reasoning_options;
 use crate::codec::chat::request::{gemini, json_schema};
 use crate::codec::{
     Error, Operation, RequestView, Result,
-    document::{Document, Name, Value},
+    document::{Document, Value},
     encode::Encoder,
 };
 use results::write_results;
@@ -28,7 +28,7 @@ fn originals(doc: &Document, target: usize, e: &mut Encoder<'_, '_>, skip: &[&st
         let Value::String(text) = doc.node(pointer)?.value else {
             return Err(Error::Schema);
         };
-        let field_name = Name::Pointer(text);
+        let field_name = doc.pointer_name(text)?;
         let mut skipped = false;
         for name in skip {
             skipped |= doc.name_is(field_name, name)?;

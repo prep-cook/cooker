@@ -496,7 +496,7 @@ fn write_part(
                 continue;
             }
             comma(&mut first, e)?;
-            doc.write_name(crate::codec::document::Name::Pointer(text), e)?;
+            doc.write_name(doc.pointer_name(text)?, e)?;
             e.bytes(b":")?;
             doc.write(doc.required(entry, "value")?, e)?;
         }

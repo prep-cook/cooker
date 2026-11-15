@@ -60,23 +60,20 @@ pub fn pointer(doc: &Document, mut node: usize, e: &mut Encoder<'_, '_>) -> Resu
 /// stored bytes are contiguous and need no JSON escape is copied in unescaped runs; any other
 /// name is decoded one scalar at a time.
 pub(crate) fn write_pointer_segment(doc: &Document, name: Name, e: &mut Encoder<'_, '_>) -> Result<()> {
-    let encoded = matches!(name, Name::Pointer(_));
+    let encoded = matches!(name, Name::Pointer(..));
     let raw = match name {
         Name::Static(name) => Some(name.as_bytes()),
-        Name::Mapped(text) | Name::Pointer(text) if text.span.len() >= 2 => doc.source(text)?.slice(Span {
+        Name::Mapped(text, _) if text.span.len() >= 2 => doc.source(text)?.slice(Span {
             start: text.span.start + 1,
             end: text.span.end - 1,
         })?,
+        Name::Pointer(text, _) => doc.source(text)?.slice(text.span)?,
         _ => None,
     };
     if let Some(bytes) = raw.filter(|bytes| plain(bytes, encoded)) {
         if encoded {
             // A pointer name is the stored pointer's last segment, already encoded.
-            let start = bytes
-                .iter()
-                .rposition(|&byte| byte == b'/')
-                .map_or(0, |slash| slash + 1);
-            return e.bytes(&bytes[start..]);
+            return e.bytes(bytes);
         }
         let mut start = 0;
         for (index, &byte) in bytes.iter().enumerate() {
