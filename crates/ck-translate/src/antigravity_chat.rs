@@ -13,8 +13,8 @@ use crate::common::{
     UserTurnDrops, gemini_part_is_sendable, go_lower, go_upper, normalize_openai_file_data, now_nanos,
     parse_rfc3339_unix, restore_sanitized_tool_name, sanitize_claude_tool_id, system_reminder_text, trim_space,
 };
-use crate::gemini::attach_default_safety_settings;
 use crate::gemini_chat_request::{audio_mime, content_node, function_declaration, text_part};
+use crate::gemini_gemini::attach_default_safety_settings;
 use crate::responses_tools::{disambiguated_tool_name_map, map_sanitized_function_name, sanitized_function_name_map};
 use crate::stream::GoStream;
 use crate::{Error, Registered, ResponseCtx, thinking};

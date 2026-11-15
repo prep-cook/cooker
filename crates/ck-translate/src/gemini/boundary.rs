@@ -1,6 +1,7 @@
 //! Gemini generation and count boundaries over the canonical inference stream.
 
 pub mod egress;
+pub mod envelope;
 pub mod request;
 mod request_content;
 mod request_encode;

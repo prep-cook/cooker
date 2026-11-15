@@ -11,7 +11,7 @@ use ck_wire::signature::{
 };
 
 use crate::common::{go_lower, restore_sanitized_tool_name, trim_space};
-use crate::gemini::{attach_default_safety_settings, has_function_response};
+use crate::gemini_gemini::{attach_default_safety_settings, has_function_response};
 use crate::responses_tools::{disambiguated_tool_name_map, map_sanitized_function_name, sanitized_function_name_map};
 use crate::stream::GoStream;
 use crate::{Error, Registered, ResponseCtx};
@@ -21,7 +21,7 @@ pub static PAIR: Registered = registered!(
     request: |ctx, body| Ok(convert(ctx.model, body)),
     non_stream: |ctx, body| Ok(non_stream(ctx.original_request, body)),
     go_stream: go_stream,
-    token_count: Some(crate::gemini::token_count),
+    token_count: Some(crate::gemini_gemini::token_count),
 );
 
 /// The part fields that can carry a function name.

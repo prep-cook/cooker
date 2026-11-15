@@ -183,6 +183,7 @@ pub trait RequestIngress {
     /// Deadline for the oldest ready payload still awaiting publication, or none.
     /// The owner must schedule `flush` even while input is idle, and recheck this
     /// after every advance/flush. Later input must not postpone an existing deadline.
+    /// Deadlines and collection delays read the owner's store clock, [`Writer::now`].
     fn flush_deadline(&self) -> Option<std::time::Instant>;
 
     /// Publish ready payload without completing the request or an open media object.

@@ -55,8 +55,7 @@ fn completed(mapped: &Mapped) -> Option<Value> {
 }
 
 /// 500 audio deltas of 40 bytes each fit a 16-frame pool: they share data records instead of
-/// costing a frame-aligned record each. The codec's 100 ms flush delay reads the wall clock, so a
-/// slow host may publish a few extra records; the bound only rules out one record per delta.
+/// costing a frame-aligned record each. The store clock stands still, so no deadline passes.
 #[test]
 fn streamed_audio_deltas_share_data_records() {
     let raw = sample(500 * 40);
@@ -68,7 +67,7 @@ fn streamed_audio_deltas_share_data_records() {
     ingress.finish(&mut mapped.writer).unwrap();
     let (records, bytes) = data_records(&mapped);
     assert_eq!(bytes, raw);
-    assert!(records <= 25, "{records} data records");
+    assert_eq!(records, raw.len().div_ceil(THRESHOLD));
     assert_eq!(completed(&mapped).unwrap()["bytes"], raw.len());
 }
 
@@ -81,21 +80,12 @@ fn held_audio_publishes_when_it_fills_a_record() {
     let mut ingress = streamed(&mut mapped);
     let stream: String = raw.chunks(3000).map(|piece| audio(&encode(piece))).collect();
     feed(&mut ingress, &mut mapped, &stream);
-    // The tenth delta reaches the threshold; the wall-clock deadline may publish more on a
-    // slow host, never less.
     let (records, bytes) = data_records(&mapped);
     assert_eq!(THRESHOLD.div_ceil(3000) * 3000, 30_000);
-    assert!(
-        bytes.len() >= 30_000 && records <= 2,
-        "{records} records, {} bytes",
-        bytes.len()
-    );
-    assert_eq!(bytes, raw[..bytes.len()]);
+    assert_eq!((records, bytes), (1, raw[..30_000].to_vec()));
     feed(&mut ingress, &mut mapped, &end());
     ingress.finish(&mut mapped.writer).unwrap();
-    let (records, bytes) = data_records(&mapped);
-    assert_eq!(bytes, raw);
-    assert!(records <= 3, "{records} data records");
+    assert_eq!(data_records(&mapped), (2, raw));
 }
 
 /// Base64 quartets split across SSE records decode into one record; a flush publishes only the
@@ -113,19 +103,13 @@ fn audio_quartets_split_across_records_share_a_record() {
     let mut ingress = streamed(&mut mapped);
     // 143 pieces of 7 characters hold 1,001 characters: 250 quartets and one split character.
     let stream: String = pieces[..143].iter().map(|piece| audio(piece)).collect();
-    // The 100 ms deadline runs on the wall clock, so a slow host may publish once before the
-    // flush; the bytes published at each point are what the split quartet decides.
     feed(&mut ingress, &mut mapped, &stream);
     ingress.flush(&mut mapped.writer).unwrap();
-    let (records, bytes) = data_records(&mapped);
-    assert_eq!(bytes, raw[..750].to_vec());
-    assert!(records <= 2, "{records} data records");
+    assert_eq!(data_records(&mapped), (1, raw[..750].to_vec()));
     let stream: String = pieces[143..].iter().map(|piece| audio(piece)).collect::<String>() + &end();
     feed(&mut ingress, &mut mapped, &stream);
     ingress.finish(&mut mapped.writer).unwrap();
-    let (records, bytes) = data_records(&mapped);
-    assert_eq!(bytes, raw);
-    assert!(records <= 4, "{records} data records");
+    assert_eq!(data_records(&mapped), (2, raw));
 }
 
 /// Held audio reports a deadline at most 100 ms after collection starts, which later records do
@@ -134,12 +118,12 @@ fn audio_quartets_split_across_records_share_a_record() {
 fn held_audio_has_a_flush_deadline() {
     let raw = sample(4 * 30);
     let pieces: Vec<String> = raw.chunks(30).map(|piece| audio(&encode(piece))).collect();
-    let mut mapped = Mapped::new();
+    let clock = std::sync::Arc::new(ck_stream::ManualClock::default());
+    let mut mapped = Mapped::with_clock(clock.clone());
     let mut ingress = streamed(&mut mapped);
-    let began = std::time::Instant::now();
     feed(&mut ingress, &mut mapped, &pieces[0]);
     let deadline = ingress.flush_deadline().unwrap();
-    assert!(deadline > began && deadline <= std::time::Instant::now() + std::time::Duration::from_millis(100));
+    assert_eq!(deadline, mapped.writer.now() + std::time::Duration::from_millis(100));
     feed(&mut ingress, &mut mapped, &pieces[1]);
     assert_eq!(ingress.flush_deadline(), Some(deadline));
     assert_eq!(data_records(&mapped).0, 0);
@@ -147,7 +131,7 @@ fn held_audio_has_a_flush_deadline() {
     assert!(ingress.flush_deadline().is_none());
     assert_eq!(data_records(&mapped), (1, raw[..60].to_vec()));
     feed(&mut ingress, &mut mapped, &pieces[2]);
-    std::thread::sleep(std::time::Duration::from_millis(101));
+    clock.advance(std::time::Duration::from_millis(100));
     feed(&mut ingress, &mut mapped, &pieces[3]);
     assert!(ingress.flush_deadline().is_none());
     assert_eq!(data_records(&mapped), (2, raw.clone()));

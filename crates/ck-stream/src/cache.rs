@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     hash::{BuildHasherDefault, Hasher},
     io,
     ops::Bound::{Excluded, Unbounded},
@@ -20,72 +20,15 @@ use crate::{
     publication::{State, Stream},
 };
 
+mod clock;
+mod evict;
 mod stats;
-use stats::Failures;
-pub use stats::StoreStats;
-
-/// Monotonic elapsed time. Implementations must never move backwards.
-pub trait Clock: Send + Sync + 'static {
-    /// Must not panic: reads and lease drops call it after taking frame references and
-    /// metadata charges, and an unwind there strands both.
-    fn now(&self) -> Duration;
-}
-
-pub struct MonotonicClock(Instant);
-impl Default for MonotonicClock {
-    fn default() -> Self {
-        Self(Instant::now())
-    }
-}
-impl Clock for MonotonicClock {
-    fn now(&self) -> Duration {
-        self.0.elapsed()
-    }
-}
-
-/// Injectable clock for retention tests and storage measurements, not wall-clock time.
-#[derive(Default)]
-pub struct ManualClock(AtomicU64);
-impl ManualClock {
-    pub fn advance(&self, duration: Duration) {
-        let nanos = u64::try_from(duration.as_nanos()).expect("clock duration fits u64");
-        checked_add(&self.0, nanos).expect("clock does not overflow");
-    }
-}
-impl Clock for ManualClock {
-    fn now(&self) -> Duration {
-        Duration::from_nanos(self.0.load(Ordering::Acquire))
-    }
-}
-
-fn checked_add(counter: &AtomicU64, increment: u64) -> Option<u64> {
-    let mut old = counter.load(Ordering::Acquire);
-    loop {
-        let new = old.checked_add(increment)?;
-        match counter.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(old),
-            Err(current) => old = current,
-        }
-    }
-}
+use clock::checked_add;
+pub use clock::{Clock, ManualClock, MonotonicClock};
+use stats::{Failures, Maintenance};
+pub use stats::{MaintenanceFailures, StoreStats};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Maintenance failures since the store opened. The crate has no logger: the runtime reads
-/// these counters and the first unread error (`Store::take_reclaim_error`) and logs them.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MaintenanceFailures {
-    /// Ticks whose expiry or decay returned an I/O error.
-    pub errors: u64,
-    /// Ticks that panicked. The maintenance thread contains each panic and keeps running.
-    pub panics: u64,
-}
-
-#[derive(Default)]
-struct Maintenance {
-    failures: MaintenanceFailures,
-    first_error: Option<io::Error>,
-}
 
 /// Hashes stream ids by one multiplication. The store assigns ids sequentially, so no client
 /// chooses the keys in the table, and a lookup skips SipHash's cost.
@@ -187,6 +130,8 @@ pub(crate) struct Inner {
 
 pub(crate) struct Retention {
     clock: Arc<dyn Clock>,
+    /// The instant at which `clock` reads zero.
+    epoch: Instant,
     fence: RwLock<()>,
     active: AtomicBool,
     pub(crate) failures: Failures,
@@ -232,6 +177,10 @@ impl Retention {
     pub(crate) fn now(&self) -> Duration {
         self.clock.now()
     }
+
+    pub(crate) fn instant(&self) -> Instant {
+        self.epoch + self.clock.now()
+    }
 }
 
 struct RetentionGuard<'a> {
@@ -246,67 +195,20 @@ impl Drop for RetentionGuard<'_> {
 }
 
 impl Inner {
-    /// Invalidate the least recently read streams whose `gain` (what invalidation returns now)
-    /// together covers `wanted`. Streams that would return nothing stay cached; if every
-    /// candidate together cannot cover the request, nothing is invalidated and this returns false.
-    fn evict(&self, exclude: Option<u64>, wanted: usize, gain: fn(&Stream, &State) -> usize) -> bool {
-        let _retention = self.retention.retain();
-        let mut cache = self.cache.lock();
-        let mut victims = Vec::new();
-        let mut found = 0;
-        let mut refreshed = HashSet::new();
-        let mut cursor = None;
-        while found < wanted {
-            let next = match cursor {
-                None => cache.order.first(),
-                Some(key) => cache.order.range((Excluded(key), Unbounded)).next(),
-            };
-            let Some(&key) = next else {
-                break;
-            };
-            cursor = Some(key);
-            if Some(key.1) == exclude {
-                continue;
-            }
-            let stream = cache.streams[&key.1].stream.clone();
-            let state = stream.state.lock();
-            // Queue timestamps are lower bounds. Once maintenance has observed a stream, the
-            // fence holds off new leases, so one requeue at the real value is exact except for
-            // an acknowledgement racing this pass, which then counts as arriving after it.
-            let last_read = stream.last_read();
-            if last_read != key.0 && refreshed.insert(key.1) {
-                drop(state);
-                cache.requeue(key, last_read);
-                continue;
-            }
-            let returned = gain(&stream, &state);
-            if returned > 0 {
-                found += returned;
-                victims.push(key);
-            }
-        }
-        if found < wanted {
-            return false;
-        }
-        #[cfg(test)]
-        if let Some(hook) = self.evict_hook.lock().take() {
-            hook();
-        }
-        cache.evictions += victims.len() as u64;
-        for key in victims {
-            let stream = cache.remove(key.1).unwrap();
-            stream.invalidate_locked(&mut stream.state.lock());
-            cache.retire(&stream);
-        }
-        true
-    }
-
     fn tick(&self) -> io::Result<()> {
         let now = self.retention.clock.now();
         {
             let _retention = self.retention.retain();
             let mut cache = self.cache.lock();
-            while let Some(&(read, id)) = cache.order.first() {
+            let mut cursor = None;
+            loop {
+                let next = match cursor {
+                    None => cache.order.first(),
+                    Some(key) => cache.order.range((Excluded(key), Unbounded)).next(),
+                };
+                let Some(&(read, id)) = next else {
+                    break;
+                };
                 if now.saturating_sub(read) <= self.limits.cache_ttl {
                     break;
                 }
@@ -319,6 +221,12 @@ impl Inner {
                 let last_read = stream.last_read();
                 if last_read != read {
                     cache.requeue((read, id), last_read);
+                    continue;
+                }
+                // A held request stays while a dependent is cached, and expires on the first
+                // tick after the last one leaves.
+                if stream.is_held() {
+                    cursor = Some((read, id));
                     continue;
                 }
                 cache.remove(id);
@@ -407,10 +315,16 @@ pub struct Store {
 
 impl Store {
     pub fn open(config: Config) -> io::Result<Self> {
-        Self::with_clock(config, Arc::new(MonotonicClock::default()))
+        let epoch = Instant::now();
+        Self::start(config, Arc::new(MonotonicClock(epoch)), epoch)
     }
 
+    /// [`Writer::now`] then reads `clock` from the time of this call.
     pub fn with_clock(config: Config, clock: Arc<dyn Clock>) -> io::Result<Self> {
+        Self::start(config, clock, Instant::now())
+    }
+
+    fn start(config: Config, clock: Arc<dyn Clock>, epoch: Instant) -> io::Result<Self> {
         let limits = config.resolve()?;
         let pool = Arc::new(Pool::open(
             &config.directory,
@@ -425,6 +339,7 @@ impl Store {
             cache: parking_lot::Mutex::new(Cache::default()),
             retention: Arc::new(Retention {
                 clock,
+                epoch,
                 fence: RwLock::new(()),
                 active: AtomicBool::new(false),
                 failures: Failures::default(),
@@ -481,6 +396,30 @@ impl Store {
 
     /// Admit one exclusive producer. The returned id is an internal generation, not an auth token.
     pub fn create(&self) -> Result<Writer, Error> {
+        self.admit(None)
+    }
+
+    /// Admit a response stream that depends on `request`, the request stream of its exchange
+    /// (INTERNAL-STREAM.md §6.4): the response charges the request's frame and metadata quota,
+    /// and the request neither expires nor is evicted on its own while a dependent is cached.
+    /// `Gone` if the request left the cache; `InvalidRecord` if `request` is itself dependent
+    /// or belongs to another store.
+    pub fn create_dependent(&self, request: &Writer) -> Result<Writer, Error> {
+        // Another store's request has another cache lock and other limits.
+        if !Arc::ptr_eq(request.store(), &self.inner) {
+            return Err(Error::InvalidRecord);
+        }
+        let request = request.stream();
+        // Charged before admission may evict another stream for a header slot.
+        request.charge_dependency()?;
+        let admitted = self.admit(Some(request));
+        if admitted.is_err() {
+            request.release_dependency();
+        }
+        admitted
+    }
+
+    fn admit(&self, request: Option<&Arc<Stream>>) -> Result<Writer, Error> {
         // Header slots bound the mapping, not the cache: when none is free, evict the least
         // recently read stream exactly as under frame pressure. Invalidation frees its slot.
         let slot = loop {
@@ -490,7 +429,10 @@ impl Store {
             if let Some(slot) = self.inner.pool.claim_slot() {
                 break slot;
             }
-            if !self.inner.evict(None, 1, State::slot_count) {
+            if !self
+                .inner
+                .evict(request.map(|request| request.id), 1, State::slot_count)
+            {
                 self.inner.retention.failures.record(None);
                 return Err(Error::StorageExhausted);
             }
@@ -501,6 +443,8 @@ impl Store {
         } else {
             checked_add(&NEXT_ID, 1).ok_or(Error::StorageExhausted)
         }
+        // Linked under the cache lock, which eviction and expiry hold until they invalidate.
+        .and_then(|id| request.map_or(Ok(id), |request| request.depend(&request.state.lock()).map(|()| id)))
         .inspect_err(|_| self.inner.pool.release_slot(slot))?;
         let now = self.inner.retention.clock.now();
         let stream = Arc::new(Stream::new(
@@ -510,6 +454,7 @@ impl Store {
             self.inner.retention.clone(),
             self.inner.limits,
             now,
+            request.cloned(),
         ));
         cache.insert(stream.clone());
         Ok(Writer::new(self.inner.clone(), stream))

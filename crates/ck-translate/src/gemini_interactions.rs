@@ -12,8 +12,8 @@ use crate::common::{
     UserRun, UserTurnDrops, gemini_part_is_sendable, go_lower, go_runes, go_upper, interactions_attachment_type,
     is_interactions_instruction_step, normalize_openai_file_data, trim_space,
 };
-use crate::gemini::{reorder_user_parts, set_function_response_result};
 use crate::gemini_chat_request::content_node;
+use crate::gemini_gemini::{reorder_user_parts, set_function_response_result};
 use crate::gemini_interactions_response as response;
 use crate::{Registered, stream};
 

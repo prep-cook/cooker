@@ -29,8 +29,8 @@ impl Reader {
             if after > state.next_sequence {
                 return (Err(Error::InvalidPosition), false);
             }
-            if READER_BYTES > stream.limits.max_metadata_bytes.saturating_sub(Stream::metadata(state)) {
-                return (Err(Error::StorageExhausted), false);
+            if let Err(error) = stream.charge_metadata(READER_BYTES) {
+                return (Err(error), false);
             }
             state.readers += 1;
             (Ok(()), true)
@@ -136,6 +136,7 @@ impl Drop for Reader {
     fn drop(&mut self) {
         self.stream.retention.reading(&self.stream, |state| {
             state.readers -= 1;
+            self.stream.release_metadata(READER_BYTES);
             ((), true)
         });
     }
@@ -228,6 +229,7 @@ impl Drop for Lease {
             if self.stream.pool.release(frame) {
                 // The stream had detached this frame; its last lease freed it.
                 self.stream.detached.fetch_sub(1, Ordering::AcqRel);
+                self.stream.release_frames(1);
             }
         }
         // Single-frame leases, the common case, own no list and take no lock.
@@ -235,6 +237,7 @@ impl Drop for Lease {
             let bytes = std::mem::size_of_val::<[u32]>(frames);
             drop(std::mem::take(frames));
             self.stream.state.lock().external_metadata -= bytes;
+            self.stream.release_metadata(bytes);
         }
     }
 }

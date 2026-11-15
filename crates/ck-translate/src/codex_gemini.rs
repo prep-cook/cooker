@@ -8,14 +8,14 @@ use sha2::{Digest, Sha256};
 
 use crate::common::{format_rfc3339_utc, go_lower, is_gemini_thought_part, trim_space};
 use crate::stream::GoStream;
-use crate::{Error, Registered, ResponseCtx, gemini};
+use crate::{Error, Registered, ResponseCtx, gemini_gemini};
 
 pub static PAIR: Registered = registered!(
     Gemini -> Codex,
     request: |ctx, body| Ok(convert(ctx.model, body)),
     non_stream: non_stream,
     go_stream: go_stream,
-    token_count: Some(gemini::token_count),
+    token_count: Some(gemini_gemini::token_count),
 );
 
 const NAME_LIMIT: usize = 64;

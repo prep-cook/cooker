@@ -15,4 +15,5 @@ pub(crate) mod models;
 pub(crate) mod openai;
 pub(crate) mod sanitize;
 pub(crate) mod speech;
+pub mod streams;
 pub(crate) mod videos;
