@@ -133,8 +133,17 @@ pub(crate) fn credential_headers(
     req: &ck_core::exec::ExecRequest,
     _original: &[u8],
 ) -> Vec<(String, String)> {
-    let session = ck_wire::session::cpa_session_id(req.session.as_deref());
-    ck_wire::headers::custom_headers(&credential.attributes, &req.headers, session.as_deref())
+    client_headers(credential, &req.headers, req.session.as_deref())
+}
+
+/// [`credential_headers`] from the client's request headers and canonical session.
+pub(crate) fn client_headers(
+    credential: &Credential,
+    client: &http::HeaderMap,
+    session: Option<&str>,
+) -> Vec<(String, String)> {
+    let session = ck_wire::session::cpa_session_id(session);
+    ck_wire::headers::custom_headers(&credential.attributes, client, session.as_deref())
 }
 
 /// Version reported where Go sends `buildinfo.Version`.

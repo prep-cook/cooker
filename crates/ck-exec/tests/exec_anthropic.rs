@@ -78,10 +78,25 @@ impl Fixture {
     /// `body` through the old route, read to its end: the selector's old arm
     /// (`Executors::execute`) when `selector`, else `ClaudeExecutor::execute` itself.
     async fn old_route(&self, body: &[u8], selector: bool) {
+        let req = self.old_request(body, OldOperation::Generate, UsageSink::default());
+        let (credential, cfg) = (&self.exchange.credential, &self.exchange.cfg);
+        let mut answer = if selector {
+            self.executors.execute(credential, req, cfg).await
+        } else {
+            self.executors.claude.execute(credential, req, cfg).await
+        }
+        .unwrap();
+        if let ck_core::exec::ResponseBody::Stream(events) = &mut answer.body {
+            while events.next().await.is_some() {}
+        }
+    }
+
+    /// The old route's request for an Anthropic client's `body`.
+    fn old_request(&self, body: &[u8], operation: OldOperation, usage: UsageSink) -> ExecRequest {
         let value: Value = serde_json::from_slice(body).unwrap();
         let exchange = &self.exchange;
-        let req = ExecRequest {
-            operation: OldOperation::Generate,
+        ExecRequest {
+            operation,
             source_format: Format::Claude,
             response_format: Format::Claude,
             requested_model: value["model"].as_str().unwrap().into(),
@@ -97,17 +112,7 @@ impl Fixture {
             headers: exchange.headers.clone(),
             caller: exchange.caller.clone(),
             resolved_model: None,
-            usage: UsageSink::default(),
-        };
-        let (credential, cfg) = (&exchange.credential, &exchange.cfg);
-        let mut answer = if selector {
-            self.executors.execute(credential, req, cfg).await
-        } else {
-            self.executors.claude.execute(credential, req, cfg).await
-        }
-        .unwrap();
-        if let ck_core::exec::ResponseBody::Stream(events) = &mut answer.body {
-            while events.next().await.is_some() {}
+            usage,
         }
     }
 
@@ -132,7 +137,7 @@ impl Fixture {
         }
         let attempt = self.exchange.attempt(&self.streams.store);
         let validated = self.executors.fence(&attempt, ingress, request).unwrap();
-        let handle = self.exchange.request(validated);
+        let handle = self.exchange.request_with(validated, body);
         let response = self.streams.response(request);
         let id = response.id();
         (self.executors.start(&attempt, &handle, request, response).await, id)
@@ -564,5 +569,7 @@ async fn request_side_facts_reach_the_usage_sink_and_response_usage_does_not() {
     assert!(!calls.iter().any(|c| c.starts_with("response_")), "{calls:?}");
 }
 
+#[path = "exec_anthropic/cloak.rs"]
+mod cloak;
 #[path = "exec_anthropic/parity.rs"]
 mod parity;

@@ -51,6 +51,8 @@ struct State {
     message_started: bool,
     finished: bool,
     terminal: bool,
+    /// `done` was published: the response is complete and canonical.
+    completed: bool,
 }
 impl Ingress {
     pub fn new(
@@ -89,9 +91,14 @@ impl Ingress {
                 message_started: false,
                 finished: false,
                 terminal: false,
+                completed: false,
             },
             failed: false,
         })
+    }
+    /// Whether the response completed: `done` was published, never after a failure.
+    pub fn completed(&self) -> bool {
+        self.state.completed
     }
     fn handle(&mut self, owner: &mut Writer, result: Result<()>) -> Result<()> {
         if let Err(error) = result {
@@ -408,6 +415,7 @@ impl State {
             |e| event_origin(origin, "message_stop", &["type"], e),
         )?;
         self.terminal = true;
+        self.completed = true;
         Ok(())
     }
 }

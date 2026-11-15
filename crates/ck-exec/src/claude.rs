@@ -25,7 +25,6 @@
 mod alias;
 mod betas;
 mod cloak;
-mod compaction;
 mod detect;
 mod execute;
 mod headers;
@@ -211,8 +210,8 @@ impl ClaudeExecutor {
 
     /// The old route, kept for the server's `claude` arm until D2 and for Kimi's delegation
     /// until P8. Everything only it reaches goes with the later of the two: `run`,
-    /// `generate_with`, `count_tokens`, `compact`, the `translate` module, `ck_translate::pair`
-    /// and the `UsageSink::response_*` calls.
+    /// `generate_with`, `count_tokens`, the `translate` module, `ck_translate::pair` and the
+    /// `UsageSink::response_*` calls.
     pub async fn execute(
         &self,
         credential: &Credential,
@@ -253,79 +252,26 @@ impl ClaudeExecutor {
                 || crate::antigravity_compaction::has_trigger(&req.body)
                 || crate::antigravity_compaction::has_trigger(&req.original_body)
             {
-                return Box::pin(self.compact(credential, req, cfg, delegation)).await;
+                // Messages has no native compaction, and the gateway writes no summary in its
+                // place (owner question 7): refused before any upstream call, as the
+                // contract's fence refuses it.
+                req.usage.discard();
+                return Err(ExecError::local(400, FailureScope::Request, execute::NO_COMPACT));
             }
         }
-        // Both paths are boxed: a request future of about 10 KB inline in every caller's
-        // state (the dispatch loop, Home, the WebSocket session) overflowed a 2 MiB
-        // worker stack in debug builds once the summary turn added a second one.
-        Box::pin(self.run(credential, req, cfg, delegation, false)).await
+        // Boxed: a request future of about 10 KB inline in every caller's state (the
+        // dispatch loop, Home, the WebSocket session) overflowed a 2 MiB worker stack in
+        // debug builds.
+        Box::pin(self.run(credential, req, cfg, delegation)).await
     }
 
-    /// `executeClaudeCompaction` / `executeClaudeCompactionStream`: a non-stream Claude
-    /// summary of the conversation, sealed into a compaction item.
-    async fn compact(
-        &self,
-        credential: &Credential,
-        mut req: ExecRequest,
-        cfg: &Config,
-        delegation: Delegation,
-    ) -> Result<ExecResponse, ExecError> {
-        let model = base_model(&req.model);
-        let stream = req.stream;
-        req.body = compaction::summary_payload(crate::antigravity_compaction::source_payload(
-            &req.body,
-            &req.original_body,
-        ))
-        .into();
-        req.original_body = Bytes::new();
-        req.alt = None;
-        req.stream = false;
-        req.source_format = Format::OpenAIResponse;
-        req.response_format = Format::Claude;
-        let answer = self.run(credential, req, cfg, delegation, true).await?;
-        let ResponseBody::Buffered(payload) = answer.body else {
-            return Err(crate::antigravity_compaction::statusless(
-                "extract summary: no summary text found in upstream response",
-            ));
-        };
-        let text = crate::antigravity_compaction::summary_text(&payload)
-            .map_err(|e| crate::antigravity_compaction::statusless(format!("extract summary: {e}")))?;
-        let sealed = crate::antigravity_compaction::seal(&text, &model)
-            .map_err(|e| crate::antigravity_compaction::statusless(format!("seal compaction capsule: {e}")))?;
-        let usage = compaction::Usage::of(&payload);
-        let mut headers = answer.headers;
-        if !stream {
-            return Ok(ExecResponse {
-                status: 200,
-                headers,
-                body: ResponseBody::Buffered(compaction::response(&model, &sealed, usage).into()),
-            });
-        }
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("text/event-stream"),
-        );
-        let chunks: Vec<Result<Bytes, ExecError>> = compaction::stream_chunks(&model, &sealed, usage)
-            .into_iter()
-            .map(|chunk| Ok(Bytes::from(chunk)))
-            .collect();
-        Ok(ExecResponse {
-            status: 200,
-            headers,
-            body: ResponseBody::Stream(futures_util::stream::iter(chunks).boxed()),
-        })
-    }
-
-    /// One Execute / ExecuteStream / CountTokens after compaction; `compaction_summary`
-    /// marks the summary turn of [`Self::compact`].
+    /// One Execute / ExecuteStream / CountTokens.
     async fn run(
         &self,
         credential: &Credential,
         req: ExecRequest,
         cfg: &Config,
         delegation: Delegation,
-        compaction_summary: bool,
     ) -> Result<ExecResponse, ExecError> {
         if req.response_format != Format::Claude && ck_translate::pair(req.response_format, Format::Claude).is_none() {
             return Err(ExecError::local(
@@ -339,8 +285,7 @@ impl ClaudeExecutor {
             req.resolved_model.as_ref(),
             req.execution_session.as_deref(),
         );
-        let mut ctx = Ctx::new(self, credential, attempt, cfg, delegation);
-        ctx.compaction_summary = compaction_summary;
+        let ctx = Ctx::new(self, credential, attempt, cfg, delegation);
         match req.operation {
             Operation::Generate => self.generate(ctx, req).await,
             Operation::CountTokens => self.count_tokens(ctx, req, delegation.count_upstream).await,
@@ -1019,10 +964,9 @@ struct Ctx<'a> {
     kimi: bool,
     /// `upstreamRequestLogProvider`: the provider request logs name.
     log_provider: &'static str,
-    /// The summary turn of a Responses compaction (`claudeCompactionSummaryFromContext`).
-    compaction_summary: bool,
-    /// The execution contract's path (`execute.rs`): the fence refuses what the old path
-    /// rewrote, and nothing collects a response body.
+    /// An execution contract request the cloak and the Claude Code identity leave alone
+    /// (`execute.rs`): the fence refuses what the old path rewrote. A request they shape is
+    /// prepared as on the old path (contract G5).
     contract: bool,
     /// Normalized execution-session ID (websocket executions), or empty.
     execution: String,
@@ -1381,7 +1325,6 @@ impl<'a> Ctx<'a> {
             upstream_model: delegation.upstream_model.map_or_else(|| base.clone(), |f| f(&base)),
             kimi: kimi_upstream(&credential.provider, &base_url),
             log_provider: delegation.request_log_provider.unwrap_or("claude"),
-            compaction_summary: false,
             contract: false,
             execution: session::normalize(execution_session.unwrap_or_default()),
             is_compat: resolved_model.is_some_and(|r| r.is_compat()),
@@ -1473,10 +1416,12 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// Whether the old content normalizers run: only on the old path. The contract path sends
-    /// the client's content as the fence accepted it, and the official API judges the rest:
-    /// no forced-tool or sampling rewrite, no signature sanitizing, no proxy-owned prefix
-    /// recovery and no Kimi attribution stripping. The cache rewrites, which change only the caller's cost, run on both
+    /// Whether the old content normalizers run: on the old path, and on the contract path for
+    /// a request the cloak or the Claude Code identity shapes (contract G5), which is prepared
+    /// as the old path prepares it. Any other contract request goes upstream as the fence
+    /// accepted it, and the official API judges the rest: no forced-tool or sampling rewrite,
+    /// no signature sanitizing, no proxy-owned prefix recovery and no Kimi attribution
+    /// stripping. The cache rewrites, which change only the caller's cost, run on both
     /// (owner question 14; P8 removes the old path).
     pub(super) fn legacy_body(&self) -> bool {
         !self.contract
@@ -1490,11 +1435,10 @@ impl<'a> Ctx<'a> {
         !self.contract || ck_wire::thinking::parse_suffix(req.model).has_suffix
     }
 
-    /// Whether the old route keeps this credential: the cloak would shape a request the
-    /// detection does not confirm as Claude Code, or the Claude Code identity applies.
-    /// Confirmation reads the client's own body, which `Execute` does not see (owner question
-    /// 13 removes this split).
-    pub(crate) fn old_route_only(&self) -> bool {
+    /// Whether the cloak may shape this credential's requests (one the detection does not
+    /// confirm as Claude Code), or the Claude Code identity applies. Such a request is
+    /// prepared from the client's own body on the execution contract too (contract G5).
+    pub(crate) fn may_cloak(&self) -> bool {
         self.cli_profile || self.wire_policy(false).0
     }
 
@@ -1775,9 +1719,6 @@ impl<'a> Ctx<'a> {
             // stripDefaultKimiClaudeCodeAttribution: Kimi reads the block as prompt text. The
             // contract path never deletes caller content.
             body = strip_attribution_system(&body);
-        }
-        if self.compaction_summary {
-            body = compaction::finalize(body);
         }
         // 868e137: the payload rules match the fully prepared body and apply once. Only
         // header extraction, signing and read-only checks follow.

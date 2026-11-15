@@ -1,4 +1,7 @@
-//! Kimi executor (internal/runtime/executor/kimi_executor.go).
+//! Kimi executor (internal/runtime/executor/kimi_executor.go): the old execution path. Chat,
+//! Gemini and Responses generations run under the execution contract (`kimi_exec`); this
+//! path keeps what that route sends back here (Claude Messages clients, token counts and
+//! Responses requests carrying a custom `apply_patch` tool) until D2 removes the old arm.
 //!
 //! Three wire paths, chosen by the client format:
 //! - Claude Messages: delegated to the Claude executor against Kimi's Anthropic-compatible
@@ -22,7 +25,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::{Credential, MetadataPatch};
-use ck_core::exec::{ExecError, ExecRequest, ExecResponse, ExecStream, FailureScope, Operation, ResponseBody};
+use ck_core::exec::{
+    ExecError, ExecRequest, ExecResponse, ExecStream, FailureScope, Operation, ResponseBody, UsageSink,
+};
 use ck_core::format::Format;
 use ck_translate::{RequestCtx, ResponseCtx, StreamTranslator, apply_patch_responses};
 use ck_wire::gostr::GoStr;
@@ -32,8 +37,9 @@ use futures_util::StreamExt;
 
 use crate::claude::{ClaudeExecutor, Delegation};
 use crate::kimi_auth::{self, DeviceFlow};
+use crate::kimi_edit;
 use crate::kimi_http::{
-    BUILD_VERSION, credential_headers, go_arch, go_os, hostname, payload_rules, refresh_due, rfc3339_local_now,
+    BUILD_VERSION, client_headers, go_arch, go_os, hostname, payload_rules, refresh_due, rfc3339_local_now,
     status_error,
 };
 use crate::kimi_http::{DeferredUsage, UsageRule, apply_patch_requested, defer_usage, report_model};
@@ -69,6 +75,11 @@ impl KimiExecutor {
             oauth_host: None,
             replay: Arc::default(),
         }
+    }
+
+    /// The HTTP client for `credential`'s effective proxy.
+    pub(crate) fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
+        self.clients.get(&Proxy::effective(credential, cfg))
     }
 
     /// Sends token refreshes to a local mock instead of auth.kimi.com / auth.kimi.ai.
@@ -210,7 +221,7 @@ pub(crate) fn base_url(credential: &Credential) -> String {
     kimi_auth::api_base(kimi_auth::resolve_domain(credential)).to_owned()
 }
 
-fn chat_url(credential: &Credential) -> String {
+pub(crate) fn chat_url(credential: &Credential) -> String {
     let base = base_url(credential);
     if base.ends_with("/v1") {
         format!("{base}/chat/completions")
@@ -219,7 +230,7 @@ fn chat_url(credential: &Credential) -> String {
     }
 }
 
-fn responses_url(credential: &Credential) -> String {
+pub(crate) fn responses_url(credential: &Credential) -> String {
     let base = base_url(credential);
     if base.ends_with("/v1") {
         format!("{base}/responses")
@@ -267,8 +278,14 @@ fn device_id(credential: &Credential) -> String {
         .unwrap_or_else(|_| "cli-proxy-api-device".into())
 }
 
-/// `applyKimiHeadersWithAuth` plus credential custom headers.
-fn headers(credential: &Credential, req: &ExecRequest, stream: bool) -> GoHeaders {
+/// `applyKimiHeadersWithAuth` plus credential custom headers; `client` and `session` are the
+/// client's request headers and canonical session.
+pub(crate) fn headers(
+    credential: &Credential,
+    client: &http::HeaderMap,
+    session: Option<&str>,
+    stream: bool,
+) -> GoHeaders {
     let mut h = GoHeaders::new();
     h.set("Content-Type", "application/json");
     h.set("Authorization", format!("Bearer {}", access_token(credential)));
@@ -286,7 +303,7 @@ fn headers(credential: &Credential, req: &ExecRequest, stream: bool) -> GoHeader
             "application/json"
         },
     );
-    for (name, value) in credential_headers(credential, req, original(req)) {
+    for (name, value) in client_headers(credential, client, session) {
         h.set(&name, value);
     }
     h
@@ -342,21 +359,21 @@ fn thinking(body: &[u8], req: &ExecRequest, to: &str) -> Result<Vec<u8>, ExecErr
 }
 
 /// Go's bufio.Scanner limits: 1 MiB for Chat Completions lines, 50 MiB for Responses.
-const CHAT_LINE_LIMIT: usize = 1_048_576;
-const RESPONSES_LINE_LIMIT: usize = 52_428_800;
+pub(crate) const CHAT_LINE_LIMIT: usize = 1_048_576;
+pub(crate) const RESPONSES_LINE_LIMIT: usize = 52_428_800;
 
 /// One upstream send (kimi_executor.go's four `RecordAPIRequest` sites): the capture of
 /// the request, its response metadata and a rejected response's body, then the send.
-async fn post(
+pub(crate) async fn post(
     client: &wreq::Client,
     credential: &Credential,
-    req: &ExecRequest,
+    usage: &UsageSink,
     url: &str,
     headers: GoHeaders,
     body: Vec<u8>,
 ) -> Result<Upstream, ExecError> {
     use crate::kimi_http::{capture_chunk, capture_error, capture_metadata, capture_request};
-    let capture = req.capture();
+    let capture = usage.capture();
     let (auth_type, auth_value) = ck_core::registry::dynamic::account_info(credential);
     capture_request(
         capture,
@@ -368,14 +385,14 @@ async fn post(
         (auth_type, &auth_value),
     );
     // Go's TrackHTTPClient: the TTFT runs from the request to the first body byte.
-    req.usage.round_trip_started();
+    usage.round_trip_started();
     // Go reads every Kimi body with a scanner or io.ReadAll: one cut short fails with
     // `unexpected EOF`.
     let mut upstream = send_scanned(client, url, headers, Bytes::from(body), None)
         .await
         .inspect_err(|e| capture_error(capture, e))?;
     capture_metadata(capture, upstream.status, &upstream.headers);
-    upstream.body = crate::kimi_http::track_first_byte(upstream.body, &req.usage, false);
+    upstream.body = crate::kimi_http::track_first_byte(upstream.body, usage, false);
     if !(200..300).contains(&upstream.status) {
         let error = status_error(upstream).await;
         // ponytail: the error body is the MAX_ERROR_BODY prefix (proxy.rs ceiling); Go
@@ -455,9 +472,9 @@ async fn execute_chat(
     let upstream = post(
         client,
         credential,
-        &req,
+        &req.usage,
         &chat_url(credential),
-        headers(credential, &req, req.stream),
+        headers(credential, &req.headers, req.session.as_deref(), req.stream),
         body.clone(),
     )
     .await?;
@@ -789,9 +806,9 @@ async fn execute_responses(
     let upstream = post(
         client,
         credential,
-        &req,
+        &req.usage,
         &responses_url(credential),
-        headers(credential, &req, req.stream),
+        headers(credential, &req.headers, req.session.as_deref(), req.stream),
         body.clone(),
     )
     .await?;
@@ -963,7 +980,7 @@ fn fallback_reasoning(msg: &Res<'_>, latest: Option<&[u8]>) -> Vec<u8> {
 
 /// `normalizeKimiToolMessageLinks`: drop empty assistant turns, repair tool_call_id links
 /// and give tool-calling assistant turns reasoning_content.
-fn normalize_tool_message_links(body: Vec<u8>) -> Result<Vec<u8>, ExecError> {
+pub(crate) fn normalize_tool_message_links(body: Vec<u8>) -> Result<Vec<u8>, ExecError> {
     if body.is_empty() || !gj::valid(&body) {
         return Ok(body);
     }
@@ -973,7 +990,7 @@ fn normalize_tool_message_links(body: Vec<u8>) -> Result<Vec<u8>, ExecError> {
     }
     let msgs = messages.array();
     let mut dropped = vec![false; msgs.len()];
-    let mut patches: Vec<(usize, &str, Vec<u8>, &str)> = Vec::new();
+    let mut patches: Vec<LinkPatch<'_>> = Vec::new();
     let mut pending: Vec<Vec<u8>> = Vec::new();
     let mut latest: Option<Vec<u8>> = None;
     for (index, msg) in msgs.iter().enumerate() {
@@ -1030,40 +1047,48 @@ fn normalize_tool_message_links(body: Vec<u8>) -> Result<Vec<u8>, ExecError> {
             _ => {}
         }
     }
-    let any_dropped = dropped.iter().any(|d| *d);
-    if !any_dropped && patches.is_empty() {
+    if !dropped.contains(&true) && patches.is_empty() {
         return Ok(body);
     }
-    if !any_dropped && patches.len() == 1 {
-        let (index, path, value, context) = &patches[0];
-        return gj::try_set_str(&body, &format!("messages.{index}.{path}"), value)
-            .map_err(|e| internal_error(format!("kimi executor: {context}: {e}")));
-    }
-    let mut items = Vec::with_capacity(msgs.len());
+    let edits = link_edits(&msgs, &dropped, &patches)?;
+    drop((msgs, messages));
+    let mut body = body;
+    kimi_edit::splice(&mut body, edits);
+    Ok(body)
+}
+
+/// A link patch: message index, member path, value and the error context.
+type LinkPatch<'p> = (usize, &'p str, Vec<u8>, &'p str);
+
+/// The in-place edits that patch messages and remove the `dropped` ones; only a patched
+/// message is copied, to set its members.
+fn link_edits(
+    msgs: &[Res<'_>],
+    dropped: &[bool],
+    patches: &[LinkPatch<'_>],
+) -> Result<Vec<kimi_edit::Edit>, ExecError> {
+    let spans: Vec<_> = msgs.iter().map(kimi_edit::span).collect();
+    let mut edits: Vec<_> = kimi_edit::removals(&spans, dropped)
+        .into_iter()
+        .map(|range| (range, Vec::new()))
+        .collect();
     let mut next = patches.iter().peekable();
     for (index, msg) in msgs.iter().enumerate() {
-        if dropped[index] {
-            continue;
-        }
-        let mut raw = msg.raw().to_vec();
+        let mut patched: Option<Vec<u8>> = None;
         while let Some((_, path, value, context)) = next.next_if(|p| p.0 == index) {
-            raw = gj::try_set_str(&raw, path, value)
-                .map_err(|e| internal_error(format!("kimi executor: {context}: {e}")))?;
+            let raw = patched.as_deref().unwrap_or(msg.raw());
+            let set = gj::try_set_str(raw, path, value);
+            patched = Some(set.map_err(|e| internal_error(format!("kimi executor: {context}: {e}")))?);
         }
-        items.push(raw);
+        if let Some(raw) = patched {
+            edits.push((spans[index].clone(), raw));
+        }
     }
-    gj::try_set_raw(&body, "messages", gj::join(&items)).map_err(|e| {
-        let context = if any_dropped {
-            "failed to drop empty assistant messages"
-        } else {
-            patches[0].3
-        };
-        internal_error(format!("kimi executor: {context}: {e}"))
-    })
+    Ok(edits)
 }
 
 /// `normalizeKimiTools`: inline local `$ref`s and default the root schema type.
-fn normalize_tools(body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn normalize_tools(body: Vec<u8>) -> Vec<u8> {
     if body.is_empty() {
         return body;
     }
@@ -1071,19 +1096,14 @@ fn normalize_tools(body: Vec<u8>) -> Vec<u8> {
     normalize_tool_list(body, "functions", false)
 }
 
-fn normalize_tool_list(body: Vec<u8>, key: &str, is_tools: bool) -> Vec<u8> {
+fn normalize_tool_list(mut body: Vec<u8>, key: &str, is_tools: bool) -> Vec<u8> {
     let items = gj::get(&body, key);
     if !items.is_array() {
         return body;
     }
-    let items = items.array();
-    if items.is_empty() {
-        return body;
-    }
-    let mut changed = false;
-    let mut updated = Vec::with_capacity(items.len());
-    for item in &items {
-        let mut raw = item.raw().to_vec();
+    // Only a schema that changes is copied, to normalize it; it replaces its span in place.
+    let mut edits = Vec::new();
+    for item in &items.array() {
         let path = if is_tools && item.get("function.parameters").exists() {
             Some("function.parameters")
         } else if item.get("parameters").exists() {
@@ -1095,20 +1115,15 @@ fn normalize_tool_list(body: Vec<u8>, key: &str, is_tools: bool) -> Vec<u8> {
             let params = item.get(path);
             if params.is_object() {
                 let normalized = normalize_parameters_schema(params.raw());
-                if normalized != params.raw()
-                    && let Ok(next) = gj::try_set_raw(&raw, path, &normalized)
-                {
-                    raw = next;
-                    changed = true;
+                if normalized != params.raw() {
+                    edits.push((kimi_edit::span(&params), normalized));
                 }
             }
         }
-        updated.push(raw);
     }
-    if !changed {
-        return body;
-    }
-    gj::try_set_raw(&body, key, gj::join(&updated)).unwrap_or(body)
+    drop(items);
+    kimi_edit::splice(&mut body, edits);
+    body
 }
 
 fn normalize_parameters_schema(raw: &[u8]) -> Vec<u8> {
@@ -1128,7 +1143,7 @@ fn normalize_parameters_schema(raw: &[u8]) -> Vec<u8> {
 }
 
 /// `normalizeKimiTemperature`: Kimi accepts only 0.6 without thinking and 1.0 with it.
-fn normalize_temperature(mut body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn normalize_temperature(mut body: Vec<u8>) -> Vec<u8> {
     let temperature = gj::get(&body, "temperature");
     if !temperature.exists() {
         return body;
@@ -1168,7 +1183,7 @@ fn is_tool_output(item: &Res<'_>) -> bool {
 
 /// `NormalizeKimiResponsesInput`: tool outputs must follow their parallel calls directly;
 /// items in between move after the outputs.
-fn normalize_responses_input(body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn normalize_responses_input(mut body: Vec<u8>) -> Vec<u8> {
     if body.is_empty() || !gj::valid(&body) {
         return body;
     }
@@ -1176,20 +1191,27 @@ fn normalize_responses_input(body: Vec<u8>) -> Vec<u8> {
     if !input.is_array() {
         return body;
     }
-    let items = input.array();
-    if items.is_empty() {
-        return body;
+    let moves = output_moves(&input.array());
+    drop(input);
+    for (front, unit) in moves {
+        body[front..unit.end].rotate_left(unit.start - front);
     }
-    let mut reordered = false;
-    let mut result: Vec<&[u8]> = Vec::with_capacity(items.len());
+    body
+}
+
+/// Where [`normalize_responses_input`] moves each tool output, in the order to apply them: the
+/// output with the separator before it (`unit`), to `front`, the start of the items that came
+/// between it and its calls. A moved item always follows a call, so it has a separator, and a
+/// move leaves the offsets before `front` and after the output as they were.
+fn output_moves(items: &[Res<'_>]) -> Vec<(usize, std::ops::Range<usize>)> {
+    let item_end = |k: usize| items[k].index + items[k].raw.len();
+    let mut moves = Vec::new();
     let mut i = 0;
     while i < items.len() {
         if !is_tool_call(&items[i]) {
-            result.push(items[i].raw());
             i += 1;
             continue;
         }
-        let start = i;
         let mut end = i;
         let mut ids: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
         let mut count = 0;
@@ -1201,56 +1223,62 @@ fn normalize_responses_input(body: Vec<u8>) -> Vec<u8> {
             }
             end += 1;
         }
-        result.extend(items[start..end].iter().map(|v| v.raw()));
-        if count == 0 {
+        let last = (count > 0).then(|| matched_outputs(items, end, &ids, count)).flatten();
+        let Some(last) = last else {
             i = end;
             continue;
-        }
-        let mut needed = ids.clone();
-        let mut remaining = count;
-        let mut last = None;
-        for (j, item) in items.iter().enumerate().skip(end) {
-            if remaining == 0 || is_tool_call(item) {
-                break;
-            }
-            if is_tool_output(item) {
-                let id = responses_call_id(item);
-                if let Some(n) = needed.get_mut(&id).filter(|n| **n > 0) {
-                    *n -= 1;
-                    remaining -= 1;
-                    last = Some(j);
-                }
-            }
-        }
-        match last.filter(|_| remaining == 0) {
-            Some(last) => {
-                let mut outputs = Vec::new();
-                let mut between = Vec::new();
-                let mut consumed = ids;
-                for item in &items[end..=last] {
-                    if is_tool_output(item) {
-                        let id = responses_call_id(item);
-                        if let Some(n) = consumed.get_mut(&id).filter(|n| **n > 0) {
-                            *n -= 1;
-                            outputs.push(item.raw());
-                            continue;
-                        }
+        };
+        let mut consumed = ids;
+        let mut front: Option<usize> = None;
+        for (k, item) in items.iter().enumerate().take(last + 1).skip(end) {
+            let matched = is_tool_output(item)
+                && match consumed.get_mut(&responses_call_id(item)) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        true
                     }
-                    between.push(item.raw());
+                    _ => false,
+                };
+            let unit = item_end(k - 1)..item_end(k);
+            match (matched, front) {
+                (false, None) => front = Some(unit.start),
+                (true, Some(at)) => {
+                    front = Some(at + unit.len());
+                    moves.push((at, unit));
                 }
-                reordered |= !between.is_empty();
-                result.extend(outputs);
-                result.extend(between);
-                i = last + 1;
+                _ => {}
             }
-            None => i = end,
+        }
+        i = last + 1;
+    }
+    moves
+}
+
+/// The index of the last of the outputs answering every call in `ids` (`count` in all) after
+/// the calls ending at `end`, before the next call; `None` if some call has no output there.
+fn matched_outputs(
+    items: &[Res<'_>],
+    end: usize,
+    ids: &std::collections::HashMap<Vec<u8>, usize>,
+    count: usize,
+) -> Option<usize> {
+    let mut needed = ids.clone();
+    let mut remaining = count;
+    let mut last = None;
+    for (j, item) in items.iter().enumerate().skip(end) {
+        if remaining == 0 || is_tool_call(item) {
+            break;
+        }
+        if is_tool_output(item) {
+            let id = responses_call_id(item);
+            if let Some(n) = needed.get_mut(&id).filter(|n| **n > 0) {
+                *n -= 1;
+                remaining -= 1;
+                last = Some(j);
+            }
         }
     }
-    if !reordered {
-        return body;
-    }
-    let joined = gj::join(&result);
-    gj::try_set_raw(&body, "input", joined).unwrap_or(body)
+    last.filter(|_| remaining == 0)
 }
 
 /// `restoreClaudeResponseModel`: put the client's model back on a Claude response body or

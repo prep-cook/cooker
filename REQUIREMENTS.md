@@ -168,6 +168,7 @@ Intentional designs that look like defects:
 | Polling pauses in hidden tabs | Avoid work for an unseen dashboard | Existing ui/REQUIREMENTS.md design |
 | ProviderIcon.tsx draws brand marks from vendored providerMarks.ts path data | Lucide lacks brand marks; monochrome vendored artwork follows text color; check:ui permits that file's SVG | Existing ui/REQUIREMENTS.md design; attribution/license provenance stays in the existing source and notices |
 | Optional Rosé Pine palettes (Main, Moon, Dawn) may fall below WCAG AA | Preserve the optional palettes' published colors; the default Neutral palette must meet AA. Measurements below distinguish AA failures from stricter project-target misses. | An owner, 2026-11-13: 「主題的話是例外的」 |
+| An Anthropic request the Claude OAuth cloak or Claude Code identity shapes goes upstream as prepared from the client's own bytes | The cloak's detection reads the client's member order and `cch` signs the body built from those bytes; re-encoding would change the identity, session and fingerprint (`docs/EXECUTION-CONTRACT.md`, G5) | An owner, 2026-11-16: 「別的按建議」, adopting option (a): 「在契約加一條 G5：把客戶端的原始位元組傳進執行器，只有 cloak 原樣送出，作為唯一的直通例外」 |
 
 Contrast inventory copied from `ui/REQUIREMENTS.md`. Browser rows cover rendered sign-in/System pages, open menus and info/error banners at 1440 px in English. Palette rows are computed mapped pairs, not proof they appear in a measured page. Dawn applies to both Rosé Pine palettes. Disabled text is exempt where noted; that does not exempt placeholder text.
 
