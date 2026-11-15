@@ -334,6 +334,151 @@ dependencies = [
 ]
 
 [[package]]
+name = "ck-core"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "http",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tracing",
+ "unsafe-libyaml",
+]
+
+[[package]]
+name = "ck-differential-driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "ck-core",
+ "ck-exec",
+ "ck-server",
+ "tokio",
+ "wreq",
+]
+
+[[package]]
+name = "ck-exec"
+version = "0.4.1"
+dependencies = [
+ "async-compression",
+ "base64 0.22.1",
+ "brotli-decompressor",
+ "btls",
+ "bytes",
+ "chrono",
+ "ck-core",
+ "ck-translate",
+ "ck-wire",
+ "flate2",
+ "futures-util",
+ "getrandom 0.3.4",
+ "gjson",
+ "http",
+ "http-body",
+ "httpdate",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "socket2",
+ "tiktoken-rs",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "windows-sys",
+ "wreq",
+]
+
+[[package]]
+name = "ck-server"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "axum",
+ "base64 0.22.1",
+ "bcrypt",
+ "btls",
+ "bytes",
+ "chrono",
+ "ck-core",
+ "ck-exec",
+ "ck-translate",
+ "ck-wire",
+ "flate2",
+ "futures-util",
+ "getrandom 0.3.4",
+ "gjson",
+ "http-body",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "socket2",
+ "subtle",
+ "tokio",
+ "tokio-btls",
+ "tokio-util",
+ "tower",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "windows-sys",
+ "wreq",
+ "zstd",
+]
+
+[[package]]
+name = "ck-translate"
+version = "0.4.1"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "ck-core",
+ "ck-wire",
+ "rand",
+ "regex",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "ck-wire"
+version = "0.4.1"
+dependencies = [
+ "base64 0.22.1",
+ "ck-core",
+ "http",
+ "memchr",
+ "ryu",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -378,151 +523,6 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
-
-[[package]]
-name = "ck-wire"
-version = "0.4.1"
-dependencies = [
- "base64 0.22.1",
- "ck-core",
- "http",
- "memchr",
- "ryu",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "tokio",
-]
-
-[[package]]
-name = "ck-core"
-version = "0.4.1"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "futures-util",
- "http",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "tracing",
- "unsafe-libyaml",
-]
-
-[[package]]
-name = "ck-differential-driver"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "ck-core",
- "ck-exec",
- "ck-server",
- "tokio",
- "wreq",
-]
-
-[[package]]
-name = "ck-exec"
-version = "0.4.1"
-dependencies = [
- "async-compression",
- "base64 0.22.1",
- "brotli-decompressor",
- "btls",
- "bytes",
- "chrono",
- "ck-wire",
- "ck-core",
- "ck-translate",
- "flate2",
- "futures-util",
- "getrandom 0.3.4",
- "gjson",
- "http",
- "http-body",
- "httpdate",
- "libc",
- "regex",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "socket2",
- "tiktoken-rs",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tower",
- "tracing",
- "url",
- "uuid",
- "windows-sys",
- "wreq",
-]
-
-[[package]]
-name = "ck-server"
-version = "0.4.1"
-dependencies = [
- "anyhow",
- "async-compression",
- "axum",
- "base64 0.22.1",
- "bcrypt",
- "btls",
- "bytes",
- "chrono",
- "ck-wire",
- "ck-core",
- "ck-exec",
- "ck-translate",
- "flate2",
- "futures-util",
- "getrandom 0.3.4",
- "gjson",
- "http-body",
- "hyper",
- "hyper-util",
- "libc",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "socket2",
- "subtle",
- "tokio",
- "tokio-btls",
- "tokio-util",
- "tower",
- "tower-service",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "windows-sys",
- "wreq",
- "zstd",
-]
-
-[[package]]
-name = "ck-translate"
-version = "0.4.1"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "ck-wire",
- "ck-core",
- "rand",
- "regex",
- "serde_json",
- "sha2",
- "uuid",
-]
 
 [[package]]
 name = "cpufeatures"
@@ -641,9 +641,9 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "flate2"
-version = "1.1.10"
+version = "1.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+checksum = "626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
@@ -2058,9 +2058,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.29.0"
+version = "1.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
+checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -2450,27 +2450,27 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.14.0"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "8.0.0"
+version = "8.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae42c0555055784c70058d19ba8e275528e8a99a706684868ace5da4e716a4ab"
+checksum = "5a9ea9cc2576c2fcc104e9cec04f46e3ede564f4fbc206831e4ef7e859a4140d"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.0+zstd.1.5.7"
+version = "2.1.3+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
+checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
 dependencies = [
  "cc",
  "pkg-config",
