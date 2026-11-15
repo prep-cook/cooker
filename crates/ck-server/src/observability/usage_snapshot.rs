@@ -10,7 +10,7 @@ use ck_translate::codec::{self, RequestView, internal};
 /// snapshot (`docs/INTERNAL-STREAM.md` §3.5), read from the attempt's stream by a
 /// runtime-owned reader, independently of client delivery and resume. A later snapshot
 /// replaces the whole value; snapshots are never summed. `None` is an absent count, never zero.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CanonicalUsage {
     /// Inclusive input.
     pub input_tokens: Option<u64>,
@@ -24,9 +24,117 @@ pub struct CanonicalUsage {
     pub cache_write_5m_tokens: Option<u64>,
     /// `cache_write_by_ttl["3600"]`.
     pub cache_write_1h_tokens: Option<u64>,
+    /// `cache_write_by_ttl["1800"]`.
+    pub cache_write_30m_tokens: Option<u64>,
+    /// `cache_write_by_ttl["43200"]`.
+    pub cache_write_12h_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+    /// The tier the source's own usage reports ([`TIERS`]).
+    pub service_tier: Option<String>,
+    /// The billed units besides the token counts that the snapshot reports, in [`DIMENSIONS`]
+    /// order. An unreported dimension is not listed.
+    pub dimensions: Vec<(&'static str, Dimension)>,
     /// The snapshot is the scope's last authoritative one.
     pub final_snapshot: bool,
+}
+
+/// One billed unit's reported value. Each dimension keeps its own unit: counts of different
+/// dimensions are never added or priced alike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dimension {
+    Count(u64),
+    Text(String),
+}
+
+/// The billing dimensions accounting records besides the token counts: `(source protocol, path
+/// in its native usage, record name, whether a count)`. Both accounting paths read these rows:
+/// the canonical snapshot's `native` value, which keeps provider fields isolated (Q3), and the
+/// legacy parsers' upstream usage object. A provider unit adds a row for each billed unit its
+/// usage reports.
+const DIMENSIONS: &[(&str, &[&str], &str, bool)] = &[
+    (
+        "chat",
+        &["prompt_tokens_details", "audio_tokens"],
+        "input_audio_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["prompt_tokens_details", "text_tokens"],
+        "input_text_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["prompt_tokens_details", "image_tokens"],
+        "input_image_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["completion_tokens_details", "audio_tokens"],
+        "output_audio_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["completion_tokens_details", "text_tokens"],
+        "output_text_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["completion_tokens_details", "image_tokens"],
+        "output_image_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["completion_tokens_details", "accepted_prediction_tokens"],
+        "accepted_prediction_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["completion_tokens_details", "rejected_prediction_tokens"],
+        "rejected_prediction_tokens",
+        true,
+    ),
+    ("anthropic", &["speed"], "speed", false),
+    ("anthropic", &["inference_geo"], "inference_geo", false),
+    (
+        "anthropic",
+        &["server_tool_use", "web_search_requests"],
+        "web_search_requests",
+        true,
+    ),
+    (
+        "anthropic",
+        &["server_tool_use", "web_fetch_requests"],
+        "web_fetch_requests",
+        true,
+    ),
+];
+
+/// The service tier inside a source's native usage: `(protocol, member)`.
+const TIERS: &[(&str, &str)] = &[("anthropic", "service_tier"), ("gemini", "serviceTier")];
+
+/// The [`DIMENSIONS`] rows of one source protocol: `(path, record name, whether a count)`.
+pub(crate) fn dimension_rows(protocol: &str) -> impl Iterator<Item = (&'static [&'static str], &'static str, bool)> {
+    DIMENSIONS
+        .iter()
+        .filter(move |row| row.0 == protocol)
+        .map(|&(_, path, name, count)| (path, name, count))
+}
+
+/// The usage member, the first segment of its [`DIMENSIONS`] path, holding the dimension `name`.
+pub(crate) fn dimension_member(name: &str) -> Option<&'static str> {
+    DIMENSIONS.iter().find(|row| row.2 == name).map(|row| row.1[0])
+}
+
+/// The usage member holding one source protocol's service tier ([`TIERS`]).
+pub(crate) fn tier_member(protocol: &str) -> Option<&'static str> {
+    TIERS.iter().find(|row| row.0 == protocol).map(|row| row.1)
 }
 
 /// Response facts the usage record keeps besides counts, read from the same stream: the
@@ -89,12 +197,83 @@ fn snapshot(doc: &Document) -> codec::Result<CanonicalUsage> {
         cache_write_tokens: count(usage, "cache_write_tokens")?,
         cache_write_5m_tokens: by_ttl("300")?,
         cache_write_1h_tokens: by_ttl("3600")?,
+        cache_write_30m_tokens: by_ttl("1800")?,
+        cache_write_12h_tokens: by_ttl("43200")?,
         reasoning_tokens: count(usage, "reasoning_tokens")?,
+        service_tier: native_tier(doc, usage)?,
+        dimensions: dimensions(doc, usage)?,
         final_snapshot: match doc.member(usage, "final")? {
             Some(node) => matches!(doc.node(node)?.value, Value::Bool(true)),
             None => false,
         },
     })
+}
+
+/// The node at `path` below `node`, through objects only.
+fn at(doc: &Document, mut node: usize, path: &[&str]) -> codec::Result<Option<usize>> {
+    for name in path {
+        if !matches!(doc.node(node)?.value, Value::Object) {
+            return Ok(None);
+        }
+        match doc.member(node, name)? {
+            Some(child) => node = child,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(node))
+}
+
+/// The value of one dimension: an unsigned count or a string, as its row declares. Null, a
+/// count that is not an unsigned integer and a value of the other kind report nothing the
+/// record can name, so the dimension stays absent.
+fn dimension(doc: &Document, node: usize, count: bool) -> codec::Result<Option<Dimension>> {
+    match doc.node(node)?.value {
+        Value::Unsigned(_) | Value::Number(_) if count => match doc.unsigned(node) {
+            Ok(n) => Ok(Some(Dimension::Count(n))),
+            Err(codec::Error::Schema) => Ok(None),
+            Err(error) => Err(error),
+        },
+        Value::String(_) | Value::Text(_) if !count => string(doc, node).map(|text| Some(Dimension::Text(text))),
+        _ => Ok(None),
+    }
+}
+
+/// The native value of `usage` and its source protocol.
+fn native(doc: &Document, usage: usize) -> codec::Result<Option<(usize, String)>> {
+    let Some(native) = doc.member(usage, "native")? else {
+        return Ok(None);
+    };
+    match (doc.member(native, "protocol")?, doc.member(native, "value")?) {
+        (Some(protocol), Some(value)) if matches!(doc.node(protocol)?.value, Value::String(_) | Value::Text(_)) => {
+            Ok(Some((value, string(doc, protocol)?)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn dimensions(doc: &Document, usage: usize) -> codec::Result<Vec<(&'static str, Dimension)>> {
+    let mut found = Vec::new();
+    if let Some((value, protocol)) = native(doc, usage)? {
+        for (path, name, count) in dimension_rows(&protocol) {
+            if let Some(node) = at(doc, value, path)?
+                && let Some(value) = dimension(doc, node, count)?
+            {
+                found.push((name, value));
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn native_tier(doc: &Document, usage: usize) -> codec::Result<Option<String>> {
+    if let Some((value, protocol)) = native(doc, usage)?
+        && let Some(member) = tier_member(&protocol)
+        && let Some(node) = at(doc, value, &[member])?
+        && let Some(Dimension::Text(tier)) = dimension(doc, node, false)?
+    {
+        return Ok(Some(tier));
+    }
+    Ok(None)
 }
 
 /// The root member `name`: `None` when absent, `Some(None)` for `null`, else its text.
@@ -105,12 +284,16 @@ fn text(doc: &Document, name: &str) -> codec::Result<Option<Option<String>>> {
     if matches!(doc.node(node)?.value, Value::Null) {
         return Ok(Some(None));
     }
+    string(doc, node).map(|text| Some(Some(text)))
+}
+
+fn string(doc: &Document, node: usize) -> codec::Result<String> {
     let mut text = String::new();
     let mut chars = doc.chars(node)?;
     while let Some(c) = chars.next_scalar()? {
         text.push(c);
     }
-    Ok(Some(Some(text)))
+    Ok(text)
 }
 
 /// A hash naming the request's cacheable prefix: its tools and its leading system and
