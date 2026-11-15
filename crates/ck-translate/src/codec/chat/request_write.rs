@@ -53,6 +53,8 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
                 write_gemini_tools(doc, child, e)?;
             } else if doc.name_is(name, "response_format")? && super::json_schema::from_gemini(doc)? {
                 write_gemini_format(doc, child, e)?;
+            } else if doc.name_is(name, "tool_choice")? && flat_allowed(doc, child)? {
+                write_allowed(doc, child, e)?;
             } else {
                 super::super::request_controls::write(doc, child, e)?;
             }
@@ -81,6 +83,31 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
     e.bytes(b"}")
 }
 
+/// Whether `choice` is a Responses request's flat allowed-tools choice, which the fence admitted
+/// only with function and custom tools named flat.
+fn flat_allowed(doc: &Document, choice: usize) -> Result<bool> {
+    if !matches!(doc.node(choice)?.value, Value::Object) || doc.member(choice, "allowed_tools")?.is_some() {
+        return Ok(false);
+    }
+    doc.string_is(doc.required(choice, "type")?, "allowed_tools")
+}
+/// Writes a flat allowed-tools choice in Chat's nested form, each tool's name under its type.
+fn write_allowed(doc: &Document, choice: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"{\"type\":\"allowed_tools\",\"allowed_tools\":{\"mode\":")?;
+    doc.write(doc.required(choice, "mode")?, e)?;
+    e.bytes(b",\"tools\":[")?;
+    for (i, tool) in doc.children(doc.required(choice, "tools")?)?.enumerate() {
+        let kind = doc.required(tool, "type")?;
+        e.bytes(if i == 0 { b"{\"type\":" } else { b",{\"type\":" })?;
+        doc.write(kind, e)?;
+        e.bytes(b",")?;
+        doc.write(kind, e)?;
+        e.bytes(b":{\"name\":")?;
+        doc.write(doc.required(tool, "name")?, e)?;
+        e.bytes(b"}}")?;
+    }
+    e.bytes(b"]}}")
+}
 /// Writes Gemini JSON mode as a `json_schema` format with a fixed name, or `json_object` when it
 /// has no schema.
 fn write_gemini_format(doc: &Document, format: usize, e: &mut Encoder<'_, '_>) -> Result<()> {

@@ -78,6 +78,7 @@ mod meta_codex;
 mod meta_wire;
 pub mod oauth;
 pub mod openai_compat;
+pub mod openai_compat_exec;
 mod openai_compat_go;
 mod openai_compat_http;
 pub mod openai_compat_multipart;
@@ -178,6 +179,7 @@ impl Executors {
     pub fn destination(&self, attempt: &types::Attempt<'_>) -> Option<&'static str> {
         match attempt.credential.provider.as_str() {
             "codex" => Some(pipeline::destination(&self.codex, attempt)),
+            p if openai_compat::handles(p) => Some(pipeline::destination(&self.openai.compat, attempt)),
             gemini_exec::PROVIDER => Some(pipeline::destination(&self.google.gemini, attempt)),
             _ => None,
         }
@@ -192,6 +194,7 @@ impl Executors {
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
             "codex" => pipeline::fence(&self.codex, attempt, ingress, request),
+            p if openai_compat::handles(p) => pipeline::fence(&self.openai.compat, attempt, ingress, request),
             gemini_exec::PROVIDER => pipeline::fence(&self.google.gemini, attempt, ingress, request),
             _ => Err(ck_translate::codec::Error::Destination),
         }
@@ -205,6 +208,7 @@ impl Executors {
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
             "codex" => pipeline::refence(&self.codex, attempt, view),
+            p if openai_compat::handles(p) => pipeline::refence(&self.openai.compat, attempt, view),
             gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
             _ => Err(ck_translate::codec::Error::Destination),
         }
@@ -221,6 +225,9 @@ impl Executors {
     ) -> Result<pipeline::Started, ExecError> {
         match attempt.credential.provider.as_str() {
             "codex" => pipeline::start(&self.codex, attempt, request, upload, response).await,
+            p if openai_compat::handles(p) => {
+                pipeline::start(&self.openai.compat, attempt, request, upload, response).await
+            }
             gemini_exec::PROVIDER => pipeline::start(&self.google.gemini, attempt, request, upload, response).await,
             provider => {
                 response.finish(ck_stream::Terminal::Gone);
