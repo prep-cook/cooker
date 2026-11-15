@@ -4,11 +4,11 @@
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
-use ck_core::exec::{CacheBreakpoint, CacheFingerprint, ClaudeCacheTelemetry, ExecRequest};
+use ck_core::exec::{CacheBreakpoint, CacheFingerprint, ClaudeCacheTelemetry};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{Ctx, Prepared, alias, detect, identity, session, signals};
+use super::{Ctx, Input, Prepared, alias, detect, identity, session, signals};
 
 fn hash(secret: &str, domain: &str, value: &str) -> String {
     session::hex(&alias::digest(secret, &format!("cache-telemetry-{domain}"), value))
@@ -41,7 +41,7 @@ fn contains_media(value: &Value) -> bool {
     }
 }
 
-pub(super) fn collect(ctx: &Ctx<'_>, req: &ExecRequest, prepared: &Prepared) -> Option<ClaudeCacheTelemetry> {
+pub(super) fn collect(ctx: &Ctx<'_>, req: &Input<'_>, prepared: &Prepared) -> Option<ClaudeCacheTelemetry> {
     // Never export a credential verifier, including a key-derived credential ID,
     // wire identity or aliased tool name. A process-local secret also keys content
     // hashes. Restarts begin a new observation epoch; no secret is persisted/logged.
@@ -65,15 +65,15 @@ pub(super) fn collect(ctx: &Ctx<'_>, req: &ExecRequest, prepared: &Prepared) -> 
         .collect();
     betas.sort();
     betas.dedup();
-    let declared = detect::header(&req.headers, "x-cliproxy-request-type");
+    let declared = detect::header(req.headers, "x-cliproxy-request-type");
     let kind = if matches!(declared, "main" | "helper" | "subagent" | "compaction") {
         declared
     } else if ctx.compaction_summary {
         "compaction"
-    } else if signals::subagent(&req.headers, &prepared.body) {
+    } else if signals::subagent(req.headers, &prepared.body) {
         "subagent"
     } else if signals::probe_or_helper(&prepared.body)
-        || detect::detect(&req.headers, &prepared.body, false, &ctx.settings).helper_profile
+        || detect::detect(req.headers, &prepared.body, false, &ctx.settings).helper_profile
     {
         "helper"
     } else {
@@ -96,7 +96,7 @@ pub(super) fn collect(ctx: &Ctx<'_>, req: &ExecRequest, prepared: &Prepared) -> 
     let session_id = user["session_id"]
         .as_str()
         .map(str::to_owned)
-        .or_else(|| req.session.clone())
+        .or_else(|| req.session.map(str::to_owned))
         .unwrap_or_default();
     // Scope includes routing and caller isolation, but stores none of those values.
     let workspace: Vec<_> = prepared
@@ -114,13 +114,13 @@ pub(super) fn collect(ctx: &Ctx<'_>, req: &ExecRequest, prepared: &Prepared) -> 
         &serde_json::to_string(&(
             &account_hash,
             &ctx.base_url,
-            &req.caller.principal,
+            req.principal,
             &user["account_uuid"],
             workspace,
         ))
         .ok()?,
     );
-    let retry = detect::header(&req.headers, "x-stainless-retry-count")
+    let retry = detect::header(req.headers, "x-stainless-retry-count")
         .parse::<usize>()
         .unwrap_or(0)
         > 0

@@ -135,7 +135,7 @@ impl Egress {
                         e.bytes(b"}")?;
                         if let Some(usage) = &self.usage {
                             e.bytes(b",\"usage\":")?;
-                            write_usage(usage, false, e)?;
+                            write_delta_usage(usage, e)?;
                         }
                         original_members(&doc, x, e)
                     })?)?;

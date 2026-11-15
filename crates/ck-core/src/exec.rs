@@ -285,6 +285,11 @@ impl UsageSink {
         self
     }
 
+    /// The attached request capture (upstream request and response logs).
+    pub fn capture(&self) -> &CaptureSink {
+        &self.1
+    }
+
     /// Whether anyone listens; executors can skip the work otherwise.
     pub fn enabled(&self) -> bool {
         self.0.is_some()
@@ -423,7 +428,7 @@ impl ExecRequest {
     /// Optional per-call wire capture, independent of usage accounting. Capture
     /// the handle before spawning a stream task; clones retain the same observer.
     pub fn capture(&self) -> &CaptureSink {
-        &self.usage.1
+        self.usage.capture()
     }
 }
 
