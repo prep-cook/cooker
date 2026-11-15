@@ -5,143 +5,137 @@
 //! members), so the scanner returns the exact error or tree.
 
 use super::{Document, Name, NameHash, Node, Text, Value};
-use crate::codec::{Result, source::Span};
+use crate::codec::{Result, source::Span, table::charge};
 
 /// Containers open at once; the scanner refuses deeper input.
 const DEPTH: usize = 128;
 /// Members of one object checked for a duplicate by a linear scan. A larger object goes to the
 /// scanner's keyed index, so crafted names cannot make the check quadratic.
 const MEMBERS: usize = 64;
+/// Member names of all open objects that the counting pass holds for its duplicate check.
+const NAMES: usize = 256;
 
 impl Document {
     /// Adds the nodes of `bytes`, the whole of source 0, to this empty document. Returns false,
-    /// leaving no nodes, when the scanner must read `bytes` instead.
+    /// leaving no nodes and no charge, when the scanner must read `bytes` instead.
     pub(super) fn read_contiguous(&mut self, bytes: &[u8]) -> Result<bool> {
-        let Some(bound) = std::str::from_utf8(bytes).ok().and_then(|_| node_bound(bytes)) else {
+        if std::str::from_utf8(bytes).is_err() || u32::try_from(bytes.len()).is_err() {
             return Ok(false);
-        };
-        self.reserve(bound, 1, 0)?;
-        let mut reader = Reader {
-            nodes: &mut self.nodes,
+        }
+        // The first pass validates and counts without storing nodes, so the document charges
+        // only for input it reads, and exactly the nodes the scanner path would charge after
+        // the scanner's own tables; it never needs more quota than that path.
+        let mut count = Count::new();
+        if (Reader {
+            sink: &mut count,
             bytes,
             at: 0,
-        };
-        if reader.run().is_none() {
-            self.nodes.clear();
+        })
+        .run()
+        .is_none()
+        {
+            return Ok(false);
+        }
+        self.reserve(count.values, 1, 0)?;
+        let mut build = Build { nodes: &mut self.nodes };
+        if (Reader {
+            sink: &mut build,
+            bytes,
+            at: 0,
+        })
+        .run()
+        .is_none()
+        {
+            // Unreachable after a successful count; release the charge before the scanner runs.
+            (self.nodes, self.sources) = (Vec::new(), Vec::new());
+            charge(&mut self.metadata, 0)?;
             return Ok(false);
         }
         Ok(true)
     }
 }
 
-/// An upper bound on the values in `bytes`: the root, plus one per `{`, `[` and `,` outside
-/// strings, since each of those opens at most one value. `None` for an unterminated string.
-fn node_bound(bytes: &[u8]) -> Option<usize> {
-    let (mut bound, mut at) = (1usize, 0);
-    while at < bytes.len() {
-        match bytes[at] {
-            b'"' => loop {
-                at += 1;
-                match *bytes.get(at)? {
-                    b'"' => break,
-                    b'\\' => at += 1,
-                    _ => {}
-                }
-            },
-            b'{' | b'[' | b',' => bound += 1,
-            _ => {}
-        }
-        at += 1;
-    }
-    Some(bound)
+/// Where the reader puts the values it reads. A handle names an open container.
+trait Sink {
+    /// Adds a value as the last child of `parent`; `None` declines the input.
+    fn push(&mut self, parent: Option<usize>, name: Option<Name>, value: Value) -> Option<usize>;
+    /// The container that holds open container `node`.
+    fn parent(&self, node: usize) -> Option<usize>;
+    fn object(&self, node: usize) -> bool;
+    /// Accepts member name `stored` of open `object`; `None` for a duplicate or too many names.
+    fn member(&mut self, object: usize, stored: Span, bytes: &[u8]) -> Option<()>;
+    fn close(&mut self, node: usize);
 }
 
-/// Reads one JSON value; every method returns `None` to decline the input.
-struct Reader<'a> {
+/// Counts values and checks member names, holding only the open containers.
+struct Count {
+    values: usize,
+    /// Per depth: whether the open container is an object, and its first name in `names`.
+    open: [(bool, u16); DEPTH],
+    names: [(u32, u32); NAMES],
+    named: usize,
+}
+
+impl Count {
+    fn new() -> Self {
+        Self {
+            values: 0,
+            open: [(false, 0); DEPTH],
+            names: [(0, 0); NAMES],
+            named: 0,
+        }
+    }
+}
+
+impl Sink for Count {
+    fn push(&mut self, parent: Option<usize>, _: Option<Name>, value: Value) -> Option<usize> {
+        self.values += 1;
+        let depth = parent.map_or(0, |parent| parent + 1);
+        if let Value::Object | Value::Array = value {
+            // No slot past `DEPTH` declines the input, as the scanner refuses it.
+            *self.open.get_mut(depth)? = (matches!(value, Value::Object), self.named as u16);
+        }
+        Some(depth)
+    }
+
+    fn parent(&self, node: usize) -> Option<usize> {
+        node.checked_sub(1)
+    }
+
+    fn object(&self, node: usize) -> bool {
+        self.open[node].0
+    }
+
+    fn member(&mut self, object: usize, stored: Span, bytes: &[u8]) -> Option<()> {
+        let first = usize::from(self.open[object].1);
+        if self.named - first == MEMBERS || self.named == NAMES {
+            return None;
+        }
+        let name = |(start, end): (u32, u32)| &bytes[start as usize + 1..end as usize - 1];
+        let new = (stored.start as u32, stored.end as u32);
+        // Every name in this input is unescaped, so equal names have equal bytes.
+        if self.names[first..self.named]
+            .iter()
+            .any(|&other| name(other) == name(new))
+        {
+            return None;
+        }
+        self.names[self.named] = new;
+        self.named += 1;
+        Some(())
+    }
+
+    fn close(&mut self, node: usize) {
+        self.named = usize::from(self.open[node].1);
+    }
+}
+
+/// Stores the nodes of input the counting pass accepted, within the capacity charged for it.
+struct Build<'a> {
     nodes: &'a mut Vec<Node>,
-    bytes: &'a [u8],
-    at: usize,
 }
 
-impl Reader<'_> {
-    fn run(&mut self) -> Option<()> {
-        let mut parent: Option<usize> = None;
-        let mut depth = 0;
-        let mut name = None;
-        loop {
-            self.skip_whitespace();
-            let start = self.at;
-            let value = match *self.bytes.get(start)? {
-                b'{' => Value::Object,
-                b'[' => Value::Array,
-                b'"' => {
-                    self.string()?;
-                    Value::String(self.text(start))
-                }
-                b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => self.atom()?,
-                _ => return None,
-            };
-            let node = self.push(parent, name.take(), value)?;
-            if let Value::Object | Value::Array = value {
-                if depth == DEPTH {
-                    return None;
-                }
-                depth += 1;
-                parent = Some(node);
-                self.at += 1;
-                self.skip_whitespace();
-                match (value, *self.bytes.get(self.at)?) {
-                    (Value::Object, b'}') | (Value::Array, b']') => {}
-                    (Value::Object, _) => {
-                        name = Some(self.key(node)?);
-                        continue;
-                    }
-                    _ => continue,
-                }
-            }
-            // After a value: close containers until the next member or the end of the input.
-            loop {
-                self.skip_whitespace();
-                let Some(open) = parent else {
-                    return (self.at == self.bytes.len()).then_some(());
-                };
-                let object = matches!(self.nodes[open].value, Value::Object);
-                match (object, *self.bytes.get(self.at)?) {
-                    (_, b',') => {
-                        self.at += 1;
-                        if object {
-                            name = Some(self.key(open)?);
-                        }
-                        break;
-                    }
-                    (true, b'}') | (false, b']') => {
-                        self.at += 1;
-                        parent = self.nodes[open].parent;
-                        depth -= 1;
-                    }
-                    _ => return None,
-                }
-            }
-        }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while let Some(b' ' | b'\t' | b'\r' | b'\n') = self.bytes.get(self.at) {
-            self.at += 1;
-        }
-    }
-
-    fn text(&self, start: usize) -> Text {
-        Text {
-            source: 0,
-            span: Span {
-                start: start as u64,
-                end: self.at as u64,
-            },
-        }
-    }
-
-    /// Appends a node as the last child of `parent`, within the capacity already charged.
+impl Sink for Build<'_> {
     fn push(&mut self, parent: Option<usize>, name: Option<Name>, value: Value) -> Option<usize> {
         if self.nodes.len() == self.nodes.capacity() {
             return None;
@@ -176,6 +170,102 @@ impl Reader<'_> {
         Some(index)
     }
 
+    fn parent(&self, node: usize) -> Option<usize> {
+        self.nodes[node].parent
+    }
+
+    fn object(&self, node: usize) -> bool {
+        matches!(self.nodes[node].value, Value::Object)
+    }
+
+    /// The counting pass already checked every name of the same bytes.
+    fn member(&mut self, _: usize, _: Span, _: &[u8]) -> Option<()> {
+        Some(())
+    }
+
+    fn close(&mut self, _: usize) {}
+}
+
+/// Reads one JSON value into `sink`; every method returns `None` to decline the input.
+struct Reader<'a, S> {
+    sink: &'a mut S,
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<S: Sink> Reader<'_, S> {
+    fn run(&mut self) -> Option<()> {
+        let mut parent: Option<usize> = None;
+        let mut name = None;
+        loop {
+            self.skip_whitespace();
+            let start = self.at;
+            let value = match *self.bytes.get(start)? {
+                b'{' => Value::Object,
+                b'[' => Value::Array,
+                b'"' => {
+                    self.string()?;
+                    Value::String(self.text(start))
+                }
+                b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => self.atom()?,
+                _ => return None,
+            };
+            let node = self.sink.push(parent, name.take(), value)?;
+            if let Value::Object | Value::Array = value {
+                parent = Some(node);
+                self.at += 1;
+                self.skip_whitespace();
+                match (value, *self.bytes.get(self.at)?) {
+                    (Value::Object, b'}') | (Value::Array, b']') => {}
+                    (Value::Object, _) => {
+                        name = Some(self.key(node)?);
+                        continue;
+                    }
+                    _ => continue,
+                }
+            }
+            // After a value: close containers until the next member or the end of the input.
+            loop {
+                self.skip_whitespace();
+                let Some(open) = parent else {
+                    return (self.at == self.bytes.len()).then_some(());
+                };
+                let object = self.sink.object(open);
+                match (object, *self.bytes.get(self.at)?) {
+                    (_, b',') => {
+                        self.at += 1;
+                        if object {
+                            name = Some(self.key(open)?);
+                        }
+                        break;
+                    }
+                    (true, b'}') | (false, b']') => {
+                        self.at += 1;
+                        self.sink.close(open);
+                        parent = self.sink.parent(open);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(b' ' | b'\t' | b'\r' | b'\n') = self.bytes.get(self.at) {
+            self.at += 1;
+        }
+    }
+
+    fn text(&self, start: usize) -> Text {
+        Text {
+            source: 0,
+            span: Span {
+                start: start as u64,
+                end: self.at as u64,
+            },
+        }
+    }
+
     /// Reads the member name and colon that open the next member of `object`.
     fn key(&mut self, object: usize) -> Option<Name> {
         self.skip_whitespace();
@@ -184,27 +274,14 @@ impl Reader<'_> {
             return None;
         }
         let text = self.text(start);
-        let stored = &self.bytes[start + 1..self.at - 1];
-        let mut sibling = self.nodes[object].first;
-        for _ in 0..MEMBERS {
-            let Some(index) = sibling else {
-                self.skip_whitespace();
-                if self.bytes.get(self.at) != Some(&b':') {
-                    return None;
-                }
-                self.at += 1;
-                return Some(Name::Mapped(text, NameHash::plain(stored)));
-            };
-            // Every name in this input is unescaped, so equal names have equal bytes.
-            let Some(Name::Mapped(other, _)) = self.nodes[index].name else {
-                return None;
-            };
-            if &self.bytes[other.span.start as usize + 1..other.span.end as usize - 1] == stored {
-                return None;
-            }
-            sibling = self.nodes[index].next;
+        self.sink.member(object, text.span, self.bytes)?;
+        let digest = NameHash::plain(&self.bytes[start + 1..self.at - 1]);
+        self.skip_whitespace();
+        if self.bytes.get(self.at) != Some(&b':') {
+            return None;
         }
-        None
+        self.at += 1;
+        Some(Name::Mapped(text, digest))
     }
 
     /// Steps over the string opening at the current byte; returns whether it holds an escape.

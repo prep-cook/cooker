@@ -116,7 +116,7 @@ The source protocol is provenance; internal routing, scheduling, accounting and 
 | `...` | JSON values | Unknown extension members preserved; only registered fields control execution. |
 
 Every record carries correlation, even when its payload is empty. Source IDs are restored by capable egress, not regenerated on each delta.
-An egress may establish correlation through a binding instead of re-reading the identity strings of every record. One emitter writes every record of a canonical writer generation, starting at the writer's first byte, and its identity never changes. The egress therefore checks `request_id`, `stream_id`, `attempt` and `direction` once, on the record with `seq` 0, and binds that identity to the generation; every later record must come from the same generation with the next `seq`. A routing attempt or a replacement stream is written through a new emitter on a fresh writer, so its egress builds a new binding; a binding never moves to another generation. Records still carry every required field. Wire ingress and the replay of published records validate on their own and use no binding.
+An egress checks the correlation of every record it reads: `request_id`, `stream_id`, `attempt` and `direction` against the identity it was built with, or, built without one, against the first record's, and `seq` against the next expected value. Any holder of a writer can append records, so an egress checks every record, not only the first.
 For source protocols without item IDs, allocate stable local items at part/block starts; close them at source stops or a validated choice finish.
 A signature-only Gemini part gets its own item/block even if it contains no text. Do not attach it to the preceding textual part.
 

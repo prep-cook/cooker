@@ -1,8 +1,8 @@
 use super::{
     Error, Result,
-    document::Document,
-    event::{Identity, Kind},
-    source::Source,
+    document::{Document, Value},
+    event::{Direction, Identity, Kind},
+    source::{Source, Span},
 };
 use ck_stream::{Lease, Position, Record, Writer};
 
@@ -46,8 +46,18 @@ pub fn decode(owner: &mut Writer, lease: Lease) -> Result<(Kind, Document)> {
     read(owner, lease).map(|(kind, _, doc)| (kind, doc))
 }
 
-/// [`decode`], also returning the record's `seq`.
-fn read(owner: &mut Writer, lease: Lease) -> Result<(Kind, u64, Document)> {
+/// The correlation members of one record's `x_ck`, found in one walk over its members.
+#[derive(Default)]
+struct Envelope {
+    seq: u64,
+    request_id: Option<usize>,
+    stream_id: Option<usize>,
+    attempt: Option<usize>,
+    direction: Option<usize>,
+}
+
+/// [`decode`], also returning the record's correlation members.
+fn read(owner: &mut Writer, lease: Lease) -> Result<(Kind, Envelope, Document)> {
     let record = lease.record();
     if record.start.generation != owner.id() {
         return Err(Error::Position);
@@ -63,30 +73,43 @@ fn read(owner: &mut Writer, lease: Lease) -> Result<(Kind, u64, Document)> {
     let mut source = Source::new(owner)?;
     source.push(lease, advance(record.start, start)?..advance(record.start, end)?)?;
     let mut doc = Document::parse_internal(owner, source, record.len())?;
-    let x = doc.required(doc.root(), "x_ck")?;
-    let sequence = doc.unsigned(doc.required(x, "seq")?)?;
-    if doc.unsigned(doc.required(x, "v")?)? != 1 || Some(sequence) != frame.sequence {
+    let mut envelope = Envelope::default();
+    let (mut v, mut seq) = (None, None);
+    for child in doc.children(doc.required(doc.root(), "x_ck")?)? {
+        let name = doc.node(child)?.name.ok_or(Error::Schema)?;
+        let slot = if doc.name_is(name, "v")? {
+            &mut v
+        } else if doc.name_is(name, "seq")? {
+            &mut seq
+        } else if doc.name_is(name, "request_id")? {
+            &mut envelope.request_id
+        } else if doc.name_is(name, "stream_id")? {
+            &mut envelope.stream_id
+        } else if doc.name_is(name, "attempt")? {
+            &mut envelope.attempt
+        } else if doc.name_is(name, "direction")? {
+            &mut envelope.direction
+        } else {
+            continue;
+        };
+        slot.get_or_insert(child);
+    }
+    envelope.seq = doc.unsigned(seq.ok_or(Error::Schema)?)?;
+    if doc.unsigned(v.ok_or(Error::Schema)?)? != 1 || Some(envelope.seq) != frame.sequence {
         return Err(Error::Schema);
     }
     if kind == Kind::Chunk {
         super::chat::prepare_response(&mut doc)?;
     }
-    Ok((kind, sequence, doc))
+    Ok((kind, envelope, doc))
 }
 
-/// The canonical response stream one egress reads, bound to its writer generation and to one
-/// identity (docs/INTERNAL-STREAM.md, §3.2).
-///
-/// One [`Emitter`](super::event::Emitter) writes every record of a canonical generation: it
-/// publishes only at the writer's start or right after its own last record, and its identity
-/// never changes. The record with `seq` 0 therefore establishes the identity of the whole
-/// generation, and the binding checks it once: `direction` is `response`, and `request_id`,
-/// `stream_id` and `attempt` equal the identity the egress was built with, when it has one.
-/// Every later record must come from the bound generation with the next `seq`; its identity
-/// strings are not read again. A routing attempt or a replacement stream is written through a
-/// new emitter on a fresh writer, so its egress builds a new binding; a binding never moves to
-/// another generation. Wire ingress and the ingress replay of published records validate
-/// separately and never use a binding.
+/// Checks every record of one canonical response stream an egress reads: it comes from the
+/// writer generation the egress was built on with the next `seq`, and carries the `request_id`,
+/// `stream_id` and `attempt` of the identity the egress was built with, or, for an egress built
+/// without one, of the stream's first record, with `direction` `response`
+/// (docs/INTERNAL-STREAM.md, §3.2). Any holder of the writer can append a record, so no record's
+/// identity is taken from an earlier one. Ingress replay of published records uses [`decode`].
 pub(crate) struct Binding {
     generation: u64,
     identity: Option<Identity>,
@@ -107,31 +130,49 @@ impl Binding {
         if owner.id() != self.generation {
             return Err(Error::Position);
         }
-        let (kind, sequence, doc) = read(owner, lease)?;
-        if sequence != self.next {
+        let (kind, envelope, doc) = read(owner, lease)?;
+        if envelope.seq != self.next {
             return Err(Error::Schema);
         }
-        if sequence == 0 {
-            self.establish(&doc)?;
-        }
-        self.next = sequence.checked_add(1).ok_or(Error::Limit)?;
-        Ok((kind, doc))
-    }
-
-    fn establish(&self, doc: &Document) -> Result<()> {
-        let x = doc.required(doc.root(), "x_ck")?;
-        if !doc.string_is(doc.required(x, "direction")?, "response")? {
-            return Err(Error::Schema);
-        }
-        if let Some(identity) = self.identity
-            && (doc.unsigned(doc.required(x, "attempt")?)? != identity.attempt
-                || !doc.string_is(doc.required(x, "request_id")?, identity.request_id.as_str())?
-                || !doc.string_is(doc.required(x, "stream_id")?, identity.stream_id.as_str())?)
+        let field = |slot: Option<usize>| slot.ok_or(Error::Schema);
+        let identity = match self.identity {
+            Some(identity) => identity,
+            None => *self.identity.insert(Identity {
+                request_id: super::identity::local(&doc, field(envelope.request_id)?)?,
+                stream_id: super::identity::local(&doc, field(envelope.stream_id)?)?,
+                attempt: doc.unsigned(field(envelope.attempt)?)?,
+                direction: Direction::Response,
+            }),
+        };
+        if doc.unsigned(field(envelope.attempt)?)? != identity.attempt
+            || !string_equals(&doc, field(envelope.request_id)?, identity.request_id.as_str())?
+            || !string_equals(&doc, field(envelope.stream_id)?, identity.stream_id.as_str())?
+            || !string_equals(&doc, field(envelope.direction)?, "response")?
         {
             return Err(Error::Schema);
         }
-        Ok(())
+        self.next = envelope.seq.checked_add(1).ok_or(Error::Limit)?;
+        Ok((kind, doc))
     }
+}
+
+/// Whether string `node` is `value`: one byte comparison when the stored string has no escapes.
+/// Bytes equal to a `value` without a backslash hold no escape, so they decode to `value`.
+fn string_equals(doc: &Document, node: usize, value: &str) -> Result<bool> {
+    if let Value::String(text) = doc.node(node)?.value
+        && !value.contains('\\')
+        && text.span.len() == value.len() as u64 + 2
+        && doc.source(text)?.equals(
+            Span {
+                start: text.span.start + 1,
+                end: text.span.end - 1,
+            },
+            value.as_bytes(),
+        )?
+    {
+        return Ok(true);
+    }
+    doc.string_is(node, value)
 }
 
 /// SSE framing of one canonical record, scanned one byte at a time.

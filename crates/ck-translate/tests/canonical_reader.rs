@@ -186,13 +186,20 @@ fn mutated_records_read_like_the_scanner() {
 /// Publishes a response start padded to `start_len` bytes, then an opaque record, and returns
 /// both leases.
 fn straddle(mapped: &mut Mapped, start_len: usize) -> (ck_stream::Lease, ck_stream::Lease) {
-    let mut emitter = Emitter::new(identity("request"));
+    let leases = straddle_with(mapped, identity("request"), start_len);
+    assert_eq!(leases.0.record().len(), start_len as u64);
+    leases
+}
+
+/// [`straddle`] by an emitter of `who`; the padding fits the default identity's length.
+fn straddle_with(mapped: &mut Mapped, who: Identity, start_len: usize) -> (ck_stream::Lease, ck_stream::Lease) {
+    let mut emitter = Emitter::new(who);
     let base = codec::encode::measure(|e| {
         e.bytes(b"event: x_ck.response.start\nid: 0\ndata: {\"x_ck\":{\"v\":1,\"request_id\":\"request\",\"stream_id\":\"stream\",\"attempt\":1,\"seq\":0,\"direction\":\"response\"},\"pad\":\"\"}\n\n")
     })
     .unwrap();
     let pad = "a".repeat(start_len - base);
-    let start = emitter
+    emitter
         .emit(
             &mut mapped.writer,
             Kind::ResponseStart,
@@ -204,7 +211,6 @@ fn straddle(mapped: &mut Mapped, start_len: usize) -> (ck_stream::Lease, ck_stre
             |_| Ok(()),
         )
         .unwrap();
-    assert_eq!(start.len(), start_len as u64);
     emitter
         .emit(
             &mut mapped.writer,
@@ -294,8 +300,71 @@ fn binding_checks_identity_once_and_seq_on_every_record() {
     };
     let mut binding = Binding::new(&mapped.writer, None);
     assert!(matches!(binding.decode(&mut mapped.writer, error), Err(Error::Schema)));
+    // An escape in the stored id never compares equal to its spelling as plain bytes.
+    let mut mapped = Mapped::new();
+    let (start, _) = straddle_with(
+        &mut mapped,
+        Identity {
+            request_id: LocalId::new("a\nb").unwrap(),
+            ..identity("request")
+        },
+        200,
+    );
+    let mut binding = Binding::new(&mapped.writer, Some(identity("a\\nb")));
+    assert!(matches!(binding.decode(&mut mapped.writer, start), Err(Error::Schema)));
     // Plain decoding, used by ingress replay, keeps no binding.
     let mut mapped = Mapped::new();
     let (_, record) = records(&mut mapped);
     assert_eq!(internal::decode(&mut mapped.writer, record).unwrap().0, Kind::Opaque);
+}
+
+/// The tree or error of `bytes` read by `parse` on a fresh stream with `budget` bytes of
+/// metadata quota.
+fn under_budget(
+    bytes: &[u8],
+    budget: usize,
+    parse: fn(&mut ck_stream::Writer, Source, u64) -> codec::Result<Document>,
+) -> Result<Vec<String>, String> {
+    let directory = std::env::temp_dir().join(format!("ck-reader-{}", uuid::Uuid::new_v4()));
+    let mut config = ck_stream::Config::new(directory.clone());
+    config.pool_bytes = Some(16 * ck_stream::FRAME_BYTES);
+    config.max_event_bytes = 16 * ck_stream::FRAME_BYTES;
+    config.max_metadata_bytes = budget;
+    config.header_slots = 8;
+    config.workers = 1;
+    let mut store =
+        ck_stream::Store::with_clock(config, std::sync::Arc::new(ck_stream::ManualClock::default())).unwrap();
+    let mut writer = store.create().unwrap();
+    let mut source = Source::new(&mut writer).unwrap();
+    source.push_bytes(&mut writer, bytes).unwrap();
+    let outcome = parse(&mut writer, source, bytes.len() as u64)
+        .map(|doc| tree(&doc))
+        .map_err(|error| format!("{error:?}"));
+    drop(writer);
+    store.shutdown().unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
+    outcome
+}
+
+/// At the smallest metadata quota under which the scanner reads `bytes`, the contiguous reader
+/// reads them too: it never charges more than the scanner path, also when it declines.
+#[test]
+fn contiguous_reader_needs_no_more_quota_than_the_scanner() {
+    let arrays = format!("[{}]", vec!["[]"; 1000].join(","));
+    let members: Vec<_> = (0..1000).map(|i| format!("\"m{i}\":[]")).collect();
+    let object = format!("{{{}}}", members.join(","));
+    for bytes in [arrays.as_bytes(), object.as_bytes()] {
+        let (mut low, mut high) = (0, 4 << 20);
+        while high - low > 1 {
+            let mid = (low + high) / 2;
+            if under_budget(bytes, mid, Document::parse).is_ok() {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        let expected = under_budget(bytes, high, Document::parse).unwrap();
+        assert_eq!(expected.len(), 1001);
+        assert_eq!(under_budget(bytes, high, Document::parse_internal), Ok(expected));
+    }
 }

@@ -19,7 +19,7 @@ mod semantic;
 
 use codec::{
     BodyMode, Error, Operation, ResponseEgress, ResponseIngress,
-    event::{Direction, Identity, LocalId},
+    event::{Direction, Identity, Kind, LocalId},
 };
 use semantic::Mapped;
 use std::task::Poll;
@@ -43,6 +43,11 @@ enum Client {
 
 /// Translates a streamed Chat response into canonical records and returns their leases.
 fn records(m: &mut Mapped) -> Vec<ck_stream::Lease> {
+    open_records(m, true)
+}
+
+/// [`records`]; without `finish`, the stream stops after the content deltas, still open.
+fn open_records(m: &mut Mapped, finish: bool) -> Vec<ck_stream::Lease> {
     let chunk = |delta: &str, finish: &str| {
         format!(
             "data: {{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{delta},\"finish_reason\":{finish}}}]}}\n\n"
@@ -51,8 +56,11 @@ fn records(m: &mut Mapped) -> Vec<ck_stream::Lease> {
     let body = chunk(r#"{"role":"assistant","content":"a"}"#, "null")
         + &chunk(r#"{"content":"b"}"#, "null")
         + &chunk(r#"{"content":"c"}"#, "null")
-        + &chunk("{}", "\"stop\"")
-        + "data: [DONE]\n\n";
+        + &if finish {
+            chunk("{}", "\"stop\"") + "data: [DONE]\n\n"
+        } else {
+            String::new()
+        };
     let mut ingress = codec::chat::response::Ingress::new(
         &mut m.writer,
         &m.store,
@@ -63,7 +71,9 @@ fn records(m: &mut Mapped) -> Vec<ck_stream::Lease> {
     )
     .unwrap();
     ingress.advance(&mut m.writer, body.as_bytes()).unwrap();
-    ingress.finish(&mut m.writer).unwrap();
+    if finish {
+        ingress.finish(&mut m.writer).unwrap();
+    }
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
     let mut leases = Vec::new();
     while let Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
@@ -136,6 +146,30 @@ fn egresses_built_with_an_identity_refuse_a_stream_of_another() {
         let leases = records(&mut m);
         assert!(
             matches!(feed(&mut m, client, identity("other"), leases), Some(Error::Schema)),
+            "{client:?}"
+        );
+    }
+}
+
+/// A record any holder of the writer appends with another stream's identity, after valid ones
+/// from the ingress emitter, never reaches a client: every record's identity is checked.
+#[test]
+fn every_egress_refuses_a_record_with_another_identity() {
+    for client in [Client::Chat, Client::Anthropic, Client::Responses, Client::Gemini] {
+        let mut m = Mapped::new();
+        let count = open_records(&mut m, false).len();
+        let forged = format!(
+            "id: {count}\ndata: {{\"x_ck\":{{\"v\":1,\"request_id\":\"OTHER\",\"stream_id\":\"OTHER\",\"attempt\":99,\"seq\":{count},\"direction\":\"request\"}},\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"INJECTED\"}},\"finish_reason\":null}}]}}\n\n"
+        );
+        codec::encode::publish(&mut m.writer, Kind::Chunk as u32, 0, |e| e.bytes(forged.as_bytes())).unwrap();
+        let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
+        let mut leases = Vec::new();
+        while let Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
+            leases.push(lease);
+        }
+        assert_eq!(leases.len(), count + 1);
+        assert!(
+            matches!(feed(&mut m, client, identity("request"), leases), Some(Error::Schema)),
             "{client:?}"
         );
     }
