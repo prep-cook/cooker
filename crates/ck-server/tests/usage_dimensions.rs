@@ -180,3 +180,73 @@ async fn chat_modality_and_prediction_details_reach_accounting() {
         ]
     );
 }
+
+/// Meta segmentation bills per image and per video frame (`usage.images_processed`,
+/// `usage.video_frames_processed`). Each count the Responses usage reports reaches accounting
+/// as its own dimension, buffered or streamed; an unreported or malformed one stays absent; the
+/// token counts are the upstream's. A streamed usage repeated on a later event replaces the
+/// earlier one rather than adding to it.
+#[tokio::test]
+async fn meta_segmentation_counts_reach_accounting() {
+    let tokens = serde_json::json!({"input_tokens":12,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":15});
+    for (counts, expected) in [
+        (
+            serde_json::json!({"images_processed":2}),
+            vec![("images_processed", Dimension::Count(2))],
+        ),
+        (
+            serde_json::json!({"video_frames_processed":48}),
+            vec![("video_frames_processed", Dimension::Count(48))],
+        ),
+        (
+            serde_json::json!({"images_processed":1,"video_frames_processed":0}),
+            vec![
+                ("images_processed", Dimension::Count(1)),
+                ("video_frames_processed", Dimension::Count(0)),
+            ],
+        ),
+        (serde_json::json!({}), Vec::new()),
+        (
+            serde_json::json!({"images_processed":null,"video_frames_processed":-1}),
+            Vec::new(),
+        ),
+    ] {
+        let mut usage = tokens.clone();
+        usage
+            .as_object_mut()
+            .unwrap()
+            .extend(counts.as_object().unwrap().clone());
+        let response = |status: &str| serde_json::json!({"id":"r","object":"response","created_at":1,"model":"m","status":status,"output":[{"id":"msg","type":"message","role":"assistant","content":[{"type":"output_text","text":"mask"}]}],"usage":usage});
+        let streamed: String = [
+            serde_json::json!({"type":"response.created","sequence_number":0,"response":{"id":"r","object":"response","created_at":1,"model":"m","status":"in_progress","output":[],"usage":null}}),
+            serde_json::json!({"type":"response.in_progress","sequence_number":1,"response":response("in_progress")}),
+            serde_json::json!({"type":"response.completed","sequence_number":2,"response":response("completed")}),
+        ]
+        .iter()
+        .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
+        .collect();
+        for (mode, body) in [
+            (BodyMode::Buffered, response("completed").to_string()),
+            (BodyMode::Streaming, streamed),
+        ] {
+            let accounted = account(|writer, _| {
+                let mut ingress = ck_translate::responses::response::Ingress::new(
+                    writer,
+                    identity(),
+                    Operation::Generate,
+                    mode,
+                    LIMIT,
+                )
+                .unwrap();
+                ingest(&mut ingress, writer, body.as_bytes());
+            })
+            .await;
+            assert_eq!(accounted.dimensions, expected, "{counts} {mode:?}");
+            assert_eq!(
+                (accounted.input_tokens, accounted.output_tokens, accounted.total_tokens),
+                (Some(12), Some(3), Some(15)),
+                "{counts} {mode:?}"
+            );
+        }
+    }
+}

@@ -389,11 +389,11 @@ struct Merged {
 }
 
 impl Merged {
-    /// `StreamUsageBuffer.Observe(detail, true)`: a detail with tokens (or without a tier)
-    /// replaces the buffer, keeping the old tier when it has none; a tier-only detail
-    /// updates just the tier.
-    fn observe(&mut self, usage: Option<(ck_core::format::Format, Vec<u8>)>, tier: String, nonzero: bool) {
-        if tier.is_empty() || nonzero {
+    /// `StreamUsageBuffer.Observe(detail, true)`: a detail with billing evidence (a nonzero token
+    /// or a billed unit) or without a tier replaces the buffer, keeping the old tier when it has
+    /// none; a tier-only detail updates just the tier.
+    fn observe(&mut self, usage: Option<(ck_core::format::Format, Vec<u8>)>, tier: String, evidence: bool) {
+        if tier.is_empty() || evidence {
             self.usage = usage;
             if !tier.is_empty() {
                 self.tier = tier;
@@ -620,8 +620,21 @@ fn observe_parsed(merged: &mut Merged, format: ck_core::format::Format, payload:
         merged.observe(None, tier, false);
         return true;
     }
-    merged.observe(Some((format, node.raw().to_vec())), tier, usage_nonzero(&node));
+    let evidence = usage_nonzero(&node) || reports_billed_units(&node);
+    merged.observe(Some((format, node.raw().to_vec())), tier, evidence);
     true
+}
+
+/// Usage members billed in their own unit rather than in tokens: Meta segmentation's images and
+/// video frames, the `responses` rows of ck-server's `usage_snapshot::DIMENSIONS`.
+const BILLED_UNITS: [&str; 2] = ["images_processed", "video_frames_processed"];
+
+/// The usage reports a [`BILLED_UNITS`] count the usage record keeps (an unsigned integer). Such
+/// a usage is billing evidence with every token count zero, so a tier beside it must not drop it.
+fn reports_billed_units(node: &ck_wire::json::Res<'_>) -> bool {
+    BILLED_UNITS
+        .iter()
+        .any(|member| std::str::from_utf8(node.get(member).raw()).is_ok_and(|raw| raw.parse::<u64>().is_ok()))
 }
 
 /// Taps the upstream lines for usage the way `rule`'s Go executor observes them: each

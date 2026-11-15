@@ -114,6 +114,9 @@ const DIMENSIONS: &[(&str, &[&str], &str, bool)] = &[
         "web_fetch_requests",
         true,
     ),
+    // Meta segmentation: per-image and per-frame billing quantities.
+    ("responses", &["images_processed"], "images_processed", true),
+    ("responses", &["video_frames_processed"], "video_frames_processed", true),
 ];
 
 /// The service tier inside a source's native usage: `(protocol, member)`.
