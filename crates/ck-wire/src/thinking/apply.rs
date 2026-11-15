@@ -624,7 +624,7 @@ fn extract_gemini_config(body: &[u8], provider: &str) -> Config {
         let path = format!("{prefix}.{key}");
         let level = json::get(body, &path);
         if level.exists() {
-            return level_or_special(&level.str());
+            return level_or_special(&level.str().trim().go_lower());
         }
     }
     for key in ["thinkingBudget", "thinking_budget"] {
