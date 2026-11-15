@@ -305,7 +305,7 @@ fn secrets_stay_out_of_logs_exports_reads_and_history() {
     for (what, text) in shown {
         for secret in &secrets {
             assert!(!text.contains(secret.as_str()), "{what} shows a secret");
-            assert!(!text.contains(&secret.to_uppercase()), "{what} shows a secret");
+            assert!(!text.contains(&secret.to_ascii_uppercase()), "{what} shows a secret");
         }
     }
 }
@@ -339,7 +339,10 @@ fn a_retained_candidate_is_the_base_after_failed_publication() {
         .accept(store.current().as_ref().clone(), &mut pending)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("would disappear") || error.contains("cannot return"), "{error}");
+    assert!(
+        error.contains("would disappear") || error.contains("cannot return"),
+        "{error}"
+    );
     drop(pending);
     std::fs::remove_dir(&path).unwrap();
     std::fs::rename(dir.join("old.db"), &path).unwrap();
