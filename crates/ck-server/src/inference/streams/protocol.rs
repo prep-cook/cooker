@@ -52,10 +52,10 @@ impl ProtocolEgress {
                 |_| {},
             )?)),
             Protocol::Responses => {
-                // ponytail: D2-1 passes the exchange's response id and the committed attempt's
-                // producer through `StreamHandle` and `Attached`. Until then the id derives from
-                // the response stream, the same for live delivery and resume, and the producer is
-                // a placeholder that nothing reads before D2-6a.
+                // ponytail: the id derives from the committed response stream, the same for live
+                // delivery and resume, and the producer is a placeholder nothing reads. The state
+                // store (D2-6b) needs one id across attempts and envelopes (D2-6a) need the real
+                // producer; each passes it through `StreamHandle` and `Attached`.
                 let id = codec::identity::ResponseId::new("resp_", stream.id())?
                     .issued()
                     .ok_or(codec::Error::Schema)?;

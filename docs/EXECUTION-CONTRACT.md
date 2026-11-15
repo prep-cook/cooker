@@ -8,8 +8,8 @@ This page fixes the interfaces Phase D units build against: stream ownership, th
 | --- | --- | --- |
 | `Execute`, `Attempt`, `Client`, `Request`, `Streams`, `Upstream`, `Body`, `Counted` | `crates/ck-exec/src/types.rs` | each provider unit |
 | `Producer`, `Started` | `crates/ck-exec/src/pipeline.rs` | D1 |
-| `Protocol`, `Framing`, `Output` | `crates/ck-server/src/http/egress.rs` | D2 |
-| `Exchange`, `Owner`, `StreamHandle`, `StreamId` | `crates/ck-server/src/inference/streams.rs` | D2 (exchange), D3 (registry, resume) |
+| `Protocol`, `Framing`, `Output`, `deliver`, `Failed` | `crates/ck-server/src/http/egress.rs` | D2 |
+| `Exchange`, `Owner`, `StreamHandle`, `StreamId`, `Uncommitted` | `crates/ck-server/src/inference/streams.rs` | D2 (exchange), D3 (registry, resume) |
 | `CanonicalUsage`, `ResponseFacts` (tracker input) | `crates/ck-server/src/observability/usage_snapshot.rs` | D3 |
 | `Writer::allocator`, `Store::create_dependent`, `Writer::now` | `crates/ck-stream/src/publication/writer.rs` | done in D0 |
 
@@ -89,7 +89,7 @@ The producer's output, `Result<(), ExecError>`, is the attempt's routing outcome
 
 An `Exchange` is one client request: its `Owner`, its egress `Output` and the request stream's producer writer. `Owner` is the creating `Caller` plus, for an ephemeral client key, its grant's call scope (`sess_...`); a resume must match both. `Output` is the client protocol, operation and `Framing` (`Json`, `Sse`, or Gemini's `JsonArray`), fixed when the exchange starts.
 
-At commitment the exchange finishes the request stream with `Terminal::Done` and becomes a `StreamHandle`, registered under a fresh `StreamId` of 128 random bits. The handle keeps the owner, the output, the response stream's allocator and the request stream's allocator. `StreamId` has no `Debug` or `Display` and travels only in `X-Ck-Stream-Id`.
+`http::egress::deliver` drives one attempt's response stream through the client codec. At commitment the exchange finishes the request stream with `Terminal::Done` and becomes a `StreamHandle`, registered under a fresh `StreamId` of 128 random bits; then the response goes out with `X-Ck-Stream-Id`, the zero cursor in `X-Ck-Stream-Cursor`, the caller's trace, routing and upstream headers, and the first bytes. An attempt whose stream publishes `error` or a terminal before any deliverable byte returns `Failed` with the exchange and an `Uncommitted` reason; the `error` record never reaches the egress. The live body is the resume body from the zero cursor, so SSE events carry `id: v1.e.<n>` from the start. The handle keeps the owner, the output, the response stream's allocator and the request stream's allocator. `StreamId` has no `Debug` or `Display` and travels only in `X-Ck-Stream-Id`.
 
 Resume looks up the handle, authorizes the caller against `StreamHandle::owner` before any cursor lookup, attaches a reader with `Store::reader(response.id(), ..)`, rebuilds the request view (§2) and re-encodes with `StreamHandle::output`. A resume request cannot change the output, select a provider or start an attempt.
 
