@@ -9,9 +9,11 @@
 //! - A completion whose `output` is empty or absent gets the items
 //!   `response.output_item.done` announced. They wait in scratch leases of the response
 //!   stream, never on the heap.
-//! - A completed response is cached for reasoning replay once the ingress accepted the whole
-//!   SSE event it ends, as `xai_sse` reads that event: a cut, refused or failed completion
-//!   caches nothing, nor one after an upstream failure, whose input the ingress ignores.
+//! - A completed response is cached for reasoning replay from the ingress's own parse of it,
+//!   once the ingress accepted it as the end of the stream: a cut, refused or failed
+//!   completion caches nothing, nor one after an upstream failure, whose input the ingress
+//!   ignores. Replay copies no event into the response stream, so it cannot cost the
+//!   response its storage.
 //! - The body ending before the completion boundary fails with Go's 408.
 //!
 //! One SSE event goes out per upstream event, in order; the ingress decodes the result. A
@@ -22,6 +24,7 @@ use std::sync::Arc;
 
 use ck_stream::{ScratchLease, Writer};
 use ck_translate::apply_patch_responses as apply_patch;
+use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::encode::{self, Encoder};
 use ck_translate::codec::{self, ResponseIngress};
 use ck_translate::responses::response::Ingress;
@@ -29,10 +32,10 @@ use ck_wire::gostr::trim_space;
 use ck_wire::json::{self as gj, Kind};
 
 use crate::xai::MAX_LINE;
+use crate::xai_exec::{object_member, text_is};
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_request::Prepared;
 use crate::xai_response::{self as response, NamespaceRefs, NamespaceRestorer, XSearchFilter, text};
-use crate::xai_sse::Accepted;
 
 /// The response decoder of one xAI attempt: generation through the xAI line rules, or a
 /// buffered compact whose success clears the session's replay.
@@ -107,14 +110,19 @@ pub struct Events {
     /// Folded calls in flight, by item id.
     folded: HashSet<String>,
     alias: String,
-    replay: Option<(Arc<replay::Store>, ReplayScope)>,
-    /// What the ingress made of the events it was handed, while replay is on.
-    accepted: Accepted,
 }
 
 impl Events {
-    pub(crate) fn new(inner: Ingress, prepared: Prepared, store: Arc<replay::Store>) -> Self {
+    pub(crate) fn new(mut inner: Ingress, prepared: Prepared, store: Arc<replay::Store>) -> Self {
         let scope = prepared.replay_scope;
+        if scope.valid() {
+            inner.on_completed(Box::new(move |doc, response| {
+                // A completion replay cannot read caches nothing; the response is unaffected.
+                if let Ok(Some(items)) = replay_items(doc, response) {
+                    replay::cache_items(&store, &scope, &items);
+                }
+            }));
+        }
         Self {
             inner,
             line: Vec::new(),
@@ -126,8 +134,6 @@ impl Events {
             restorer: NamespaceRestorer::new(prepared.namespace_tools),
             folded: HashSet::new(),
             alias: prepared.web_search_alias,
-            replay: scope.valid().then_some((store, scope)),
-            accepted: Accepted::default(),
         }
     }
 
@@ -332,17 +338,34 @@ impl Events {
         self.feed(owner, b"\n")
     }
 
-    /// Hands `bytes` to the ingress; once it accepted them, replay caches the completion they
-    /// ended, if `xai_sse` read one with no failure before it.
     fn feed(&mut self, owner: &mut Writer, bytes: &[u8]) -> codec::Result<()> {
-        self.inner.advance(owner, bytes)?;
-        if let Some((store, scope)) = &self.replay
-            && let Some(items) = self.accepted.read(owner, bytes)
-        {
-            replay::cache_items(store, scope, &items);
-        }
-        Ok(())
+        self.inner.advance(owner, bytes)
     }
+}
+
+/// The output item types replay keeps.
+const KEPT: [&str; 4] = ["reasoning", "message", "function_call", "custom_tool_call"];
+
+/// The output items of completed `response` that replay keeps, each written out on its own;
+/// `None` when it has no output array.
+fn replay_items(doc: &Document, response: usize) -> codec::Result<Option<Vec<Vec<u8>>>> {
+    let Some(output) = object_member(doc, response, "output")? else {
+        return Ok(None);
+    };
+    if !matches!(doc.node(output)?.value, Value::Array) {
+        return Ok(None);
+    }
+    let mut items = Vec::new();
+    for item in doc.children(output)? {
+        let mut kept = false;
+        for kind in KEPT {
+            kept |= text_is(doc, item, "type", kind)?;
+        }
+        if kept {
+            items.push(encode::owned(|e| doc.write(item, e))?);
+        }
+    }
+    Ok(Some(items))
 }
 
 /// Where a terminal event's `output` takes the collected items: `event[at..end]` becomes

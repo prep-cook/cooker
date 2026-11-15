@@ -18,6 +18,12 @@ mod item;
 mod tools;
 pub(super) use tools::Server;
 
+/// Receives a streamed `response.completed` event's `response` object once the ingress has
+/// accepted it as the successful end of the stream; no failure ended the stream before it.
+/// The document is the ingress's own parse and lives only for the call, so an observer adds
+/// no stream storage of its own.
+pub type Completed = Box<dyn FnMut(&Document, usize) + Send>;
+
 pub struct Ingress {
     owner: u64,
     source: Option<Source>,
@@ -65,9 +71,14 @@ impl Ingress {
                 errored: false,
                 next_media: 0,
                 audio: None,
+                completed: None,
             },
             failed: false,
         })
+    }
+    /// Hands the completion that ends this streamed body to `observer`; see [`Completed`].
+    pub fn on_completed(&mut self, observer: Completed) {
+        self.state.completed = Some(observer);
     }
     fn handle(&mut self, owner: &mut Writer, result: Result<()>) -> Result<()> {
         if let Err(error) = result {
@@ -194,6 +205,7 @@ struct State {
     errored: bool,
     next_media: u64,
     audio: Option<super::audio::Ingress>,
+    completed: Option<Completed>,
 }
 impl Item {
     fn scope(&self, block: Option<u64>) -> Scope {

@@ -26,7 +26,10 @@ const CONSUMED: &[&str] = &[
 #[derive(Clone, Copy)]
 enum Class {
     Failure,
-    Terminal,
+    /// `response.completed`, or `response.incomplete` when not `completed`.
+    Terminal {
+        completed: bool,
+    },
     /// `response.created` or `response.in_progress`, by name.
     Lifecycle(&'static str),
     Added,
@@ -77,8 +80,8 @@ const fn text(part: &'static str, field: &'static str, summary: bool, snapshot: 
 const EVENTS: &[(&str, Class)] = &[
     ("error", Class::Failure),
     ("response.failed", Class::Failure),
-    ("response.completed", Class::Terminal),
-    ("response.incomplete", Class::Terminal),
+    ("response.completed", Class::Terminal { completed: true }),
+    ("response.incomplete", Class::Terminal { completed: false }),
     ("response.created", Class::Lifecycle("response.created")),
     ("response.in_progress", Class::Lifecycle("response.in_progress")),
     ("response.output_item.added", Class::Added),
@@ -247,12 +250,7 @@ impl State {
                 Some(response) => self.fail(owner, &doc, response),
                 None => self.upstream_error(owner),
             },
-            Class::Terminal => {
-                let response = doc.required(root, "response")?;
-                self.start(owner, Some((&doc, response)))?;
-                self.unknown(owner, &doc, &["type", "response", "sequence_number"], source, event)?;
-                self.complete(owner, &doc, response)
-            }
+            Class::Terminal { completed } => self.terminal(owner, &doc, source, event, completed),
             Class::Lifecycle(name) => {
                 let response = doc.required(root, "response")?;
                 self.lifecycle(owner, &doc, response)?;
@@ -282,6 +280,26 @@ impl State {
                 self.unknown(owner, &doc, CONSUMED, source, event)
             }
         }
+    }
+
+    /// The terminal event `doc`; a `completed` one the ingress accepted goes to the observer.
+    fn terminal(
+        &mut self,
+        owner: &mut Writer,
+        doc: &Document,
+        source: &Source,
+        event: &sse::Event,
+        completed: bool,
+    ) -> Result<()> {
+        let response = doc.required(doc.root(), "response")?;
+        self.start(owner, Some((doc, response)))?;
+        self.unknown(owner, doc, &["type", "response", "sequence_number"], source, event)?;
+        // A failed response ends in `Err`, so only an accepted completion is observed.
+        self.complete(owner, doc, response)?;
+        if completed && let Some(observer) = &mut self.completed {
+            observer(doc, response);
+        }
+        Ok(())
     }
 
     /// Parses the event data. Non-JSON data under a mapped event name is invalid JSON; any other
@@ -386,7 +404,7 @@ impl State {
                 self.arguments(owner, at, doc, doc.required(root, field)?, snapshot)
             }
             Class::Annotation => self.annotation_event(owner, doc),
-            Class::Failure | Class::Terminal | Class::Lifecycle(_) => Err(Error::Schema),
+            Class::Failure | Class::Terminal { .. } | Class::Lifecycle(_) => Err(Error::Schema),
         }
     }
 

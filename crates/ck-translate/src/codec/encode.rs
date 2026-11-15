@@ -6,10 +6,12 @@ use super::{
     source::{Source, Span},
 };
 
-/// A counting pass or a mapped reservation. Neither mode buffers output bytes.
+/// A counting pass, a mapped reservation, or a vector a caller keeps outside the stream
+/// ([`owned`]). Only the last buffers output bytes.
 pub struct Encoder<'a, 'w> {
     reservation: Option<&'a mut Reservation<'w>>,
     scratch: Option<&'a mut ck_stream::ScratchReservation>,
+    owned: Option<&'a mut Vec<u8>>,
     length: usize,
     quoted: bool,
 }
@@ -50,6 +52,9 @@ impl Encoder<'_, '_> {
         }
         if let Some(scratch) = &mut self.scratch {
             scratch.write(bytes)?;
+        }
+        if let Some(owned) = &mut self.owned {
+            owned.extend_from_slice(bytes);
         }
         Ok(())
     }
@@ -187,6 +192,7 @@ pub(crate) fn measure(encode: impl FnOnce(&mut Encoder<'_, '_>) -> Result<()>) -
     let mut encoder = Encoder {
         reservation: None,
         scratch: None,
+        owned: None,
         length: 0,
         quoted: false,
     };
@@ -216,6 +222,7 @@ pub(super) fn publish_record(
     let mut count = Encoder {
         reservation: None,
         scratch: None,
+        owned: None,
         length: 0,
         quoted: false,
     };
@@ -229,6 +236,7 @@ pub(super) fn publish_record(
         let mut encoder = Encoder {
             reservation: Some(&mut reservation),
             scratch: None,
+            owned: None,
             length: 0,
             quoted: false,
         };
@@ -240,6 +248,21 @@ pub(super) fn publish_record(
     Ok(reservation.commit()?)
 }
 
+/// Bytes for a caller that keeps them outside the stream, such as a provider's replay cache.
+/// They take no stream storage, so keeping them cannot cost the response its quota.
+pub fn owned(encode: impl Fn(&mut Encoder<'_, '_>) -> Result<()>) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(measure(&encode)?);
+    let mut encoder = Encoder {
+        reservation: None,
+        scratch: None,
+        owned: Some(&mut bytes),
+        length: 0,
+        quoted: false,
+    };
+    encode(&mut encoder)?;
+    Ok(bytes)
+}
+
 /// External bytes remain unpublished, charged to the canonical writer's stream.
 /// A lease can span many frames without imposing the canonical event-size limit.
 pub fn scratch(
@@ -249,6 +272,7 @@ pub fn scratch(
     let mut count = Encoder {
         reservation: None,
         scratch: None,
+        owned: None,
         length: 0,
         quoted: false,
     };
@@ -263,6 +287,7 @@ pub fn scratch(
     let mut encoder = Encoder {
         reservation: None,
         scratch: Some(&mut reservation),
+        owned: None,
         length: 0,
         quoted: false,
     };

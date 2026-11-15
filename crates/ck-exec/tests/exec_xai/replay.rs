@@ -8,14 +8,18 @@ const ENC: &str = "TKwE++a7qP4CXIXITJIj2DYyQCSyR3JuUSrOe758M0CwwzrC2cbGVuOaEQaBq
 
 /// One completed Responses turn with encrypted reasoning and a message.
 fn reasoning_turn() -> String {
+    turn_ending("response.completed", "completed")
+}
+
+/// A turn with encrypted reasoning and a message, ended by event `kind` whose response has
+/// `status`.
+fn turn_ending(kind: &str, status: &str) -> String {
     let reasoning = json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":ENC,"status":"completed"});
     [
         event(json!({"type":"response.created","response":response("in_progress", json!([]))})),
         event(json!({"type":"response.output_item.done","output_index":0,"item":reasoning})),
         event(json!({"type":"response.output_item.done","output_index":1,"item":message("hello")})),
-        event(
-            json!({"type":"response.completed","response":response("completed", json!([reasoning, message("hello")]))}),
-        ),
+        event(json!({"type":kind,"response":response(status, json!([reasoning, message("hello")]))})),
     ]
     .concat()
 }
@@ -149,4 +153,50 @@ async fn malformed_json_is_no_error() {
             "{malformed}"
         );
     }
+}
+
+/// Replay takes no storage the delivery needs: at every pool size, an exchange ends the same
+/// way with replay off (no caller) and on. A 240,000-character event before the completion
+/// once failed with replay on only, at 17 to 21 frames.
+#[tokio::test]
+async fn replay_takes_no_storage_from_delivery() {
+    let blob = event(json!({"type":"provider.extra","blob":"x".repeat(240_000)}));
+    let completed = event(json!({"type":"response.completed","response":response("completed", json!([]))}));
+    let body = format!("{blob}{completed}");
+    let executors = executors();
+    let mut completions = 0;
+    for frames in 16..=32 {
+        let mut ends = Vec::new();
+        for principal in ["", "sk-a"] {
+            let streams = Streams::with_frames(frames);
+            let upstream = StreamUpstream::start([Reply::sse(body.clone())]).await;
+            let mut exchange = exchange(&upstream);
+            exchange.caller.principal = principal.into();
+            let input = (TURN, 64, Sessions::default());
+            let run = run_on(
+                &streams,
+                &executors,
+                &exchange,
+                Client::Responses,
+                Operation::Generate,
+                input,
+            )
+            .await;
+            let (outcome, published, _) = produce(&streams, run.started.unwrap()).await;
+            ends.push((outcome.is_ok(), published.terminal));
+        }
+        assert_eq!(ends[0], ends[1], "{frames} frames: replay off, then on");
+        completions += usize::from(ends[1].0);
+    }
+    assert!(completions > 0, "no pool size completed");
+}
+
+/// Only a successful `response.completed` caches: an incomplete response, and a completion
+/// whose response failed, which the ingress ends as a failure, cache nothing.
+#[tokio::test]
+async fn only_a_successful_completion_caches() {
+    let incomplete = turn_ending("response.incomplete", "incomplete");
+    assert_eq!(replayed(incomplete).await, (true, false));
+    let failed = turn_ending("response.completed", "failed");
+    assert_eq!(replayed(failed).await, (false, false));
 }
