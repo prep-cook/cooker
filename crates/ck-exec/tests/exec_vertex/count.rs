@@ -128,3 +128,35 @@ fn a_count_naming_cached_content_is_refused() {
     let generate = r#"{"cachedContent":"cachedContents/abc","contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
     gemini_fence(Operation::Generate, generate).unwrap();
 }
+
+/// Default rules check the count as it was before the Codex tool normalization: a default on
+/// an index that normalization removed does not apply.
+#[tokio::test]
+async fn count_default_rules_see_the_body_before_codex_normalization() {
+    let path = "tools.0.functionDeclarations.0.parametersJsonSchema.properties.yield_time_ms.type.1";
+    for section in ["default", "default-raw"] {
+        let streams = Streams::new();
+        let upstream = StreamUpstream::start([Reply::json(COUNT)]).await;
+        let mut exchange = exchange(&upstream);
+        exchange
+            .headers
+            .insert("user-agent", "codex_cli_rs/0.50".parse().unwrap());
+        let value = if section == "default" { "null" } else { "'\"null\"'" };
+        exchange.cfg = ck_core::config::Config::parse(&format!(
+            "requests:\n  payload:\n    {section}:\n      - models: [{{name: gemini-2.5-pro, protocol: gemini}}]\n        params: {{{path}: {value}}}\n"
+        ))
+        .unwrap();
+        let body = concat!(
+            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[{"name":"exec_command","#,
+            r#""parametersJsonSchema":{"type":"object","properties":{"yield_time_ms":{"type":["number","integer"]}}}}]}]}"#,
+        );
+        counted(&streams, &exchange, Client::Gemini, body).await;
+        let sent = json_body(&upstream.captured()[0]);
+        let schema = &sent["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"];
+        assert_eq!(
+            schema["properties"]["yield_time_ms"]["type"],
+            json!(["integer"]),
+            "{section}: {sent}"
+        );
+    }
+}

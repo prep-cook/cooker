@@ -359,13 +359,13 @@ fn count_body(call: &Call<'_>, upload: Vec<u8>) -> Vec<u8> {
     }
     drop(upload);
     let mut body = vertex::strip_call_ids(projected);
+    // Default rules check the projection as it was before the rules' own rewrites (the Codex
+    // tool normalization); only they need a copy of it.
+    let original = call.rules_read_baseline().then(|| body.clone());
     if gj::get(&body, "model").exists() {
         call.name_model(&mut body, "model");
     }
-    // No separate baseline: default rules then check the body as it enters, which differs
-    // from the projection only in the value of an existing `model`, never in which members
-    // exist, so the rules decide alike; the engine copies it only when a default rule exists.
-    call.rules("", &[], body)
+    call.rules("", original.as_deref().unwrap_or_default(), body)
 }
 
 /// Whether the request names cached content: a Gemini client's `cachedContent`, kept as its

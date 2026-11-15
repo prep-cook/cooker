@@ -267,6 +267,11 @@ impl<'r> Call<'r> {
         }
     }
 
+    /// Whether the payload rules read a baseline: only default rules do.
+    pub(crate) fn rules_read_baseline(&self) -> bool {
+        ck_wire::payload::Rules::of(self.attempt.cfg).has_defaults()
+    }
+
     /// The configured payload rules under `root`, the last change to the body.
     pub(crate) fn rules(&self, root: &str, original: &[u8], body: Vec<u8>) -> Vec<u8> {
         let rules = ck_wire::payload::Rules::of(self.attempt.cfg);
