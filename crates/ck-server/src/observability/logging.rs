@@ -743,6 +743,9 @@ where
             event.metadata().file().zip(event.metadata().line()),
             fields,
         );
+        // Every log line drops URL credentials, whatever field carried them (owner ruling
+        // Q18).
+        let line = ck_wire::redact::urls_in(&line).into_owned();
         fire_hooks(&Entry {
             line: &line,
             level: logrus_level(level),
@@ -825,6 +828,10 @@ fn format_line(now: chrono::NaiveDateTime, level: &Level, caller: Option<(&str, 
     line.push('\n');
     line
 }
+
+#[cfg(test)]
+#[path = "logging_url_tests.rs"]
+mod url_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1375,7 +1382,7 @@ mod tests {
         assert!(lines[0].contains("] [23456789] [warn ] ["), "{written}");
     }
 
-    struct SharedWriter(std::sync::Arc<Mutex<Vec<u8>>>);
+    pub(super) struct SharedWriter(pub(super) std::sync::Arc<Mutex<Vec<u8>>>);
 
     impl Write for SharedWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {

@@ -320,3 +320,25 @@ fn malformed_callback_urls_hide_the_code() {
         assert!(!message.contains("sk-review-secret"), "{message}");
     }
 }
+
+/// Round 3, finding 5: a callback's `error_description` holding a URL reaches the login
+/// error redacted.
+#[tokio::test]
+async fn callback_errors_hide_url_credentials() {
+    let dir = temp_dir();
+    let interaction = Interaction {
+        manual_delay: Duration::from_millis(1),
+        prompt: Some(Box::new(|| {
+            Box::pin(async {
+                Ok("http://127.0.0.1/callback?error=access_denied&error_description=http%3A%2F%2Fu%3Ask-review-secret%40127.0.0.1%2F%3Fcode%3Dsk-review-secret%23sk-review-secret\n".to_owned())
+            })
+        })),
+        show_url: Box::new(|_| {}),
+    };
+    let mock = oauth_mock().await;
+    let (listener, _) = callback().await;
+    let error = login_with(&dir, listener, mock, interaction, None).await.unwrap_err();
+    let body = String::from_utf8_lossy(&error.body);
+    assert_eq!(body, "OAuth error access_denied: http://127.0.0.1/?code=***#***");
+    std::fs::remove_dir_all(dir).unwrap();
+}

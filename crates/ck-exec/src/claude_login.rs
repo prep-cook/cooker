@@ -192,8 +192,15 @@ pub(crate) fn print_ssh_tunnel_instructions(port: u16) {
     println!("{border}");
 }
 
+/// A login error. Its text can quote the callback's `error` and `error_description`
+/// or a pasted URL, so every URL in it is redacted (owner ruling Q18).
 fn login_error(message: impl Into<String>) -> ExecError {
-    ExecError::local(400, FailureScope::Request, message)
+    let message = message.into();
+    ExecError::local(
+        400,
+        FailureScope::Request,
+        ck_wire::redact::urls_in(&message).into_owned(),
+    )
 }
 
 /// `ClaudeAuthenticator.Login` + `Manager.Login` persistence, serving the callback on

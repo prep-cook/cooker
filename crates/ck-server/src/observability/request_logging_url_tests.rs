@@ -83,15 +83,21 @@ async fn every_query_value_and_fragment_is_masked_in_logs() {
     }
 }
 
-/// Review of #127, finding 3: the logged copies of URL-bearing headers are redacted, in
-/// the request log and in the forced error log; the client receives them unchanged.
+/// The logged copies of URL-bearing headers are redacted by value, whatever the name or
+/// grammar (round 3, findings 3 and 4), in the request log and in the forced error log;
+/// the client receives them unchanged.
 #[tokio::test]
 async fn url_headers_are_redacted_in_logs_only() {
     const HEADERS: &[(&str, &str)] = &[
         ("location", "http://127.0.0.1/v1?key=sk-review-secret"),
         ("content-location", "/v1/r?token=sk-review-secret"),
         ("referer", "https://u:sk-review-secret@127.0.0.1/cb#sk-review-secret"),
-        ("link", "<http://127.0.0.1/p?key=sk-review-secret>; rel=\"next\""),
+        ("link", "http://127.0.0.1/?code=sk-review-secret"),
+        ("refresh", "http://127.0.0.1/?code=sk-review-secret; url=/next"),
+        (
+            "reporting-endpoints",
+            "default=\"http://127.0.0.1/reports?key=sk-review-secret\"",
+        ),
     ];
     for enabled in [true, false] {
         let (content, received) = persisted_request(enabled, StatusCode::BAD_GATEWAY, "/fixture", HEADERS, |log| {
@@ -113,7 +119,9 @@ async fn url_headers_are_redacted_in_logs_only() {
             "Location: http://127.0.0.1/v1?key=***\n",
             "Content-Location: /v1/r?token=***\n",
             "Referer: https://127.0.0.1/cb#***\n",
-            "Link: <http://127.0.0.1/p?key=***>; rel=\"next\"\n",
+            "Link: http://127.0.0.1/?code=***\n",
+            "Refresh: http://127.0.0.1/?code=*** url=/next\n",
+            "Reporting-Endpoints: default=\"http://127.0.0.1/reports?key=***\"\n",
         ] {
             assert_eq!(content.matches(want).count(), copies, "{want}: {content}");
         }
@@ -151,4 +159,64 @@ async fn urls_in_captured_errors_are_redacted() {
     ] {
         assert!(content.contains(want), "{want}: {content}");
     }
+}
+
+/// Round 3, finding 1: an upstream error body is captured with its URLs redacted.
+#[tokio::test]
+async fn upstream_error_bodies_are_redacted_in_captures() {
+    let content = persisted(true, StatusCode::BAD_GATEWAY, |log| {
+        let sink = log.capture_sink();
+        sink.record(Request(upstream_request("http://127.0.0.1/v1", &[], b"")));
+        sink.record(ResponseMetadata(502, &[]));
+        sink.record(ResponseChunk(
+            br#"{"error":{"message":"request failed for http://u:sk-review-secret@127.0.0.1/?code=sk-review-secret#sk-review-secret"}}"#,
+        ));
+    })
+    .await;
+    let content = String::from_utf8(content).unwrap();
+    assert!(!content.contains(SECRET), "{content}");
+    line(
+        &content,
+        r#"{"error":{"message":"request failed for http://127.0.0.1/?code=***#***"}}"#,
+    );
+}
+
+/// Round 3, finding 2: quoted references whatever the quote, references after `=`, and
+/// path-absolute references in captured errors.
+#[tokio::test]
+async fn every_reference_shape_in_captured_errors_is_redacted() {
+    let content = persisted(true, StatusCode::OK, |log| {
+        let sink = log.capture_sink();
+        sink.record(Request(upstream_request("http://127.0.0.1/v1", &[], b"")));
+        for error in [
+            "Post 'http://127.0.0.1/?code=prefix sk-review-secret': EOF",
+            "Post \" http://127.0.0.1/?code=prefix sk-review-secret\": EOF",
+            "request failed: url=//user:sk-review-secret@127.0.0.1/?code=sk-review-secret",
+            "request failed: /callback?code=sk-review-secret#sk-review-secret",
+            "Post \"http://127.0.0.1/?code=prefix\r\nsk-review-secret\": EOF",
+        ] {
+            sink.record(ResponseError(error));
+        }
+        sink.record(WebsocketError {
+            stage: "read",
+            error: "Post \"http://127.0.0.1/?code=prefix\r\nsk-review-secret\": EOF",
+        });
+    })
+    .await;
+    let content = String::from_utf8(content).unwrap();
+    assert!(!content.contains(SECRET), "{content}");
+    for want in [
+        "Error: Post 'http://127.0.0.1/?code=***': EOF",
+        "Error: Post \" http://127.0.0.1/?code=***\": EOF",
+        "Error: request failed: url=//127.0.0.1/?code=***",
+        "Error: request failed: /callback?code=***#***",
+    ] {
+        line(&content, want);
+    }
+    // The captured error and the websocket error.
+    assert_eq!(
+        content.matches("\nError: Post \"<redacted url>\": EOF\n").count(),
+        2,
+        "{content}"
+    );
 }

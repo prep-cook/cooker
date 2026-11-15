@@ -256,8 +256,7 @@ impl Client {
         let owner_commit = method == wreq::Method::POST && path == "/admin/v1/apply";
         let (code, data) = self.request(method, path, body).await?;
         if code >= 400 || (owner_commit && code != 200) {
-            let text = String::from_utf8_lossy(ck_wire::gostr::trim_space(&data)).into_owned();
-            return Err(format!("HTTP {code}: {text}"));
+            return Err(http_error(code, &data));
         }
         if owner_commit {
             let receipt: Value =
@@ -494,8 +493,7 @@ impl Client {
             return Ok(None);
         }
         if code >= 400 {
-            let text = String::from_utf8_lossy(ck_wire::gostr::trim_space(&data)).into_owned();
-            return Err(format!("HTTP {code}: {text}"));
+            return Err(http_error(code, &data));
         }
         body.and_then(|mut b| b.get_mut("spec").map(Value::take))
             .ok_or_else(|| "invalid owner setting response".to_owned())
@@ -693,6 +691,13 @@ pub fn value_at<'a>(cfg: &'a Object, path: &str) -> Option<&'a Value> {
         value = value.get(part)?;
     }
     Some(value)
+}
+
+/// Go's `HTTP <code>: <body>`, with every URL in the body redacted (owner ruling Q18):
+/// the body is an upstream error the TUI displays.
+fn http_error(code: u16, data: &[u8]) -> String {
+    let text = String::from_utf8_lossy(ck_wire::gostr::trim_space(data));
+    format!("HTTP {code}: {}", ck_wire::redact::urls_in(&text))
 }
 
 /// The innermost cause of a request error.
@@ -1273,6 +1278,22 @@ mod tests {
             assert!(err.starts_with(&want.replace("PORT", &port.to_string())), "{err}");
             assert!(!err.contains("sk-review-secret"), "{err}");
         }
+    }
+
+    /// Round 3, finding 6: an HTTP error shows its body with every URL redacted.
+    #[tokio::test]
+    async fn http_errors_hide_url_credentials_in_the_body() {
+        let body = "request failed for http://user:sk-review-secret@127.0.0.1/?code=sk-review-secret#sk-review-secret";
+        let (port, _) = record(format!(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let err = Client::new(&format!("http://127.0.0.1:{port}"), "k")
+            .get_config()
+            .await
+            .unwrap_err();
+        assert_eq!(err, "HTTP 502: request failed for http://127.0.0.1/?code=***#***");
     }
 
     #[tokio::test]

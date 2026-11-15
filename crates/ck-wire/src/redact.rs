@@ -22,66 +22,208 @@ pub fn url(raw: &str) -> String {
     render(raw).unwrap_or_else(|| UNPRINTABLE.to_owned())
 }
 
-/// `text` with every URL rendered by [`url`]: each `scheme://` token, and each `//`
-/// token at the start of the text or after whitespace, `"`, `'`, `(` or `<`. A token
-/// opened by `"` runs to the closing `"` (Go quotes URLs in its errors, and a quoted URL
-/// can hold spaces); any other token runs to the next whitespace or `"`, so a URL
-/// followed by other punctuation loses that punctuation rather than printing part of a
-/// secret.
+/// `text` with every URL reference rendered by [`url`]; see [`bytes`].
 pub fn urls_in(text: &str) -> Cow<'_, str> {
-    if !text.contains("//") {
+    match bytes(text.as_bytes()) {
+        Cow::Borrowed(_) => Cow::Borrowed(text),
+        // Replacements are ASCII and cut only at ASCII bytes, so UTF-8 stays valid.
+        Cow::Owned(out) => {
+            Cow::Owned(String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+        }
+    }
+}
+
+/// `text` (any bytes) with every URL reference rendered by [`url`], for errors, captures
+/// and logs. A reference is found two ways:
+///
+/// - A span delimited by `"…"`, `'…'` or `<…>` whose contents, after leading spaces,
+///   start with `scheme://`, `//` or `/`: the whole contents are the reference, so a
+///   quoted URL holding spaces is redacted whole, and one holding a line break prints as
+///   [`UNPRINTABLE`].
+/// - Otherwise a token running to the next whitespace or `"` that starts after whitespace
+///   or a delimiter (`"'(<[{=,;:`) with `scheme://`, `://`, `//` or `/`. A token that is
+///   none of these but holds `?` followed by `=` (`callback?code=…`) is ambiguous and
+///   prints as [`UNPRINTABLE`] from the last delimiter before its `?`.
+///
+/// A reference that is not UTF-8 prints as [`UNPRINTABLE`]; other bytes are unchanged.
+/// The scan is linear in `text`, and a reference is passed over whole, so text that is
+/// already redacted comes back unchanged.
+pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
+    if !text.iter().any(|b| matches!(b, b'/' | b'?' | b'#')) {
         return Cow::Borrowed(text);
     }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = next_url(rest) {
-        let quoted = start > 0 && rest.as_bytes()[start - 1] == b'"';
-        let len = if quoted {
-            closing_quote(&rest[start..])
-        } else {
-            rest[start..].find(|c: char| c.is_whitespace() || c == '"')
+    let mut out = Vec::new();
+    let (mut copied, mut i) = (0, 0);
+    let mut next = Next::default();
+    while i < text.len() {
+        let found = match DELIMITERS.iter().position(|(open, _)| *open == text[i]) {
+            Some(kind) => next.span(text, i, kind),
+            None if boundary(text, i) => next.token(text, i),
+            None => None,
         };
-        let end = len.map_or(rest.len(), |len| start + len);
-        out.push_str(&rest[..start]);
-        out.push_str(&url(&rest[start..end]));
-        rest = &rest[end..];
+        let Some((start, end, rendered)) = found else {
+            i += 1;
+            continue;
+        };
+        if rendered.as_bytes() != &text[start..end] {
+            out.extend_from_slice(&text[copied..start]);
+            out.extend_from_slice(rendered.as_bytes());
+            copied = end;
+        }
+        i = end;
     }
-    out.push_str(rest);
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.extend_from_slice(&text[copied..]);
     Cow::Owned(out)
 }
 
-/// Where the next URL token in `text` starts.
-fn next_url(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut from = 0;
-    while let Some(i) = text[from..].find("//").map(|i| from + i) {
-        if i > 0 && bytes[i - 1] == b':' {
-            let mut start = i - 1;
-            while start > 0 && scheme_byte(bytes[start - 1]) {
-                start -= 1;
-            }
-            return Some(start);
-        }
-        if i == 0 || bytes[i - 1].is_ascii_whitespace() || matches!(bytes[i - 1], b'"' | b'\'' | b'(' | b'<') {
-            return Some(i);
-        }
-        from = i + 2;
-    }
-    None
+const DELIMITERS: [(u8, u8); 3] = [(b'"', b'"'), (b'\'', b'\''), (b'<', b'>')];
+
+/// The next position at or after the scan of each byte [`bytes`] looks for, so every
+/// search covers its bytes once and the scan stays linear.
+#[derive(Default)]
+struct Next {
+    closers: [Option<usize>; 3],
+    stop: Option<usize>,
+    query: Option<usize>,
+    equals: Option<usize>,
 }
 
-/// The length of a Go-quoted string's contents: up to the first `"` not escaped by `\`.
-fn closing_quote(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
+impl Next {
+    /// The reference delimited by the opener at `i`: its contents' range and rendering.
+    fn span(&mut self, text: &[u8], i: usize, kind: usize) -> Option<(usize, usize, String)> {
+        // A closer found for an earlier opener also closes this one: the opener lies
+        // inside that span, so it is escaped there and the escape parity matches.
+        let close = match self.closers[kind] {
+            Some(at) if at > i => at,
+            _ => {
+                let at = closing(&text[i + 1..], DELIMITERS[kind].1).map_or(text.len(), |n| i + 1 + n);
+                *self.closers[kind].insert(at)
+            }
+        };
+        if close == text.len() {
+            return None;
+        }
+        let start = i + 1 + text[i + 1..close].iter().take_while(|b| **b == b' ').count();
+        starts_reference(&text[start..close]).then(|| (start, close, render_bytes(&text[start..close])))
+    }
+
+    /// The reference or ambiguous query starting at `i`: its range and rendering.
+    fn token(&mut self, text: &[u8], i: usize) -> Option<(usize, usize, String)> {
+        let stop = seek(text, i, &mut self.stop, |b| b.is_ascii_whitespace() || b == b'"');
+        if starts_reference(&text[i..stop]) {
+            return Some((i, stop, render_bytes(&text[i..stop])));
+        }
+        let query = seek(text, i, &mut self.query, |b| b == b'?');
+        // A later delimiter before the `?` starts the token that is checked instead, so a
+        // reference such as `url=//…` keeps its name.
+        if query >= stop || (i + 1..query).any(|j| boundary(text, j)) {
+            return None;
+        }
+        let equals = seek(text, query, &mut self.equals, |b| b == b'=');
+        (equals < stop).then(|| (i, stop, UNPRINTABLE.to_owned()))
+    }
+}
+
+/// The first position at or after `from` holding a byte that `hit`s, or `text.len()`.
+/// `cache` holds an earlier answer, which stays right while it is not before `from`.
+fn seek(text: &[u8], from: usize, cache: &mut Option<usize>, hit: impl Fn(u8) -> bool) -> usize {
+    match *cache {
+        Some(at) if at >= from => at,
+        _ => *cache.insert(
+            text[from..]
+                .iter()
+                .position(|b| hit(*b))
+                .map_or(text.len(), |n| from + n),
+        ),
+    }
+}
+
+/// The length of a delimited span's contents: up to `close`, a backslash escaping the
+/// next byte in a quoted span.
+fn closing(text: &[u8], close: u8) -> Option<usize> {
     let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some(i),
+    while i < text.len() {
+        match text[i] {
+            b'\\' if close != b'>' => i += 2,
+            b if b == close => return Some(i),
             _ => i += 1,
         }
     }
     None
+}
+
+fn boundary(text: &[u8], i: usize) -> bool {
+    i == 0 || text[i - 1].is_ascii_whitespace() || b"\"'(<[{=,;:".contains(&text[i - 1])
+}
+
+/// `scheme://`, `://`, `//` or `/` at the start of `text`.
+fn starts_reference(text: &[u8]) -> bool {
+    let scheme = text.iter().take_while(|b| scheme_byte(**b)).count();
+    text.starts_with(b"/") || (text[scheme..].starts_with(b"://") && (scheme == 0 || text[0].is_ascii_alphabetic()))
+}
+
+fn render_bytes(reference: &[u8]) -> String {
+    std::str::from_utf8(reference).map_or_else(|_| UNPRINTABLE.to_owned(), url)
+}
+
+/// A [`std::io::Write`] that passes every line through [`bytes`] before `out`. A line
+/// longer than [`LINE_LIMIT`] is cut at its last whitespace or quote before the limit.
+// ponytail: a reference longer than LINE_LIMIT with no whitespace or quote is redacted in
+// LINE_LIMIT pieces, so its later pieces lose their context; a streaming tokenizer would
+// lift that ceiling.
+pub struct Writer<W: std::io::Write> {
+    out: W,
+    line: Vec<u8>,
+}
+
+/// The longest line [`Writer`] holds before redacting part of it.
+pub const LINE_LIMIT: usize = 1 << 20;
+
+impl<W: std::io::Write> Writer<W> {
+    pub fn new(out: W) -> Self {
+        Self { out, line: Vec::new() }
+    }
+
+    /// Redacts and writes what is buffered, and returns the inner writer.
+    pub fn finish(mut self) -> std::io::Result<W> {
+        self.drain(self.line.len())?;
+        Ok(self.out)
+    }
+
+    fn drain(&mut self, end: usize) -> std::io::Result<()> {
+        let rest = self.line.split_off(end);
+        self.out.write_all(&bytes(&self.line))?;
+        self.line = rest;
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut rest = buf;
+        while let Some(newline) = rest.iter().position(|b| *b == b'\n') {
+            self.line.extend_from_slice(&rest[..=newline]);
+            self.drain(self.line.len())?;
+            rest = &rest[newline + 1..];
+        }
+        self.line.extend_from_slice(rest);
+        while self.line.len() > LINE_LIMIT {
+            let cut = self.line[..LINE_LIMIT]
+                .iter()
+                .rposition(|b| b.is_ascii_whitespace() || matches!(b, b'"' | b'\''))
+                .filter(|i| *i > 0)
+                .unwrap_or(LINE_LIMIT);
+            self.drain(cut)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
 }
 
 /// A raw query (without its `?`) with every value masked: `name=value` prints as
@@ -96,87 +238,6 @@ pub fn query(raw: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("&")
-}
-
-/// The logged copy of header `name` (lowercase) when its value is or holds a URL:
-/// `Location`, `Content-Location`, `Referer`, `Origin` and the rewrite headers as
-/// [`url`] renders them, each `<target>` and URL-like parameter of a `Link`, and the URL
-/// of a `Refresh`. `None` for every other header. A value that is not UTF-8, or one whose
-/// syntax cannot be followed, prints as [`UNPRINTABLE`].
-pub fn url_header(name: &str, value: &[u8]) -> Option<String> {
-    let render: fn(&str) -> String = match name {
-        "location" | "content-location" | "referer" | "origin" | "x-original-url" | "x-rewrite-url"
-        | "x-forwarded-uri" => url,
-        "link" => link,
-        "refresh" => refresh,
-        _ => return None,
-    };
-    Some(std::str::from_utf8(value).map_or_else(|_| UNPRINTABLE.to_owned(), render))
-}
-
-/// `Link`: every `<target>`, and every parameter value that looks like a URL (`anchor`).
-fn link(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(i) = rest.find(['<', '"', '=']) {
-        out.push_str(&rest[..=i]);
-        let after = &rest[i + 1..];
-        let (field, close, tail) = match rest.as_bytes()[i] {
-            b'<' => match after.find('>') {
-                Some(end) => (url(&after[..end]), ">", &after[end + 1..]),
-                None => return out + UNPRINTABLE,
-            },
-            b'"' => match after.find('"') {
-                Some(end) if !after[..end].contains('\\') => (link_param(&after[..end]), "\"", &after[end + 1..]),
-                _ => return out + UNPRINTABLE,
-            },
-            _ => {
-                let value = after.trim_start();
-                if value.starts_with('"') {
-                    out.push_str(&after[..after.len() - value.len()]);
-                    rest = value;
-                    continue;
-                }
-                let end = after.find([';', ',']).unwrap_or(after.len());
-                (link_param(&after[..end]), "", &after[end..])
-            }
-        };
-        out.push_str(&field);
-        out.push_str(close);
-        rest = tail;
-    }
-    out + rest
-}
-
-fn link_param(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.contains(['?', '#', '@']) || trimmed.contains("//") || trimmed.starts_with('/') {
-        let lead = &value[..value.len() - value.trim_start().len()];
-        format!("{lead}{}", url(trimmed))
-    } else {
-        value.to_owned()
-    }
-}
-
-/// `Refresh: <delay>[; url=<target>]`, written back as `<delay>; url=<target>` with the
-/// target rendered by [`url`]. Spaces around `url` and `=`, and quotes, are accepted.
-fn refresh(value: &str) -> String {
-    let Some(i) = value.find([';', ',']) else {
-        let delay = value.trim().bytes().all(|b| b.is_ascii_digit() || b == b'.');
-        return if delay {
-            value.to_owned()
-        } else {
-            UNPRINTABLE.to_owned()
-        };
-    };
-    let mut target = value[i + 1..].trim_start();
-    if target.get(..3).is_some_and(|t| t.eq_ignore_ascii_case("url"))
-        && let Some(rest) = target[3..].trim_start().strip_prefix('=')
-    {
-        target = rest;
-    }
-    let target = target.trim().trim_matches(['"', '\'']);
-    format!("{}; url={}", &value[..i], url(target))
 }
 
 fn render(raw: &str) -> Option<String> {

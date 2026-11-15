@@ -180,6 +180,7 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             deferred: deferred.clone(),
         });
     }
+    // The record keeps this URL, so its query is masked as it enters.
     let query = ck_wire::redact::query(request.uri().query().unwrap_or_default());
     let url = if query.is_empty() {
         path
@@ -554,7 +555,7 @@ impl RequestLog {
                     if info.url.is_empty() {
                         String::from("<unknown>")
                     } else {
-                        ck_wire::redact::url(info.url)
+                        info.url.to_owned()
                     }
                 )
                 .unwrap();
@@ -617,7 +618,8 @@ impl RequestLog {
                 if record.upstream.error {
                     part.push(b'\n');
                 }
-                // Defense in depth: executors redact URLs in their errors already.
+                // Redacted whole here: an error can hold a raw line break inside a quoted URL,
+                // which the log's line writer would see as two lines.
                 writeln!(part, "Error: {}", ck_wire::redact::urls_in(error)).unwrap();
                 record.api_response.append(&record.state.dir, &part);
                 record.upstream.error = true;
@@ -652,7 +654,7 @@ impl RequestLog {
             WebsocketRequest(info) => {
                 let mut part = websocket_event("api.websocket.request");
                 if !info.url.is_empty() {
-                    writeln!(part, "Upstream URL: {}", ck_wire::redact::url(info.url)).unwrap();
+                    writeln!(part, "Upstream URL: {}", info.url).unwrap();
                 }
                 upstream_auth(&mut part, &info);
                 part.extend_from_slice(b"Headers:\n");
@@ -687,6 +689,8 @@ impl RequestLog {
                 if !stage.is_empty() {
                     writeln!(part, "Stage: {stage}").unwrap();
                 }
+                // Redacted whole here: an error can hold a raw line break inside a quoted URL,
+                // which the log's line writer would see as two lines.
                 writeln!(part, "Error: {}", ck_wire::redact::urls_in(error)).unwrap();
                 upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
             }
@@ -1229,9 +1233,12 @@ impl Record {
     fn write(self, forced: bool, max: i64, decompress_error: Option<String>) -> io::Result<()> {
         std::fs::create_dir_all(&self.state.dir)?;
         let filename = filename(&self.url, &self.id, Local::now(), forced);
-        let mut file = unique_file(&self.state.dir, &filename)?;
+        // Every URL in the log, wherever it came from (URLs, errors, headers, bodies),
+        // drops its credentials here (owner ruling Q18); the bytes sent to the client and
+        // upstream are not touched.
+        let mut file = ck_wire::redact::Writer::new(unique_file(&self.state.dir, &filename)?);
         self.format(&mut file, decompress_error)?;
-        drop(file);
+        drop(file.finish()?);
         if forced {
             retain_errors(&self.state.dir, max)?;
         }
@@ -1387,20 +1394,9 @@ fn redacted(name: &str) -> bool {
     name.contains("cookie") || name == crate::inference::streams::STREAM_ID_HEADER || name == "last-event-id"
 }
 
-/// What every logged copy of a header shows, masked or not: [`REDACTED`] for the
-/// [`redacted`] headers, and a URL-bearing header (`Location`, `Referer`, `Link` and the
-/// like) with its URLs redacted ([`ck_wire::redact::url_header`]). Headers sent to the
-/// client stay unchanged.
-fn logged_header(name: &str, value: &[u8]) -> Option<Vec<u8>> {
-    if redacted(name) {
-        return Some(REDACTED.as_bytes().to_vec());
-    }
-    ck_wire::redact::url_header(name, value).map(String::into_bytes)
-}
-
 fn masked_header(name: &str, value: &[u8]) -> Vec<u8> {
-    if let Some(logged) = logged_header(name, value) {
-        return logged;
+    if redacted(name) {
+        return REDACTED.as_bytes().to_vec();
     }
     if name.contains("authorization") {
         let trimmed = trim(value);
@@ -1424,8 +1420,8 @@ fn headers(out: &mut dyn Write, headers: &HeaderMap, mask: bool) -> io::Result<(
         write!(out, "{}: ", header_name(name.as_str()))?;
         if mask {
             out.write_all(&masked_header(name.as_str(), value.as_bytes()))?;
-        } else if let Some(logged) = logged_header(name.as_str(), value.as_bytes()) {
-            out.write_all(&logged)?;
+        } else if redacted(name.as_str()) {
+            out.write_all(REDACTED.as_bytes())?;
         } else {
             out.write_all(value.as_bytes())?;
         }

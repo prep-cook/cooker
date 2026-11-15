@@ -130,6 +130,26 @@ fn urls_inside_text_are_rendered_in_place() {
         urls_in(&wreq),
         "error sending request for uri (http://h/?api_key=*** client error"
     );
+    let redacted = "error sending request for uri (http://127.0.0.1:1/?api_key=*** EOF";
+    assert_eq!(urls_in(redacted), redacted);
+}
+
+/// Each search covers its bytes once, so a long minified body (an embedding array) does
+/// not make a log line quadratic.
+#[test]
+fn the_scan_is_linear() {
+    let n = 1 << 17;
+    for text in [
+        format!("/x [{}]", "1,".repeat(n)),
+        format!("/x {}", "a?b,".repeat(n)),
+        format!("/x {}", "x?y=".repeat(n)),
+        format!("/x {}>", "<".repeat(2 * n)),
+        format!("/x {}", "\"a".repeat(n)),
+    ] {
+        let started = std::time::Instant::now();
+        let _ = bytes(text.as_bytes());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{}", &text[..12]);
+    }
 }
 
 /// Review of #127, finding 2: a quoted URL runs to its closing quote, and a
@@ -165,63 +185,117 @@ fn quoted_and_scheme_relative_urls_are_whole() {
     }
 }
 
+/// Round 3, findings 2 to 4: single quotes, a space after the opening quote, a reference
+/// after `=`, path-absolute references, and URL-bearing header values whatever the
+/// header's name or grammar.
 #[test]
-fn url_headers_are_rendered_for_logs() {
-    for (name, value, want) in [
+fn every_reference_shape_is_redacted() {
+    for (text, want) in [
         (
-            "location",
-            "http://127.0.0.1/v1?key=sk-review-secret",
-            "http://127.0.0.1/v1?key=***",
-        ),
-        ("location", "/v1/next?key=sk-review-secret", "/v1/next?key=***"),
-        ("location", "next?key=sk-review-secret", UNPRINTABLE),
-        (
-            "content-location",
-            "https://u:sk-review-secret@h.example/x",
-            "https://h.example/x",
+            "Post 'http://127.0.0.1/?code=prefix sk-review-secret': EOF",
+            "Post 'http://127.0.0.1/?code=***': EOF",
         ),
         (
-            "referer",
-            "https://h.example/cb#sk-review-secret",
-            "https://h.example/cb#***",
-        ),
-        ("x-original-url", "/v1?token=sk-review-secret", "/v1?token=***"),
-        (
-            "link",
-            r#"<https://h.example/p?key=sk-review-secret>; rel="next", </p?page=2>; rel="last""#,
-            r#"<https://h.example/p?key=***>; rel="next", </p?page=***>; rel="last""#,
-        ),
-        ("link", "</p?key=sk-review-secret", "<<redacted url>"),
-        // Review of #127, finding 1: URL parameters, and spaces around `url =`.
-        (
-            "link",
-            r#"</next>; anchor="/callback?code=sk-review-secret"; rel="next""#,
-            r#"</next>; anchor="/callback?code=***"; rel="next""#,
+            "Post \" http://127.0.0.1/?code=prefix sk-review-secret\": EOF",
+            "Post \" http://127.0.0.1/?code=***\": EOF",
         ),
         (
-            "link",
-            "</next>; anchor = /cb?code=sk-review-secret; title=\"a\\\"sk-review-secret\"",
-            "</next>; anchor = /cb?code=***; title=\"<redacted url>",
+            "request failed: url=//user:sk-review-secret@127.0.0.1/?code=sk-review-secret",
+            "request failed: url=//127.0.0.1/?code=***",
         ),
         (
-            "refresh",
-            "0; URL='https://h.example/?key=sk-review-secret'",
-            "0; url=https://h.example/?key=***",
+            "request failed: /callback?code=sk-review-secret#sk-review-secret",
+            "request failed: /callback?code=***#***",
         ),
         (
-            "refresh",
-            "0; url = http://127.0.0.1/?code=sk-review-secret",
-            "0; url=http://127.0.0.1/?code=***",
+            "redirect_uri=callback?code=sk-review-secret",
+            "redirect_uri=<redacted url>",
         ),
-        ("refresh", "5", "5"),
-        ("refresh", "http://127.0.0.1/?code=sk-review-secret", UNPRINTABLE),
+        (
+            "Refresh: http://127.0.0.1/?code=sk-review-secret; url=/next",
+            "Refresh: http://127.0.0.1/?code=*** url=/next",
+        ),
+        (
+            "Refresh: 0; url = http://127.0.0.1/?code=sk-review-secret",
+            "Refresh: 0; url = http://127.0.0.1/?code=***",
+        ),
+        (
+            "Link: http://127.0.0.1/?code=sk-review-secret",
+            "Link: http://127.0.0.1/?code=***",
+        ),
+        (
+            r#"Link: <https://h.example/p?key=sk-review-secret>; rel="next", </p?page=2>; rel="last""#,
+            r#"Link: <https://h.example/p?key=***>; rel="next", </p?page=***>; rel="last""#,
+        ),
+        (
+            r#"Link: </next>; anchor="/callback?code=sk-review-secret"; rel="next""#,
+            r#"Link: </next>; anchor="/callback?code=***"; rel="next""#,
+        ),
+        ("Link: </p?key=sk-review-secret", "Link: </p?key=***"),
+        (
+            r#"Reporting-Endpoints: default="http://127.0.0.1/reports?key=sk-review-secret""#,
+            r#"Reporting-Endpoints: default="http://127.0.0.1/reports?key=***""#,
+        ),
+        ("Location: next?key=sk-review-secret", "Location: <redacted url>"),
+        (
+            "Content-Location: https://u:sk-review-secret@h.example/x",
+            "Content-Location: https://h.example/x",
+        ),
+        (
+            r#"{"error":{"message":"request failed for http://u:sk-review-secret@127.0.0.1/?code=sk-review-secret#sk-review-secret"}}"#,
+            r#"{"error":{"message":"request failed for http://127.0.0.1/?code=***#***"}}"#,
+        ),
+        (
+            r#"{"url":"https://h.example/v1?key=sk-review-secret","n":1}"#,
+            r#"{"url":"https://h.example/v1?key=***","n":1}"#,
+        ),
+        (
+            "don't use http://h/?k=sk-review-secret, it's bad",
+            "don't use http://h/?k=*** it's bad",
+        ),
     ] {
-        let got = url_header(name, value.as_bytes()).unwrap();
-        assert_eq!(got, want, "{name}: {value}");
-        assert_no_secret(&got, value);
+        let got = urls_in(text);
+        assert_eq!(got, want, "{text}");
+        assert_no_secret(&got, text);
+        // The log writer scans error lines that were redacted already.
+        assert_eq!(urls_in(&got), got, "{text}");
     }
-    assert_eq!(url_header("location", b"/x?k=\xff"), Some(UNPRINTABLE.to_owned()));
-    assert_eq!(url_header("content-type", b"text/plain"), None);
+    for unchanged in [
+        "Content-Type: application/json; charset=utf-8",
+        "User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
+        "open /etc/hosts: permission denied",
+        "and/or what? #1",
+        r#"{"image":"/9j/4AAQSkZJRgABAQ=="}"#,
+    ] {
+        assert_eq!(urls_in(unchanged), unchanged);
+    }
+    assert_eq!(bytes(b"/x?k=\xffsk-review-secret"), &b"<redacted url>"[..]);
+    assert_eq!(bytes(b"\xff\xfe http://h/?k=v"), &b"\xff\xfe http://h/?k=***"[..]);
+}
+
+/// The line writer redacts what is split across writes, and a line past the limit.
+#[test]
+fn the_writer_redacts_whole_lines() {
+    use std::io::Write as _;
+    let mut writer = Writer::new(Vec::new());
+    for part in [
+        "Location: http://127.0.0.1/?co",
+        "de=sk-review",
+        "-secret\nBody: \"/cb?code=sk-",
+        "review-secret\"",
+    ] {
+        writer.write_all(part.as_bytes()).unwrap();
+    }
+    let out = String::from_utf8(writer.finish().unwrap()).unwrap();
+    assert_eq!(out, "Location: http://127.0.0.1/?code=***\nBody: \"/cb?code=***\"");
+    let mut writer = Writer::new(Vec::new());
+    // The reference straddles the limit, so the cut must fall at the space before it.
+    let filler = "a".repeat(LINE_LIMIT - 8);
+    writer
+        .write_all(format!("{filler} http://h/?k=sk-review-secret").as_bytes())
+        .unwrap();
+    let out = String::from_utf8(writer.finish().unwrap()).unwrap();
+    assert!(out.ends_with(" http://h/?k=***") && !out.contains(SECRET));
 }
 
 #[test]
