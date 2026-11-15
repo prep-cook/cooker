@@ -1,19 +1,37 @@
 //! Client egress and commitment (`docs/EXECUTION-CONTRACT.md` §9): the client gets nothing
 //! before the first deliverable byte, an attempt that ends first leaves its exchange for
 //! another attempt, and a committed response never fails over or holds the producer back.
+//! The attempt loop around it (D2-PLAN §3.2, §5.2) settles and discards each failed attempt
+//! before the next one starts.
 
 mod stream_fixture;
 
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use bytes::Bytes;
+use ck_core::config::Config;
+use ck_core::credential::Credential;
+use ck_core::exec::{ExecError, FailureScope};
+use ck_core::format::Format;
+use ck_exec::pipeline::Started;
+use ck_exec::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
+use ck_server::Runtime;
 use ck_server::http::egress::{Failed, Framing, Output, Protocol, deliver};
+use ck_server::inference::dispatch::{self, Arms, Call, Codec, Served, Trace};
 use ck_server::inference::streams::{Exchange, StreamId, Uncommitted};
-use ck_stream::Terminal;
-use ck_translate::codec::chat::request::read_request;
-use ck_translate::codec::event::Direction;
-use ck_translate::codec::{Operation, RequestView};
+use ck_stream::{Terminal, Writer};
+use ck_translate::codec::chat::request::{ChatCapability, read_request};
+use ck_translate::codec::chat::response::Ingress as ChatIngress;
+use ck_translate::codec::event::{Direction, LocalId};
+use ck_translate::codec::{self, BodyMode, Operation, RequestFence, RequestView, ResponseIngress, ValidatedRequest};
+use futures_util::{StreamExt, stream};
+use serde_json::Value;
 use stream_fixture::*;
+use tokio::sync::oneshot;
 
 /// Long enough for a published record to reach a waiting delivery.
 const SETTLE: Duration = Duration::from_millis(200);
@@ -269,6 +287,603 @@ async fn a_committed_response_never_holds_back_the_producer() {
         );
         if let Some(response) = held {
             assert_eq!(body(response).await, (text, true), "{client:?}");
+        }
+    }
+}
+
+/// What the fake contract arm does for one credential.
+#[derive(Clone, Copy, Debug)]
+enum Script {
+    /// `destination()` is `None`: the old arm runs against the refusing loopback upstream.
+    Old,
+    /// `refence` answers this error.
+    Refence(fn() -> codec::Error),
+    /// The executor fails before any response record.
+    Refused,
+    /// The executor publishes a usage snapshot, then fails.
+    UsageThenRefused,
+    /// The executor fails with a stream resource error.
+    StorageExhausted,
+    /// The upstream body fails before any content.
+    BodyFails,
+    /// The upstream answers in full.
+    Answers,
+    /// One content chunk, then the body fails once the test releases it.
+    FailsAfterContent,
+}
+
+/// One `start` call, recorded on entry.
+struct Begun {
+    credential: String,
+    stream: u64,
+    identity: String,
+    attempt: u64,
+    /// Whether the previous attempt's response stream was already discarded.
+    previous_gone: Option<bool>,
+    /// Usage records enqueued before this attempt started.
+    records: usize,
+}
+
+/// The contract arm scripted per credential id; `start` runs the real `pipeline::start`.
+struct Fake {
+    rt: Arc<Runtime>,
+    scripts: [(&'static str, Script); 2],
+    begun: Mutex<Vec<Begun>>,
+    records: Mutex<Vec<Value>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl Fake {
+    fn script(&self, attempt: &Attempt<'_>) -> Script {
+        let id = attempt.credential.id.rsplit('/').next().unwrap();
+        let script = self.scripts.iter().find(|(credential, _)| *credential == id);
+        script.expect("a scripted credential").1
+    }
+
+    /// Moves the enqueued usage records into `records`; how many there are.
+    fn drain(&self) -> usize {
+        let mut records = self.records.lock().unwrap();
+        let popped = self.rt.usage_queue().pop_oldest(usize::MAX);
+        records.extend(
+            popped
+                .iter()
+                .map(|record| serde_json::from_slice::<Value>(record).unwrap()),
+        );
+        records.len()
+    }
+
+    /// The usage records once `count` arrived or five seconds passed, and any that follow
+    /// within the settle window.
+    async fn records(&self, count: usize) -> Vec<Value> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while self.drain() < count && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.drain();
+        self.records.lock().unwrap().clone()
+    }
+}
+
+impl Arms for Fake {
+    fn destination(&self, attempt: &Attempt<'_>) -> Option<&'static str> {
+        match self.script(attempt) {
+            Script::Old => None,
+            _ => Some("chat"),
+        }
+    }
+
+    fn refence<'a>(&self, attempt: &Attempt<'_>, view: RequestView<'a>) -> codec::Result<ValidatedRequest<'a>> {
+        match self.script(attempt) {
+            Script::Refence(error) => Err(error()),
+            _ => RequestFence::default().end(view, &ChatCapability),
+        }
+    }
+
+    async fn start(
+        &self,
+        attempt: &Attempt<'_>,
+        request: &Request<'_>,
+        upload: &mut Writer,
+        response: Writer,
+    ) -> Result<Started, ExecError> {
+        let records = self.drain();
+        {
+            let mut begun = self.begun.lock().unwrap();
+            let previous = begun.last().map(|previous| previous.stream);
+            begun.push(Begun {
+                credential: attempt.credential.id.rsplit('/').next().unwrap().to_owned(),
+                stream: response.id(),
+                identity: attempt.identity.stream_id.as_str().to_owned(),
+                attempt: attempt.identity.attempt,
+                previous_gone: previous.map(|id| matches!(attempt.store.reader(id, 0), Err(ck_stream::Error::Gone))),
+                records,
+            });
+        }
+        let executor = Executor {
+            script: self.script(attempt),
+            release: &self.release,
+        };
+        ck_exec::pipeline::start(&executor, attempt, request, upload, response).await
+    }
+}
+
+/// A Chat upstream following one [`Script`].
+struct Executor<'f> {
+    script: Script,
+    release: &'f Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl Execute for Executor<'_> {
+    type Capability = ChatCapability;
+    type Ingress = ChatIngress;
+
+    fn capability(&self, _attempt: &Attempt<'_>) -> ChatCapability {
+        ChatCapability
+    }
+
+    async fn execute(
+        &self,
+        attempt: &Attempt<'_>,
+        _request: &Request<'_>,
+        streams: Streams<'_>,
+    ) -> Result<Upstream<ChatIngress>, ExecError> {
+        let mut ingress = ChatIngress::new(
+            streams.response,
+            attempt.store,
+            attempt.identity,
+            Operation::Generate,
+            BodyMode::Streaming,
+            1 << 20,
+        )
+        .unwrap();
+        let refused = || ExecError::local(503, FailureScope::Transport, "refused");
+        let broken = || ExecError::local(502, FailureScope::Transport, "upstream");
+        let content = || chunk(r#"{"role":"assistant","content":"hel"}"#, "null");
+        let body: Body = match self.script {
+            Script::Refused => return Err(refused()),
+            Script::StorageExhausted => {
+                return Err(ExecError::local(503, FailureScope::Request, "stream.storage_exhausted"));
+            }
+            Script::UsageThenRefused => {
+                let usage = r#"data: {"id":"r","model":"m","created":1,"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#;
+                ingress
+                    .advance(streams.response, format!("{usage}\n\n").as_bytes())
+                    .unwrap();
+                if ingress.flush_deadline().is_some() {
+                    ingress.flush(streams.response).unwrap();
+                }
+                return Err(refused());
+            }
+            Script::BodyFails => stream::iter([Err(broken())]).boxed(),
+            Script::Answers => stream::iter(
+                [
+                    content(),
+                    chunk(r#"{"content":"lo"}"#, "null"),
+                    chunk("{}", r#""stop""#),
+                    done(),
+                ]
+                .map(Ok),
+            )
+            .boxed(),
+            Script::FailsAfterContent => {
+                let release = self.release.lock().unwrap().take().unwrap();
+                stream::iter([Ok(content())])
+                    .chain(stream::once(async move {
+                        let _ = release.await;
+                        Err(broken())
+                    }))
+                    .boxed()
+            }
+            Script::Old | Script::Refence(_) => unreachable!("never started"),
+        };
+        Ok(Upstream {
+            status: 200,
+            headers: HeaderMap::new(),
+            body,
+            ingress,
+        })
+    }
+
+    async fn count_tokens(
+        &self,
+        _attempt: &Attempt<'_>,
+        _request: &Request<'_>,
+        _streams: Streams<'_>,
+    ) -> Result<Counted<ChatIngress>, ExecError> {
+        unreachable!("generation only")
+    }
+
+    async fn compact(
+        &self,
+        _attempt: &Attempt<'_>,
+        _request: &Request<'_>,
+        _streams: Streams<'_>,
+    ) -> Result<Upstream<ChatIngress>, ExecError> {
+        unreachable!("generation only")
+    }
+}
+
+/// A loopback upstream that answers every request 503: the old arm's Claude executor; its
+/// request count.
+async fn refusing_upstream() -> (String, Arc<AtomicUsize>) {
+    let sends = Arc::new(AtomicUsize::new(0));
+    let counted = sends.clone();
+    let app = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { (StatusCode::SERVICE_UNAVAILABLE, "unavailable") }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, sends)
+}
+
+fn credential(id: &str) -> Credential {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("type".into(), "claude".into());
+    metadata.insert("access_token".into(), format!("fake-{id}").into());
+    // An operator rule that fails a 503 over: a stream resource failure must stop anyway.
+    metadata.insert(
+        "request_scoped_errors".into(),
+        serde_json::json!([{"status": 503, "match": ["stream.storage_exhausted"], "action": "continue-and-cooldown"}]),
+    );
+    let path = Path::new("/mock");
+    ck_server::testing::local(Credential::from_file(path, &path.join(id), metadata).unwrap())
+}
+
+const CLIENT: &[u8] = br#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+
+fn call() -> Call {
+    Call {
+        entry: Format::OpenAI,
+        response: Format::OpenAI,
+        operation: ck_core::exec::Operation::Generate,
+        model: "claude-sonnet-5".into(),
+        body: Bytes::from_static(CLIENT),
+        stream: true,
+        alt: None,
+        headers: HeaderMap::new(),
+        caller: owner(KEY).caller,
+        forced_provider: None,
+        selection_model: None,
+        execution_session: None,
+        request_path: "/v1/chat/completions".into(),
+        peer: None,
+        turn: None,
+        media: None,
+    }
+}
+
+#[tokio::test]
+async fn each_attempt_settles_and_is_discarded_before_the_next() {
+    /// How the call ends.
+    #[derive(Clone, Copy, Debug)]
+    enum Ends {
+        /// The answer commits. `clean`: the whole answer and nothing from a failed attempt.
+        Commits { clean: bool },
+        /// No candidate committed: the call's status.
+        Status(u16),
+    }
+    struct Row {
+        case: &'static str,
+        /// Credentials `a` and `b`. A fresh runtime's round robin tries `a` first, as
+        /// `scheduler_attempts.rs` relies on.
+        scripts: [Script; 2],
+        /// The exchange's request stream ends with this terminal before the call.
+        request: Option<Terminal>,
+        ends: Ends,
+        /// Credentials whose contract-arm attempt started, in order.
+        started: &'static [&'static str],
+        /// Usage records enqueued before each started attempt.
+        settled: &'static [usize],
+        /// `failed` of each usage record, oldest first.
+        failed: &'static [bool],
+        /// Input tokens of the first usage record.
+        input_tokens: Option<i64>,
+        /// Requests the old arm sent upstream.
+        old: usize,
+        /// Credentials cooling down for the model afterwards; a skip or a resource failure
+        /// is neutral and cools nothing.
+        cooled: &'static [&'static str],
+    }
+    let unsupported = || codec::Error::Unsupported;
+    let rows = [
+        Row {
+            case: "an executor error before any record fails over",
+            scripts: [Script::Refused, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["a", "b"],
+            settled: &[0, 1],
+            failed: &[true, false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a usage snapshot before an executor error is kept",
+            scripts: [Script::UsageThenRefused, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["a", "b"],
+            settled: &[0, 1],
+            failed: &[true, false],
+            input_tokens: Some(7),
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a producer error before commitment fails over",
+            scripts: [Script::BodyFails, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["a", "b"],
+            settled: &[0, 1],
+            failed: &[true, false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "every candidate refuses",
+            scripts: [Script::Refence(unsupported), Script::Refence(unsupported)],
+            request: None,
+            ends: Ends::Status(400),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "an unsupported request skips to the next candidate",
+            scripts: [Script::Refence(unsupported), Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["b"],
+            settled: &[0],
+            failed: &[false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a schema refusal skips to the next candidate",
+            scripts: [Script::Refence(|| codec::Error::Schema), Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["b"],
+            settled: &[0],
+            failed: &[false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "exhausted storage at the fence stops",
+            scripts: [
+                Script::Refence(|| codec::Error::Storage(ck_stream::Error::StorageExhausted)),
+                Script::Answers,
+            ],
+            request: None,
+            ends: Ends::Status(503),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a gone stream at the fence stops",
+            scripts: [
+                Script::Refence(|| codec::Error::Storage(ck_stream::Error::Gone)),
+                Script::Answers,
+            ],
+            request: None,
+            ends: Ends::Status(410),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a codec defect at the fence stops",
+            scripts: [Script::Refence(|| codec::Error::Position), Script::Answers],
+            request: None,
+            ends: Ends::Status(500),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a cancelled request stops",
+            scripts: [
+                Script::Refence(|| codec::Error::Storage(ck_stream::Error::Closed)),
+                Script::Answers,
+            ],
+            request: Some(Terminal::Cancelled),
+            ends: Ends::Status(499),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a request ended by shutdown stops",
+            scripts: [
+                Script::Refence(|| codec::Error::Storage(ck_stream::Error::Closed)),
+                Script::Answers,
+            ],
+            request: Some(Terminal::Shutdown),
+            ends: Ends::Status(503),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a request ended by exhausted storage stops",
+            scripts: [
+                Script::Refence(|| codec::Error::Storage(ck_stream::Error::Closed)),
+                Script::Answers,
+            ],
+            request: Some(Terminal::StorageExhausted),
+            ends: Ends::Status(503),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "an executor resource error stops",
+            scripts: [Script::StorageExhausted, Script::Answers],
+            request: None,
+            ends: Ends::Status(503),
+            started: &["a"],
+            settled: &[0],
+            failed: &[true],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a failure after commitment does not retry",
+            scripts: [Script::FailsAfterContent, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: false },
+            started: &["a"],
+            settled: &[0],
+            failed: &[true],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "an old-arm failure fails over to the contract arm",
+            scripts: [Script::Old, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["b"],
+            settled: &[1],
+            failed: &[true, false],
+            input_tokens: None,
+            old: 1,
+            cooled: &["a"],
+        },
+    ];
+    let (upstream, sends) = refusing_upstream().await;
+    let usage = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
+    for row in rows {
+        let case = row.case;
+        let fixture = Fixture::with_credentials(vec![credential("a"), credential("b")], &upstream);
+        fixture.rt.usage_queue().configure(true, &usage);
+        let (release, released) = oneshot::channel();
+        let fake = Fake {
+            rt: fixture.rt.clone(),
+            scripts: [("a", row.scripts[0]), ("b", row.scripts[1])],
+            begun: Mutex::default(),
+            records: Mutex::default(),
+            release: Mutex::new(Some(released)),
+        };
+        let mut exchange = exchange(&fixture, owner(KEY), output(Protocol::Chat, Framing::Sse), CLIENT);
+        let (document, media) = request_view(&fixture, &mut exchange);
+        if let Some(terminal) = row.request {
+            exchange.request.finish(terminal);
+        }
+        let codec = Codec {
+            exchange,
+            view: RequestView {
+                document: &document,
+                media: &media,
+                operation: Operation::Generate,
+            },
+            request_id: LocalId::new("request").unwrap(),
+        };
+        let sent = sends.load(Ordering::SeqCst);
+        let trace = Trace::with_request_id(Some("trace".into()));
+        let served = tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch::run_exchange(&fixture.rt, &fake, call(), &trace, codec),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: the call finishes"));
+        match (served, row.ends) {
+            (Ok(Served::Committed(response)), Ends::Commits { clean }) => {
+                let _ = release.send(());
+                let (text, ended) = tokio::time::timeout(Duration::from_secs(5), body(response))
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: the body ends"));
+                assert!(text.contains("hel"), "{case}: {text}");
+                if clean {
+                    assert!(
+                        ended && text.contains("lo") && !text.contains("error"),
+                        "{case}: only the committed attempt reaches the client: {text}"
+                    );
+                }
+            }
+            (Err(error), Ends::Status(status)) => assert_eq!(error.failure.status(), status, "{case}"),
+            (Ok(Served::Old(_)), _) => panic!("{case}: the old arm answered"),
+            (Ok(Served::Committed(_)), ends) => panic!("{case}: committed, expected {ends:?}"),
+            (Err(error), ends) => panic!("{case}: status {}, expected {ends:?}", error.failure.status()),
+        }
+        let records = fake.records(row.failed.len()).await;
+        let failed: Vec<bool> = records
+            .iter()
+            .map(|record| record["failed"].as_bool().unwrap())
+            .collect();
+        assert_eq!(failed, row.failed, "{case}: one usage record per attempt: {records:?}");
+        if let Some(tokens) = row.input_tokens {
+            assert_eq!(
+                records[0]["tokens"]["input_tokens"], tokens,
+                "{case}: the snapshot before the failure is kept"
+            );
+        }
+        assert_eq!(sends.load(Ordering::SeqCst) - sent, row.old, "{case}: old-arm sends");
+        let cooled: Vec<&str> = ["a", "b"]
+            .into_iter()
+            .filter(|id| {
+                let credential = fixture.rt.store().snapshot().into_iter().find(|c| c.id.ends_with(id));
+                fixture.rt.store().blocked(&credential.unwrap(), "claude-sonnet-5")
+            })
+            .collect();
+        assert_eq!(cooled, row.cooled, "{case}: cooling credentials");
+        let begun = fake.begun.lock().unwrap();
+        let started: Vec<&str> = begun.iter().map(|begun| begun.credential.as_str()).collect();
+        assert_eq!(started, row.started, "{case}: started attempts");
+        for (i, attempt) in begun.iter().enumerate() {
+            assert_eq!(attempt.attempt, i as u64 + 1, "{case}: attempt number");
+            assert_eq!(
+                attempt.records,
+                row.settled[i],
+                "{case}: attempt {} starts after the previous one accounted",
+                i + 1
+            );
+            if let Some(previous) = i.checked_sub(1).map(|i| &begun[i]) {
+                assert!(
+                    attempt.stream != previous.stream && attempt.identity != previous.identity,
+                    "{case}: each attempt gets a new stream"
+                );
+                assert_eq!(
+                    attempt.previous_gone,
+                    Some(true),
+                    "{case}: attempt {} starts after the previous one was discarded",
+                    i + 1
+                );
+            }
         }
     }
 }

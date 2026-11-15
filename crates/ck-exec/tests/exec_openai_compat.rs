@@ -332,7 +332,7 @@ async fn a_cut_body_ends_with_one_error() {
 }
 
 /// Refusals before any response byte are attempt failures with Go's scopes, and the attempt's
-/// response stream is discarded.
+/// response stream ends with `UpstreamError` for the server to discard.
 #[tokio::test]
 async fn upstream_refusals_fail_the_attempt_before_commitment() {
     for (status, scope) in [
@@ -347,7 +347,11 @@ async fn upstream_refusals_fail_the_attempt_before_commitment() {
         let error = started.err().expect("a refusal fails the attempt");
         assert_eq!((error.status, error.scope), (status, scope));
         assert!(String::from_utf8_lossy(&error.body).contains("no"));
-        assert!(matches!(streams.store.reader(id, 0), Err(ck_stream::Error::Gone)));
+        let mut reader = streams.store.reader(id, 0).unwrap();
+        assert!(matches!(
+            reader.next().await,
+            Some(Read::Terminal(Terminal::UpstreamError))
+        ));
     }
     let upstream = StreamUpstream::start([]).await;
     let (streams, mut exchange) = (Streams::new(), exchange(&upstream));

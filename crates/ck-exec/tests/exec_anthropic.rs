@@ -385,10 +385,11 @@ async fn an_upstream_refusal_fails_the_attempt_before_commitment() {
     let error = started.err().expect("a 429 is an attempt failure");
     assert_eq!(error.status, 429);
     assert_eq!(upstream.requests(), 1);
-    // The pipeline discards the response stream of a failed attempt.
+    // The pipeline ends the failed attempt's response stream; the server discards it.
+    let mut reader = fixture.streams.store.reader(id, 0).unwrap();
     assert!(matches!(
-        fixture.streams.store.reader(id, 0),
-        Err(ck_stream::Error::Gone)
+        reader.next().await,
+        Some(Read::Terminal(Terminal::UpstreamError))
     ));
 }
 

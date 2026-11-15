@@ -38,10 +38,12 @@ async fn upstream_refusals_fail_the_attempt_before_commitment() {
         if status == 429 {
             assert!(error.retry_after.is_some());
         }
-        assert!(
-            streams.store.reader(id, 0).is_err(),
-            "the attempt's stream is discarded"
-        );
+        // The attempt's stream ends for the server to discard after its usage reader.
+        let mut reader = streams.store.reader(id, 0).unwrap();
+        assert!(matches!(
+            reader.next().await,
+            Some(ck_stream::Read::Terminal(Terminal::UpstreamError))
+        ));
         assert_eq!(upstream.requests(), 1);
     }
 }

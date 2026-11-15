@@ -41,18 +41,32 @@ impl Fixture {
 
     /// [`Fixture::new`] with the runtime configured from `yaml`.
     pub fn with_config(yaml: &str, configure: impl FnOnce(&mut ck_stream::Config)) -> Self {
+        Self::build(yaml, Vec::new(), "http://127.0.0.1:9", configure)
+    }
+
+    /// [`Fixture::new`] with `credentials` and the Claude executor on `claude`, a loopback URL.
+    pub fn with_credentials(credentials: Vec<ck_core::credential::Credential>, claude: &str) -> Self {
+        Self::build("", credentials, claude, |_| {})
+    }
+
+    fn build(
+        yaml: &str,
+        credentials: Vec<ck_core::credential::Credential>,
+        claude: &str,
+        configure: impl FnOnce(&mut ck_stream::Config),
+    ) -> Self {
         let directory = std::env::temp_dir().join(format!("ck-streams-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let mut config = Config::parse(yaml).unwrap();
         config.api_keys = vec![KEY.into(), OTHER.into()];
         let executors = ck_exec::Executors {
-            claude: ck_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+            claude: ck_exec::claude::ClaudeExecutor::new(claude).unwrap(),
             codex: Default::default(),
             devices: Default::default(),
             openai: Default::default(),
             google: Default::default(),
         };
-        let rt = Arc::new(ck_server::testing::runtime(config, Vec::new(), executors));
+        let rt = Arc::new(ck_server::testing::runtime(config, credentials, executors));
         let mut stream = ck_stream::Config::new(directory.join("pool"));
         stream.pool_bytes = Some(64 * ck_stream::FRAME_BYTES);
         stream.max_metadata_bytes = 4 * 1024 * 1024;
@@ -156,7 +170,39 @@ impl Live {
 /// before commitment. The attempt's id is set at commitment.
 pub fn start(fixture: &Fixture, owner: Owner, output: Output, body: &[u8]) -> (Exchange, Live) {
     let streams = fixture.rt.streams();
-    let (request, writer, ingress) = streams
+    let exchange = exchange(fixture, owner, output, body);
+    let (writer, ingress) = streams
+        .with_store(|store| {
+            let mut writer = store.create_dependent(&exchange.request).unwrap();
+            let ingress = response::Ingress::new(
+                &mut writer,
+                store,
+                identity(Direction::Response),
+                Operation::Generate,
+                BodyMode::Streaming,
+                1 << 20,
+            )
+            .unwrap();
+            (writer, ingress)
+        })
+        .unwrap();
+    let response = writer.allocator();
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let producer = streams.spawn(produce(ingress, writer, receiver));
+    let live = Live {
+        id: StreamId([0; 16]),
+        response,
+        upstream: Some(sender),
+        producer,
+    };
+    (exchange, live)
+}
+
+/// Runs Chat request ingress for `body`: the exchange before its first attempt.
+pub fn exchange(fixture: &Fixture, owner: Owner, output: Output, body: &[u8]) -> Exchange {
+    let request = fixture
+        .rt
+        .streams()
         .with_store(|store| {
             let mut request = store.create().unwrap();
             let mut client = request::Ingress::new(
@@ -170,30 +216,10 @@ pub fn start(fixture: &Fixture, owner: Owner, output: Output, body: &[u8]) -> (E
             client.advance(&mut request, body).unwrap();
             client.finish(&mut request, &request::ChatCapability).unwrap();
             drop(client);
-            let mut writer = store.create_dependent(&request).unwrap();
-            let ingress = response::Ingress::new(
-                &mut writer,
-                store,
-                identity(Direction::Response),
-                Operation::Generate,
-                BodyMode::Streaming,
-                1 << 20,
-            )
-            .unwrap();
-            (request, writer, ingress)
+            request
         })
         .unwrap();
-    let response = writer.allocator();
-    let (sender, receiver) = mpsc::unbounded_channel();
-    let producer = streams.spawn(produce(ingress, writer, receiver));
-    let exchange = Exchange { owner, output, request };
-    let live = Live {
-        id: StreamId([0; 16]),
-        response,
-        upstream: Some(sender),
-        producer,
-    };
-    (exchange, live)
+    Exchange { owner, output, request }
 }
 
 /// [`start`] for a Chat client, committed at once under a fresh id.

@@ -32,10 +32,12 @@ async fn upstream_refusals_fail_the_attempt_before_commitment() {
         assert_eq!(error.retry_after.map(|d| d.as_secs()), retry);
         assert_eq!(&error.body[..], body.as_bytes());
         assert_eq!(error.headers.get("x-request-id").unwrap(), "r1");
-        assert!(
-            streams.store.reader(id, 0).is_err(),
-            "the attempt's stream is discarded"
-        );
+        // The attempt's stream ends for the server to discard after its usage reader.
+        let mut reader = streams.store.reader(id, 0).unwrap();
+        assert!(matches!(
+            reader.next().await,
+            Some(ck_stream::Read::Terminal(Terminal::UpstreamError))
+        ));
     }
 }
 

@@ -14,7 +14,7 @@ mod resume;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use axum::http::HeaderValue;
 use ck_core::exec::Caller;
@@ -144,7 +144,8 @@ pub(crate) struct Attached {
 /// The runtime's stream store, committed handles and stream tasks ([`crate::Runtime::streams`]).
 #[derive(Default)]
 pub struct Registry {
-    store: RwLock<Option<Store>>,
+    /// Shared so an attempt can hold the store across its awaits (`ck_exec::types::Attempt`).
+    store: RwLock<Option<Arc<Store>>>,
     handles: Mutex<Handles>,
     tasks: tokio_util::task::TaskTracker,
     closed: AtomicBool,
@@ -165,16 +166,21 @@ impl Registry {
         if slot.is_some() || self.closed.load(Ordering::Acquire) {
             return Err(store);
         }
-        *slot = Some(store);
+        *slot = Some(Arc::new(store));
         Ok(())
     }
 
     /// Runs `f` on the store. `Closed` after shutdown.
+    pub fn with_store<R>(&self, f: impl FnOnce(&Store) -> R) -> Result<R, ck_stream::Error> {
+        self.store().map(|store| f(&store))
+    }
+
+    /// The store, for an attempt that holds it across awaits. `Closed` after shutdown.
     // ponytail: the store opens at first use from the §6.4 defaults (`$XDG_RUNTIME_DIR/cooker`);
     // Phase F opens it at startup from the deploy-only `stream.*` settings through `install`.
-    pub fn with_store<R>(&self, f: impl FnOnce(&Store) -> R) -> Result<R, ck_stream::Error> {
+    pub fn store(&self) -> Result<Arc<Store>, ck_stream::Error> {
         if let Some(store) = self.store.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
-            return Ok(f(store));
+            return Ok(store.clone());
         }
         let mut slot = self.store.write().unwrap_or_else(PoisonError::into_inner);
         if self.closed.load(Ordering::Acquire) {
@@ -182,9 +188,9 @@ impl Registry {
         }
         if slot.is_none() {
             let config = ck_stream::Config::from_environment().map_err(ck_stream::Error::Io)?;
-            *slot = Some(Store::open(config).map_err(ck_stream::Error::Io)?);
+            *slot = Some(Arc::new(Store::open(config).map_err(ck_stream::Error::Io)?));
         }
-        Ok(f(slot.as_ref().expect("opened above")))
+        Ok(slot.as_ref().expect("opened above").clone())
     }
 
     /// Registers a committed handle under its id. After shutdown began, its response stops
@@ -255,7 +261,16 @@ impl Registry {
     pub async fn finish_shutdown(&self) -> std::io::Result<()> {
         self.begin_shutdown();
         let store = self.store.write().unwrap_or_else(PoisonError::into_inner).take();
-        let stopped = store.map_or(Ok(()), |mut store| store.shutdown());
+        // The listener closed, so no request handler holds the store any more; stream tasks
+        // hold writers, never the store. A holder left over shuts it down when it drops.
+        let stopped = match store.map(Arc::try_unwrap) {
+            None => Ok(()),
+            Some(Ok(mut store)) => store.shutdown(),
+            Some(Err(_)) => {
+                tracing::warn!("stream store still shared at shutdown; it stops when released");
+                Ok(())
+            }
+        };
         self.tasks.close();
         self.tasks.wait().await;
         stopped

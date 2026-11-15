@@ -95,13 +95,15 @@ async fn a_flush_deadline_is_served_while_the_upstream_is_idle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_attempt_discards_its_response_stream() {
+async fn a_refused_attempt_ends_its_response_stream_for_the_caller_to_discard() {
     let fixture = Fixture::new(4 * 1024 * 1024);
     let (stub, _upstream) = Stub::new(Answer::Refuse);
     let (started, _upload, id) = fixture.launch(&stub, Operation::Generate).await;
     let error = started.err().unwrap();
     assert_eq!((error.status, error.scope), (503, FailureScope::Transport));
-    assert!(matches!(fixture.store.reader(id, 0), Err(ck_stream::Error::Gone)));
+    // The stream keeps its records until the server's finalizer discards it, so a usage
+    // reader attached before the call reaches a terminal instead of losing them.
+    assert_eq!(fixture.records(id).await.1, Terminal::UpstreamError);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
