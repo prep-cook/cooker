@@ -393,7 +393,7 @@ pub(crate) async fn error_from(capture: &CaptureSink, upstream: Upstream) -> Exe
         .await
         .unwrap_or_default();
     capture.record(CaptureEvent::ResponseChunk(&body));
-    status_err(status, body)
+    status_err(status, body).from_upstream()
 }
 
 /// `io.ReadAll` of the whole response, then Go's status check (countTokens and
@@ -405,7 +405,7 @@ async fn read_then_check(capture: &CaptureSink, upstream: Upstream) -> Result<(h
     let limit = if ok { usize::MAX } else { proxy::MAX_ERROR_BODY };
     let data = read_captured(capture, upstream, limit).await?;
     if !ok {
-        return Err(status_err(status, data));
+        return Err(status_err(status, data).from_upstream());
     }
     Ok((headers, data))
 }
@@ -455,7 +455,7 @@ pub(crate) fn claude_error(req: &ExecRequest, out: &[u8]) -> Result<(), ExecErro
         return Ok(());
     }
     req.usage.publish_failure_with_usage(502, &String::from_utf8_lossy(out));
-    Err(status_err(502, Bytes::copy_from_slice(out)))
+    Err(status_err(502, Bytes::copy_from_slice(out)).from_upstream())
 }
 
 impl GeminiExecutor {

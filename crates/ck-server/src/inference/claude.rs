@@ -125,7 +125,9 @@ pub fn read_failed(rejection: &BytesRejection) -> Response {
 /// The status and text for a failed body read: Go's `HTTPStatusFromErrorOr(err, 400)`
 /// and `err.Error()`, which is 413 for the configured body limit.
 pub(crate) fn read_error(rejection: &BytesRejection) -> (u16, String) {
-    if crate::http::body_limit::is_too_large(rejection) {
+    if crate::http::body_limit::is_too_large(rejection)
+        || rejection.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE
+    {
         (413, crate::http::body_limit::MESSAGE.to_owned())
     } else {
         (400, rejection.body_text())
@@ -147,7 +149,10 @@ async fn handle(
     tracing::trace!(target: "cpa_latency", stage = "handler");
     let mut body = match body {
         Ok(body) => body,
-        Err(rejection) => return read_failed(&rejection),
+        Err(rejection) => {
+            let (status, reason) = read_error(&rejection);
+            return crate::http::errors::anthropic(status, &format!("Invalid request: {reason}"));
+        }
     };
     let fields = peek(&body);
     let raw_model = gojson::gjson_string(fields.get("model"));

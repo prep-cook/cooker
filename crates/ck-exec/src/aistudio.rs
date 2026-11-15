@@ -42,7 +42,7 @@ fn plain_error(message: impl Into<String>) -> ExecError {
 
 /// Go's `statusErr{code: status}`; a status outside HTTP's range is answered as 500.
 fn status_error(status: i64, body: Vec<u8>) -> ExecError {
-    g::status_err(u16::try_from(status).ok().filter(|s| *s >= 100).unwrap_or(500), body)
+    g::status_err(u16::try_from(status).ok().filter(|s| *s >= 100).unwrap_or(500), body).from_upstream()
 }
 
 fn header_map(headers: &std::collections::BTreeMap<String, Vec<String>>) -> http::HeaderMap {

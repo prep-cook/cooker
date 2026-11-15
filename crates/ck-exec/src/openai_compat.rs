@@ -113,6 +113,7 @@ pub(crate) fn status_error(status: u16, headers: http::HeaderMap, body: Bytes, w
         retry_after,
         direct: false,
         addon: None,
+        upstream: true,
     }
 }
 

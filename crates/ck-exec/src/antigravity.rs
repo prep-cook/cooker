@@ -198,7 +198,7 @@ fn cooldown_key(credential: &Credential, model: &str) -> Option<String> {
 /// (`newAntigravityStatusErr`).
 pub(crate) fn upstream_error(status: u16, body: Bytes) -> ExecError {
     let retry = (status == 429).then(|| auth::parse_retry_delay(&body)).flatten();
-    let mut error = gemini::status_err(status, body);
+    let mut error = gemini::status_err(status, body).from_upstream();
     error.retry_after = retry;
     error
 }
@@ -624,7 +624,9 @@ impl AntigravityExecutor {
         }
         let project = auth::project_id(credential);
         if project.is_empty() {
-            return Err(gemini::status_err(400, "antigravity auth missing project_id"));
+            let mut error = gemini::status_err(400, "antigravity auth missing project_id");
+            error.scope = ck_core::exec::FailureScope::Credential;
+            return Err(error);
         }
         let derived = ag::derived_session_id(req.derived_session.as_deref());
         let body = ag::gemini_to_antigravity(model, body, project, &derived);

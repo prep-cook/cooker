@@ -13,6 +13,14 @@ use ck_exec::Executors;
 use ck_exec::claude::ClaudeExecutor;
 use ck_server::router;
 
+fn assert_local_error(text: &str, kind: &str) {
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["error"]["type"], kind);
+    assert!(value["error"]["message"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(value["error"].get("param"), Some(&serde_json::Value::Null));
+    assert_eq!(value["error"].get("code"), Some(&serde_json::Value::Null));
+}
+
 /// Requests seen, the compact failure to answer with (`None` answers `{"ok":true}`),
 /// and the SSE body to stream (`None` streams `CHUNK` and `[DONE]`).
 #[derive(Default)]
@@ -277,10 +285,7 @@ async fn compact_decodes_zstd_request_body() {
     )
     .await;
     assert_eq!(status, 400);
-    assert_eq!(
-        text,
-        r#"{"error":{"message":"Invalid request: unsupported request content encoding: br","type":"invalid_request_error"}}"#
-    );
+    assert_local_error(&text, "invalid_request_error");
 }
 
 /// Go `TestOpenAIResponsesCompactRejectsStream`: 400 before any upstream call.
@@ -290,10 +295,7 @@ async fn compact_rejects_stream() {
     let body = br#"{"model":"fast","stream":true}"#.to_vec();
     let (status, text) = send(&url, "/v1/responses/compact", &[], body).await;
     assert_eq!(status, 400, "{text}");
-    assert_eq!(
-        text,
-        r#"{"error":{"message":"Streaming not supported for compact responses","type":"invalid_request_error"}}"#
-    );
+    assert_local_error(&text, "invalid_request_error");
     assert!(seen.0.lock().unwrap().is_empty(), "the executor is never called");
 }
 

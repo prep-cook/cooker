@@ -30,8 +30,7 @@ use scheduling::registry;
 
 pub use runtime::state::Runtime;
 
-// ponytail: fixed 64 MiB request cap so image-heavy Claude requests pass (axum's default
-// is 2 MiB; gin has none). Make it configurable if anyone needs more.
+/// Ceiling for non-Anthropic client routes.
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 /// The API routes alone; unregistered paths get gin's bare NoRoute 404.
@@ -75,8 +74,14 @@ fn api(rt: Arc<Runtime>) -> Router {
         .route("/openai/v1/videos", post(videos::create))
         .route("/openai/v1/videos/{video_id}/content", get(videos::content))
         .route("/openai/v1/videos/{video_id}", get(videos::retrieve))
-        .route("/v1/messages", post(claude::messages))
-        .route("/v1/messages/count_tokens", post(claude::count_tokens))
+        .route(
+            "/v1/messages",
+            post(claude::messages).layer(DefaultBodyLimit::max(http::errors::ANTHROPIC_MAX_REQUEST_BYTES)),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(claude::count_tokens).layer(DefaultBodyLimit::max(http::errors::ANTHROPIC_MAX_REQUEST_BYTES)),
+        )
         // Resume of a committed response; the stream identity travels only in `X-Ck-Stream-Id`.
         .route("/v1/streams", get(inference::streams::resume))
         .route("/v1/responses", post(openai::responses))

@@ -309,6 +309,29 @@ async fn claude_stream_malformed_function_call_writes_one_error_event() {
     assert!(text.contains(r#""type":"api_error""#), "{text}");
 }
 
+/// A Gemini MALFORMED_FUNCTION_CALL answered without streaming is an upstream-translated
+/// error: the Claude route shows its message instead of the status text.
+#[tokio::test]
+async fn claude_malformed_function_call_keeps_the_upstream_message() {
+    let body = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"partial"}]},"finishReason":"MALFORMED_FUNCTION_CALL","index":0}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":2,"totalTokenCount":6}}"#;
+    let up = scripted(&serde_json::json!({
+        "status": 200,
+        "headers": [["Content-Type", "application/json"]],
+        "body": body,
+    }))
+    .await;
+    let url = proxy_to(&up).await;
+    let request = r#"{"model":"flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, _, text) = post(&url, "/v1/messages", request).await;
+    assert_eq!(status, 502, "{text}");
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["error"]["type"], "api_error", "{text}");
+    assert_eq!(
+        value["error"]["message"], "Gemini response finished with MALFORMED_FUNCTION_CALL",
+        "{text}"
+    );
+}
+
 /// A client that goes away mid-stream while the upstream holds its stream open: Go's
 /// scanner fails with `context canceled`, which the usage record carries as a 499 without
 /// tokens (ck-exec replays the Go recordings of each case).

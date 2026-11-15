@@ -1,6 +1,5 @@
 //! Route surface through the real runtime, Claude executor and a local mock upstream.
-//! Expected shapes come from the Go handlers they port (cited per assertion); the Go
-//! binary comparison for the same routes lives in harness/fixtures.py.
+//! Success, routing and retry recordings retain their contracts; HTTP errors follow F13/F14.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -18,6 +17,36 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 const MODEL: &str = "claude-sonnet-4-6";
+
+fn assert_openai_error(text: &str) -> Value {
+    let value: Value = serde_json::from_str(text).unwrap();
+    let error = value["error"].as_object().expect("error object");
+    assert!(error["message"].as_str().is_some_and(|s| !s.is_empty()), "{text}");
+    assert!(error["type"].as_str().is_some_and(|s| !s.is_empty()), "{text}");
+    assert_eq!(error.get("param"), Some(&Value::Null));
+    let code = error.get("code").expect("nullable code is required");
+    assert!(code.is_null() || code.is_string(), "{text}");
+    value
+}
+
+fn assert_claude_error_body(text: &str, kind: &str) -> Value {
+    let value: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], kind);
+    assert!(value["error"]["message"].as_str().is_some_and(|s| !s.is_empty()));
+    let id = value["request_id"].as_str().expect("local request_id");
+    assert!(!id.is_empty());
+    value
+}
+
+fn assert_claude_error(text: &str, headers: &wreq::header::HeaderMap, kind: &str) -> Value {
+    let value = assert_claude_error_body(text, kind);
+    assert_eq!(
+        value["request_id"].as_str().unwrap(),
+        headers["request-id"].to_str().unwrap()
+    );
+    value
+}
 
 fn event(kind: &str, data: Value) -> String {
     format!("event: {kind}\ndata: {data}\n\n")
@@ -260,7 +289,8 @@ async fn nonstream_keepalive_commits_like_go() {
         assert!(headers.get("content-length").is_some(), "{headers:?}");
         assert_eq!(split(&text).0, 0, "{text:?}");
         if case == "fast_error" {
-            assert_eq!(text, want["body"].as_str().unwrap());
+            let error = assert_claude_error(&text, &headers, "invalid_request_error");
+            assert_eq!(error["error"]["message"], "bad input");
         }
     }
 
@@ -297,10 +327,13 @@ async fn nonstream_keepalive_commits_like_go() {
         let text = String::from_utf8(text).unwrap();
         let (newlines, rest) = split(&text);
         assert!(newlines >= 1, "{text:?}");
-        let (want_newlines, want_rest) = split(want["body"].as_str().unwrap());
+        let (want_newlines, _) = split(want["body"].as_str().unwrap());
         assert_eq!(want_newlines, 1);
         if case == "slow_error" {
-            assert_eq!(rest, want_rest);
+            // Legacy keepalive has already committed the headers; D2 owns its removal.
+            let error = assert_claude_error_body(&rest, "invalid_request_error");
+            assert!(!headers.contains_key("request-id"));
+            assert_eq!(error["error"]["message"], "bad input");
         } else {
             let reply: Value = serde_json::from_str(&rest).unwrap();
             assert_eq!(reply["choices"][0]["message"]["content"], "hi");
@@ -460,11 +493,8 @@ async fn failover_stop_rules_and_cooldown_contracts() {
     )
     .await;
     assert_eq!(status, 400);
-    // BuildErrorResponseBody passes the upstream JSON through.
-    assert_eq!(
-        text,
-        r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#
-    );
+    let error = assert_openai_error(&text);
+    assert_eq!(error["error"]["type"], "invalid_request_error");
     assert_eq!(p.seen.requests.lock().unwrap().len(), 1);
 
     // Quota: the 429 cools the only credential; the next request is a model cooldown
@@ -492,22 +522,21 @@ async fn failover_stop_rules_and_cooldown_contracts() {
     let retry: u64 = headers["retry-after"].to_str().unwrap().parse().unwrap();
     // The Claude executor adds its quota fuzz on top of the upstream 30s.
     assert!(retry >= 30, "{retry}");
-    let cooldown: Value = serde_json::from_str(&text).unwrap();
+    let cooldown = assert_openai_error(&text);
+    assert_eq!(cooldown["error"]["type"], "rate_limit_error");
     assert_eq!(cooldown["error"]["code"], "model_cooldown");
     assert_eq!(cooldown["error"]["provider"], "claude");
     assert_eq!(cooldown["error"]["last_upstream_error"], "rate_limit_error: slow down");
-    assert!(
-        text.starts_with(r#"{"error":{"code":"model_cooldown","last_upstream_error""#),
-        "sorted keys: {text}"
-    );
-    let (status, _, text) = post(
+    assert!(cooldown["error"]["reset_seconds"].is_u64() && cooldown["error"]["reset_time"].is_string());
+    let (status, headers, text) = post(
         &p.url,
         "/v1/messages",
         &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
     )
     .await;
     assert_eq!(status, 429);
-    assert!(text.starts_with(r#"{"type":"error","error":{"type":"rate_limit_error","message":"All credentials for model claude-sonnet-4-6 are cooling down via provider claude"#), "{text}");
+    let error = assert_claude_error(&text, &headers, "rate_limit_error");
+    assert!(error["error"]["message"].as_str().unwrap().contains("slow down"));
     assert_eq!(
         p.seen.requests.lock().unwrap().len(),
         1,
@@ -718,22 +747,21 @@ async fn misc_routes_match_go() {
     assert_eq!(other.headers()["content-type"], "text/html; charset=utf-8");
     // Interactions validation (interactions_handlers.go).
     let (status, _, text) = post(&p.url, "/v1beta/interactions", r#"{"model":"a","agent":"b"}"#).await;
+    assert_eq!(status, 400);
+    let error: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(error["error"]["code"], 400);
+    assert_eq!(error["error"]["status"], "INVALID_ARGUMENT");
     assert_eq!(
-        (status, text.as_str()),
-        (
-            400,
-            r#"{"error":{"message":"request requires exactly one of model or agent","type":"invalid_request_error"}}"#
-        )
+        error["error"]["message"],
+        "request requires exactly one of model or agent"
     );
     // Gemini action parsing (gemini_handlers.go).
     let (status, _, text) = post(&p.url, "/v1beta/models/x", "{}").await;
-    assert_eq!(
-        (status, text.as_str()),
-        (
-            404,
-            r#"{"error":{"message":"/v1beta/models/x not found.","type":"invalid_request_error"}}"#
-        )
-    );
+    assert_eq!(status, 404);
+    let error: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(error["error"]["code"], 404);
+    assert_eq!(error["error"]["status"], "NOT_FOUND");
+    assert!(error["error"]["message"].as_str().is_some_and(|s| !s.is_empty()));
     let (status, _, text) = post(&p.url, &format!("/v1beta/models/{MODEL}:embed"), "{}").await;
     assert_eq!((status, text.as_str()), (200, ""));
     // Compact through Claude: Messages has no native compaction, so it is refused before
@@ -1001,12 +1029,10 @@ async fn empty_stream_fails_over_and_reports_empty_stream() {
 
     let empty: Reply = Box::new(|| ([("content-type", "text/event-stream")], "").into_response());
     let (url, _, _) = scripted_proxy("", &["fake-a"], vec![empty]).await;
-    let (status, _, text) = post(&url, "/v1/messages", &body).await;
+    let (status, headers, text) = post(&url, "/v1/messages", &body).await;
     assert_eq!(status, 500);
-    assert_eq!(
-        text,
-        r#"{"type":"error","error":{"type":"api_error","message":"empty_stream: upstream stream closed before first payload"}}"#
-    );
+    let error = assert_claude_error(&text, &headers, "api_error");
+    assert!(!error.to_string().contains("upstream stream closed"));
 }
 
 /// Go handlers_stream.go: `requests.streaming.bootstrap-retries` re-runs a stream that
@@ -1103,7 +1129,8 @@ async fn response_framing_follows_go_net_http() {
         res.headers().get("content-type").unwrap(),
         "application/json; charset=utf-8"
     );
-    assert_eq!(res.text().await.unwrap(), r#"{"error":"Missing API key"}"#);
+    let error = assert_openai_error(&res.text().await.unwrap());
+    assert_eq!(error["error"]["type"], "authentication_error");
 }
 
 /// Go `RequestPathMetadataKey` is gin's `FullPath()`: route templates in gin syntax.

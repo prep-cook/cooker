@@ -1,0 +1,8 @@
+Fixed
+
+- Return protocol-local OpenAI, Anthropic and Gemini HTTP errors (including `/v1beta/interactions`) for authentication, failed body reads and size limits. Anthropic errors include a local request ID, safe documented detail codes and the correct conflict type.
+- Accept Anthropic Messages and token-counting bodies up to 128 MB (128,000,000 bytes), unless `server.max-request-body-bytes` sets a smaller limit; reject oversized bodies with Anthropic HTTP 413 errors.
+- Return `error.param: null` for local unknown-model failures without discarding upstream error parameters.
+- Preserve legacy SSE error payloads while normalizing HTTP errors, including JSON errors after a non-streaming keepalive. Speech requests exceeding the shared body ceiling return 413 rather than falling through to the speech-specific 400 response.
+- Preserve upstream and scheduler error messages in protocol-local Anthropic HTTP envelopes while filtering undocumented detail fields and upstream request IDs.
+- OpenAI HTTP errors keep every member an upstream or the scheduler adds (a numeric `code`, `model`, `provider`, `reset_seconds`, `last_upstream_error`). Anthropic HTTP errors hide only text cooker itself wrote about executors and credentials; upstream messages, translated upstream errors and local request errors such as an unknown model or an unsupported compaction request pass through. A refused Antigravity token refresh, a missing Antigravity project ID and a credential removed, disabled or refused during preparation now count as credential failures (same status), so they fail over and the Anthropic route hides their text.

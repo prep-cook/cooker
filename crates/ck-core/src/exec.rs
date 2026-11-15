@@ -606,6 +606,9 @@ pub struct ExecError {
     /// WebSocket error frames and stream bootstrap failures). `headers` stays the
     /// classification copy and is never sent, except as a `direct` response's headers.
     pub addon: Option<Box<HeaderMap>>,
+    /// `body` is an upstream response's message rather than text this process wrote. Routes
+    /// that hide local detail from clients (Anthropic) show upstream messages only.
+    pub upstream: bool,
 }
 
 impl ExecError {
@@ -618,7 +621,14 @@ impl ExecError {
             retry_after: None,
             direct: false,
             addon: None,
+            upstream: false,
         }
+    }
+
+    /// Marks an error built from an upstream response.
+    pub fn from_upstream(mut self) -> Self {
+        self.upstream = true;
+        self
     }
 }
 

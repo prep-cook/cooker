@@ -164,5 +164,6 @@ pub(crate) fn status_err(status: u16, message: impl Into<Bytes>) -> ExecError {
         retry_after: None,
         direct: false,
         addon: None,
+        upstream: false,
     }
 }

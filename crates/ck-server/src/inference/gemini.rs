@@ -32,11 +32,14 @@ pub async fn action(
     let action = action.trim_start_matches('/');
     let parts: Vec<&str> = action.split(':').collect();
     if parts.len() != 2 {
-        return respond::error_detail(404, &format!("{} not found.", uri.path()), "invalid_request_error");
+        return crate::http::errors::gemini(404, "Not Found");
     }
     let body = match body {
         Ok(body) => body,
-        Err(rejection) => return crate::inference::claude::read_failed(&rejection),
+        Err(rejection) => {
+            let (status, reason) = crate::inference::claude::read_error(&rejection);
+            return crate::http::errors::gemini(status, &reason);
+        }
     };
     let alt = alt(uri.query().unwrap_or_default());
     let (operation, stream) = match parts[1] {
@@ -67,7 +70,7 @@ pub async fn action(
     let keepalive = respond::keepalive(&rt.config()).filter(|_| alt.is_none());
     dispatch::serve(&rt, call, move |result| async move {
         match result {
-            Err(failure) => errors::openai(&failure),
+            Err(failure) => errors::gemini(&failure),
             Ok(Done::Buffered { body, .. }) => respond::json(200, "application/json", body),
             Ok(Done::Stream { first, rest, .. }) => {
                 let raw = alt.is_some();
@@ -92,7 +95,7 @@ impl Writer for GeminiSse {
 
     fn error(&mut self, error: &ExecError) -> Vec<Bytes> {
         let status = crate::scheduling::classify::response_status(error);
-        let body = errors::openai_body(status, &crate::scheduling::classify::error_text(error));
+        let body = errors::openai_stream_body(status, &crate::scheduling::classify::error_text(error));
         vec![if self.raw {
             Bytes::from(body)
         } else {
@@ -121,10 +124,10 @@ pub async fn interactions(
         Ok(body) => body,
         Err(rejection) => {
             let (status, reason) = crate::inference::claude::read_error(&rejection);
-            return respond::error_detail(status, &reason, "invalid_request_error");
+            return crate::http::errors::gemini(status, &reason);
         }
     };
-    let invalid = |m: &str| respond::error_detail(400, m, "invalid_request_error");
+    let invalid = |m: &str| crate::http::errors::gemini(400, m);
     let Ok(Value::Object(root)) = serde_json::from_slice::<Value>(&body) else {
         if serde_json::from_slice::<Value>(&body).is_ok() {
             return invalid("request requires exactly one of model or agent");
@@ -181,7 +184,7 @@ pub async fn interactions(
     let keepalive = respond::keepalive(&rt.config());
     dispatch::serve(&rt, call, move |result| async move {
         match result {
-            Err(failure) => errors::openai(&failure),
+            Err(failure) => errors::gemini(&failure),
             Ok(Done::Buffered { body, .. }) => respond::json(200, "application/json", body),
             Ok(Done::Stream { first, rest, .. }) => {
                 respond::sse(respond::stream(first, rest, InteractionsSse, keepalive))
@@ -212,7 +215,7 @@ impl Writer for InteractionsSse {
 
     fn error(&mut self, error: &ExecError) -> Vec<Bytes> {
         let status = crate::scheduling::classify::response_status(error);
-        let body = errors::openai_body(status, &crate::scheduling::classify::error_text(error));
+        let body = errors::openai_stream_body(status, &crate::scheduling::classify::error_text(error));
         vec![Bytes::from(format!("event: error\ndata: {body}\n\n"))]
     }
 

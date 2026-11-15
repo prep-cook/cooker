@@ -33,6 +33,8 @@ pub fn error_detail(status: u16, message: &str, kind: &str) -> Response {
     let detail = crate::http::gojson::Obj::new()
         .str("message", message)
         .str("type", kind)
+        .raw("param", "null")
+        .raw("code", "null")
         .finish();
     gin_json(status, crate::http::gojson::Obj::new().raw("error", &detail).finish())
 }
@@ -155,6 +157,7 @@ pub fn write_error_headers(dst: &mut axum::http::HeaderMap, src: &axum::http::He
         if reserved_response_header(name.as_str())
             || hop_by_hop(name.as_str())
             || name == axum::http::header::CONTENT_TYPE
+            || (name == "request-id" && dst.contains_key(name))
         {
             continue;
         }
