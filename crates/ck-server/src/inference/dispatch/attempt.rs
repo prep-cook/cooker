@@ -11,11 +11,11 @@
 //! 3. the stream is discarded with `Terminal::Gone`.
 //!
 //! Step 2 runs on the attempt's own stream task from the moment the attempt starts, so a
-//! client that goes away before commitment neither drops the usage record nor loses its
-//! final usage; that task then discards the abandoned streams itself. A committed attempt
-//! settles on the same task once its producer ends. The finalizer prevents duplicate
-//! accounting in cooker; it cannot stop an upstream from billing a request whose response
-//! failed before commitment.
+//! client that goes away neither drops the usage record nor loses its final usage. Step 3
+//! belongs to the [`Exchange`], which owns every stream of the request and discards an
+//! attempt's stream only after its settlement released it. The finalizer prevents
+//! duplicate accounting in cooker; it cannot stop an upstream from billing a request whose
+//! response failed before commitment.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use tokio::sync::oneshot;
 use super::{Call, Fault, Trace};
 use crate::http::egress::{self, Failed};
 use crate::http::respond;
-use crate::inference::streams::{Exchange, Uncommitted};
+use crate::inference::streams::{Exchange, Settled, Uncommitted};
 use crate::observability::usage_record::{Facts, Tracker};
 use crate::observability::usage_snapshot;
 use crate::runtime::state::{Lease, Outcome, Runtime};
@@ -102,17 +102,6 @@ impl<'v, 'x, X: Arms> Arm<'v, 'x, X> {
             view: codec.view,
             request_id: codec.request_id,
             started: 0,
-        }
-    }
-}
-
-/// An exchange that ends without commitment discards its request stream (contract §7). The
-/// loop settles and discards every attempt before it returns, so no attempt still depends
-/// on the request stream here.
-impl<X> Drop for Arm<'_, '_, X> {
-    fn drop(&mut self) {
-        if let Some(mut exchange) = self.exchange.take() {
-            exchange.request.finish(Terminal::Gone);
         }
     }
 }
@@ -199,15 +188,8 @@ pub(super) async fn run<X: Arms>(
     arm.started += 1;
     // From here the attempt's settlement runs on its own stream task, so a client that goes
     // away before commitment cannot drop the record or lose its final usage.
-    let (begun, settlement) = settle_spawn(
-        rt,
-        usage,
-        lease,
-        upstream,
-        response.allocator(),
-        exchange.request.allocator(),
-        reader,
-    );
+    let settled = exchange.attempt(response.allocator());
+    let (begun, settlement) = settle_spawn(rt, usage, lease, upstream, response.allocator(), reader, settled);
     let sink = match &settlement.sink {
         Some(sink) => sink.clone().with_capture(req.capture().clone()),
         None => req.usage.clone(),
@@ -227,7 +209,6 @@ pub(super) async fn run<X: Arms>(
             original: &call.body,
         },
     };
-    let mut handle = response.allocator();
     lease.redispatch();
     let started = arm
         .arms
@@ -244,11 +225,9 @@ pub(super) async fn run<X: Arms>(
             arm.exchange = Some(exchange);
             let _ = begun.send(Begun::Refused(error.clone()));
             let _ = settlement.done.await;
-            handle.finish(Terminal::Gone);
             return failed(error);
         }
     };
-    drop(handle);
     let _ = begun.send(Begun::Started {
         producer,
         headers: headers.clone(),
@@ -273,9 +252,7 @@ pub(super) async fn run<X: Arms>(
             if matches!(reason, Uncommitted::Codec(_)) {
                 stream.finish(Terminal::Cancelled);
             }
-            let error = uncommitted_error(reason, settlement.done.await);
-            stream.finish(Terminal::Gone);
-            failed(error)
+            failed(uncommitted_error(reason, settlement.done.await))
         }
     }
 }
@@ -321,17 +298,17 @@ struct Settlement {
 }
 
 /// §5.2 step 2 on a stream task: waits for the attempt's outcome, drains the usage reader to
-/// the stream's terminal, settles the tracker exactly once and then reports the outcome.
-/// When nobody receives it, the client went away before commitment: the task then discards
-/// the attempt's stream and the exchange's request stream (§5.2 step 3) itself.
+/// the stream's terminal, settles the tracker exactly once, releases `settled` so the
+/// exchange may discard the attempt's stream, and then reports the outcome. It runs whether
+/// or not the client is still there.
 fn settle_spawn(
     rt: &Arc<Runtime>,
     usage: Option<&Arc<Facts>>,
     lease: &Lease,
     upstream: &str,
-    mut response: Writer,
-    mut request: Writer,
+    response: Writer,
     reader: ck_stream::Reader,
+    settled: Settled,
 ) -> (oneshot::Sender<Begun>, Settlement) {
     let mut tracker = usage.map(|facts| {
         let mut tracker = Tracker::start(rt, facts, &lease.credential, upstream);
@@ -356,7 +333,7 @@ fn settle_spawn(
             Err(_) => Err(abandoned()),
         };
         // Every outcome above left the stream with a terminal, so the reader ends.
-        let (usage, facts) = usage_snapshot::read(response.allocator(), reader).await;
+        let (usage, facts) = usage_snapshot::read(response, reader).await;
         if let Some(mut tracker) = tracker {
             tracker.canonical(usage.as_ref(), &facts);
             match &outcome {
@@ -364,10 +341,8 @@ fn settle_spawn(
                 Err(error) => tracker.fail(error),
             }
         }
-        if report.send(outcome).is_err() {
-            response.finish(Terminal::Gone);
-            request.finish(Terminal::Gone);
-        }
+        drop(settled);
+        let _ = report.send(outcome);
     });
     (begun, Settlement { sink, done })
 }

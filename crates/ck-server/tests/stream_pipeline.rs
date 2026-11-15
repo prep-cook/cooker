@@ -28,7 +28,7 @@ use ck_translate::codec::chat::request::{ChatCapability, read_request};
 use ck_translate::codec::chat::response::Ingress as ChatIngress;
 use ck_translate::codec::event::{Direction, LocalId};
 use ck_translate::codec::{self, BodyMode, Operation, RequestFence, RequestView, ResponseIngress, ValidatedRequest};
-use futures_util::{StreamExt, stream};
+use futures_util::{FutureExt, StreamExt, stream};
 use serde_json::Value;
 use stream_fixture::*;
 use tokio::sync::oneshot;
@@ -314,6 +314,8 @@ enum Script {
     FailsAtOnce,
     /// The whole answer with 7 input tokens of usage, once the test releases it.
     Held,
+    /// The executor panics.
+    Panics,
 }
 
 /// A usage-only Chat chunk: 7 input tokens.
@@ -492,6 +494,7 @@ impl Execute for Executor<'_> {
                     }))
                     .boxed()
             }
+            Script::Panics => panic!("the executor panics"),
             Script::Old | Script::Refence(_) => unreachable!("never started"),
         };
         Ok(Upstream {
@@ -959,5 +962,200 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn every_exit_keeps_the_committed_streams_and_discards_the_rest() {
+    /// How the call ends.
+    #[derive(Clone, Copy, Debug)]
+    enum Exit {
+        /// The call returns; a committed body is dropped unread, as a client that leaves.
+        Returns,
+        /// The client leaves while the egress waits, before the attempt settles.
+        LeavesBeforeSettlement,
+        /// The attempt settles while the client no longer reads, then the client leaves.
+        LeavesAfterSettlement,
+        /// The attempt panics.
+        Panics,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Kept {
+        Yes,
+        Gone,
+    }
+    struct Row {
+        case: &'static str,
+        model: &'static str,
+        scripts: [Script; 2],
+        exit: Exit,
+        /// The request stream afterwards.
+        request: Kept,
+        /// Each started attempt's response stream afterwards, in order.
+        responses: &'static [Kept],
+    }
+    let unsupported = || codec::Error::Unsupported;
+    let rows = [
+        Row {
+            case: "a committed answer keeps its streams and drops the failed attempt before it",
+            model: "claude-sonnet-5",
+            scripts: [Script::Refused, Script::Answers],
+            exit: Exit::Returns,
+            request: Kept::Yes,
+            responses: &[Kept::Gone, Kept::Yes],
+        },
+        Row {
+            case: "every attempt fails",
+            model: "claude-sonnet-5",
+            scripts: [Script::Refused, Script::Refused],
+            exit: Exit::Returns,
+            request: Kept::Gone,
+            responses: &[Kept::Gone, Kept::Gone],
+        },
+        Row {
+            case: "every old-arm attempt fails",
+            model: "claude-sonnet-5",
+            scripts: [Script::Old, Script::Old],
+            exit: Exit::Returns,
+            request: Kept::Gone,
+            responses: &[],
+        },
+        Row {
+            case: "every candidate refuses",
+            model: "claude-sonnet-5",
+            scripts: [Script::Refence(unsupported), Script::Refence(unsupported)],
+            exit: Exit::Returns,
+            request: Kept::Gone,
+            responses: &[],
+        },
+        Row {
+            case: "an unknown model fails routing",
+            model: "unregistered-model",
+            scripts: [Script::Answers, Script::Answers],
+            exit: Exit::Returns,
+            request: Kept::Gone,
+            responses: &[],
+        },
+        Row {
+            case: "the client leaves before the attempt settles",
+            model: "claude-sonnet-5",
+            scripts: [Script::Held, Script::Answers],
+            exit: Exit::LeavesBeforeSettlement,
+            request: Kept::Gone,
+            responses: &[Kept::Gone],
+        },
+        Row {
+            case: "the client leaves after the attempt settled",
+            model: "claude-sonnet-5",
+            scripts: [Script::Held, Script::Answers],
+            exit: Exit::LeavesAfterSettlement,
+            request: Kept::Gone,
+            responses: &[Kept::Gone],
+        },
+        Row {
+            case: "the attempt panics",
+            model: "claude-sonnet-5",
+            scripts: [Script::Panics, Script::Answers],
+            exit: Exit::Panics,
+            request: Kept::Gone,
+            responses: &[Kept::Gone],
+        },
+    ];
+    let (upstream, _sends) = refusing_upstream().await;
+    let usage = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
+    for row in rows {
+        let case = row.case;
+        let fixture = Fixture::with_credentials(vec![credential("a"), credential("b")], &upstream);
+        fixture.rt.usage_queue().configure(true, &usage);
+        let (release, released) = oneshot::channel();
+        let fake = Fake {
+            rt: fixture.rt.clone(),
+            scripts: [("a", row.scripts[0]), ("b", row.scripts[1])],
+            begun: Mutex::default(),
+            records: Mutex::default(),
+            release: Mutex::new(Some(released)),
+        };
+        let mut exchange = exchange(&fixture, owner(KEY), output(Protocol::Chat, Framing::Sse), CLIENT);
+        let (document, media) = request_view(&fixture, &mut exchange);
+        let request = exchange.request.id();
+        let codec = Codec {
+            exchange,
+            view: RequestView {
+                document: &document,
+                media: &media,
+                operation: Operation::Generate,
+            },
+            request_id: LocalId::new("request").unwrap(),
+        };
+        let mut call = call();
+        call.model = row.model.into();
+        let trace = Trace::with_request_id(Some("trace".into()));
+        let mut run = Box::pin(
+            std::panic::AssertUnwindSafe(dispatch::run_exchange(&fixture.rt, &fake, call, &trace, codec))
+                .catch_unwind(),
+        );
+        let waiting = async {
+            while fake.begun.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(SETTLE).await;
+        };
+        match row.exit {
+            Exit::Returns | Exit::Panics => {
+                let ended = tokio::time::timeout(Duration::from_secs(5), run)
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: the call finishes"));
+                match (ended, row.exit) {
+                    (Ok(Ok(Served::Committed(response))), Exit::Returns) => drop(response),
+                    (Ok(_), Exit::Returns) => {}
+                    (Err(_), Exit::Panics) => {}
+                    (_, exit) => panic!("{case}: did not end as {exit:?}"),
+                }
+            }
+            Exit::LeavesBeforeSettlement | Exit::LeavesAfterSettlement => {
+                tokio::select! {
+                    _ = &mut run => panic!("{case}: answered before the upstream did"),
+                    () = waiting => {}
+                }
+                if let Exit::LeavesAfterSettlement = row.exit {
+                    let _ = release.send(());
+                    assert_eq!(fake.records(1).await.len(), 1, "{case}: the attempt settled");
+                    drop(run);
+                } else {
+                    drop(run);
+                    let _ = release.send(());
+                }
+            }
+        }
+        drop((document, media));
+        let streams: Vec<u64> = std::iter::once(request)
+            .chain(fake.begun.lock().unwrap().iter().map(|begun| begun.stream))
+            .collect();
+        let expected: Vec<Kept> = std::iter::once(row.request)
+            .chain(row.responses.iter().copied())
+            .collect();
+        let states = || -> Vec<Kept> {
+            streams
+                .iter()
+                .map(|id| {
+                    match fixture
+                        .rt
+                        .streams()
+                        .with_store(|store| store.reader(*id, 0).map(drop))
+                        .unwrap()
+                    {
+                        Ok(()) => Kept::Yes,
+                        Err(ck_stream::Error::Gone) => Kept::Gone,
+                        Err(error) => panic!("{case}: stream {id}: {error:?}"),
+                    }
+                })
+                .collect()
+        };
+        // Discards that wait for an attempt's settlement land once its usage is settled.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while states() != expected && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(states(), expected, "{case}: request then response streams");
     }
 }

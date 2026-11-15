@@ -12,7 +12,7 @@ use ck_core::config::Config;
 use ck_core::exec::Caller;
 use ck_server::Runtime;
 use ck_server::http::egress::{Framing, Output, Protocol};
-use ck_server::inference::streams::{Exchange, Owner, StreamHandle, StreamId};
+use ck_server::inference::streams::{Exchange, Owner, StreamId};
 use ck_stream::{ManualClock, Store, Terminal, Writer};
 use ck_translate::codec::chat::{request, response};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
@@ -200,26 +200,26 @@ pub fn start(fixture: &Fixture, owner: Owner, output: Output, body: &[u8]) -> (E
 
 /// Runs Chat request ingress for `body`: the exchange before its first attempt.
 pub fn exchange(fixture: &Fixture, owner: Owner, output: Output, body: &[u8]) -> Exchange {
-    let request = fixture
+    fixture
         .rt
         .streams()
         .with_store(|store| {
-            let mut request = store.create().unwrap();
+            let mut exchange = Exchange::new(owner, output, store).unwrap();
+            let request = &mut exchange.request;
             let mut client = request::Ingress::new(
-                &mut request,
+                request,
                 store,
                 identity(Direction::Request),
                 Operation::Generate,
                 1 << 20,
             )
             .unwrap();
-            client.advance(&mut request, body).unwrap();
-            client.finish(&mut request, &request::ChatCapability).unwrap();
+            client.advance(request, body).unwrap();
+            client.finish(request, &request::ChatCapability).unwrap();
             drop(client);
-            request
+            exchange
         })
-        .unwrap();
-    Exchange { owner, output, request }
+        .unwrap()
 }
 
 /// [`start`] for a Chat client, committed at once under a fresh id.
@@ -229,16 +229,10 @@ pub fn commit(fixture: &Fixture, owner: Owner, framing: Framing, body: &[u8]) ->
         operation: Operation::Generate,
         framing,
     };
-    let (mut exchange, mut live) = start(fixture, owner, output, body);
-    exchange.request.finish(Terminal::Done);
+    let (exchange, mut live) = start(fixture, owner, output, body);
     live.id = StreamId::random();
-    fixture.rt.streams().register(StreamHandle {
-        id: live.id,
-        owner: exchange.owner,
-        output,
-        response: live.response.allocator(),
-        request: exchange.request.allocator(),
-    });
+    let handle = exchange.into_handle(live.id, live.response.allocator());
+    fixture.rt.streams().register(handle);
     live
 }
 
