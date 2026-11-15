@@ -132,3 +132,20 @@ pub trait Execute: Send + Sync {
         streams: Streams<'_>,
     ) -> impl Future<Output = Result<Upstream<Self::Ingress>, ExecError>> + Send;
 }
+
+/// `statusErr{code, msg}`: no retry hint, no headers; an empty message reads `status N`.
+pub(crate) fn status_err(status: u16, message: impl Into<Bytes>) -> ExecError {
+    let mut body: Bytes = message.into();
+    if body.is_empty() {
+        body = Bytes::from(format!("status {status}"));
+    }
+    ExecError {
+        status,
+        scope: crate::upstream::scope_for(status),
+        body,
+        headers: Box::default(),
+        retry_after: None,
+        direct: false,
+        addon: None,
+    }
+}
