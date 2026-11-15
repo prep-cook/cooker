@@ -87,20 +87,22 @@ async fn a_padded_session_is_another_session() {
     assert!(sent["input"].to_string().contains(ENC), "{sent}");
 }
 
-/// An upstream `error` ends the response; a completion after it in the same chunk, which the
-/// ingress ignores, caches nothing.
+/// An upstream error ends the response; a completion after it in the same chunk, which the
+/// ingress ignores, caches nothing. The error is read as the ingress reads it, from the whole
+/// SSE event: named by its type, by an `event` line after its data, or split over data lines.
 #[tokio::test]
 async fn a_completion_after_an_error_caches_nothing() {
-    let executors = executors();
-    let a = ("sk-a", "xai-1");
-    let error = event(json!({"type":"error","code":"server_error","message":"boom"}));
-    let body = reasoning_turn().replacen(
-        "event: response.completed",
-        &format!("{error}event: response.completed"),
-        1,
-    );
-    let (_, ok) = turn(&executors, a, TURN, Reply::sse(body)).await;
-    assert!(!ok, "the error fails the attempt");
-    let (sent, _) = turn(&executors, a, NEXT, Reply::sse(sse())).await;
-    assert!(!sent["input"].to_string().contains(ENC), "{sent}");
+    let typed = event(json!({"type":"error","code":"server_error","message":"boom"}));
+    let named_after = "data: {\"message\":\"boom\"}\nevent: error\n\n".to_owned();
+    let split = "data: {\"type\":\ndata: \"error\",\"message\":\"boom\"}\n\n".to_owned();
+    for error in [typed, named_after, split] {
+        let executors = executors();
+        let a = ("sk-a", "xai-1");
+        let at = "event: response.completed";
+        let body = reasoning_turn().replacen(at, &format!("{error}{at}"), 1);
+        let (_, ok) = turn(&executors, a, TURN, Reply::sse(body)).await;
+        assert!(!ok, "the error fails the attempt: {error}");
+        let (sent, _) = turn(&executors, a, NEXT, Reply::sse(sse())).await;
+        assert!(!sent["input"].to_string().contains(ENC), "{error}: {sent}");
+    }
 }

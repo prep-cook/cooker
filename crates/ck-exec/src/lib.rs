@@ -112,6 +112,7 @@ mod xai_replay_store;
 mod xai_request;
 mod xai_response;
 mod xai_shape;
+mod xai_sse;
 pub mod xai_url;
 mod xai_ws;
 

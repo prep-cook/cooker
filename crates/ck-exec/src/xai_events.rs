@@ -33,6 +33,7 @@ use crate::xai::MAX_LINE;
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_request::Prepared;
 use crate::xai_response::{self as response, NamespaceRefs, NamespaceRestorer, XSearchFilter, text};
+use crate::xai_sse::Failures;
 
 /// The response decoder of one xAI attempt: generation through the xAI line rules, or a
 /// buffered compact whose success clears the session's replay.
@@ -108,10 +109,8 @@ pub struct Events {
     folded: HashSet<String>,
     alias: String,
     replay: Option<(Arc<replay::Store>, ReplayScope)>,
-    /// The name of the SSE event in progress.
-    name: Option<Vec<u8>>,
-    /// An upstream failure event went to the ingress, which ignores what follows it.
-    failed: bool,
+    /// The upstream failures the ingress was handed; it ignores what follows one.
+    failures: Failures,
     /// The completion's output items replay keeps, waiting for the blank line that ends it;
     /// `None` when the completion has no output array.
     completed: Option<Vec<ScratchLease>>,
@@ -132,8 +131,7 @@ impl Events {
             folded: HashSet::new(),
             alias: prepared.web_search_alias,
             replay: scope.valid().then_some((store, scope)),
-            name: None,
-            failed: false,
+            failures: Failures::default(),
             completed: None,
         }
     }
@@ -303,14 +301,13 @@ impl Events {
     /// output, and a completion is passed on with them.
     fn data(&mut self, owner: &mut Writer, line: &[u8], event: &[u8]) -> codec::Result<()> {
         let kind = gj::get(event, "type").bytes().into_owned();
-        self.failed |= failure(self.name.as_deref(), event);
         match kind.as_slice() {
             b"response.output_item.done" => {
                 self.items.collect(owner, event)?;
                 self.put(owner, line)
             }
             b"response.completed" | b"response.incomplete" => {
-                let replay = kind == b"response.completed" && self.replay.is_some() && !self.failed;
+                let replay = kind == b"response.completed" && self.replay.is_some() && !self.failures.seen;
                 let Some(splice) = self.items.splice(event) else {
                     if replay {
                         self.completed = kept(owner, event)?;
@@ -327,10 +324,10 @@ impl Events {
                 let mut at = 0;
                 while at < lease.len() {
                     let chunk = lease.chunk(at).map_err(codec::Error::Storage)?;
-                    self.inner.advance(owner, chunk)?;
+                    self.feed(owner, chunk)?;
                     at += chunk.len();
                 }
-                self.inner.advance(owner, b"\n")?;
+                self.feed(owner, b"\n")?;
                 if replay {
                     self.completed = Some(self.items.take());
                 }
@@ -344,14 +341,10 @@ impl Events {
     /// that is the completion, the ingress has accepted it and replay caches it.
     fn put(&mut self, owner: &mut Writer, content: &[u8]) -> codec::Result<()> {
         if !content.is_empty() {
-            if let Some(name) = content.strip_prefix(b"event:") {
-                self.name = Some(trim_space(name).to_vec());
-            }
-            self.inner.advance(owner, content)?;
-            return self.inner.advance(owner, b"\n");
+            self.feed(owner, content)?;
+            return self.feed(owner, b"\n");
         }
-        self.name = None;
-        self.inner.advance(owner, b"\n")?;
+        self.feed(owner, b"\n")?;
         if let (Some(leases), Some((store, scope))) = (self.completed.take(), &self.replay) {
             let mut items = Vec::with_capacity(leases.len());
             for lease in &leases {
@@ -367,25 +360,15 @@ impl Events {
         }
         Ok(())
     }
-}
 
-/// Whether an upstream event is a failure the Responses ingress ends the response with and
-/// ignores the input after: `error` or `response.failed` by its `type`, else by its SSE
-/// name, else a non-null `error` member.
-fn failure(name: Option<&[u8]>, event: &[u8]) -> bool {
-    const FAILURES: [&[u8]; 2] = [b"error", b"response.failed"];
-    if !gj::parse(event).is_object() {
-        return false;
+    /// Hands `bytes` to the ingress, and to the failure reader while a completion may still
+    /// be cached.
+    fn feed(&mut self, owner: &mut Writer, bytes: &[u8]) -> codec::Result<()> {
+        self.inner.advance(owner, bytes)?;
+        let keep = self.replay.is_some() && !self.failures.seen;
+        self.failures.read(bytes, keep);
+        Ok(())
     }
-    let kind = gj::get(event, "type");
-    if kind.exists() {
-        return kind.kind == Kind::String && FAILURES.contains(&&*kind.bytes());
-    }
-    if let Some(name) = name {
-        return FAILURES.contains(&name);
-    }
-    let error = gj::get(event, "error");
-    error.exists() && error.kind != Kind::Null
 }
 
 /// The output items of a completion replay keeps, each in its own scratch lease; `None`
