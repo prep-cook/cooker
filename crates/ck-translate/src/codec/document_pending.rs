@@ -65,9 +65,7 @@ impl Pending {
                 json::Kind::Bool => Value::Bool(self.document.input().equals(scanned.span, b"true")?),
                 json::Kind::Null => Value::Null,
             };
-            let node = self
-                .document
-                .add(scanned.key.map(|span| Name::Mapped(Text { source: 0, span })), value)?;
+            let node = self.document.add(scanned.name(0), value)?;
             self.document
                 .append(self.node(scanned.parent.ok_or(Error::Schema)?)?, node)?;
             self.nodes.push(node)?;

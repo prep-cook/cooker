@@ -132,11 +132,7 @@ impl Ingress {
             source: 0,
             span: wire.span,
         };
-        let node = self.document.add(
-            wire.key
-                .map(|span| Name::Mapped(codec::document::Text { source: 0, span })),
-            Value::String(text),
-        )?;
+        let node = self.document.add(wire.name(0), Value::String(text))?;
         self.document.append(parent, node)?;
         super::super::request_provenance::capture(&mut self.document, owner, node)?;
         let media_index = self.media.len();

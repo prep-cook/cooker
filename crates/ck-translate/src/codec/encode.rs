@@ -54,6 +54,12 @@ impl Encoder<'_, '_> {
         Ok(())
     }
 
+    /// The offset of the next byte from the record's start. Both passes encode the same bytes,
+    /// so the counting pass yields the offsets the write pass commits.
+    pub fn mark(&self) -> u64 {
+        self.length as u64
+    }
+
     pub fn quoted_json(&mut self, write: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
         if self.quoted {
             return Err(Error::Schema);

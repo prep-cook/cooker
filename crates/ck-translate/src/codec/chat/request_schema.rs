@@ -309,11 +309,13 @@ fn content_part(doc: &Document, media: &Registry, part: usize) -> Result<()> {
 }
 
 /// A tool result in a user turn, which request egress writes as a `tool` message: text parts
-/// only, and no Gemini-native `result` object.
+/// only, or a Gemini `result` as its JSON text. Chat has no field for a Gemini `error`.
 fn tool_result(doc: &Document, part: usize) -> Result<()> {
     require_string(doc, doc.required(part, "tool_call_id")?)?;
-    if doc.member(part, "result")?.is_some() {
-        return Err(Error::Unsupported);
+    match super::request::gemini::outcome(doc, part)? {
+        Some(super::request::gemini::Outcome::Error(_)) => return Err(Error::Unsupported),
+        Some(super::request::gemini::Outcome::Result(_)) => return Ok(()),
+        None => (),
     }
     optional(doc, part, "is_error", boolean)?;
     optional(doc, part, "content", |doc, content| {
@@ -328,8 +330,10 @@ fn tool_result(doc: &Document, part: usize) -> Result<()> {
 
 fn response_format(doc: &Document, node: usize) -> Result<()> {
     object(doc, node)?;
-    // Chat ingress keeps only these members; another protocol's schema members (Gemini's
-    // `responseSchema`) have no Chat form.
+    if super::request::json_schema::from_gemini(doc)? {
+        return super::request::gemini::json_mode(doc, node).map(|_| ());
+    }
+    // Chat ingress keeps only these members.
     for member in doc.children(node)? {
         let name = doc.node(member)?.name.ok_or(Error::Schema)?;
         if !doc.name_is(name, "type")? && !doc.name_is(name, "json_schema")? {
