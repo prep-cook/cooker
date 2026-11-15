@@ -1922,7 +1922,14 @@ impl<'a> Ctx<'a> {
         }
         body = cloak::strip_prompt_cache_options(body);
         if self.first_party || self.cli_profile {
-            for field in ["metadata", "context_management", "diagnostics"] {
+            // count_tokens takes no metadata or diagnostics. It does take context_management
+            // and counts the edited context, so the contract path keeps the caller's.
+            let fields: &[&str] = if self.legacy_body() {
+                &["metadata", "context_management", "diagnostics"]
+            } else {
+                &["metadata", "diagnostics"]
+            };
+            for field in fields {
                 body = rawjson::delete(&body, field);
             }
         }

@@ -367,3 +367,47 @@ async fn a_kimi_origin_keeps_the_callers_system_text() {
         assert!(sent["system"].to_string().contains(text), "{sent}");
     }
 }
+
+/// The upstream requests a sink captured, as (url, body).
+#[derive(Default)]
+struct Sent(std::sync::Mutex<Vec<(String, Vec<u8>)>>);
+
+impl ck_core::exec::CaptureObserver for Sent {
+    fn record(&self, event: ck_core::exec::CaptureEvent<'_>) {
+        if let ck_core::exec::CaptureEvent::Request(request) = event {
+            let entry = (request.url.to_owned(), request.body.to_vec());
+            self.0.lock().unwrap().push(entry);
+        }
+    }
+}
+
+/// count_tokens counts the context after the caller's edits, so a first-party count keeps
+/// `context_management`; it takes no `metadata`.
+#[tokio::test]
+async fn a_first_party_count_keeps_the_callers_context_management() {
+    let mut key = credential("claude", "https://api.anthropic.com", "sk-ant-api03-test");
+    // The proxy refuses every connection: the count is captured, and nothing leaves the host.
+    key.attributes.insert("proxy_url".into(), "http://127.0.0.1:1".into());
+    let mut fixture = Fixture::with(key, "http://127.0.0.1:1", SONNET);
+    let beta = "context-management-2025-06-27".parse().unwrap();
+    fixture.exchange.headers.insert("anthropic-beta", beta);
+    let sent = std::sync::Arc::new(Sent::default());
+    let sink = ck_core::exec::CaptureSink::new(sent.clone());
+    fixture.exchange.usage = UsageSink::default().with_capture(sink);
+    let edits = json!({"edits": [{"type": "clear_tool_uses_20250919",
+        "trigger": {"type": "input_tokens", "value": 30000}, "keep": {"type": "tool_uses", "value": 5}}]});
+    let body = json!({"model": SONNET, "messages": [{"role": "user", "content": "hi"}],
+        "context_management": edits, "metadata": {"user_id": "u-1"}});
+    let (started, _, _request) = fixture
+        .anthropic(&serde_json::to_vec(&body).unwrap(), Operation::CountTokens)
+        .await;
+    assert!(started.is_err(), "the loopback proxy refuses the connection");
+    let (url, request) = sent.0.lock().unwrap().pop().expect("the prepared count request");
+    assert!(
+        url.starts_with("https://api.anthropic.com/v1/messages/count_tokens"),
+        "{url}"
+    );
+    let request: Value = serde_json::from_slice(&request).unwrap();
+    assert_eq!(request["context_management"], edits);
+    assert!(request.get("metadata").is_none(), "{request}");
+}
