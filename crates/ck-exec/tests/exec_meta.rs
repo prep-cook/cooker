@@ -76,10 +76,15 @@ async fn every_client_protocol_goes_out_as_meta_and_comes_back() {
 
 /// The old path's upload for a Responses client: request, then drain its response.
 async fn old_path(exchange: &Exchange, body: &[u8], stream: bool) {
+    old_path_from(exchange, body, stream, Format::OpenAIResponse).await;
+}
+
+/// [`old_path`] for a client of `source`.
+async fn old_path_from(exchange: &Exchange, body: &[u8], stream: bool, source: Format) {
     let request = ExecRequest {
         operation: ExecOperation::Generate,
-        source_format: Format::OpenAIResponse,
-        response_format: Format::OpenAIResponse,
+        source_format: source,
+        response_format: source,
         requested_model: "client-model".into(),
         model: exchange.model.clone(),
         original_body: Bytes::copy_from_slice(body),
@@ -164,6 +169,63 @@ async fn a_responses_client_matches_the_old_path() {
         assert_eq!(reasoning["summary"][0]["text"], "thought", "{sent}");
         assert_eq!(wire_headers(new), wire_headers(old), "stream {stream}");
         assert_eq!(new.header("x-extra"), Some("1"));
+    }
+}
+
+/// String input and string message content reach Meta as the old path sent them: a Responses
+/// client's string `input` as one `input_text` part and its own messages as sent; every other
+/// client's string content as one text part (`output_text` for the assistant).
+// The old path's Chat and Anthropic translators also default `reasoning.effort` to `medium`;
+// only the input is compared for them.
+#[tokio::test]
+async fn string_input_and_content_match_the_old_path() {
+    let bodies = [
+        (
+            "responses",
+            Format::OpenAIResponse,
+            r#"{"model":"client-model","input":"hi"}"#,
+        ),
+        (
+            "responses",
+            Format::OpenAIResponse,
+            r#"{"model":"client-model","instructions":"be brief","input":"hi"}"#,
+        ),
+        (
+            "responses",
+            Format::OpenAIResponse,
+            r#"{"model":"client-model","input":[{"type":"message","role":"user","content":"hi"},{"type":"message","role":"assistant","content":"hello"},{"type":"message","role":"user","content":"more"}]}"#,
+        ),
+        (
+            "responses",
+            Format::OpenAIResponse,
+            r#"{"model":"client-model","input":[{"type":"message","role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "chat",
+            Format::OpenAI,
+            r#"{"model":"client-model","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"more"}]}"#,
+        ),
+        (
+            "anthropic",
+            Format::Claude,
+            r#"{"model":"client-model","max_tokens":64,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"more"}]}"#,
+        ),
+    ];
+    for (protocol, source, body) in bodies {
+        let upstream = StreamUpstream::start([Reply::sse(sse()), Reply::sse(sse())]).await;
+        let exchange = exchange(&upstream);
+        let streams = Streams::new();
+        let (started, id, _request) =
+            run(&streams, &exchange, protocol, Operation::Generate, body.as_bytes(), 64).await;
+        finish(&streams, started.unwrap(), id).await.0.unwrap();
+        old_path_from(&exchange, body.as_bytes(), false, source).await;
+        let captured = upstream.captured();
+        let (new, old) = (json_body(&captured[0]), json_body(&captured[1]));
+        if source == Format::OpenAIResponse {
+            assert_eq!(new, old, "{body}");
+        } else {
+            assert_eq!(new["input"], old["input"], "{body}");
+        }
     }
 }
 
@@ -291,6 +353,73 @@ fn apply_patch_keeps_the_old_route() {
         fenced("responses", Operation::Compact, compact),
         Err("Unsupported".to_owned())
     );
+}
+
+/// The `apply_patch` fence reads only the carriers the old bridge rewrites: the object a
+/// custom patch tool is made of, held as data anywhere else, routes nowhere.
+#[test]
+fn apply_patch_is_found_only_where_it_is_declared_chosen_or_called() {
+    let patch = r#"{"type":"custom","name":"apply_patch"}"#;
+    let custom = r#"{"type":"custom","name":"apply_patch","description":"Patch","format":{"type":"grammar","syntax":"lark","definition":"start: x"}}"#;
+    let lookup = r#"{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"object","default":PATCH}}}}"#
+        .replace("PATCH", patch);
+    let not_patch = [
+        // A function call whose arguments hold the object.
+        format!(
+            r#"{{"model":"m","input":[{{"type":"function_call","call_id":"c1","name":"lookup","arguments":{}}},{{"type":"function_call_output","call_id":"c1","output":"ok"}}],"tools":[{lookup}]}}"#,
+            serde_json::to_string(patch).unwrap()
+        ),
+        // A schema default.
+        format!(r#"{{"model":"m","input":"hi","tools":[{lookup}]}}"#),
+        // An unknown request field.
+        format!(r#"{{"model":"m","input":"hi","x_extra":{patch}}}"#),
+    ];
+    for body in &not_patch {
+        assert_eq!(
+            fenced("responses", Operation::Generate, body.as_bytes()),
+            Ok(()),
+            "{body}"
+        );
+    }
+    let real = [
+        ("responses", format!(r#"{{"model":"m","input":"hi","tools":[{custom}]}}"#)),
+        (
+            "responses",
+            format!(r#"{{"model":"m","input":"hi","tools":[{{"type":"namespace","name":"fs","description":"files","tools":[{custom}]}}]}}"#),
+        ),
+        (
+            "responses",
+            format!(r#"{{"model":"m","input":"hi","tools":[{custom}],"tool_choice":{patch}}}"#),
+        ),
+        (
+            "responses",
+            r#"{"model":"m","input":[{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch"},{"type":"custom_tool_call_output","call_id":"c1","output":"ok"},{"role":"user","content":"next"}]}"#.into(),
+        ),
+        (
+            "responses",
+            r#"{"model":"m","input":[{"type":"custom_tool_call","call_id":"c1","namespace":"fs","name":"apply_patch","input":"*** Begin Patch"},{"type":"custom_tool_call_output","call_id":"c1","output":"ok"},{"role":"user","content":"next"}]}"#.into(),
+        ),
+        (
+            "chat",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"custom","custom":{"name":"apply_patch"}}]}"#.into(),
+        ),
+        (
+            "responses",
+            format!(r#"{{"model":"m","input":[{{"type":"additional_tools","tools":[{custom}]}},{{"role":"user","content":"hi"}}]}}"#),
+        ),
+        ("responses", format!(r#"{{"model":"m","input":"hi","tool_choice":{patch}}}"#)),
+        (
+            "chat",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"c1","type":"custom","custom":{"name":"apply_patch","input":"*** Begin Patch"}}]},{"role":"tool","tool_call_id":"c1","content":"ok"}]}"#.into(),
+        ),
+    ];
+    for (protocol, body) in &real {
+        assert_eq!(
+            fenced(protocol, Operation::Generate, body.as_bytes()),
+            Err("Destination".to_owned()),
+            "{protocol}: {body}"
+        );
+    }
 }
 
 /// The selector runs Meta credentials through this executor.
