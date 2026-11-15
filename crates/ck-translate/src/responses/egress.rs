@@ -1,7 +1,7 @@
 use super::{Table, is, response::append_fragment};
 use crate::codec::{
     self, BodyMode, Error, Operation, Result,
-    document::{Document, Name, Value},
+    document::{Document, Value},
     encode::{self, Encoder},
     event::Kind,
     internal,
@@ -489,7 +489,7 @@ fn restore_originals(doc: &mut Document, x: usize, target: usize) -> Result<()> 
             return Err(Error::Schema);
         };
         let value = doc.remove(entry, "value")?.ok_or(Error::Schema)?;
-        let field = doc.add(Some(Name::Pointer(pointer)), Value::Null)?;
+        let field = doc.add(Some(doc.pointer_name(pointer)?), Value::Null)?;
         doc.transplant(field, value)?;
         // A later value of a started member is merged into it: omitted nested members keep
         // their started values (§3.6).

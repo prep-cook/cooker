@@ -10,6 +10,7 @@ use std::{
 
 use super::{
     Error, Result,
+    document::{Digest, Name, NameHash, Text},
     source::{Source, Span},
 };
 use decode::string_eq;
@@ -32,9 +33,19 @@ pub struct Node {
     /// End of the last complete decoded scalar, excluding the closing quote.
     pub validated_end: u64,
     pub key: Option<Span>,
+    /// The digest of `key`'s decoded name; meaningless without a key.
+    key_digest: Digest,
     pub first: Option<usize>,
     pub next: Option<usize>,
     pub parent: Option<usize>,
+}
+
+impl Node {
+    /// This member's name, with its key in document source `source`.
+    pub(crate) fn name(&self, source: usize) -> Option<Name> {
+        self.key
+            .map(|span| Name::Mapped(Text { source, span }, self.key_digest))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -51,12 +62,13 @@ struct Frame {
     node: usize,
     expect: Expect,
     key: Option<Span>,
+    key_digest: Digest,
     last: Option<usize>,
 }
 struct Key {
     span: Span,
     parent: usize,
-    retained: Option<super::document::Name>,
+    retained: Option<Name>,
     previous: Option<usize>,
 }
 #[derive(Clone, Copy)]
@@ -173,7 +185,7 @@ impl Scanner {
         result
     }
 
-    pub(crate) fn bind_key(&mut self, span: Span, name: super::document::Name) {
+    pub(crate) fn bind_key(&mut self, span: Span, name: Name) {
         if let Ok(index) = self.keys.binary_search_by_key(&span.start, |key| key.span.start) {
             self.keys[index].retained = Some(name);
         }
@@ -337,6 +349,7 @@ impl Scanner {
                         Expect::ArrayFirst
                     },
                     key: None,
+                    key_digest: Digest::default(),
                     last: None,
                 });
             }
@@ -392,9 +405,11 @@ impl Scanner {
     fn key(&mut self, source: &Source, span: Span, document: Option<&super::document::Document>) -> Result<()> {
         let parent = self.frames.last().ok_or(Error::Json)?.node;
         let mut hash = self.hash.build_hasher();
+        let mut name = NameHash::default();
         let mut decoded = Decoded::new(source, span)?;
         while let Some(scalar) = decoded.next_scalar()? {
             hash.write_u32(scalar as u32);
+            name.push(scalar);
         }
         let key = (parent, hash.finish());
         let previous = self.key_heads.get(&key).copied();
@@ -431,6 +446,7 @@ impl Scanner {
         });
         let frame = self.frames.last_mut().unwrap();
         frame.key = Some(span);
+        frame.key_digest = name.finish(span.len() - 2);
         frame.expect = Expect::Colon;
         Ok(())
     }
@@ -446,7 +462,7 @@ impl Scanner {
             }
             frame.last = Some(index);
             frame.expect = Expect::Comma;
-            frame.key.take()
+            frame.key.take().map(|span| (span, frame.key_digest))
         } else {
             None
         };
@@ -454,7 +470,8 @@ impl Scanner {
             kind,
             span,
             validated_end: span.end,
-            key,
+            key: key.map(|(span, _)| span),
+            key_digest: key.map_or(Digest::default(), |(_, digest)| digest),
             first: None,
             next: None,
             parent: self.frames.last().map(|frame| frame.node),

@@ -128,16 +128,13 @@ fn empty_generation_config_does_not_block_foreign_destinations() {
     assert_eq!(chat["tool_choice"], "auto");
     assert!(translate(P::Gemini, P::Anthropic, &input).is_ok());
     assert_eq!(translate(P::Gemini, P::Gemini, &input).unwrap(), input);
-    // A function response has no Chat or Anthropic form yet: refused, not dropped.
+    // A function response reaches Chat and Anthropic as its result's JSON text.
     let mut result = input.clone();
     result["contents"] = json!([{"parts":[{"text":"weather?"}],"role":"user"},
         {"parts":[{"functionCall":{"id":"fc_1","args":{"city":"Paris"},"name":"get_weather"}}],"role":"model"},
         {"parts":[{"functionResponse":{"id":"fc_1","name":"get_weather","response":{"result":"19C clear"}}}],"role":"user"}]);
     for to in [P::Chat, P::Anthropic] {
-        assert!(matches!(
-            translate(P::Gemini, to, &result),
-            Err(codec::Error::Unsupported)
-        ));
+        assert!(translate(P::Gemini, to, &result).is_ok());
     }
     assert_eq!(translate(P::Gemini, P::Gemini, &result).unwrap(), result);
     let mut native = input.clone();
@@ -168,11 +165,11 @@ fn snake_case_gemini_members_map_like_camel_case() {
     assert_eq!(anthropic["tools"][0]["input_schema"], schema);
 }
 
-/// Gemini's response schema members have no Chat or Anthropic form: the fence refuses them as
-/// unsupported, not as malformed.
+/// Gemini's enum mode has no Chat or Anthropic form: the fence refuses it as unsupported, not
+/// as malformed.
 #[test]
-fn gemini_response_schema_is_unsupported_at_chat_and_anthropic() {
-    let input = json!({"contents":[{"parts":[{"text":"json"}],"role":"user"}],"generationConfig":{"responseMimeType":"application/json","responseSchema":{"properties":{"a":{"type":"INTEGER"}},"type":"OBJECT"}}});
+fn gemini_enum_response_schema_is_unsupported_at_chat_and_anthropic() {
+    let input = json!({"contents":[{"parts":[{"text":"json"}],"role":"user"}],"generationConfig":{"responseMimeType":"text/x.enum","responseSchema":{"enum":["a"],"type":"STRING"}}});
     for to in [P::Chat, P::Anthropic] {
         assert!(matches!(
             translate(P::Gemini, to, &input),

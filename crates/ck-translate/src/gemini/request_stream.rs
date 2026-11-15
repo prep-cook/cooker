@@ -55,7 +55,7 @@ impl Ingress {
     /// Publishes `request.start` and the root object field once the first node is scanned.
     fn start(&mut self, owner: &mut Writer) -> Result<()> {
         let input = self.input.as_mut().ok_or(Error::Closed)?;
-        self.emitter.request_start(
+        let record = self.emitter.request_start(
             owner,
             RequestView {
                 document: &input.document,
@@ -63,17 +63,13 @@ impl Ingress {
                 operation: self.operation,
             },
         )?;
-        codec::internal::next(owner, &mut self.reader)?;
-        self.emitter.emit(
-            owner,
-            Kind::RequestField,
-            Scope::default(),
-            |e| e.bytes(b",\"pointer\":\"\",\"value\":{}"),
-            |_| Ok(()),
-        )?;
-        let (_, event) = codec::internal::next(owner, &mut self.reader)?;
+        codec::internal::committed(&mut self.reader, record)?;
+        let (record, spans) =
+            self.emitter
+                .emit_field(owner, |e| e.bytes(b"\"\""), |e| e.bytes(b"{}").map(|()| false))?;
+        let lease = codec::internal::committed(&mut self.reader, record)?;
         let root = input.document.root();
-        input.document.bind_field(root, event)?;
+        input.document.bind_field(owner, root, lease, spans)?;
         input.document.mark_published(root);
         self.started = true;
         Ok(())

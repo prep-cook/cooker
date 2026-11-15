@@ -24,7 +24,7 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
     // Consecutive Chat tool messages answer the preceding assistant's calls in one user turn.
     let (mut calls, mut results) = (None, false);
     for message in doc.children(messages)? {
-        if super::is(doc, message, "role", "system")? {
+        if super::request_schema::system(doc, message)? {
             continue;
         }
         let tool = super::is(doc, message, "role", "tool")?;
@@ -51,7 +51,7 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
     }
     e.bytes(if results { b"]}]" } else { b"]" })?;
     for message in doc.children(messages)? {
-        if super::is(doc, message, "role", "system")? {
+        if super::request_schema::system(doc, message)? {
             e.bytes(b",\"systemInstruction\":")?;
             write_message(view, message, true, None, e)?;
         }
@@ -92,8 +92,10 @@ fn config(doc: &Document, x: Option<usize>, native: Option<usize>, e: &mut Encod
         native_config = None;
     }
     let thinking = x.map(|x| doc.member(x, "thinking")).transpose()?.flatten();
+    let top_k = super::request_schema::top_k(doc, x)?;
     let config_present = native_config.is_some()
         || thinking.is_some()
+        || top_k.is_some()
         || doc.member(root, "response_format")?.is_some()
         || doc.member(root, "max_completion_tokens")?.is_some()
         || super::request::config().iter().try_fold(false, |yes, (_, key)| {
@@ -101,7 +103,7 @@ fn config(doc: &Document, x: Option<usize>, native: Option<usize>, e: &mut Encod
         })?;
     if config_present {
         e.bytes(b",\"generationConfig\":{")?;
-        generation_config(doc, thinking, native_config, e)?;
+        generation_config(doc, (thinking, top_k), native_config, e)?;
         e.bytes(b"}")?;
     } else if null_config {
         e.bytes(b",\"generationConfig\":null")?;
@@ -115,11 +117,11 @@ fn config(doc: &Document, x: Option<usize>, native: Option<usize>, e: &mut Encod
     }
     Ok(())
 }
-/// Writes the members of `generationConfig`: mapped controls, response schema, thinking and the
-/// native config, comma-separated.
+/// Writes the members of `generationConfig`: mapped controls, Anthropic `top_k`, response schema,
+/// thinking and the native config, comma-separated.
 fn generation_config(
     doc: &Document,
-    thinking: Option<usize>,
+    (thinking, top_k): (Option<usize>, Option<usize>),
     native_config: Option<usize>,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
@@ -146,6 +148,11 @@ fn generation_config(
     {
         comma(&mut first, e)?;
         e.bytes(b"\"maxOutputTokens\":")?;
+        doc.write(n, e)?;
+    }
+    if let Some(n) = top_k {
+        comma(&mut first, e)?;
+        e.bytes(b"\"topK\":")?;
         doc.write(n, e)?;
     }
     if let Some(format) = doc.member(root, "response_format")? {
@@ -395,10 +402,15 @@ fn write_message(
             write_part(view, part, Some(entry), previous, e)?;
         }
     }
+    // Claude thinking history is stripped, as at a Chat upstream (owner ruling 2026-11-15).
+    let claude = super::is(doc, doc.required(doc.root(), "x_ck")?, "original_protocol", "anthropic")?;
     if let Some(content) = content {
         if matches!(doc.node(content)?.value, Value::Array) {
             for part in doc.children(content)? {
-                if super::origin(doc, part, "part")?.is_some() {
+                if super::origin(doc, part, "part")?.is_some()
+                    || (claude
+                        && (super::is(doc, part, "type", "reasoning")? || super::is(doc, part, "type", "redacted")?))
+                {
                     continue;
                 }
                 comma(&mut first, e)?;
@@ -484,7 +496,7 @@ fn write_part(
                 continue;
             }
             comma(&mut first, e)?;
-            doc.write_name(crate::codec::document::Name::Pointer(text), e)?;
+            doc.write_name(doc.pointer_name(text)?, e)?;
             e.bytes(b":")?;
             doc.write(doc.required(entry, "value")?, e)?;
         }
