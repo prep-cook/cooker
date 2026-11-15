@@ -13,6 +13,7 @@
 //! bytes the cloak built from them. The fence still validates it first.
 
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 
 use ck_core::exec::{CaptureEvent, ExecError, FailureScope, ResolvedModel, ResponseBody, UsageSink};
 use ck_core::format::Format;
@@ -20,12 +21,14 @@ use ck_stream::{ScratchLease, Writer};
 use ck_translate::anthropic::request::{AnthropicCapability, Budget, Egress};
 use ck_translate::anthropic::response::Ingress;
 use ck_translate::codec::document::{Document, Value};
-use ck_translate::codec::{self, BodyMode, Operation, RequestEgress, RequestFence, RequestView, ValidatedRequest};
+use ck_translate::codec::{
+    self, BodyMode, Operation, RequestEgress, RequestFence, RequestView, ResponseIngress, ValidatedRequest,
+};
 use futures_util::StreamExt;
 
 use super::{
-    ClaudeExecutor, Ctx, Delegation, Input, Prepared, RawResponse, base_model, cloak, detect, fast_request_error,
-    header_value, rebuild_mid_system, replay, sanitize_for_upstream, stream, telemetry,
+    ClaudeExecutor, Completion, Ctx, Delegation, Input, Prepared, RawResponse, base_model, cloak, detect,
+    fast_request_error, header_value, rebuild_mid_system, replay, sanitize_for_upstream, stream, telemetry,
 };
 use crate::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
 
@@ -38,7 +41,7 @@ pub(super) const NO_COMPACT: &str = "This model does not support compaction; cho
 
 impl Execute for ClaudeExecutor {
     type Capability = AnthropicCapability;
-    type Ingress = Ingress;
+    type Ingress = ClaudeIngress;
 
     fn capability(&self, attempt: &Attempt<'_>) -> AnthropicCapability {
         capability(attempt.model, attempt.resolved_model)
@@ -49,7 +52,7 @@ impl Execute for ClaudeExecutor {
         attempt: &Attempt<'_>,
         request: &Request<'_>,
         streams: Streams<'_>,
-    ) -> Result<Upstream<Ingress>, ExecError> {
+    ) -> Result<Upstream<ClaudeIngress>, ExecError> {
         // Boxed like the old path: the prepared request future is large.
         Box::pin(self.messages(attempt, request, streams)).await
     }
@@ -59,7 +62,7 @@ impl Execute for ClaudeExecutor {
         attempt: &Attempt<'_>,
         request: &Request<'_>,
         streams: Streams<'_>,
-    ) -> Result<Counted<Ingress>, ExecError> {
+    ) -> Result<Counted<ClaudeIngress>, ExecError> {
         Box::pin(self.count(attempt, request, streams)).await
     }
 
@@ -68,7 +71,7 @@ impl Execute for ClaudeExecutor {
         _attempt: &Attempt<'_>,
         _request: &Request<'_>,
         _streams: Streams<'_>,
-    ) -> Result<Upstream<Ingress>, ExecError> {
+    ) -> Result<Upstream<ClaudeIngress>, ExecError> {
         // The capability refuses compact at the fence, so no request reaches this.
         Err(ExecError::local(400, FailureScope::Model, NO_COMPACT))
     }
@@ -137,7 +140,7 @@ impl ClaudeExecutor {
         attempt: &Attempt<'_>,
         request: &Request<'_>,
         streams: Streams<'_>,
-    ) -> Result<Upstream<Ingress>, ExecError> {
+    ) -> Result<Upstream<ClaudeIngress>, ExecError> {
         let doc = request.validated.view().document;
         let facts = Facts::of(doc).map_err(encoding)?;
         let stream = streaming(doc, facts.client_format).map_err(encoding)?;
@@ -179,12 +182,15 @@ impl ClaudeExecutor {
         }
         let raw = sent?;
         let (status, headers) = (raw.status, raw.headers.clone());
-        let body = relay(&ctx, &mut prepared, raw, usage);
+        let (body, pending) = relay(&ctx, &mut prepared, raw, usage);
         Ok(Upstream {
             status,
             headers,
             body,
-            ingress,
+            ingress: ClaudeIngress {
+                inner: ingress,
+                pending,
+            },
         })
     }
 
@@ -195,7 +201,7 @@ impl ClaudeExecutor {
         attempt: &Attempt<'_>,
         request: &Request<'_>,
         streams: Streams<'_>,
-    ) -> Result<Counted<Ingress>, ExecError> {
+    ) -> Result<Counted<ClaudeIngress>, ExecError> {
         let cfg = scoped(attempt);
         let mut ctx = context(self, attempt, request, &cfg);
         let facts = Facts::of(request.validated.view().document).map_err(encoding)?;
@@ -238,7 +244,7 @@ impl ClaudeExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
         mut prepared: Prepared,
-    ) -> Result<Counted<Ingress>, ExecError> {
+    ) -> Result<Counted<ClaudeIngress>, ExecError> {
         let limit = stream::MAX_LINE as u64;
         let ingress = Ingress::new(
             streams.response,
@@ -256,7 +262,10 @@ impl ClaudeExecutor {
             status: raw.status,
             headers: raw.headers,
             body: recorded(body_of(raw.body), capture.clone()),
-            ingress,
+            ingress: ClaudeIngress {
+                inner: ingress,
+                pending: None,
+            },
         }))
     }
 }
@@ -282,23 +291,79 @@ fn local_count(ctx: &Ctx<'_>, input: &Input<'_>, translated: &[u8]) -> Result<u6
 }
 
 /// The prepared request's response body: whole native events after alias restore when the
-/// upstream streams, which also completes continuity and the thread; the bytes as read
-/// otherwise. Request logs record every chunk.
-fn relay(ctx: &Ctx<'_>, prepared: &mut Prepared, raw: RawResponse, usage: &UsageSink) -> Body {
+/// upstream streams, with the completion its `message_stop` arms; the bytes as read otherwise.
+/// Request logs record every chunk.
+fn relay(ctx: &Ctx<'_>, prepared: &mut Prepared, raw: RawResponse, usage: &UsageSink) -> (Body, Option<Pending>) {
     let fast = ctx.first_party && prepared.fast;
     let capture = usage.capture().clone();
     let body = body_of(raw.body);
     if !prepared.stream {
-        return recorded(body, capture)
-            .map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)))
-            .boxed();
+        let body = recorded(body, capture).map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)));
+        return (body.boxed(), None);
     }
-    let completion = ctx.completion(prepared);
-    let request_id = header_value(&raw.headers, "request-id");
-    let done: stream::OnComplete = Box::new(move |message_id| completion.complete(&message_id, &request_id));
-    stream::relay(body, prepared.reverse.clone(), done, None, capture)
-        .map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)))
-        .boxed()
+    let pending = Pending {
+        completion: ctx.completion(prepared),
+        request_id: header_value(&raw.headers, "request-id"),
+        message_id: Arc::default(),
+    };
+    let seen = pending.message_id.clone();
+    let done: stream::OnComplete = Box::new(move |message_id| *seen.lock().expect("message id") = Some(message_id));
+    let body = stream::relay(body, prepared.reverse.clone(), done, None, capture)
+        .map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)));
+    (body.boxed(), Some(pending))
+}
+
+/// The Anthropic response ingress of a Claude attempt. A streamed turn records its thread
+/// aliases and session continuity only once this ingress published `done`: the relay sees
+/// `message_stop` before the canonical ingress judges the response, which it may still reject.
+pub struct ClaudeIngress {
+    inner: Ingress,
+    pending: Option<Pending>,
+}
+
+/// A completion waiting for the canonical verdict; the relay sets the message ID at
+/// `message_stop`, before it passes that event on.
+struct Pending {
+    completion: Completion,
+    request_id: String,
+    message_id: Arc<Mutex<Option<String>>>,
+}
+
+impl ClaudeIngress {
+    fn settle(&mut self, step: codec::Result<()>) -> codec::Result<()> {
+        if self.inner.completed()
+            && let Some(pending) = self.pending.take()
+            && let Some(id) = pending.message_id.lock().expect("message id").take()
+        {
+            pending.completion.complete(&id, &pending.request_id);
+        }
+        step
+    }
+}
+
+impl ResponseIngress for ClaudeIngress {
+    fn flush_deadline(&self) -> Option<std::time::Instant> {
+        self.inner.flush_deadline()
+    }
+
+    fn flush(&mut self, owner: &mut Writer) -> codec::Result<()> {
+        let step = self.inner.flush(owner);
+        self.settle(step)
+    }
+
+    fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> codec::Result<()> {
+        let step = self.inner.advance(owner, bytes);
+        self.settle(step)
+    }
+
+    fn finish(&mut self, owner: &mut Writer) -> codec::Result<()> {
+        let step = self.inner.finish(owner);
+        self.settle(step)
+    }
+
+    fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> codec::Result<()> {
+        self.inner.fail(owner, status, scope)
+    }
 }
 
 /// Records each chunk of a body the executor passes on as read.

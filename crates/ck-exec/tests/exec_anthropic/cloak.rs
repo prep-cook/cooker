@@ -395,3 +395,43 @@ async fn a_codex_clients_tool_integers_are_rewritten_before_the_cloak() {
     assert_eq!(new, old_wire(&oauth(), SONNET, &codex, &body, false).await);
     assert!(new.body.contains("\"integer\""), "{}", new.body);
 }
+
+/// Thread aliases and session continuity are recorded only for a response the canonical
+/// ingress completed: a continuation of a rejected turn finds no thread state, one of a
+/// completed turn reaches the upstream.
+#[tokio::test]
+async fn only_a_completed_turn_records_thread_state() {
+    // `message_stop` without the finishing `message_delta`: the ingress rejects it.
+    const CUT: &str = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"msg_cut","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        "\n\nevent: message_stop\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    let tools = json!([{"name": "Read", "description": "Read a file", "input_schema": {"type": "object"}}]);
+    let messages = json!([{"role": "user", "content": "read it"}]);
+    let create = serde_json::to_vec(&json!({"model": SONNET, "max_tokens": 1024, "stream": true,
+        "thread": {"type": "create"}, "tools": tools, "messages": messages}))
+    .unwrap();
+    let after = |id: &str| {
+        let thread = json!({"type": "continue", "previous_message_id": id});
+        let body = json!({"model": SONNET, "max_tokens": 1024, "stream": true, "thread": thread, "messages": messages});
+        serde_json::to_vec(&body).unwrap()
+    };
+    let upstream = StreamUpstream::start([Reply::sse(CUT), Reply::sse(SSE), Reply::sse(SSE)]).await;
+    let fixture = Fixture::with(oauth(), &upstream.url(), SONNET);
+    let (started, _, _request) = fixture.anthropic(&create, Operation::Generate).await;
+    assert!(
+        started.unwrap().producer.await.unwrap().is_err(),
+        "the ingress rejects the cut turn"
+    );
+    let (started, _, _request) = fixture.anthropic(&after("msg_cut"), Operation::Generate).await;
+    assert!(started.is_err(), "no thread state for a rejected turn");
+    assert_eq!(upstream.requests(), 1);
+    let (started, _, _request) = fixture.anthropic(&create, Operation::Generate).await;
+    started.unwrap().producer.await.unwrap().unwrap();
+    let (started, _, _request) = fixture.anthropic(&after("msg_1"), Operation::Generate).await;
+    started.unwrap().producer.await.unwrap().unwrap();
+    assert_eq!(upstream.requests(), 3);
+}
