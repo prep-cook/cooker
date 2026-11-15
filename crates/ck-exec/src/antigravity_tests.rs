@@ -285,7 +285,7 @@ async fn a_split_payload_reports_its_served_model() {
     );
 }
 
-/// Settled 65 (docs/OPEN-QUESTIONS.md): in these scenarios a Claude client receives the Claude
+/// Settled 66 (docs/OPEN-QUESTIONS.md): in these scenarios a Claude client receives the Claude
 /// model's signature as the upstream sent it (`RULED_SIGNATURE.1`), where Go hands it the
 /// single-layer decoding (`.0`). They expect Go's client bytes with that value restored; every
 /// other byte still comes from Go.
@@ -300,7 +300,7 @@ const RULED_SIGNATURE: (&str, &str) = (
     "RXFzQ2t3SUJHQUlpUUhmYWtlLWNsYXVkZS1zaWduYXR1cmUtZm9yLWFudGlncmF2aXR5LXRlc3Rz",
 );
 
-/// Go's client bytes for scenario `name`, with Settled 65 applied.
+/// Go's client bytes for scenario `name`, with Settled 66 applied.
 fn ruled(name: &str, go: &str) -> String {
     if !RULED.contains(&name) || go == "<none>" || go.is_empty() {
         return go.to_owned();

@@ -452,7 +452,7 @@ const RULED: &[(&str, &[&str], &str)] = &[(
         "TestConvertAntigravityResponseToClaude_PreservesClaudeThoughtAndToolSignatures:914:stream",
         "TestConvertAntigravityResponseToClaude_EmitsNativeSignaturesWithoutProviderPrefixes:1425:stream",
     ],
-    "Settled 65 (docs/OPEN-QUESTIONS.md): a Claude model's thinking signatures pass between client \
+    "Settled 66 (docs/OPEN-QUESTIONS.md): a Claude model's thinking signatures pass between client \
      and upstream unchanged, and no cached signature fills an unsigned block; \
      ck-exec tests/exec_antigravity.rs pins the ruled behaviour",
 )];

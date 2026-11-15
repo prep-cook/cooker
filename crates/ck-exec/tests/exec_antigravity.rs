@@ -1,6 +1,6 @@
 //! The Antigravity executor through the pipeline against a local upstream, checked against
 //! CLIProxyAPI's recorded behaviour (`tests/fixtures/antigravity_go.json`, owner rulings
-//! 65-67): the upstream request each client protocol makes, the refusal each failure
+//! 66-68): the upstream request each client protocol makes, the refusal each failure
 //! returns, the usage the canonical stream accounts, and the signatures and text each
 //! client receives.
 
@@ -405,7 +405,7 @@ fn assert_client_output(name: &str, delivered: &str, s: &Value) {
         recorded.push_str(chunk.as_str().unwrap());
     }
     let delivered = &normalize(delivered);
-    // Ruling 65: a Claude model's signature reaches the client as the upstream sent it, where
+    // Ruling 66: a Claude model's signature reaches the client as the upstream sent it, where
     // CLIProxyAPI decodes it; Gemini models keep CLIProxyAPI's carriers.
     let signatures = if s["model"].as_str().unwrap().contains("claude") {
         strings(s["upstream"]["body"].as_str().unwrap(), &["thoughtSignature"])
@@ -476,7 +476,7 @@ async fn replay(name: &str) {
 #[tokio::test]
 async fn every_client_protocol_matches_the_recorded_exchange() {
     for name in [
-        // Claude models, signed thinking (ruling 65) and the stream merge.
+        // Claude models, signed thinking (ruling 66) and the stream merge.
         "claude_stream_claude_model",
         "claude_model_execute",
         "claude_client_claude_model_empty_signature",
@@ -500,7 +500,7 @@ async fn every_client_protocol_matches_the_recorded_exchange() {
     }
 }
 
-/// Ruling 67: `/responses/compact`, a compaction trigger and an earlier compaction item are
+/// Ruling 68: `/responses/compact`, a compaction trigger and an earlier compaction item are
 /// served from a local summary turn, as CLIProxyAPI serves them.
 #[tokio::test]
 async fn compaction_is_served_locally_as_recorded() {
@@ -513,7 +513,7 @@ async fn compaction_is_served_locally_as_recorded() {
     }
 }
 
-/// Ruling 66: the reasoning replay ledger a Claude client's first turn fills, keyed by model
+/// Ruling 67: the reasoning replay ledger a Claude client's first turn fills, keyed by model
 /// and client session, restores the native call on its second turn.
 #[tokio::test]
 async fn the_replay_ledger_carries_a_session_to_its_next_turn() {
@@ -560,7 +560,7 @@ async fn sent_signatures(source: &str, payload: &Value) -> Vec<String> {
     strings(&body, &["thoughtSignature"])
 }
 
-/// Ruling 65: signed thinking goes back upstream exactly as the client holds it; CLIProxyAPI
+/// Ruling 66: signed thinking goes back upstream exactly as the client holds it; CLIProxyAPI
 /// would wrap the single-layer form. Thinking without a Claude signature is dropped, as
 /// CLIProxyAPI and OmniRoute both drop it, and no cached signature fills the gap.
 #[tokio::test]
@@ -576,7 +576,7 @@ async fn signed_thinking_goes_upstream_as_the_client_holds_it() {
     }
 }
 
-/// Ruling 65: the client receives a Claude model's thinking and tool-call signatures as the
+/// Ruling 66: the client receives a Claude model's thinking and tool-call signatures as the
 /// upstream sent them, buffered or streamed, and a later turn that drops the signature does
 /// not get it back from a cache.
 #[tokio::test]

@@ -1,6 +1,6 @@
 //! The Antigravity executor over the internal stream (`docs/EXECUTION-CONTRACT.md`).
 //!
-//! Antigravity keeps CLIProxyAPI's behaviour (owner rulings 65-67, `docs/OPEN-QUESTIONS.md`):
+//! Antigravity keeps CLIProxyAPI's behaviour (owner rulings 66-68, `docs/OPEN-QUESTIONS.md`):
 //! its translators send signed Claude thinking back and cache the signatures, its reasoning
 //! replay ledger is keyed by model and client session, and compact is answered from a local
 //! summary. An attempt therefore re-fences the client view against the client's own protocol
@@ -213,7 +213,7 @@ impl Execute for AntigravityExecutor {
         self.run(attempt, request, streams).await.map(Counted::Upstream)
     }
 
-    /// Ruling 67: the local summary CLIProxyAPI answers compact with.
+    /// Ruling 68: the local summary CLIProxyAPI answers compact with.
     async fn compact(
         &self,
         attempt: &Attempt<'_>,
