@@ -251,9 +251,14 @@ pub(crate) fn replay_session(upload: &[u8], headers: &HeaderMap, execution_sessi
 
 /// Who a replayed turn belongs to: the calling client and the upstream credential, hashed so
 /// the cache holds no client key. Turns of one session id never cross either boundary.
+/// Each identity is hashed exactly, behind its length, so no two pairs share an encoding.
 pub(crate) fn replay_owner(principal: &str, credential: &str) -> String {
-    let digest = Sha256::digest(format!("{}\0{}", principal.trim(), credential.trim()));
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    let mut hasher = Sha256::new();
+    for part in [principal, credential] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    codex_replay::hex(&hasher.finalize())
 }
 
 /// The replay turn of a completed response's output `items`: its reasoning and tool calls

@@ -169,3 +169,16 @@ fn replay_entries_belong_to_their_caller_and_credential() {
         );
     }
 }
+
+/// Owners are the exact identities: credential ids that differ only by whitespace, or
+/// principals holding the separator a joined encoding would use, never share replay.
+#[test]
+fn replay_owners_are_exact_identities() {
+    use crate::codex_shape::replay_owner;
+    assert_ne!(replay_owner("k", "account.json"), replay_owner("k", " account.json"));
+    assert_ne!(replay_owner("k ", "c"), replay_owner("k", "c"));
+    assert_ne!(replay_owner("a\0b", "c"), replay_owner("a", "b\0c"));
+    assert_ne!(replay_owner("a:b", "c"), replay_owner("a", "b:c"));
+    assert_ne!(replay_owner("ab", "c"), replay_owner("a", "bc"));
+    assert_eq!(replay_owner("a\0b", "c"), replay_owner("a\0b", "c"));
+}

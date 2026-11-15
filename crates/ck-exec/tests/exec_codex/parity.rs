@@ -222,7 +222,8 @@ async fn replay_stays_with_its_owner(old: bool) {
     let mut other_credential = exchange(&upstream);
     other_credential.headers = owner.headers.clone();
     other_credential.credential = crate::support::credential("codex", &upstream.url(), "sk-other");
-    other_credential.credential.id = "codex-other".into();
+    // File-backed ids keep their whitespace: this is another credential.
+    other_credential.credential.id = format!(" {}", owner.credential.id);
     for (exchange, body) in [
         (&owner, &first[..]),
         (&other_caller, &next[..]),
