@@ -234,7 +234,7 @@ async fn events(streams: &Streams, id: u64) -> (Vec<(String, Value)>, Option<Ter
 }
 
 #[tokio::test]
-async fn anthropic_requests_reach_the_upstream_as_the_client_sent_them() {
+async fn anthropic_requests_reach_the_upstream_as_the_old_route_sent_them() {
     for stream in [true, false] {
         let client = json!({
             "model": "client-model", "max_tokens": 2048, "stream": stream,
@@ -253,12 +253,11 @@ async fn anthropic_requests_reach_the_upstream_as_the_client_sent_them() {
         started.unwrap().producer.await.unwrap().unwrap();
 
         Fixture::new(&old, SONNET).old_route(&body, false).await;
-        let ((new_body, new), (_, old)) = (sent(&new), sent(&old));
-        // Every member and value is the client's, under the upstream model; the egress writes
-        // members in its own order. The old route adds cache markers this path does not.
-        let mut expected = client;
-        expected["model"] = json!(SONNET);
-        assert_eq!(new_body, expected);
+        let ((new_body, new), (old_body, old)) = (sent(&new), sent(&old));
+        // The egress writes members in its own order; every member and value is the old
+        // route's, its cache markers included (owner question 14).
+        assert_eq!(new_body, old_body);
+        assert_eq!(new_body["metadata"], client["metadata"]);
         assert_eq!(new.path, "/v1/messages?beta=true");
         // A key on an origin other than api.anthropic.com goes as a bearer token.
         assert_eq!(new.header("authorization"), Some("Bearer sk-ant-api03-test"));

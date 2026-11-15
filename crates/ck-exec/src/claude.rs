@@ -1471,10 +1471,11 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// Whether the old body normalizers run: only on the old path. The contract path sends
-    /// the client's body as the fence accepted it, and the official API judges the rest:
-    /// no forced-tool or sampling rewrite, no cache markers or TTL edits, no signature
-    /// sanitizing and no proxy-owned prefix recovery (P8 removes the old path).
+    /// Whether the old content normalizers run: only on the old path. The contract path sends
+    /// the client's content as the fence accepted it, and the official API judges the rest:
+    /// no forced-tool or sampling rewrite, no signature sanitizing and no proxy-owned prefix
+    /// recovery. The cache rewrites, which change only the caller's cost, run on both
+    /// (owner question 14; P8 removes the old path).
     pub(super) fn legacy_body(&self) -> bool {
         !self.contract
     }
@@ -1700,25 +1701,23 @@ impl<'a> Ctx<'a> {
         if self.legacy_body() {
             body = normalize_sampling(body, confirmed);
         }
-        // `shouldEnsureCacheControl`. The contract path sends the client's markers as written.
-        let legacy = self.legacy_body();
-        let cpa_owns_cache = legacy && !explicit && !confirmed && (cloaked || cloak::count_cache_controls(&body) == 0);
+        // `shouldEnsureCacheControl`. The cache rewrites change only the caller's cost, so the
+        // contract path keeps them (owner question 14).
+        let cpa_owns_cache = !explicit && !confirmed && (cloaked || cloak::count_cache_controls(&body) == 0);
         if cpa_owns_cache {
             body = cloak::ensure_cache_control(body);
         }
-        if legacy {
-            body = cloak::enforce_cache_limit(body, 4);
-        }
+        body = cloak::enforce_cache_limit(body, 4);
         // `prompt_cache_options` is the gateway's own member, never Anthropic's.
         body = cloak::strip_prompt_cache_options(body);
         let subagent = signals::subagent(req.headers, &body);
         let subagent_1h = subagent && signals::subagent_requests_1h(req.headers, &body);
         if cpa_owns_cache && self.cli_profile && (!subagent || subagent_1h) && !probe {
             body = cloak::upgrade_ttl(body, "1h");
-        } else if legacy && (probe || (subagent && !subagent_1h)) && !explicit {
+        } else if (probe || (subagent && !subagent_1h)) && !explicit {
             body = cloak::strip_ttl(body);
         }
-        if legacy && !explicit {
+        if !explicit {
             body = cloak::normalize_ttl(body);
         }
         // Execute only: ExecuteStream forwards the body's own `stream` field.
@@ -1749,7 +1748,7 @@ impl<'a> Ctx<'a> {
             }
         }
         let mut thinking_recovery = false;
-        if legacy {
+        if self.legacy_body() {
             body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
             (body, thinking_recovery) = enable_prefix_drop(body, &self.base_model);
         }
@@ -1900,11 +1899,9 @@ impl<'a> Ctx<'a> {
                 body = m.obfuscate(&body);
             }
         }
-        if self.legacy_body() {
-            body = cloak::enforce_cache_limit(body, 4);
-            if !explicit {
-                body = cloak::normalize_ttl(body);
-            }
+        body = cloak::enforce_cache_limit(body, 4);
+        if !explicit {
+            body = cloak::normalize_ttl(body);
         }
         let (mut extra_betas, stripped) = extract_betas(body);
         body = stripped;

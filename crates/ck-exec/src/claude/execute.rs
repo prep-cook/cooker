@@ -110,12 +110,16 @@ pub(super) fn capability(model: &str, resolved: Option<&ResolvedModel>) -> Anthr
 }
 
 impl ClaudeExecutor {
-    /// Whether `attempt` stays on the old route: see [`Ctx::old_route_only`], and every
-    /// credential thinking replay serves. Replay stores a response only once it is known
+    /// Whether `attempt` stays on the old route: a request carrying any Claude Code client
+    /// signal (contract G6), see [`Ctx::old_route_only`], and every credential thinking
+    /// replay serves. Replay stores a response only once it is known
     /// complete, which `Execute` cannot see: the producer validates the body after the
     /// executor returned. The selector answers no destination for it, so the server keeps
     /// the old `claude` arm (Q1).
     pub fn old_route_only(&self, attempt: &Attempt<'_>) -> bool {
+        if super::detect::claude_code_signals(attempt.headers) {
+            return true;
+        }
         let cfg = scoped(attempt);
         let facts = (attempt.model, attempt.resolved_model, None);
         let ctx = Ctx::new(self, attempt.credential, facts, &cfg, Delegation::default());

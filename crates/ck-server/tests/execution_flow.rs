@@ -227,6 +227,7 @@ impl Fixture {
             credential: &self.credential,
             cfg: &self.cfg,
             model: "m",
+            headers: &self.headers,
             resolved_model: None,
             store: &self.store,
             identity: identity(Direction::Response, 1),

@@ -223,6 +223,7 @@ impl Exchange {
             credential: &self.credential,
             cfg: &self.cfg,
             model: &self.model,
+            headers: &self.headers,
             resolved_model: None,
             store,
             identity: identity(Direction::Response),

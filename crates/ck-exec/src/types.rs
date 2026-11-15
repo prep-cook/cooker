@@ -25,6 +25,9 @@ pub struct Attempt<'a> {
     pub cfg: &'a Config,
     /// Upstream model after alias resolution, thinking suffix included.
     pub model: &'a str,
+    /// The client's request headers, for routing decisions only (contract G6); the server
+    /// fills it on every attempt. Request execution reads `Client::headers`.
+    pub headers: &'a HeaderMap,
     /// Capabilities the dispatch loop bound to this attempt; `None` means the registry entry.
     pub resolved_model: Option<&'a ResolvedModel>,
     /// The process stream store; response ingress constructors read their own stream from it.

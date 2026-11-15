@@ -45,6 +45,8 @@ Every provider module implements `Execute` once. The selector in `crates/ck-exec
 
 `Client::usage` carries request-side facts only (§8, G4).
 
+**G6, routing headers.** `Attempt::headers` is the client's request headers, which the server fills on every attempt. The selector reads them only to decide whether an attempt stays on a provider's old arm (`destination` answers `None`, `fence` and `refence` refuse with `Destination`, `start` refuses), before any byte of the attempt is sent. Request execution reads `Client::headers`. Claude uses them to keep a request carrying any Claude Code client signal on the old route until owner question 13 settles how `Execute` sees the client's own body.
+
 `Request<'a>`, `Attempt<'a>` and `Store` are `Sync`, so a server task may hold them across an await.
 
 ## 4. Fences and failover

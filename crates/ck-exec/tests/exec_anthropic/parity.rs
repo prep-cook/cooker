@@ -57,6 +57,17 @@ fn title_helper() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// A Title280 helper body: Claude Code's member order and shape.
+fn title_body() -> Value {
+    let user_id = format!(
+        r#"{{"device_id":"{}","account_uuid":"","session_id":"{SESSION}"}}"#,
+        "a".repeat(64)
+    );
+    json!({"model": HAIKU, "max_tokens": 80, "messages": [{"role": "user", "content": "title"}],
+        "metadata": {"user_id": user_id},
+        "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}}})
+}
+
 /// The upstream request of `body` on `credential` through the old route: the selector's old
 /// arm when `selector`, else `ClaudeExecutor::execute`. The contract path refuses the attempt.
 async fn old_wire(
@@ -113,10 +124,6 @@ fn headers(captured: &Captured) -> BTreeMap<String, Vec<String>> {
 async fn requests_the_cloak_may_shape_stay_on_the_old_route_byte_for_byte() {
     let tools = json!([{"name": "read", "description": "Read a file", "input_schema": {"type": "object"}}]);
     let messages = json!([{"role": "user", "content": "Summarise the plan in one line"}]);
-    let user_id = format!(
-        r#"{{"device_id":"{}","account_uuid":"","session_id":"{SESSION}"}}"#,
-        "a".repeat(64)
-    );
     let mut always = credential("claude", "http://127.0.0.1:1", "sk-ant-api03-test");
     always.attributes.insert("cloak_mode".into(), "always".into());
     // Without a cached user id the cloak draws a new device id per request.
@@ -154,14 +161,7 @@ async fn requests_the_cloak_may_shape_stay_on_the_old_route_byte_for_byte() {
             json!({"model": OPUS_4_7, "max_tokens": 4096,
             "thinking": {"type": "disabled"}, "output_config": {"effort": "low"}, "messages": messages}),
         ),
-        (
-            "title-helper",
-            HAIKU,
-            title_helper(),
-            json!({"model": HAIKU, "max_tokens": 80,
-            "messages": [{"role": "user", "content": "title"}], "metadata": {"user_id": user_id},
-            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}}}),
-        ),
+        ("title-helper", HAIKU, title_helper(), title_body()),
     ];
     for (name, model, extra, body) in cases {
         for credential in [oauth(), always.clone()] {
@@ -206,17 +206,21 @@ async fn a_key_request_keeps_disabled_thinking_with_effort() {
     assert_eq!(sent["output_config"], json!({"effort": "low"}));
 }
 
+/// `body` on a key with `model` through the old route; returns the upstream body.
+async fn old(model: &str, body: &Value) -> Value {
+    let upstream = StreamUpstream::start([Reply::json(MESSAGE)]).await;
+    Fixture::new(&upstream, model)
+        .old_route(&serde_json::to_vec(body).unwrap(), false)
+        .await;
+    sent(&upstream).0
+}
+
 #[tokio::test]
 async fn a_model_suffix_sets_thinking_as_on_the_old_route() {
     let model = format!("{SONNET}(8192)");
     let body = json!({"model": "m", "max_tokens": 16000, "messages": [{"role": "user", "content": "hi"}]});
     let new = contract(&model, &body).await;
-    let upstream = StreamUpstream::start([Reply::json(MESSAGE)]).await;
-    Fixture::new(&upstream, &model)
-        .old_route(&serde_json::to_vec(&body).unwrap(), false)
-        .await;
-    // The old route also adds cache markers; the suffix's thinking is the same.
-    assert_eq!(new["thinking"], sent(&upstream).0["thinking"]);
+    assert_eq!(new, old(&model, &body).await);
     assert_eq!(new["thinking"]["budget_tokens"], 8192, "{new}");
     assert_eq!(new["model"], SONNET);
 }
@@ -227,14 +231,41 @@ async fn a_foreign_clients_upstream_streams_as_on_the_old_route() {
     assert_eq!(foreign("chat", chat).await["stream"], true);
 }
 
+fn marked_block(text: &str, ttl: &str) -> Value {
+    json!({"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": ttl}})
+}
+
+/// The cache rewrites change only the caller's cost, so a key request gets the old route's
+/// (owner question 14): markers where the client set none, at most four, TTLs in order.
 #[tokio::test]
-async fn a_key_request_gets_no_cache_markers_it_did_not_send() {
-    let body = json!({"model": SONNET, "max_tokens": 1024, "system": "Be brief.",
+async fn a_key_request_gets_the_old_routes_cache_rewrites() {
+    let plain = json!({"model": SONNET, "max_tokens": 1024, "system": "Be brief.",
         "messages": [{"role": "user", "content": "hi"}]});
-    let sent = contract(SONNET, &body).await;
-    assert!(!sent.to_string().contains("cache_control"), "{sent}");
-    assert_eq!(sent["system"], "Be brief.");
-    assert_eq!(sent["messages"][0]["content"], "hi");
+    let new = contract(SONNET, &plain).await;
+    assert!(new.to_string().contains("cache_control"), "{new}");
+    assert_eq!(new, old(SONNET, &plain).await);
+    let marked = marked_block;
+    let system = json!([
+        marked("a", "5m"),
+        marked("b", "1h"),
+        marked("c", "1h"),
+        marked("d", "1h"),
+        marked("e", "1h")
+    ]);
+    let marked = json!({"model": SONNET, "max_tokens": 1024, "system": system,
+        "messages": [{"role": "user", "content": "hi"}]});
+    let new = contract(SONNET, &marked).await;
+    assert!(new.to_string().matches("cache_control").count() <= 4, "{new}");
+    assert_eq!(new, old(SONNET, &marked).await);
+    let system = json!([marked_block("a", "5m"), marked_block("b", "1h")]);
+    let ordered = json!({"model": SONNET, "max_tokens": 1024, "system": system,
+        "messages": [{"role": "user", "content": "hi"}]});
+    let new = contract(SONNET, &ordered).await;
+    assert_ne!(
+        new["system"], ordered["system"],
+        "a 1h marker after a 5m one is reordered"
+    );
+    assert_eq!(new, old(SONNET, &ordered).await);
 }
 
 /// Thinking replay may store only a response known complete, which the contract path cannot
@@ -254,6 +285,7 @@ async fn thinking_replay_credentials_stay_on_the_old_route() {
         credential: &key,
         cfg: &fixture.exchange.cfg,
         model: SONNET,
+        headers: &fixture.exchange.headers,
         resolved_model,
         store: &fixture.streams.store,
         identity: identity(Direction::Response),
@@ -262,27 +294,51 @@ async fn thinking_replay_credentials_stay_on_the_old_route() {
     assert_eq!(fixture.executors.destination(&attempt(None)), Some("anthropic"));
 }
 
-/// No cache limit, TTL order, signature sanitizing or proxy-owned prefix recovery: the
-/// official API judges the client's markers and history.
+/// No signature sanitizing or proxy-owned prefix recovery: the official API judges the
+/// client's history and signed thinking.
 #[tokio::test]
-async fn a_key_request_keeps_its_markers_and_history() {
-    let marked = |text: &str, ttl: &str| json!({"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": ttl}});
-    let system = json!([
-        marked("a", "5m"),
-        marked("b", "1h"),
-        marked("c", "1h"),
-        marked("d", "1h"),
-        marked("e", "1h")
-    ]);
-    let messages = json!([
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "signature": "c2lnbmVk"}, {"type": "text", "text": "ok"}]},
-        {"role": "user", "content": "more"},
-    ]);
-    let body = json!({"model": OPUS_4_7, "max_tokens": 4096, "thinking": {"type": "adaptive"},
-        "system": system, "messages": messages});
+async fn a_key_request_sends_history_and_signed_thinking_unchanged() {
+    let assistant = json!({"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "t", "signature": "c2lnbmVk"}, {"type": "text", "text": "ok"}]});
+    let messages = json!([{"role": "user", "content": "hi"}, assistant, {"role": "user", "content": "more"}]);
+    let body = json!({"model": OPUS_4_7, "max_tokens": 4096, "thinking": {"type": "adaptive"}, "messages": messages});
     let sent = contract(OPUS_4_7, &body).await;
-    assert_eq!(sent["system"], body["system"]);
-    assert_eq!(sent["messages"], body["messages"]);
+    assert_eq!(sent["messages"][0], body["messages"][0]);
+    assert_eq!(sent["messages"][1], body["messages"][1]);
     assert_eq!(sent["thinking"], json!({"type": "adaptive"}));
+}
+
+/// A request carrying any Claude Code client signal stays on the old route even on a plain
+/// key: detection reads the client's own body, which the contract path does not have (G6).
+#[tokio::test]
+async fn a_claude_code_request_on_a_plain_key_stays_on_the_old_route() {
+    let key = credential("claude", "http://127.0.0.1:1", "sk-ant-api03-test");
+    let selected = old_wire(&key, HAIKU, &title_helper(), &title_body(), true).await;
+    let direct = old_wire(&key, HAIKU, &title_helper(), &title_body(), false).await;
+    assert_eq!(selected.path, direct.path);
+    assert_eq!(headers(&selected), headers(&direct));
+    assert_eq!(selected.body, direct.body);
+    // The old route confirms the helper: its body goes up without cache markers or `stream`.
+    let sent: Value = serde_json::from_slice(&direct.body).unwrap();
+    assert!(
+        sent.get("stream").is_none() && !sent.to_string().contains("cache_control"),
+        "{sent}"
+    );
+    let signals = [
+        ("user-agent", "claude-cli/2.1.280 (external, cli)"),
+        ("x-app", "cli"),
+        ("x-claude-code-session-id", SESSION),
+        ("x-stainless-lang", "js"),
+        ("anthropic-beta", "claude-code-20250219"),
+        ("anthropic-beta", "oauth-2025-04-20"),
+    ];
+    let mut fixture = Fixture::new(&StreamUpstream::start([]).await, HAIKU);
+    for (name, value) in signals {
+        fixture.exchange.headers = http::HeaderMap::from_iter([(name.parse().unwrap(), value.parse().unwrap())]);
+        let attempt = fixture.exchange.attempt(&fixture.streams.store);
+        assert_eq!(fixture.executors.destination(&attempt), None, "{name}");
+    }
+    fixture.exchange.headers = http::HeaderMap::from_iter([(http::header::USER_AGENT, "my-app/1.0".parse().unwrap())]);
+    let attempt = fixture.exchange.attempt(&fixture.streams.store);
+    assert_eq!(fixture.executors.destination(&attempt), Some("anthropic"));
 }
