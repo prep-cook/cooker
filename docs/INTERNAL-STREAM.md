@@ -272,7 +272,7 @@ Capability validation covers supplied model/operation, roles and ordered content
 | `X.original[]` | `{protocol, pointer, value}` | Every otherwise-unmapped original field; preserve semantic value, not the whole request bytes. |
 | `X.session` | `{id?, turn?, previous_response_id?, previous_interaction_id?, environment_id?, mode?}` | Continuation identity; retained history is position-backed and subject to limits. |
 | `X.media[]` | `{media_id, pointer, value_kind, mime?, attributes?}` | Projection of trusted per-stream reference registrations; untrusted wire values never populate the table. |
-| `X.transport` | `{kind, action?, content_type?, query?, headers?}` | Only content type, multipart names/filenames and non-secret operation query/header values consumed by the codec; no Authorization/Cookie/credential values. |
+| `X.transport` | `{kind, action?, content_type?, query?, headers?, parts?}` | Only content type, multipart names/filenames and non-secret operation query/header values consumed by the codec; no Authorization/Cookie/credential values. Multipart `parts` is an ordered array of `{name, filename?, filename_star?, content_type?, data: MediaRef}`; repeated names remain separate parts. |
 
 `X` in this section is the request object's extension, not the per-record envelope; the envelope continues to identify its transport stream. `Q` in the schemas and mapping tables means this logical request, not the questions file.
 `ContentPart` and `OperationValue` below are shared schemas in both directions; `?` permits absence, all other fields are mandatory. Strings/JSON may be position-backed; `MediaRef` means a trusted registered reference above. Unknown kinds use `opaque`, never a guessed semantic variant.
@@ -482,6 +482,12 @@ For request destinations unable to express a supplied semantic field in §4's ca
 | model/prompt/n/size/quality/style/background/output format/compression/moderation | Q model/text/n; `X.provider_parameters.images` | Preserve native controls and requested result format. |
 | image/images/mask/reference images; multipart field names/filenames/content types | X media references + data events | Multipart decoding is incremental; preserve part order, not boundary bytes. |
 | stream/partial_images/response_format/user and unknown fields | Q delivery; provider parameters/original | A single finished result still uses the same internal stream. |
+
+`codec::multipart::Ingress` decodes multipart transport with `nostd-multipart` 0.1.1, an existing incremental, heap-free parser (MIT OR Apache-2.0). It stages input and pending body spans in the owning stream's scratch frames, publishes full data chunks or flushes within the §3.4 deadline, and retains canonical positions rather than file copies. Decoded disposition names and filenames, an optional raw `filename*` parameter and part Content-Type enter `X.transport.parts`; other part headers are discarded, including Authorization and Cookie. Parts are binary media at this boundary; operation codecs interpret textual controls and map media semantics.
+
+Callers construct a quota-charged `codec::multipart::Boundary` before `Ingress` and keep it alive while parsing. It decodes quoted-pairs in the Content-Type boundary into at most 70 bytes while preserving the original Content-Type as transport metadata. The closing delimiter permits only SP/HTAB padding followed by EOF or CRLF; epilogue bytes are accepted only after CRLF. A malformed suffix or an incomplete CRLF fails admission with 400.
+
+The caller supplies body-byte, part-byte and part-count limits. Header lines have a 4 KiB ceiling including CRLF, with at most 32 headers per part. Malformed boundaries, headers or truncated bodies fail with 400; client size ceilings fail with 413. Pool or metadata exhaustion remains `stream.storage_exhausted` (503), without heap fallback. Parsing and capability validation must both succeed before `request.end`; seeing the closing delimiter alone does not admit a request before HTTP EOF. The media-route cutover is separate from this transport codec.
 
 ### 5.20 Images — response, both directions
 

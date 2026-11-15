@@ -1,3 +1,6 @@
+#[path = "semantic/multipart.rs"]
+mod multipart;
+
 #[path = "semantic/mod.rs"]
 mod semantic;
 
