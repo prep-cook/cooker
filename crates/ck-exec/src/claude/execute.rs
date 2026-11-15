@@ -143,17 +143,20 @@ impl ClaudeExecutor {
         let stream = streaming(doc, facts.client_format).map_err(encoding)?;
         let cfg = scoped(attempt);
         let mut ctx = context(self, attempt, request, &cfg);
-        let encoded;
-        let body = match shaped(&mut ctx, request, facts.client_format, false) {
-            Some(original) => original,
+        let (encoded, translated);
+        let (original, body): (&[u8], &[u8]) = match shaped(&mut ctx, request, facts.client_format, false) {
+            Some(original) => {
+                translated = codex_tools(original, request.client.headers);
+                (original, &translated)
+            }
             None => {
                 let default_max_tokens = capability(attempt.model, attempt.resolved_model).default_max_tokens;
                 encoded = encode(&request.validated, streams.request, stream, default_max_tokens)?;
-                &encoded[..]
+                (&encoded, &encoded)
             }
         };
         let usage = request.client.usage;
-        let input = facts.input(request, attempt, body, stream);
+        let input = facts.input(request, attempt, original, stream);
         // As the old path: a foreign client's upstream always streams.
         let upstream_stream = stream || facts.client_format != Format::Claude;
         let mut prepared = ctx.prepare_messages(&input, body, body, upstream_stream).await?;
@@ -197,12 +200,13 @@ impl ClaudeExecutor {
         let mut ctx = context(self, attempt, request, &cfg);
         let facts = Facts::of(request.validated.view().document).map_err(encoding)?;
         if let Some(original) = shaped(&mut ctx, request, facts.client_format, true) {
+            let translated = codex_tools(original, request.client.headers);
             let input = facts.input(request, attempt, original, false);
             if ctx.api_key.trim().is_empty() || !ctx.first_party {
-                let input_tokens = local_count(&ctx, &input, original)?;
+                let input_tokens = local_count(&ctx, &input, &translated)?;
                 return Ok(Counted::Local { input_tokens });
             }
-            let prepared = ctx.prepare_count(&input, original, original).await?;
+            let prepared = ctx.prepare_count(&input, &translated, &translated).await?;
             return self.count_upstream(&ctx, attempt, request, streams, prepared).await;
         }
         if ctx.api_key.trim().is_empty() || !ctx.first_party {
@@ -352,6 +356,17 @@ fn context<'a>(
 fn attempt_ctx<'a>(exec: &ClaudeExecutor, attempt: &Attempt<'a>, cfg: &ck_core::config::Config) -> Ctx<'a> {
     let facts = (attempt.model, attempt.resolved_model, None);
     Ctx::new(exec, attempt.credential, facts, cfg, Delegation::default())
+}
+
+/// The old route's translation of a client's Messages body (`translate::request`), before
+/// the cloak renames its tools: a Codex client's integer tool parameters
+/// (`normalize_codex_tool_integer_types`). The preparation sets the model itself.
+fn codex_tools<'b>(original: &'b [u8], headers: &http::HeaderMap) -> Cow<'b, [u8]> {
+    if ck_wire::payload::is_codex_user_agent(headers) {
+        Cow::Owned(ck_wire::payload::normalize_codex_tool_integer_types(original, headers))
+    } else {
+        Cow::Borrowed(original)
+    }
 }
 
 /// Contract G5. A request the cloak or the Claude Code identity shapes is prepared as the old

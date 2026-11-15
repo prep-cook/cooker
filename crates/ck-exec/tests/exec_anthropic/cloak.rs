@@ -378,3 +378,20 @@ async fn claude_code_header_signals_take_the_contract_path() {
         assert_eq!(fixture.executors.destination(&attempt), Some("anthropic"), "{name}");
     }
 }
+
+/// A Codex client's integer tool parameters are rewritten before the cloak renames the tools,
+/// as on the old route (`normalize_codex_tool_integer_types`).
+#[tokio::test]
+async fn a_codex_clients_tool_integers_are_rewritten_before_the_cloak() {
+    let tools = json!([{"name": "exec_command", "description": "Run a command", "input_schema":
+        {"type": "object", "properties": {"yield_time_ms": {"type": "number"}}}}]);
+    let mut body = json!({"model": SONNET, "max_tokens": 1024, "tools": tools,
+        "messages": [{"role": "user", "content": "run ls"}]});
+    let codex = [("user-agent", "codex_cli_rs/0.99")];
+    let new = new_wire(&oauth(), SONNET, &codex, &body, true).await;
+    assert_eq!(new, old_wire(&oauth(), SONNET, &codex, &body, true).await, "count");
+    body["stream"] = json!(true);
+    let new = new_wire(&oauth(), SONNET, &codex, &body, false).await;
+    assert_eq!(new, old_wire(&oauth(), SONNET, &codex, &body, false).await);
+    assert!(new.body.contains("\"integer\""), "{}", new.body);
+}
