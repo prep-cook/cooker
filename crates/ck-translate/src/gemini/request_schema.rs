@@ -45,9 +45,18 @@ fn messages(view: RequestView<'_>) -> Result<()> {
         if let Some(content) = doc.member(message, "content")? {
             match doc.node(content)?.value {
                 Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
+                // Egress orders a message's results by their calls, which keeps the place of
+                // its other parts only while the results stand together.
                 Value::Array => {
+                    let (mut blocks, mut inside) = (0, false);
                     for part in doc.children(content)? {
                         validate_part(view, part, run)?;
+                        let result = is_result(doc, part)?;
+                        blocks += usize::from(result && !inside);
+                        inside = result;
+                    }
+                    if blocks > 1 {
+                        return Err(Error::Unsupported);
                     }
                 }
                 // OpenAI sends a tool-call message's empty content as null.
@@ -122,6 +131,12 @@ pub(super) fn answered(doc: &Document, run: Option<usize>, id: usize) -> Result<
         message = next_in_turn(doc, m)?;
     }
     Ok(found.filter(|_| count == 1))
+}
+/// Whether `node` is a Chat tool message or a tool result part without Gemini's `result`: both
+/// answer a call of the preceding model turn by id.
+pub(super) fn is_result(doc: &Document, node: usize) -> Result<bool> {
+    Ok(super::is(doc, node, "role", "tool")?
+        || (super::is(doc, node, "type", "tool_result")? && doc.member(node, "result")?.is_none()))
 }
 /// The message after `message` in its model turn.
 pub(super) fn next_in_turn(doc: &Document, message: usize) -> Result<Option<usize>> {

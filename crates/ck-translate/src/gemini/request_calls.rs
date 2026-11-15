@@ -1,7 +1,7 @@
 //! Tool calls and their results as Gemini `functionCall` and `functionResponse` parts.
 use super::super::{
-    is, member, members,
-    request_schema::{answered, next_in_turn},
+    member, members,
+    request_schema::{is_result, next_in_turn},
 };
 use crate::codec::{
     Error, Result,
@@ -24,19 +24,15 @@ pub(super) fn function_call(doc: &Document, part: usize, synthetic_id: bool, e: 
     members(doc, function, &["name", "arguments"], e)?;
     e.bytes(b"}")
 }
-/// Writes `"functionResponse":{...}`; a linked id the source omitted stays omitted. A tool result
-/// from another protocol has no `result` and answers a call of turn `run` like a Chat tool message.
+/// Writes a Gemini client's `"functionResponse":{...}`; a linked id the source omitted stays
+/// omitted. Other results go through [`function_results`].
 pub(super) fn function_response(
     doc: &Document,
     part: usize,
-    run: Option<usize>,
     synthetic_id: bool,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
-    let Some(result) = doc.member(part, "result")? else {
-        let call = answered(doc, run, doc.required(part, "tool_call_id")?)?;
-        return function_result(doc, part, call.ok_or(Error::Schema)?, e);
-    };
+    let result = doc.required(part, "result")?;
     e.bytes(b"\"functionResponse\":{\"name\":")?;
     doc.write(doc.required(result, "name")?, e)?;
     if !synthetic_id {
@@ -46,9 +42,10 @@ pub(super) fn function_response(
     members(doc, result, &["name"], e)?;
     e.bytes(b"}")
 }
-/// Writes the Chat tool messages from `first` on as `functionResponse` parts in the order of the
-/// calls of model turn `run` they answer, since Gemini before 3 pairs responses with calls by
-/// position. The fence matched each to exactly one call by id, so the pairing stays the client's.
+/// Writes the tool messages or tool result parts from `first` on as `functionResponse` parts in
+/// the order of the calls of model turn `run` they answer, since Gemini before 3 pairs responses
+/// with calls by position. The fence matched each to exactly one call by id, so the pairing stays
+/// the client's.
 pub(super) fn function_results(
     doc: &Document,
     first: usize,
@@ -60,7 +57,7 @@ pub(super) fn function_results(
         for call in doc.children(doc.required(m, "tool_calls")?)? {
             let mut tool = Some(first);
             while let Some(t) = tool
-                && is(doc, t, "role", "tool")?
+                && is_result(doc, t)?
             {
                 if doc.equal_strings(doc.required(t, "tool_call_id")?, doc.required(call, "id")?)? {
                     e.bytes(if written == 0 { b"{" } else { b",{" })?;
@@ -76,7 +73,7 @@ pub(super) fn function_results(
     // Every message of the group was written once.
     let (mut total, mut tool) = (0, Some(first));
     while let Some(t) = tool
-        && is(doc, t, "role", "tool")?
+        && is_result(doc, t)?
     {
         (total, tool) = (total + 1, doc.node(t)?.next);
     }

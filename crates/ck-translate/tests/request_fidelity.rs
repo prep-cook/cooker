@@ -259,6 +259,47 @@ fn responses_outputs_reach_gemini_in_call_order() {
     );
 }
 
+/// An Anthropic user message's results reach Gemini in call order; its other parts keep their
+/// place before or after the results. Results split by another part are refused.
+#[test]
+fn anthropic_results_reach_gemini_in_call_order() {
+    let result = |id: &str, text: &str| json!({"type":"tool_result","tool_use_id":id,"content":text});
+    let text = |text: &str| json!({"type":"text","text":text});
+    let input = |content: Value| {
+        json!({"model":"gemini-x","max_tokens":100,"messages":[
+            {"role":"user","content":"weather?"},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"a","name":"weather","input":{"city":"Paris"}},
+                {"type":"tool_use","id":"b","name":"weather","input":{"city":"London"}}]},
+            {"role":"user","content":content}]})
+    };
+    let response =
+        |id: &str, text: &str| json!({"functionResponse":{"name":"weather","id":id,"response":{"result":text}}});
+    let (paris, london) = (response("a", "Paris: sun"), response("b", "London: rain"));
+    let reversed = [result("b", "London: rain"), result("a", "Paris: sun")];
+    for (content, parts) in [
+        (json!(reversed), json!([paris, london])),
+        (
+            json!([reversed[0], reversed[1], text("compare")]),
+            json!([paris, london, {"text":"compare"}]),
+        ),
+        (
+            json!([text("here"), reversed[0], reversed[1]]),
+            json!([{"text":"here"}, paris, london]),
+        ),
+    ] {
+        let out = translate(P::Anthropic, P::Gemini, &input(content)).unwrap();
+        assert_eq!(
+            out["contents"][1]["parts"][1]["functionCall"]["args"],
+            json!({"city":"London"}),
+            "{out}"
+        );
+        assert_eq!(out["contents"][2], json!({"role":"user","parts":parts}), "{out}");
+    }
+    let split = json!([reversed[0], text("then"), reversed[1]]);
+    unsupported(translate(P::Anthropic, P::Gemini, &input(split)));
+}
+
 /// An output whose id two calls of the turn share has no single call to pair with.
 #[test]
 fn responses_output_for_a_shared_call_id_stays_unsupported_at_gemini() {

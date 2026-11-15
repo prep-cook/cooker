@@ -387,22 +387,32 @@ fn write_message(
                 continue;
             }
             comma(&mut first, e)?;
-            write_part(view, part, Some(entry), previous, e)?;
+            write_part(view, part, Some(entry), e)?;
         }
     }
     // Claude thinking history is stripped, as at a Chat upstream (owner ruling 2026-11-15).
     let claude = super::is(doc, doc.required(doc.root(), "x_ck")?, "original_protocol", "anthropic")?;
     if let Some(content) = content {
         if matches!(doc.node(content)?.value, Value::Array) {
+            // A block of results is written at its first part, ordered by call.
+            let mut block = false;
             for part in doc.children(content)? {
-                if super::origin(doc, part, "part")?.is_some()
+                let result = super::request_schema::is_result(doc, part)?;
+                let written = result && block;
+                block = result;
+                if written
+                    || super::origin(doc, part, "part")?.is_some()
                     || (claude
                         && (super::is(doc, part, "type", "reasoning")? || super::is(doc, part, "type", "redacted")?))
                 {
                     continue;
                 }
                 comma(&mut first, e)?;
-                write_part(view, part, None, previous, e)?;
+                if result {
+                    function_results(doc, part, previous, e)?;
+                } else {
+                    write_part(view, part, None, e)?;
+                }
             }
         } else {
             comma(&mut first, e)?;
@@ -417,7 +427,7 @@ fn write_message(
                 continue;
             }
             comma(&mut first, e)?;
-            write_part(view, call, None, previous, e)?;
+            write_part(view, call, None, e)?;
         }
     }
     if super::request_schema::next_in_turn(doc, message)?.is_some() {
@@ -451,13 +461,7 @@ fn head(doc: &Document, message: usize, system: bool, e: &mut Encoder<'_, '_>) -
     }
     e.bytes(b"\"parts\":[")
 }
-fn write_part(
-    view: RequestView<'_>,
-    part: usize,
-    order: Option<usize>,
-    run: Option<usize>,
-    e: &mut Encoder<'_, '_>,
-) -> Result<()> {
+fn write_part(view: RequestView<'_>, part: usize, order: Option<usize>, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
     let kind = doc.required(part, "type")?;
     let flag = |name| -> Result<bool> { Ok(order.map(|n| doc.member(n, name)).transpose()?.flatten().is_some()) };
@@ -466,7 +470,7 @@ fn write_part(
     if doc.string_is(kind, "function")? {
         function_call(doc, part, flag("synthetic_id")?, e)?;
     } else if doc.string_is(kind, "tool_result")? {
-        function_response(doc, part, run, flag("synthetic_id")?, e)?;
+        function_response(doc, part, flag("synthetic_id")?, e)?;
     } else if doc.string_is(kind, "text")? || doc.string_is(kind, "reasoning")? {
         first = flag("signature_only")?;
         if !first {
