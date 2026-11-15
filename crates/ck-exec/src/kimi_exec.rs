@@ -5,8 +5,8 @@
 //!
 //! The executor shapes its own encoded upload, one heap body, in the old path's order: the
 //! normalized upstream model, the model suffix's thinking, Kimi's message, tool and temperature
-//! normalizations, and the payload rules last. A Responses upload first gets back the client's
-//! own `input` forms, since the old path forwarded the client's body. Headers, capture,
+//! normalizations, and the payload rules last. A Responses upload first gets back a string
+//! `input`, since the old path forwarded the client's body. Headers, capture,
 //! transport and error classification are the old path's (`kimi`), and so are the line limits
 //! of the response ingress. A Chat stream that ends cleanly without `[DONE]` completes, as the
 //! old path's synthetic `[DONE]` completes it.
@@ -22,7 +22,6 @@
 //!
 //! Kimi has no native compact; the capability refuses it.
 
-use bytes::Bytes;
 use ck_core::exec::{ExecError, FailureScope, UsageSink};
 use ck_core::format::Format;
 use ck_translate::codec::chat::request::{ChatCapability, Egress as ChatEgress};
@@ -40,6 +39,7 @@ use crate::kimi::{self, KimiExecutor};
 use crate::kimi_http::{capture_chunk, capture_error};
 use crate::openai_compat_exec::RelayIngress;
 use crate::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
+use crate::{kimi_edit, kimi_sse};
 
 /// The capability key of Kimi credentials.
 pub const DESTINATION: &str = "kimi";
@@ -130,7 +130,7 @@ impl Execute for KimiExecutor {
         let upstream = kimi::post(&http, credential, client.usage, &url, headers, body).await?;
         let mut body = observed(upstream.body, client.usage);
         if stream && matches!(ingress, RelayIngress::Chat(_)) {
-            body = completed(body);
+            body = kimi_sse::completed(body);
         }
         Ok(Upstream {
             status: upstream.status,
@@ -191,10 +191,10 @@ impl<'r> Shape<'r> {
         let mut body = self.model(upload);
         // The egress writes `stream`; the old path sends it only when the client did.
         if !(stream || self.stream_member) {
-            gj::delete(&mut body, "stream");
+            drop_stream(&mut body);
         }
         // No translator targets Kimi's Chat dialect, so the thinking target is `kimi`.
-        body = self.thinking(&body, Format::OpenAI.as_str(), "kimi")?;
+        body = self.thinking(body, Format::OpenAI.as_str(), "kimi")?;
         if stream && !gj::set_raw(&mut body, "stream_options.include_usage", "true") {
             return Err(ExecError::local(
                 500,
@@ -215,23 +215,29 @@ impl<'r> Shape<'r> {
         let (baseline, requested) = self.baseline(&upload);
         // The egress wrote `stream` as the old path set it.
         let mut body = self.model(upload);
-        body = self.thinking(&body, Format::OpenAIResponse.as_str(), Format::Codex.as_str())?;
+        body = self.thinking(body, Format::OpenAIResponse.as_str(), Format::Codex.as_str())?;
         body = kimi::normalize_responses_input(body);
         body = kimi::normalize_tools(body);
         body = kimi::normalize_temperature(body);
         Ok(self.rules(Format::OpenAIResponse, body, baseline, &requested))
     }
 
-    /// The client's model, and the upload as encoded when a default payload rule reads it:
-    /// only default rules check a baseline, so only they pay for a copy.
+    /// The client's model, and the client's request as the old path's default rules read it
+    /// when a default rule does: the upload without the `stream` the egress wrote for a Chat or
+    /// Responses client that sent none (a Gemini client's old baseline had one). Only default
+    /// rules check a baseline, so only they pay for a copy.
     // ponytail: with default rules the baseline is a second heap body until the rules ran,
-    // because ck_wire::payload reads it as one slice; reading it from the upload's scratch
-    // lease would need a chunked payload reader.
+    // because ck_wire::payload reads it as one slice; a payload reader over the upload's scratch
+    // lease would keep it in pool storage.
     fn baseline(&self, upload: &[u8]) -> (Option<Vec<u8>>, String) {
         let requested = gj::get(upload, "model").str().trim().to_owned();
-        let baseline = ck_wire::payload::Rules::of(self.attempt.cfg)
-            .has_defaults()
-            .then(|| upload.to_vec());
+        let baseline = ck_wire::payload::Rules::of(self.attempt.cfg).has_defaults().then(|| {
+            let mut baseline = upload.to_vec();
+            if !self.stream_member && self.source != Format::Gemini {
+                drop_stream(&mut baseline);
+            }
+            baseline
+        });
         (baseline, requested)
     }
 
@@ -243,13 +249,13 @@ impl<'r> Shape<'r> {
         body
     }
 
-    /// `helps.ApplyRequestThinking` on the upload, which is already in protocol `from`.
-    fn thinking(&self, body: &[u8], from: &str, to: &str) -> Result<Vec<u8>, ExecError> {
+    /// `helps.ApplyRequestThinking` on the upload, which is already in protocol `from`; the
+    /// body is edited, not copied.
+    fn thinking(&self, body: Vec<u8>, from: &str, to: &str) -> Result<Vec<u8>, ExecError> {
         let caps = self.attempt.resolved_model.map(|r| ModelCaps::from(&r.info));
-        apply_request_thinking(&RequestThinking {
-            body,
-            payload: body,
-            original: body,
+        let request = RequestThinking {
+            payload: None,
+            original: None,
             model: self.attempt.model,
             from,
             to,
@@ -257,8 +263,9 @@ impl<'r> Shape<'r> {
             resolved: caps.as_ref().map(Some),
             has_request_transformer: false,
             updates_changed: false,
-        })
-        .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))
+        };
+        apply_request_thinking(&request, body)
+            .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))
     }
 
     /// Reports the body sent upstream, then applies the configured payload rules, the last
@@ -313,91 +320,47 @@ fn observed(body: Body, usage: &UsageSink) -> Body {
     .boxed()
 }
 
-/// A Chat stream with the old path's synthetic `[DONE]` after a clean end. An upstream
-/// `[DONE]` has ended the stream before the producer reads it, and a read error ends the
-/// body before it.
-fn completed(body: Body) -> Body {
-    let done = futures_util::stream::once(async { Ok(Bytes::from_static(b"\n\ndata: [DONE]\n\n")) });
-    body.chain(done).boxed()
+/// Removes the root `stream` member the egress wrote, in place.
+fn drop_stream(body: &mut Vec<u8>) {
+    let stream = gj::get(body, "stream");
+    if stream.exists() {
+        let value = kimi_edit::span(&stream);
+        kimi_edit::remove_member(body, value);
+    }
 }
 
-/// The prefix the Responses egress writes on every message item.
-const MESSAGE_TYPE: &[u8] = br#""type":"message","#;
-
-/// Restores the `input` forms of a Responses client that the shared egress rewrites, as the
-/// old path forwarded them: a message item sent without `type` loses the `"type":"message"`
-/// the egress gives it, and a string `input`, which the codec keeps as its one untyped user
-/// message, goes as the string. Runs on the encoded upload, whose input items are still one
-/// per request message, before Kimi reorders them; one pass, in place.
-// ponytail: an untyped one-item `input` array holding the user's string has the canonical form
-// of a string `input`, so it goes as the string, which Kimi reads the same.
+/// A Responses client's string `input`, which the egress writes as the one message it became,
+/// goes as the string, as the old path forwarded it: the string moves into place in the body.
+/// Responses ingress marks that message's content with an `/input` original.
 fn client_input(body: &mut Vec<u8>, doc: &Document) -> codec::Result<()> {
-    let untyped = untyped_messages(doc)?;
-    let (string, cuts) = {
-        let items = gj::get(body, "input").array();
-        if items.len() != untyped.len() {
-            return Ok(());
-        }
-        let string = match (&untyped[..], &items[..]) {
-            ([true], [item]) if item.get("role").str() == "user" && item.get("content").kind == gj::Kind::String => {
-                Some(item.get("content").raw.into_owned())
-            }
-            _ => None,
-        };
-        let cuts: Vec<usize> = items
-            .iter()
-            .zip(&untyped)
-            .filter(|(item, untyped)| **untyped && body[item.index + 1..].starts_with(MESSAGE_TYPE))
-            .map(|(item, _)| item.index + 1)
-            .collect();
-        (string, cuts)
-    };
-    if let Some(string) = string {
-        gj::set_raw(body, "input", string);
+    if !string_input(doc)? {
         return Ok(());
     }
-    let mut end = cuts.first().copied().unwrap_or(body.len());
-    for (i, &cut) in cuts.iter().enumerate() {
-        let next = cuts.get(i + 1).copied().unwrap_or(body.len());
-        body.copy_within(cut + MESSAGE_TYPE.len()..next, end);
-        end += next - cut - MESSAGE_TYPE.len();
-    }
-    body.truncate(end);
+    let input = kimi_edit::span(&gj::get(body, "input"));
+    let content = kimi_edit::span(&gj::get(body, "input.0.content"));
+    let end = input.start + content.len();
+    body.copy_within(content, input.start);
+    body.drain(end..input.end);
     Ok(())
 }
 
-/// For each message the egress writes into `input` (every one but the `instructions`), whether
-/// the client sent it without a `type`, as the request's `x_ck.original` entries tell.
-fn untyped_messages(doc: &Document) -> codec::Result<Vec<bool>> {
-    let root = doc.root();
-    let (mut typed, mut instructions) = (Vec::new(), Vec::new());
-    if let Some(x) = member(doc, root, "x_ck")?
-        && let Some(original) = member(doc, x, "original")?
-    {
-        for entry in doc.children(original)? {
-            // An entry names the member it keeps with a pointer into its message.
-            if let Some((target, _)) = doc.origin(entry)?
-                && let Some(pointer) = member(doc, entry, "pointer")?
-            {
-                if text_is(doc, pointer, "/type", false)? {
-                    typed.push(target);
-                } else if text_is(doc, pointer, "/instructions", false)? {
-                    instructions.push(target);
-                }
-            }
+/// Whether a Responses client sent `input` as a string: Responses ingress binds an `/input`
+/// original to the content that string became.
+fn string_input(doc: &Document) -> codec::Result<bool> {
+    let Some(x) = member(doc, doc.root(), "x_ck")? else {
+        return Ok(false);
+    };
+    let Some(original) = member(doc, x, "original")? else {
+        return Ok(false);
+    };
+    for entry in doc.children(original)? {
+        if let Some(pointer) = member(doc, entry, "pointer")?
+            && text_is(doc, pointer, "/input", false)?
+        {
+            return Ok(true);
         }
     }
-    typed.sort_unstable();
-    instructions.sort_unstable();
-    let mut untyped = Vec::new();
-    if let Some(messages) = member(doc, root, "messages")? {
-        for message in doc.children(messages)? {
-            if instructions.binary_search(&message).is_err() {
-                untyped.push(typed.binary_search(&message).is_err());
-            }
-        }
-    }
-    Ok(untyped)
+    Ok(false)
 }
 
 /// Whether a Responses request declares, chooses or replays Codex's freeform `apply_patch`
@@ -456,16 +419,20 @@ fn declares(doc: &Document, tool: usize) -> codec::Result<bool> {
     Ok(false)
 }
 
-/// A custom `apply_patch` choice, alone or in an `allowed_tools` list.
+/// A custom `apply_patch` choice, alone or in the tools an `allowed_tools` choice allows. Other
+/// members of a choice are not choices.
 fn chooses(doc: &Document, choice: usize) -> codec::Result<bool> {
     if named_patch(doc, choice, "custom")? {
         return Ok(true);
+    }
+    if !kind_is(doc, choice, "allowed_tools")? {
+        return Ok(false);
     }
     let Some(tools) = member(doc, choice, "tools")? else {
         return Ok(false);
     };
     for child in doc.children(tools)? {
-        if chooses(doc, child)? {
+        if named_patch(doc, child, "custom")? {
             return Ok(true);
         }
     }

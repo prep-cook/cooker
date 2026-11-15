@@ -100,12 +100,24 @@ async fn old_and_new(client: &str, source: &str, model: &str, body: &str, reply:
 
 /// [`old_and_new`] under config `yaml`.
 async fn old_and_new_with(client: &str, source: &str, model: &str, body: &str, reply: Reply, yaml: &str) {
+    old_and_new_at(client, source, (model, yaml), body, reply, usize::MAX).await;
+}
+
+/// [`old_and_new_with`] with the client body fed `step` bytes at a time.
+async fn old_and_new_at(
+    client: &str,
+    source: &str,
+    (model, yaml): (&str, &str),
+    body: &str,
+    reply: Reply,
+    step: usize,
+) {
     let upstream = StreamUpstream::start([reply.clone(), reply]).await;
     let mut exchange = exchange(&upstream, model);
     exchange.cfg = ck_core::config::Config::parse(yaml).unwrap();
     let old = old_upload(&upstream, &exchange, source, body.as_bytes()).await;
     let streams = Streams::new();
-    let (started, id, _request) = run(&streams, &exchange, client, body.as_bytes(), usize::MAX).await;
+    let (started, id, _request) = run(&streams, &exchange, client, body.as_bytes(), step).await;
     finish(&streams, started.unwrap(), id).await.0.unwrap();
     let new = upstream.captured().pop().unwrap();
     assert_eq!(new.path, old.path, "{body}");
@@ -163,9 +175,14 @@ async fn responses_input_forms_match_the_old_path() {
         r#"{"model":"kimi-k3","instructions":"i","input":[{"role":"user","content":"hi"},{"type":"message","role":"assistant","content":"yo"},{"role":"user","content":"more"}]}"#,
         r#"{"model":"kimi-k3","input":[{"role":"user","content":"hi"},{"type":"function_call","call_id":"a","name":"f","arguments":"{}"},{"type":"function_call_output","call_id":"a","output":"A"},{"role":"developer","content":"between"}]}"#,
         r#"{"model":"kimi-k3","input":[{"type":"message","role":"user","content":"hi"}]}"#,
+        r#"{"model":"kimi-k3","input":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"kimi-k3","instructions":"i","input":[{"role":"user","content":"hi","id":"msg_1","extra":"keep"}]}"#,
     ] {
         old_and_new("responses", "openai-response", "kimi-k3", body, reply.clone()).await;
     }
+    // A long string the codec stores as streamed text, fed in pieces.
+    let long = format!(r#"{{"model":"kimi-k3","input":"{}"}}"#, "x".repeat(30_000));
+    old_and_new_at("responses", "openai-response", ("kimi-k3", ""), &long, reply, 64).await;
 }
 
 #[tokio::test]
@@ -190,6 +207,38 @@ async fn payload_rules_come_last_like_the_old_path() {
         r#"{"id":"r1","object":"response","created_at":1,"status":"completed","model":"k3","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}"#,
     );
     old_and_new_with("responses", "openai-response", "kimi-k3", body, reply, &yaml).await;
+}
+
+/// A `stream` default applies when the client sent none: the `stream` request egress writes is
+/// not the client's.
+#[tokio::test]
+async fn a_stream_default_sees_the_client_request() {
+    let yaml =
+        "requests:\n  payload:\n    default:\n      - models: [{name: \"kimi-*\"}]\n        params: {stream: true}\n";
+    let chat = r#"{"model":"kimi-k3","messages":[{"role":"user","content":"hi"}]}"#;
+    old_and_new_with("chat", "openai", "kimi-k3", chat, Reply::json(CHAT_JSON), yaml).await;
+    let responses = r#"{"model":"kimi-k3","input":"hi"}"#;
+    let reply = Reply::json(
+        r#"{"id":"r1","object":"response","created_at":1,"status":"completed","model":"k3","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}"#,
+    );
+    old_and_new_with("responses", "openai-response", "kimi-k3", responses, reply, yaml).await;
+}
+
+/// A Gemini client's old baseline had `stream`, so a `stream` default does not apply to it.
+#[tokio::test]
+async fn a_gemini_stream_default_keeps_the_stream() {
+    let fx = fixture("chat-stream-gemini-client");
+    let upstream = StreamUpstream::start([Reply::sse(chat_sse(true))]).await;
+    let mut exchange = fixture_exchange(&upstream, &fx);
+    let yaml =
+        "requests:\n  payload:\n    default:\n      - models: [{name: \"kimi-*\"}]\n        params: {stream: false}\n";
+    exchange.cfg = ck_core::config::Config::parse(yaml).unwrap();
+    let streams = Streams::new();
+    let body = fx["request"]["body"].as_str().unwrap().as_bytes();
+    let (started, id, _request) = run(&streams, &exchange, "gemini", body, usize::MAX).await;
+    finish(&streams, started.unwrap(), id).await.0.unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&upstream.captured()[0].body).unwrap();
+    assert_eq!(sent["stream"], true);
 }
 
 /// A default rule reads the client's request as encoded, before the suffix's thinking replaced
@@ -288,14 +337,33 @@ async fn responses_stream_reaches_every_client_egress() {
 
 #[tokio::test]
 async fn a_clean_chat_end_without_done_completes_like_the_old_path() {
-    let upstream = StreamUpstream::start([Reply::sse(chat_sse(false))]).await;
-    let exchange = exchange(&upstream, "kimi-k2");
-    let streams = Streams::new();
-    let (started, id, _request) = run(&streams, &exchange, "chat", CHAT, usize::MAX).await;
-    let (outcome, published, _) = finish(&streams, started.unwrap(), id).await;
-    outcome.unwrap();
-    assert_eq!(published.terminal, Some(Terminal::Done));
-    assert_eq!(errors(&published), 0);
+    for sse in [chat_sse(false), chat_sse(false).replace('\n', "\r\n")] {
+        let upstream = StreamUpstream::start([Reply::sse(sse).byte_at_a_time()]).await;
+        let exchange = exchange(&upstream, "kimi-k2");
+        let streams = Streams::new();
+        let (started, id, _request) = run(&streams, &exchange, "chat", CHAT, usize::MAX).await;
+        let (outcome, published, _) = finish(&streams, started.unwrap(), id).await;
+        outcome.unwrap();
+        assert_eq!(published.terminal, Some(Terminal::Done));
+        assert_eq!(errors(&published), 0);
+    }
+}
+
+/// The synthetic `[DONE]` never completes an event the upstream left open: a body that ends
+/// inside its last event, with no newline or with one, is one error.
+#[tokio::test]
+async fn a_chat_end_inside_an_event_is_one_error() {
+    let open = chat_sse(false);
+    let open = open.trim_end_matches('\n');
+    for sse in [open.to_owned(), format!("{open}\n"), format!("{open}\r\n")] {
+        let upstream = StreamUpstream::start([Reply::sse(sse)]).await;
+        let exchange = exchange(&upstream, "kimi-k2");
+        let streams = Streams::new();
+        let (started, id, _request) = run(&streams, &exchange, "chat", CHAT, usize::MAX).await;
+        let (outcome, published, _) = finish(&streams, started.unwrap(), id).await;
+        assert!(outcome.is_err(), "an open event does not complete");
+        assert_eq!(errors(&published), 1, "{:?}", records(&published));
+    }
 }
 
 #[tokio::test]
@@ -448,6 +516,12 @@ async fn apply_patch_lookalikes_in_data_stay_on_the_contract() {
             r#"{{"model":"kimi-k3","input":"hi","tools":[{{"type":"function","name":"lookup","parameters":{{"type":"object","properties":{{"q":{{"type":"object","default":{lookalike}}}}}}}}}]}}"#
         ),
         format!(r#"{{"model":"kimi-k3","input":"hi","metadata_extra":{lookalike}}}"#),
+        format!(
+            r#"{{"model":"kimi-k3","input":"hi","tools":[{{"type":"custom","name":"lookup"}}],"tool_choice":{{"type":"custom","name":"lookup","tools":[{lookalike}]}}}}"#
+        ),
+        format!(
+            r#"{{"model":"kimi-k3","input":"hi","tools":[{{"type":"function","name":"lookup","parameters":{{"type":"object"}}}}],"tool_choice":{{"type":"function","name":"lookup","tools":[{lookalike}]}}}}"#
+        ),
     ] {
         let upstream = StreamUpstream::start([Reply::json(r#"{"id":"r1","object":"response","created_at":1,"status":"completed","model":"k3","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}"#)]).await;
         let exchange = exchange(&upstream, "kimi-k3");

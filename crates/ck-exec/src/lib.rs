@@ -67,11 +67,13 @@ mod gemini_stream;
 mod google_wire;
 pub mod kimi;
 pub mod kimi_auth;
+mod kimi_edit;
 mod kimi_exec;
 #[cfg(test)]
 mod kimi_fixture;
 mod kimi_http;
 mod kimi_replay;
+mod kimi_sse;
 pub mod login_store;
 pub mod meta;
 pub mod meta_auth;

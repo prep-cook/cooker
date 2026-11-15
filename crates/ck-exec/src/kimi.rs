@@ -37,6 +37,7 @@ use futures_util::StreamExt;
 
 use crate::claude::{ClaudeExecutor, Delegation};
 use crate::kimi_auth::{self, DeviceFlow};
+use crate::kimi_edit;
 use crate::kimi_http::{
     BUILD_VERSION, client_headers, go_arch, go_os, hostname, payload_rules, refresh_due, rfc3339_local_now,
     status_error,
@@ -989,7 +990,7 @@ pub(crate) fn normalize_tool_message_links(body: Vec<u8>) -> Result<Vec<u8>, Exe
     }
     let msgs = messages.array();
     let mut dropped = vec![false; msgs.len()];
-    let mut patches: Vec<(usize, &str, Vec<u8>, &str)> = Vec::new();
+    let mut patches: Vec<LinkPatch<'_>> = Vec::new();
     let mut pending: Vec<Vec<u8>> = Vec::new();
     let mut latest: Option<Vec<u8>> = None;
     for (index, msg) in msgs.iter().enumerate() {
@@ -1046,36 +1047,44 @@ pub(crate) fn normalize_tool_message_links(body: Vec<u8>) -> Result<Vec<u8>, Exe
             _ => {}
         }
     }
-    let any_dropped = dropped.iter().any(|d| *d);
-    if !any_dropped && patches.is_empty() {
+    if !dropped.contains(&true) && patches.is_empty() {
         return Ok(body);
     }
-    if !any_dropped && patches.len() == 1 {
-        let (index, path, value, context) = &patches[0];
-        return gj::try_set_str(&body, &format!("messages.{index}.{path}"), value)
-            .map_err(|e| internal_error(format!("kimi executor: {context}: {e}")));
-    }
-    let mut items = Vec::with_capacity(msgs.len());
+    let edits = link_edits(&msgs, &dropped, &patches)?;
+    drop((msgs, messages));
+    let mut body = body;
+    kimi_edit::splice(&mut body, edits);
+    Ok(body)
+}
+
+/// A link patch: message index, member path, value and the error context.
+type LinkPatch<'p> = (usize, &'p str, Vec<u8>, &'p str);
+
+/// The in-place edits that patch messages and remove the `dropped` ones; only a patched
+/// message is copied, to set its members.
+fn link_edits(
+    msgs: &[Res<'_>],
+    dropped: &[bool],
+    patches: &[LinkPatch<'_>],
+) -> Result<Vec<kimi_edit::Edit>, ExecError> {
+    let spans: Vec<_> = msgs.iter().map(kimi_edit::span).collect();
+    let mut edits: Vec<_> = kimi_edit::removals(&spans, dropped)
+        .into_iter()
+        .map(|range| (range, Vec::new()))
+        .collect();
     let mut next = patches.iter().peekable();
     for (index, msg) in msgs.iter().enumerate() {
-        if dropped[index] {
-            continue;
-        }
-        let mut raw = msg.raw().to_vec();
+        let mut patched: Option<Vec<u8>> = None;
         while let Some((_, path, value, context)) = next.next_if(|p| p.0 == index) {
-            raw = gj::try_set_str(&raw, path, value)
-                .map_err(|e| internal_error(format!("kimi executor: {context}: {e}")))?;
+            let raw = patched.as_deref().unwrap_or(msg.raw());
+            let set = gj::try_set_str(raw, path, value);
+            patched = Some(set.map_err(|e| internal_error(format!("kimi executor: {context}: {e}")))?);
         }
-        items.push(raw);
+        if let Some(raw) = patched {
+            edits.push((spans[index].clone(), raw));
+        }
     }
-    gj::try_set_raw(&body, "messages", gj::join(&items)).map_err(|e| {
-        let context = if any_dropped {
-            "failed to drop empty assistant messages"
-        } else {
-            patches[0].3
-        };
-        internal_error(format!("kimi executor: {context}: {e}"))
-    })
+    Ok(edits)
 }
 
 /// `normalizeKimiTools`: inline local `$ref`s and default the root schema type.
@@ -1087,19 +1096,14 @@ pub(crate) fn normalize_tools(body: Vec<u8>) -> Vec<u8> {
     normalize_tool_list(body, "functions", false)
 }
 
-fn normalize_tool_list(body: Vec<u8>, key: &str, is_tools: bool) -> Vec<u8> {
+fn normalize_tool_list(mut body: Vec<u8>, key: &str, is_tools: bool) -> Vec<u8> {
     let items = gj::get(&body, key);
     if !items.is_array() {
         return body;
     }
-    let items = items.array();
-    if items.is_empty() {
-        return body;
-    }
-    let mut changed = false;
-    let mut updated = Vec::with_capacity(items.len());
-    for item in &items {
-        let mut raw = item.raw().to_vec();
+    // Only a schema that changes is copied, to normalize it; it replaces its span in place.
+    let mut edits = Vec::new();
+    for item in &items.array() {
         let path = if is_tools && item.get("function.parameters").exists() {
             Some("function.parameters")
         } else if item.get("parameters").exists() {
@@ -1111,20 +1115,15 @@ fn normalize_tool_list(body: Vec<u8>, key: &str, is_tools: bool) -> Vec<u8> {
             let params = item.get(path);
             if params.is_object() {
                 let normalized = normalize_parameters_schema(params.raw());
-                if normalized != params.raw()
-                    && let Ok(next) = gj::try_set_raw(&raw, path, &normalized)
-                {
-                    raw = next;
-                    changed = true;
+                if normalized != params.raw() {
+                    edits.push((kimi_edit::span(&params), normalized));
                 }
             }
         }
-        updated.push(raw);
     }
-    if !changed {
-        return body;
-    }
-    gj::try_set_raw(&body, key, gj::join(&updated)).unwrap_or(body)
+    drop(items);
+    kimi_edit::splice(&mut body, edits);
+    body
 }
 
 fn normalize_parameters_schema(raw: &[u8]) -> Vec<u8> {

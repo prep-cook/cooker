@@ -552,6 +552,12 @@ fn pure_functions_match_go_vectors() {
         };
         match err {
             Some(message) => assert_eq!(got, Err(message.to_owned()), "{v}"),
+            // The links normalization edits the body in place and keeps the white space Go's
+            // rebuilt array dropped, so its output is compared as JSON.
+            None if v["fn"] == "links" => {
+                let json = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+                assert_eq!(json(&got.unwrap()), json(want), "{v}");
+            }
             None => assert_eq!(got, Ok(want.to_owned()), "{v}"),
         }
     }
