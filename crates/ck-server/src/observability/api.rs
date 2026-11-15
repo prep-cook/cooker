@@ -339,52 +339,14 @@ pub(crate) fn hide_key(value: &[u8]) -> Vec<u8> {
     [&value[..keep], b"...", &value[value.len() - keep..]].concat()
 }
 
-/// Go util.MaskSensitiveQuery preserves raw names, order, malformed escapes and
-/// non-sensitive values. It does not parse/re-encode the whole query.
-/// The query an access line shows. Go v8.0.35 `d50a1995`: a v8 OAuth query carries
-/// the callback state, code and issued client ID, so none of it is logged.
+/// The query an access line shows: every value masked ([`ck_wire::redact::query`], owner
+/// ruling Q18), where Go masks only sensitive names. Go v8.0.35 `d50a1995`: a v8 OAuth
+/// query carries the callback state, code and issued client ID, so none of it is logged.
 fn logged_query(path: &str, raw: &str) -> String {
     if path.starts_with("/v8/management/oauth/") {
         return String::new();
     }
-    mask_query(raw)
-}
-
-pub(crate) fn mask_query(raw: &str) -> String {
-    raw.split('&')
-        .map(|part| {
-            let (key, value) = part.split_once('=').unwrap_or((part, ""));
-            let decoded = crate::net::access::unescape(key).unwrap_or_else(|| key.as_bytes().to_owned());
-            let lower = ck_wire::gostr::lower_bytes(ck_core::config::go_trim_space(&decoded));
-            let lower = lower.strip_suffix("[]").unwrap_or(&lower);
-            // A stream resume cursor (`GET /v1/streams?after=`) is redacted whole, as its
-            // `Last-Event-ID` header is in request capture (docs/INTERNAL-STREAM.md §6.7).
-            if lower == "after" {
-                return format!("{key}=<redacted>");
-            }
-            // v8.0.35 adds `value`: deleting a client key passes it as `?value=`.
-            if !(lower == "key"
-                || lower == "value"
-                || ["api-key", "apikey", "api_key", "token", "secret"]
-                    .iter()
-                    .any(|word| lower.contains(word)))
-            {
-                return part.to_owned();
-            }
-            let value = crate::net::access::unescape(value).unwrap_or_else(|| value.as_bytes().to_owned());
-            let value = hide_key(ck_core::config::go_trim_space(&value));
-            let escaped: String = value
-                .iter()
-                .map(|b| match b {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (*b as char).to_string(),
-                    b' ' => "+".to_owned(),
-                    _ => format!("%{b:02X}"),
-                })
-                .collect();
-            format!("{key}={escaped}")
-        })
-        .collect::<Vec<_>>()
-        .join("&")
+    ck_wire::redact::query(raw)
 }
 
 #[cfg(test)]
@@ -495,10 +457,7 @@ mod tests {
         let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert_eq!(text.lines().count(), 1, "{text}");
         assert!(text.contains("203.0.113.8"), "{text}");
-        assert!(
-            text.contains("key=abcd...hijk") && !text.contains("abcdefghijk"),
-            "{text}"
-        );
+        assert!(text.contains("key=***") && !text.contains("abcdefghijk"), "{text}");
     }
 
     #[tokio::test]
@@ -618,15 +577,14 @@ mod tests {
     fn go_access_and_redaction_goldens() {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/observe_go.json")).unwrap();
+        // The query goldens hold cooker's all-values masking (Q18), not Go's output.
         for case in fixture["query"].as_array().unwrap() {
-            // Deliberate difference: Go leaves the two-byte key `ab` in the clear.
-            let want = case["out"].as_str().unwrap().replacen("key=ab&", "key=...&", 1);
-            assert_eq!(mask_query(case["in"].as_str().unwrap()), want);
+            assert_eq!(logged_query("/v1", case["in"].as_str().unwrap()), case["out"]);
         }
-        // Go v8.0.35 `TestMaskSensitiveQueryMasksValue`.
+        // Go v8.0.35 `TestMaskSensitiveQueryMasksValue`; every value is masked here.
         assert_eq!(
-            mask_query("value=sk-secret-client-key&index=3"),
-            "value=sk-s...-key&index=3"
+            logged_query("/v1", "value=sk-secret-client-key&index=3"),
+            "value=***&index=***"
         );
         // Go v8.0.35 `TestGinLogrusLoggerRedactsV8OAuthQueries`: no v8 OAuth query, so
         // no `?` either; other paths, the v0 callback included, keep the masked query.
@@ -638,8 +596,8 @@ mod tests {
         ] {
             assert_eq!(logged_query(path, oauth), "");
         }
-        assert_eq!(logged_query("/v0/management/oauth-callback", "state=s"), "state=s");
-        assert_eq!(logged_query("/v8/management/oauthx", "state=s"), "state=s");
+        assert_eq!(logged_query("/v0/management/oauth-callback", "state=s"), "state=***");
+        assert_eq!(logged_query("/v8/management/oauthx", "state=s"), "state=***");
         for case in fixture["lines"].as_array().unwrap() {
             assert_eq!(
                 access_line(
@@ -658,11 +616,11 @@ mod tests {
                 .ends_with(r#"GET     "/x\n200 forged""#)
         );
         // Go v8.0.35 `TestGinLogrusLoggerKeepsMaskedQueryReadable`: the masked query is
-        // quoted with the path, its `...` and `&` left readable.
+        // quoted with the path, its `***` and `&` left readable.
         let query = logged_query("/v1/models", "key=sk-0123456789cdef&limit=5");
         assert!(
             access_line(200, Duration::ZERO, "127.0.0.1", "GET", &format!("/v1/models?{query}"))
-                .ends_with(r#"GET     "/v1/models?key=sk-0...cdef&limit=5""#)
+                .ends_with(r#"GET     "/v1/models?key=***&limit=***""#)
         );
         for path in [
             "/v1",

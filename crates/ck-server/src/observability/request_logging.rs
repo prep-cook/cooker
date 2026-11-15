@@ -21,7 +21,7 @@ use chrono::{DateTime, Local, SecondsFormat};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::management::api::Management;
-use crate::observability::api::{RequestId, hide_key, mask_query};
+use crate::observability::api::{RequestId, hide_key};
 use crate::{Runtime, http::body_limit};
 
 const SMALL_BODY: u64 = 1 << 20;
@@ -180,7 +180,7 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             deferred: deferred.clone(),
         });
     }
-    let query = mask_query(request.uri().query().unwrap_or_default());
+    let query = ck_wire::redact::query(request.uri().query().unwrap_or_default());
     let url = if query.is_empty() {
         path
     } else {
@@ -554,7 +554,7 @@ impl RequestLog {
                     if info.url.is_empty() {
                         String::from("<unknown>")
                     } else {
-                        logged_url(info.url)
+                        ck_wire::redact::url(info.url)
                     }
                 )
                 .unwrap();
@@ -652,7 +652,7 @@ impl RequestLog {
             WebsocketRequest(info) => {
                 let mut part = websocket_event("api.websocket.request");
                 if !info.url.is_empty() {
-                    writeln!(part, "Upstream URL: {}", logged_url(info.url)).unwrap();
+                    writeln!(part, "Upstream URL: {}", ck_wire::redact::url(info.url)).unwrap();
                 }
                 upstream_auth(&mut part, &info);
                 part.extend_from_slice(b"Headers:\n");
@@ -1387,47 +1387,20 @@ fn redacted(name: &str) -> bool {
     name.contains("cookie") || name == crate::inference::streams::STREAM_ID_HEADER || name == "last-event-id"
 }
 
-/// Deliberate difference: Go prints upstream URLs unchanged, and a configured
-/// base-url can carry credentials. The logged copy replaces any userinfo and
-/// masks sensitive query values the way the downstream URL is masked; the
-/// request itself still goes to the URL as configured.
-fn logged_url(url: &str) -> String {
-    let mut out = String::new();
-    let mut rest = url;
-    if let Some(i) = url.find("://")
-        && i > 0
-        && url[..i]
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
-    {
-        out.push_str(&url[..i + 3]);
-        rest = &url[i + 3..];
-        // Look for '@' up to the first '/', even past a '?' or '#': a
-        // password with those characters unescaped still counts as userinfo,
-        // and dropping too much is safer than printing a secret.
-        let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
-        if let Some(at) = authority.rfind('@') {
-            out.push_str(REDACTED);
-            out.push('@');
-            rest = &rest[at + 1..];
-        }
+/// What every logged copy of a header shows, masked or not: [`REDACTED`] for the
+/// [`redacted`] headers, and a URL-bearing header (`Location`, `Referer`, `Link` and the
+/// like) with its URLs redacted ([`ck_wire::redact::url_header`]). Headers sent to the
+/// client stay unchanged.
+fn logged_header(name: &str, value: &[u8]) -> Option<Vec<u8>> {
+    if redacted(name) {
+        return Some(REDACTED.as_bytes().to_vec());
     }
-    let (rest, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
-    match rest.split_once('?') {
-        Some((base, query)) => {
-            out.push_str(base);
-            out.push('?');
-            out.push_str(&mask_query(query));
-        }
-        None => out.push_str(rest),
-    }
-    out.push_str(fragment);
-    out
+    ck_wire::redact::url_header(name, value).map(String::into_bytes)
 }
 
 fn masked_header(name: &str, value: &[u8]) -> Vec<u8> {
-    if redacted(name) {
-        return REDACTED.as_bytes().to_vec();
+    if let Some(logged) = logged_header(name, value) {
+        return logged;
     }
     if name.contains("authorization") {
         let trimmed = trim(value);
@@ -1451,8 +1424,8 @@ fn headers(out: &mut dyn Write, headers: &HeaderMap, mask: bool) -> io::Result<(
         write!(out, "{}: ", header_name(name.as_str()))?;
         if mask {
             out.write_all(&masked_header(name.as_str(), value.as_bytes()))?;
-        } else if redacted(name.as_str()) {
-            out.write_all(REDACTED.as_bytes())?;
+        } else if let Some(logged) = logged_header(name.as_str(), value.as_bytes()) {
+            out.write_all(&logged)?;
         } else {
             out.write_all(value.as_bytes())?;
         }
@@ -1664,6 +1637,10 @@ async fn held_delivery(dir: &Path) {
         gate.notified().await;
     }
 }
+
+#[cfg(test)]
+#[path = "request_logging_url_tests.rs"]
+mod url_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2589,28 +2566,48 @@ mod tests {
     /// Serves one request (sending a Cookie) whose handler feeds `events` to the
     /// capture sink and answers `status` with a Set-Cookie, then returns the
     /// persisted log file.
-    async fn persisted(
+    pub(super) async fn persisted(
         enabled: bool,
         status: StatusCode,
         events: impl Fn(&RequestLog) + Clone + Send + Sync + 'static,
     ) -> Vec<u8> {
+        persisted_request(enabled, status, "/fixture", &[], events).await.0
+    }
+
+    /// [`persisted`] for a request to `uri`, with `headers` on both the request and the
+    /// response; also returns the headers the client received.
+    pub(super) async fn persisted_request(
+        enabled: bool,
+        status: StatusCode,
+        uri: &str,
+        headers: &'static [(&'static str, &'static str)],
+        events: impl Fn(&RequestLog) + Clone + Send + Sync + 'static,
+    ) -> (Vec<u8>, HeaderMap) {
         let dir = scratch();
         let state = management(&dir, enabled, false);
         let app = axum::Router::new().fallback(move |axum::Extension(log): axum::Extension<RequestLog>| {
             let events = events.clone();
             async move {
                 events(&log);
-                (status, [("set-cookie", "down=c00kie-down-set")], "done")
+                let mut response = (status, [("set-cookie", "down=c00kie-down-set")], "done").into_response();
+                for (name, value) in headers {
+                    response
+                        .headers_mut()
+                        .insert(*name, axum::http::HeaderValue::from_static(value));
+                }
+                response
             }
         });
         let mut app = router(&state, app);
-        let request = HttpRequest::builder()
+        let mut request = HttpRequest::builder()
             .method("POST")
-            .uri("/fixture")
-            .header("cookie", "client=c00kie-client")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.call(request).await.unwrap();
+            .uri(uri)
+            .header("cookie", "client=c00kie-client");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = app.call(request.body(Body::empty()).unwrap()).await.unwrap();
+        let received = response.headers().clone();
         axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let mut content = Vec::new();
         for _ in 0..500 {
@@ -2641,10 +2638,10 @@ mod tests {
         }
         assert!(leftovers.is_empty(), "spool files left behind: {leftovers:?}");
         std::fs::remove_dir_all(dir).unwrap();
-        content
+        (content, received)
     }
 
-    fn upstream_request<'a>(
+    pub(super) fn upstream_request<'a>(
         url: &'a str,
         headers: &'a [(String, String)],
         body: &'a [u8],
@@ -2693,87 +2690,6 @@ mod tests {
             );
             assert!(content.contains("\nContent-Type: application/json\n"));
         }
-    }
-
-    #[tokio::test]
-    async fn upstream_url_credentials_are_redacted_in_logs() {
-        use ck_core::exec::CaptureEvent::*;
-        let content = persisted(true, StatusCode::OK, |log| {
-            let sink = log.capture_sink();
-            sink.record(Request(upstream_request(
-                "https://alice:pw-h1dden@proxy.example/v1/models?alt=sse&key=AIza-h1dden-query-123&access_token=tok-x-h1dden-x-456#frag",
-                &[],
-                b"",
-            )));
-            sink.record(WebsocketRequest(upstream_request(
-                "wss://bob:pw2-h1dden@ws.example/realtime?client_secret=cs-xx-h1dden-xx-789&model=gpt",
-                &[],
-                b"",
-            )));
-        })
-        .await;
-        let content = String::from_utf8(content).unwrap();
-        assert!(!content.contains("h1dden"), "{content}");
-        assert!(!content.contains("alice") && !content.contains("bob:"), "{content}");
-        let line = |prefix: &str| {
-            content
-                .lines()
-                .find(|l| l.starts_with(prefix))
-                .unwrap_or_else(|| panic!("no {prefix} in {content}"))
-                .to_owned()
-        };
-        let http = line("Upstream URL: https://<redacted>@proxy.example/v1/models?alt=sse&key=");
-        assert!(http.contains("&access_token=") && http.ends_with("#frag"), "{http}");
-        let ws = line("Upstream URL: wss://<redacted>@ws.example/realtime?client_secret=");
-        assert!(ws.ends_with("&model=gpt"), "{ws}");
-
-        for url in [
-            "https://host.example/v1/users/a@b.example?alt=sse",
-            "http://127.0.0.1:8080/v1#a@b",
-            "https://host.example/v1?model=gpt",
-        ] {
-            assert_eq!(logged_url(url), url);
-        }
-        assert_eq!(
-            logged_url("https://u:p@host.example"),
-            "https://<redacted>@host.example"
-        );
-        assert_eq!(
-            logged_url("https://user@host.example/x"),
-            "https://<redacted>@host.example/x"
-        );
-    }
-
-    /// Error text an executor hands the log names no URL credential, even when the
-    /// executor did not redact it.
-    #[tokio::test]
-    async fn urls_in_captured_errors_are_redacted() {
-        use ck_core::exec::CaptureEvent::*;
-        const SECRET: &str = "sk-review-secret";
-        let error =
-            format!(r#"Post "ftp://user:{SECRET}@127.0.0.1/?api_key={SECRET}": unsupported protocol scheme "ftp""#);
-        let dial =
-            format!("dial failed: error sending request for uri (http://127.0.0.1:1/?api_key={SECRET}/responses): EOF");
-        let content = persisted(true, StatusCode::OK, move |log| {
-            let sink = log.capture_sink();
-            sink.record(Request(upstream_request("https://fixture.invalid/v1", &[], b"")));
-            sink.record(ResponseError(&error));
-            sink.record(WebsocketError {
-                stage: "dial",
-                error: &dial,
-            });
-        })
-        .await;
-        let content = String::from_utf8(content).unwrap();
-        assert!(!content.contains(SECRET), "{content}");
-        assert!(
-            content.contains(r#"Error: Post "ftp://127.0.0.1/?api_key=***": unsupported protocol scheme "ftp""#),
-            "{content}"
-        );
-        assert!(
-            content.contains("Error: dial failed: error sending request for uri (http://127.0.0.1:1/?api_key=*** EOF"),
-            "{content}"
-        );
     }
 
     #[tokio::test]
