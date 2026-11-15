@@ -330,6 +330,18 @@ fn every_split_gives_the_same_body() {
             P::Responses,
             an_tool_result(json!({"type":"tool_result","tool_use_id":"toolu_01B","content":"ok"})),
         ),
+        (
+            P::Responses,
+            P::Chat,
+            json!({"model":"gpt-x","input":"hi","top_logprobs":3}),
+        ),
+        (
+            P::Chat,
+            P::Responses,
+            json!({"model":"gpt-x","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+                "tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"function","function":{"name":"f"}}]}}}),
+        ),
     ];
     for (from, to, input) in cases {
         let raw = serde_json::to_vec(&input).unwrap();
@@ -433,4 +445,51 @@ fn gemini_native_tool_groups_are_unsupported_elsewhere() {
         }
         assert!(translate(P::Gemini, P::Gemini, &input).is_ok());
     }
+}
+
+/// Responses `top_logprobs` is the canonical root member Chat uses, so each destination judges
+/// it: Gemini and Anthropic have no form for it; Chat and Responses take the integer as it is.
+#[test]
+fn responses_top_logprobs_is_judged_by_each_destination() {
+    let input = json!({"model":"gpt-x","input":"hi","top_logprobs":3});
+    unsupported(translate(P::Responses, P::Gemini, &input));
+    unsupported(translate(P::Responses, P::Anthropic, &input));
+    assert_eq!(translate(P::Responses, P::Chat, &input).unwrap()["top_logprobs"], 3);
+    assert_eq!(
+        translate(P::Responses, P::Responses, &input).unwrap(),
+        json!({"input":[{"type":"message","role":"user","content":"hi"}],"stream":false,"model":"gpt-x","top_logprobs":3})
+    );
+}
+
+/// A Chat client's nested allowed-tools choice reaches Responses flat; a member Responses has
+/// no place for is refused at the fence, not dropped or copied.
+#[test]
+fn chat_allowed_tools_reach_responses_flat() {
+    let request = |allowed: Value| {
+        json!({"model":"gpt-x","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}},
+                {"type":"custom","custom":{"name":"c"}}],
+            "tool_choice":{"type":"allowed_tools","allowed_tools":allowed}})
+    };
+    let listed = json!([{"type":"function","function":{"name":"f"}},{"type":"custom","custom":{"name":"c"}}]);
+    let out = translate(
+        P::Chat,
+        P::Responses,
+        &request(json!({"mode":"required","tools":listed})),
+    )
+    .unwrap();
+    assert_eq!(
+        out["tool_choice"],
+        json!({"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"f"},{"type":"custom","name":"c"}]})
+    );
+    for allowed in [
+        json!({"mode":"auto","tools":[{"type":"function","function":{"name":"f","strict":true}}]}),
+        json!({"mode":"auto","tools":[{"type":"function","function":{"name":"f"},"extra":1}]}),
+        json!({"mode":"auto","tools":[{"type":"function","function":{"name":"f"}}],"extra":1}),
+    ] {
+        unsupported(translate(P::Chat, P::Responses, &request(allowed)));
+    }
+    let mut beside = request(json!({"mode":"auto","tools":[{"type":"function","function":{"name":"f"}}]}));
+    beside["tool_choice"]["function"] = json!({"name":"f"});
+    unsupported(translate(P::Chat, P::Responses, &beside));
 }

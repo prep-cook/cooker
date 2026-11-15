@@ -148,7 +148,7 @@ fn flat_allowed(doc: &Document, choice: usize) -> Result<()> {
 }
 
 /// Refuses a member of object `node` outside `names` as unsupported.
-fn only(doc: &Document, node: usize, names: &[&str]) -> Result<()> {
+pub(crate) fn only(doc: &Document, node: usize, names: &[&str]) -> Result<()> {
     for field in doc.children(node)? {
         let name = doc.node(field)?.name.ok_or(Error::Schema)?;
         let mut known = false;
