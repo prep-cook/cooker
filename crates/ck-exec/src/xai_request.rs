@@ -11,9 +11,8 @@ use ck_core::format::Format;
 use ck_translate::RequestCtx;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, GoValue, Kind, Res};
-use ck_wire::thinking::{self, ModelCaps, RequestThinking, parse_suffix};
+use ck_wire::thinking::parse_suffix;
 
-use crate::openai_compat_payload::{self as compat, set_bool_if_different, set_str_if_different};
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_response::{
     self as response, CUSTOM, ClientToolKey, FUNCTION, NAMESPACE, NamespaceRef, NamespaceRefs, WEB_SEARCH, text,
@@ -21,6 +20,7 @@ use crate::xai_response::{
 use ck_translate::apply_patch_responses as apply_patch;
 
 use crate::xai::PROVIDER;
+use crate::xai_shape::Inbound;
 const IMAGE_GENERATION: &str = "image_generation";
 const TOOL_SEARCH: &str = "tool_search";
 const X_SEARCH: &str = "x_search";
@@ -30,7 +30,6 @@ const CODEX_APP_NAMESPACE: &str = "codex_app";
 const AUTOMATION_UPDATE: &str = "automation_update";
 const SAFE_FUNCTION_PARAMETERS: &str = r#"{"type":"object","properties":{},"additionalProperties":true}"#;
 const X_SEARCH_TOOL: &str = r#"{"type":"x_search"}"#;
-const COMPOSER_PREFIX: &str = "grok-composer-";
 
 /// `xaiPreparedRequest`.
 pub(crate) struct Prepared {
@@ -46,8 +45,8 @@ pub(crate) struct Prepared {
     /// `helps.ApplyPatchResponsesState`.
     pub apply_patch: apply_patch::State,
     /// Go `finalizePayload`'s captured baseline and target protocol.
-    rule_original: Vec<u8>,
-    rule_protocol: Format,
+    pub rule_original: Vec<u8>,
+    pub rule_protocol: Format,
 }
 
 impl Prepared {
@@ -157,7 +156,8 @@ fn preserve_output_controls(mut body: Vec<u8>, source: &[u8], from: Format) -> V
     body
 }
 
-/// `prepareResponsesRequestTo`.
+/// `prepareResponsesRequestTo`: the client body translated to the Responses shape, then
+/// [`crate::xai_shape::shape`].
 pub(crate) fn prepare(
     req: &ExecRequest,
     cfg: &Config,
@@ -168,8 +168,6 @@ pub(crate) fn prepare(
 ) -> Result<Prepared, ExecError> {
     let base_model = parse_suffix(&req.model).model_name;
     let original_payload = original(req).to_vec();
-    // cliproxyauth.ResolvedModelInfo, bound by dispatch for configured xai-api-key models.
-    let caps = req.resolved_model.as_ref().map(|r| ModelCaps::from(&r.info));
     let is_compat = req.resolved_model.as_ref().is_some_and(|r| r.is_compat());
     let client = crate::codex_client::Client::new(&req.headers, cfg, PROVIDER, is_compat);
     let original_translated = translate(req, &client, to, &base_model, stream, &original_payload);
@@ -177,37 +175,25 @@ pub(crate) fn prepare(
     let original_translated = crate::translate::baseline_or_working(original_translated, &body);
     let original_translated = preserve_output_controls(original_translated, &original_payload, req.source_format);
     let body = preserve_output_controls(body, &req.body, req.source_format);
-    let mut body = thinking::apply_request_thinking(
-        &RequestThinking {
-            payload: Some(&req.body[..]),
-            original: Some(&original_payload[..]),
-            model: &req.model,
-            from: req.source_format.as_str(),
-            // Go passes the executor identifier as the target format.
-            to: PROVIDER,
-            provider: PROVIDER,
-            resolved: caps.as_ref().map(Some),
-            has_request_transformer: false,
-            updates_changed: false,
-        },
-        body.to_vec(),
-    )
-    .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
-    set_str_if_different(&mut body, "model", &base_model);
-    set_bool_if_different(&mut body, "stream", stream);
-    for key in [
-        "previous_response_id",
-        "prompt_cache_retention",
-        "safety_identifier",
-        "stream_options",
-    ] {
-        gj::delete(&mut body, key);
-    }
-    body = ck_wire::codex_client::rewrite_multi_agent_v2_input(&req.headers, &body, &client.settings, false);
-    let mut apply_patch = apply_patch::State::new(req.source_format, &original_payload, &original_translated);
-    // A plain Go error (translator/common NormalizeApplyPatchResponsesRequest).
-    body = apply_patch::normalize_executor_request(&body, Some(&original_payload))
-        .map_err(crate::openai_compat::plain_err)?;
+    let mut inbound = Inbound::of(req);
+    inbound.downstream_websocket = downstream_websocket;
+    let mut prepared = crate::xai_shape::shape(&inbound, cfg, replay_store, stream, to, body, &original_translated)?;
+    prepared.original_payload = original_payload;
+    prepared.rule_original = original_translated;
+    Ok(prepared)
+}
+
+/// What the tool rewrites leave besides the body.
+pub(crate) struct Tools {
+    pub fold: bool,
+    pub namespace_tools: NamespaceRefs,
+    pub client_declared_tools: HashSet<ClientToolKey>,
+    pub web_search_alias: String,
+}
+
+/// The `tools` and `tool_choice` rewrites of `prepareResponsesRequestTo`; folded namespace
+/// dispatchers holding a patch tool are registered with `apply_patch`.
+pub(crate) fn shape_tools(mut body: Vec<u8>, cfg: &Config, apply_patch: &mut apply_patch::State) -> (Vec<u8>, Tools) {
     let will_inject = inject_x_search(cfg);
     let fold = should_fold_namespace_tools(&body, will_inject);
     let namespace_tools = collect_namespace_refs(&body, fold);
@@ -233,77 +219,34 @@ pub(crate) fn prepare(
         body = ensure_native_x_search_tool(body);
     }
     body = clamp_tools_limit(body, MAX_TOOLS, &namespace_tools);
-    let replay_scope = replay::scope(req, &body, downstream_websocket);
-    body = replay::apply(replay_store, &replay_scope, body);
+    let tools = Tools {
+        fold,
+        namespace_tools,
+        client_declared_tools,
+        web_search_alias,
+    };
+    (body, tools)
+}
+
+/// The `input` rewrites of `prepareResponsesRequestTo` after reasoning replay, with the
+/// instructions, `stop` and image references.
+pub(crate) fn shape_input(mut body: Vec<u8>, tools: &Tools) -> Vec<u8> {
     body = normalize_input_custom_tool_calls(body);
-    body = normalize_input_namespace_tool_calls(body, fold);
-    if !web_search_alias.is_empty() {
-        body = alias_web_search_input(body, &web_search_alias, &namespace_tools);
+    body = normalize_input_namespace_tool_calls(body, tools.fold);
+    if !tools.web_search_alias.is_empty() {
+        body = alias_web_search_input(body, &tools.web_search_alias, &tools.namespace_tools);
     }
     body = response::normalize_input_reasoning_items(body);
     body = response::sanitize_input_encrypted_content(body);
     ck_wire::codex_client::normalize_codex_instructions(&mut body);
     // stop is a Chat Completions field xAI's Responses API rejects.
     gj::delete(&mut body, "stop");
-    body = normalize_image_refs(body);
-    let session_id = composer_session_id(req, &base_model);
-    if !session_id.is_empty() {
-        set_str_if_different(&mut body, "prompt_cache_key", &session_id);
-    }
-    Ok(Prepared {
-        filter_internal_x_search: response::request_has_native_x_search(&body),
-        base_model,
-        original_payload,
-        body,
-        namespace_tools,
-        client_declared_tools,
-        session_id,
-        replay_scope,
-        web_search_alias,
-        apply_patch,
-        rule_original: original_translated,
-        rule_protocol: to,
-    })
+    normalize_image_refs(body)
 }
 
 /// `xaiExecutionSessionID`.
 pub(crate) fn execution_session_id(req: &ExecRequest) -> String {
-    if let Some(s) = req
-        .execution_session
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return s.to_owned();
-    }
-    let key = text(&gj::get(&req.body, "prompt_cache_key"));
-    if !key.is_empty() {
-        return key;
-    }
-    // helps.DerivedSessionUUID("xai", ...).
-    match req.derived_session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(derived) => uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_OID,
-            format!("cli-proxy-api\0{PROVIDER}\0derived-session\0{derived}").as_bytes(),
-        )
-        .to_string(),
-        None => String::new(),
-    }
-}
-
-/// `xaiResolveComposerSessionID`: the conversation id Grok composer models need.
-fn composer_session_id(req: &ExecRequest, base_model: &str) -> String {
-    let session = execution_session_id(req);
-    if !session.is_empty() {
-        return session;
-    }
-    if !base_model.trim().go_lower().starts_with(COMPOSER_PREFIX) {
-        return String::new();
-    }
-    if let Some(key) = compat::claude_code_prompt_cache(base_model, &req.body, &req.headers) {
-        return key;
-    }
-    uuid::Uuid::new_v4().to_string()
+    Inbound::of(req).execution_session_id()
 }
 
 /// Grok version prefix of a model name (`xaiParseGrokVersionPrefix`).

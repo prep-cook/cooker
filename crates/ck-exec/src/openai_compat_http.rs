@@ -115,7 +115,21 @@ impl Capture {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Self {
-        let sink = req.capture().clone();
+        Self::on(req.capture().clone(), credential, provider, url, method, headers, body)
+    }
+
+    /// [`Capture::request`] into `sink`, for an executor that holds the sink rather than an
+    /// `ExecRequest` (`Client::usage`, contract G4).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on(
+        sink: CaptureSink,
+        credential: &Credential,
+        provider: &str,
+        url: &str,
+        method: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Self {
         if sink.enabled() {
             let (auth_type, auth_value) = ck_core::registry::dynamic::account_info(credential);
             sink.record(CaptureEvent::Request(UpstreamRequest {
