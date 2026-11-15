@@ -202,3 +202,32 @@ async fn only_a_successful_completion_caches() {
     let failed = turn_ending("response.completed", "failed");
     assert_eq!(replayed(failed).await, (false, false));
 }
+
+/// A call whose id is a number, which the client receives, is replayed with that id as a
+/// string beside the result the next turn sends for it.
+#[tokio::test]
+async fn a_numeric_call_id_is_replayed() {
+    let executors = executors();
+    let a = ("sk-a", "xai-1");
+    let call = json!({"type":"function_call","call_id":77,"name":"tool","arguments":"{}"});
+    let body = event(json!({"type":"response.completed","response":response("completed", json!([call]))}));
+    let (_, ok) = turn(&executors, a, TURN, Reply::sse(body)).await;
+    assert!(ok);
+    let next = json!({"model":MODEL,"stream":true,"previous_response_id":"resp_1","prompt_cache_key":"k1","input":[
+        {"role":"user","content":"hi"},
+        {"type":"function_call_output","call_id":"77","output":"done"},
+    ]});
+    let (sent, ok) = turn(&executors, a, &next.to_string(), Reply::sse(sse())).await;
+    assert!(ok);
+    let replayed = sent["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .cloned();
+    assert_eq!(
+        replayed,
+        Some(json!({"type":"function_call","call_id":"77","name":"tool","arguments":"{}"})),
+        "{sent}"
+    );
+}

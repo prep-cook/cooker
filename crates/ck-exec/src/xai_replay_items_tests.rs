@@ -31,8 +31,10 @@ fn normalized(owner: &mut ck_stream::Writer, json: &str) -> Option<serde_json::V
     let (store, item) = (Store::default(), doc.root());
     let mut held = store.reserve();
     let kind = kind(&doc, item).unwrap()?;
-    valid(&doc, item, kind, &mut held).unwrap().unwrap().then_some(())?;
-    let bytes = encode::owned(|e| write(&doc, item, kind, e), |_| true)
+    let Check::Kept(ids) = valid(&doc, item, kind, &mut held).unwrap() else {
+        return None;
+    };
+    let bytes = encode::owned(|e| write(&doc, item, kind, ids.as_ref(), e), |_| true)
         .unwrap()
         .unwrap();
     Some(serde_json::from_slice(&bytes).unwrap())
@@ -63,7 +65,7 @@ fn items_normalize_as_raw_items_do() {
         r#"{"type":"custom_tool_call","call_id":"c","name":"patch"}"#.to_owned(),
         r#"{"type":5,"call_id":"c"}"#.to_owned(),
     ];
-    for item in items {
+    for item in items.into_iter().chain(scalar_items()) {
         let raw = crate::xai_replay::normalize_item(item.as_bytes());
         let want = raw.map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
         assert_eq!(normalized(&mut owner, &item), want, "{item}");
@@ -71,6 +73,40 @@ fn items_normalize_as_raw_items_do() {
     drop(owner);
     drop(pool);
     let _ = std::fs::remove_dir_all(directory);
+}
+
+/// Calls whose `call_id`, `name` and `status` are each, in turn, every kind of JSON value
+/// but a string: the old route reads them as Go's `Result.String()` does.
+fn scalar_items() -> Vec<String> {
+    let values = [
+        "77",
+        "-3",
+        "0",
+        "1.5",
+        "1e3",
+        "1.0",
+        "-0.25",
+        "true",
+        "false",
+        "null",
+        r#"{"a":1}"#,
+        r#"[1,"x"]"#,
+    ];
+    let mut items = Vec::new();
+    for value in values {
+        for field in ["call_id", "name"] {
+            let mut call = serde_json::json!({"type":"function_call","call_id":"c","name":"t","arguments":"{}"});
+            call[field] = serde_json::from_str(value).unwrap();
+            items.push(call.to_string());
+            let mut custom = serde_json::json!({"type":"custom_tool_call","call_id":"c","name":"t","input":"x"});
+            custom[field] = serde_json::from_str(value).unwrap();
+            items.push(custom.to_string());
+        }
+        let mut custom = serde_json::json!({"type":"custom_tool_call","call_id":"c","name":"t","input":"x"});
+        custom["status"] = serde_json::from_str(value).unwrap();
+        items.push(custom.to_string());
+    }
+    items
 }
 
 /// The replay items of the completion `json` under a store of `limits`.
@@ -98,6 +134,22 @@ fn checking_reasoning_is_charged_while_it_runs() {
         items(&mut owner, &turn, (2 * ENC.len(), 2 * ENC.len())).map(|i| i.len()),
         Some(1)
     );
+    drop(owner);
+    drop(pool);
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// Reading a number takes a charge of its length: a long one that formats short fits an
+/// entry only while its text does.
+#[test]
+fn reading_a_number_is_charged() {
+    let (pool, directory) = pool();
+    let mut owner = pool.create().unwrap();
+    let id = format!("1.{}", "0".repeat(5_000));
+    let turn = format!(r#"{{"output":[{{"type":"function_call","call_id":{id},"name":"t","arguments":"{{}}"}}]}}"#);
+    let call = serde_json::json!({"type":"function_call","call_id":"1","name":"t","arguments":"{}"});
+    assert!(items(&mut owner, &turn, (1_000, 1_000)).is_none());
+    assert_eq!(items(&mut owner, &turn, (6_000, 6_000)), Some(vec![call]));
     drop(owner);
     drop(pool);
     let _ = std::fs::remove_dir_all(directory);

@@ -4,12 +4,14 @@
 //! bytes, charged to the turn's reservation before it is allocated; the only other buffer is
 //! the decoded `encrypted_content` a reasoning item is checked with, charged the same way and
 //! freed before its charge is returned. The rules are `xai_replay::normalize_item`'s for raw
-//! items on the old route, except that a call id, name or status must be a string.
+//! items on the old route, which reads a call's id, name and status as Go's `Result.String()`
+//! does; see [`Text`].
 
 use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::encode::{self, Encoder};
 use ck_translate::codec::{self, Error};
 use ck_wire::gostr::GoStr;
+use ck_wire::json as gj;
 use ck_wire::signature::{MAX_GROK_ENCRYPTED_CONTENT_LEN, inspect_grok_encrypted_content};
 
 use crate::xai_exec::object_member;
@@ -21,6 +23,34 @@ enum Kind {
     Message,
     FunctionCall,
     CustomToolCall,
+}
+
+/// A call's `call_id`, `name` or `status` as the old route's `text()` reads it: a string
+/// without its surrounding white space, a non-integer number in Go's float format, null or
+/// absence as nothing, and any other value as its JSON text.
+enum Text {
+    Empty,
+    /// A string node, the white space it starts with and the characters kept after it.
+    Trimmed(usize, usize, usize),
+    /// A value whose JSON text is its text: an integer, a boolean, an object or an array.
+    Json(usize),
+    /// A non-integer number, formatted.
+    Formatted(String),
+}
+
+/// A call's identity members.
+struct Ids {
+    call_id: Text,
+    name: Text,
+    status: Text,
+}
+
+/// What normalization makes of one item.
+enum Check {
+    Kept(Option<Ids>),
+    Dropped,
+    /// Checking the item would outgrow the reservation.
+    Refused,
 }
 
 const KINDS: [(&str, Kind); 4] = [
@@ -60,17 +90,17 @@ fn replay_items(doc: &Document, response: usize, held: &mut Reservation<'_>) -> 
             continue;
         };
         match valid(doc, item, kind, held)? {
-            Some(true) => kept.push((item, kind)),
-            Some(false) => {}
-            None => return Ok(None),
+            Check::Kept(ids) => kept.push((item, kind, ids)),
+            Check::Dropped => {}
+            Check::Refused => return Ok(None),
         }
     }
-    if kept.iter().all(|(_, kind)| *kind == Kind::Message) {
+    if kept.iter().all(|(_, kind, _)| *kind == Kind::Message) {
         return Ok(None);
     }
     let mut items = Vec::with_capacity(kept.len());
-    for (item, kind) in kept {
-        match encode::owned(|e| write(doc, item, kind, e), |len| held.charge(len))? {
+    for (item, kind, ids) in &kept {
+        match encode::owned(|e| write(doc, *item, *kind, ids.as_ref(), e), |len| held.charge(len))? {
             Some(bytes) => items.push(bytes),
             None => return Ok(None),
         }
@@ -90,13 +120,14 @@ fn kind(doc: &Document, item: usize) -> codec::Result<Option<Kind>> {
     Ok(None)
 }
 
-/// Whether `item` normalizes to a replay item; `None` when checking it would outgrow the
-/// reservation.
-fn valid(doc: &Document, item: usize, kind: Kind, held: &mut Reservation<'_>) -> codec::Result<Option<bool>> {
+/// What normalization makes of `item`.
+fn valid(doc: &Document, item: usize, kind: Kind, held: &mut Reservation<'_>) -> codec::Result<Check> {
     let member = |name| object_member(doc, item, name);
-    let named = |name| -> codec::Result<bool> { Ok(trimmed(doc, member(name)?)?.is_some_and(|(_, keep)| keep > 0)) };
-    Ok(Some(match kind {
-        Kind::Reasoning => return encrypted(doc, member("encrypted_content")?, held),
+    let kept = match kind {
+        Kind::Reasoning => match encrypted(doc, member("encrypted_content")?, held)? {
+            Some(kept) => kept,
+            None => return Ok(Check::Refused),
+        },
         Kind::Message => {
             let content = member("content")?;
             trimmed_is(doc, member("role")?, "assistant", true)?
@@ -105,9 +136,67 @@ fn valid(doc: &Document, item: usize, kind: Kind, held: &mut Reservation<'_>) ->
                     _ => false,
                 }
         }
-        Kind::FunctionCall => named("call_id")? && named("name")? && string_member(doc, member("arguments")?)?,
-        Kind::CustomToolCall => named("call_id")? && named("name")? && member("input")?.is_some(),
+        Kind::FunctionCall | Kind::CustomToolCall => return call(doc, item, kind, held),
+    };
+    Ok(if kept { Check::Kept(None) } else { Check::Dropped })
+}
+
+/// A call is kept with a non-empty id and name, and string arguments or any input.
+fn call(doc: &Document, item: usize, kind: Kind, held: &mut Reservation<'_>) -> codec::Result<Check> {
+    let member = |name| object_member(doc, item, name);
+    let mut read = |name| -> codec::Result<Option<Text>> { text(doc, member(name)?, held) };
+    let (Some(call_id), Some(name)) = (read("call_id")?, read("name")?) else {
+        return Ok(Check::Refused);
+    };
+    let (status, body) = match kind {
+        Kind::CustomToolCall => (read("status")?, member("input")?.is_some()),
+        _ => (Some(Text::Empty), string_member(doc, member("arguments")?)?),
+    };
+    let Some(status) = status else {
+        return Ok(Check::Refused);
+    };
+    if matches!(call_id, Text::Empty) || matches!(name, Text::Empty) || !body {
+        return Ok(Check::Dropped);
+    }
+    Ok(Check::Kept(Some(Ids { call_id, name, status })))
+}
+
+/// `text(member)` for `node`; `None` when reading a number would outgrow the reservation.
+fn text(doc: &Document, node: Option<usize>, held: &mut Reservation<'_>) -> codec::Result<Option<Text>> {
+    let Some(node) = node else {
+        return Ok(Some(Text::Empty));
+    };
+    Ok(Some(match doc.node(node)?.value {
+        Value::String(_) | Value::Text(_) => match trimmed(doc, Some(node))? {
+            Some((skip, keep)) if keep > 0 => Text::Trimmed(node, skip, keep),
+            _ => Text::Empty,
+        },
+        Value::Null => Text::Empty,
+        Value::Number(_) => return number(doc, node, held),
+        _ => Text::Json(node),
     }))
+}
+
+/// A number as `Result.String()` reads it: an integer as written, any other number in Go's
+/// float format. Reading it takes a copy of its JSON text, charged as its length; the
+/// formatted result is a few dozen bytes at most.
+fn number(doc: &Document, node: usize, held: &mut Reservation<'_>) -> codec::Result<Option<Text>> {
+    let json = |e: &mut Encoder<'_, '_>| doc.write(node, e);
+    let mut len = 0;
+    encode::owned(json, |n| {
+        len = n;
+        false
+    })?;
+    let read = || -> codec::Result<Text> {
+        let raw = encode::owned(json, |_| true)?.ok_or(Error::Schema)?;
+        let text = gj::parse(&raw).bytes();
+        Ok(if *text == *raw {
+            Text::Json(node)
+        } else {
+            Text::Formatted(String::from_utf8_lossy(&text).into_owned())
+        })
+    };
+    held.scratch(len, read).transpose()
 }
 
 /// Whether `value` is Grok encrypted content. Its decoded copy, and what checking it decodes
@@ -157,8 +246,9 @@ fn part_field(doc: &Document, part: usize) -> codec::Result<Option<(&'static str
 }
 
 /// Writes the normalized form of `item`, which [`valid`] accepted.
-fn write(doc: &Document, item: usize, kind: Kind, e: &mut Encoder<'_, '_>) -> codec::Result<()> {
+fn write(doc: &Document, item: usize, kind: Kind, ids: Option<&Ids>, e: &mut Encoder<'_, '_>) -> codec::Result<()> {
     let member = |name| object_member(doc, item, name)?.ok_or(Error::Schema);
+    let ids = || ids.ok_or(Error::Schema);
     match kind {
         Kind::Reasoning => {
             e.bytes(br#"{"type":"reasoning","summary":[],"content":null,"encrypted_content":"#)?;
@@ -186,24 +276,22 @@ fn write(doc: &Document, item: usize, kind: Kind, e: &mut Encoder<'_, '_>) -> co
         }
         Kind::FunctionCall => {
             e.bytes(br#"{"type":"function_call","call_id":"#)?;
-            write_trimmed(doc, member("call_id")?, e)?;
+            write_text(doc, &ids()?.call_id, e)?;
             e.bytes(br#","name":"#)?;
-            write_trimmed(doc, member("name")?, e)?;
+            write_text(doc, &ids()?.name, e)?;
             e.bytes(br#","arguments":"#)?;
             doc.write(member("arguments")?, e)?;
         }
         Kind::CustomToolCall => {
             e.bytes(br#"{"type":"custom_tool_call","status":"#)?;
-            match object_member(doc, item, "status")? {
-                Some(status) if trimmed(doc, Some(status))?.is_some_and(|(_, keep)| keep > 0) => {
-                    write_trimmed(doc, status, e)?;
-                }
-                _ => e.bytes(br#""completed""#)?,
+            match &ids()?.status {
+                Text::Empty => e.bytes(br#""completed""#)?,
+                status => write_text(doc, status, e)?,
             }
             e.bytes(br#","call_id":"#)?;
-            write_trimmed(doc, member("call_id")?, e)?;
+            write_text(doc, &ids()?.call_id, e)?;
             e.bytes(br#","name":"#)?;
-            write_trimmed(doc, member("name")?, e)?;
+            write_text(doc, &ids()?.name, e)?;
             e.bytes(br#","input":"#)?;
             doc.write(member("input")?, e)?;
         }
@@ -256,9 +344,14 @@ fn trimmed_is(doc: &Document, node: Option<usize>, want: &str, fold: bool) -> co
     Ok(if fold { text.go_eq_fold(want) } else { text == want })
 }
 
-/// Writes string `node` trimmed of white space, as a JSON string.
-fn write_trimmed(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> codec::Result<()> {
-    let (skip, keep) = trimmed(doc, Some(node))?.ok_or(Error::Schema)?;
+/// Writes `text` as a JSON string.
+fn write_text(doc: &Document, text: &Text, e: &mut Encoder<'_, '_>) -> codec::Result<()> {
+    let (node, skip, keep) = match text {
+        Text::Empty => return e.bytes(b"\"\""),
+        Text::Json(node) => return e.quoted_json(|e| doc.write(*node, e)),
+        Text::Formatted(text) => return e.string(text),
+        Text::Trimmed(node, skip, keep) => (*node, *skip, *keep),
+    };
     let mut chars = doc.chars(node)?;
     e.bytes(b"\"")?;
     for at in 0..skip + keep {
