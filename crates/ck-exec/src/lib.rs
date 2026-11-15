@@ -57,6 +57,7 @@ mod devin_payload;
 mod devin_request;
 mod devin_wire;
 pub mod gemini;
+mod gemini_exec;
 mod gemini_payload;
 mod gemini_stream;
 mod google_wire;
@@ -174,6 +175,7 @@ impl Executors {
     pub fn destination(&self, attempt: &types::Attempt<'_>) -> Option<&'static str> {
         match attempt.credential.provider.as_str() {
             p if openai_compat::handles(p) => Some(pipeline::destination(&self.openai.compat, attempt)),
+            gemini_exec::PROVIDER => Some(pipeline::destination(&self.google.gemini, attempt)),
             _ => None,
         }
     }
@@ -187,6 +189,7 @@ impl Executors {
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
             p if openai_compat::handles(p) => pipeline::fence(&self.openai.compat, attempt, ingress, request),
+            gemini_exec::PROVIDER => pipeline::fence(&self.google.gemini, attempt, ingress, request),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -199,6 +202,7 @@ impl Executors {
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
             p if openai_compat::handles(p) => pipeline::refence(&self.openai.compat, attempt, view),
+            gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -216,6 +220,7 @@ impl Executors {
             p if openai_compat::handles(p) => {
                 pipeline::start(&self.openai.compat, attempt, request, upload, response).await
             }
+            gemini_exec::PROVIDER => pipeline::start(&self.google.gemini, attempt, request, upload, response).await,
             provider => {
                 response.finish(ck_stream::Terminal::Gone);
                 Err(no_executor(provider))

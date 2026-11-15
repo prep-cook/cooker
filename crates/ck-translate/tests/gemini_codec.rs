@@ -230,6 +230,11 @@ fn count_is_not_usage_and_compact_is_explicitly_unsupported() {
     );
     assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), body);
     assert!(canonical.iter().all(|v| v.get("usage").is_none()));
+    let count = canonical.iter().find(|v| v.get("total_tokens").is_some()).unwrap();
+    assert_eq!(
+        (&count["input_tokens"], &count["total_tokens"]),
+        (&json!(12), &json!(12))
+    );
     let mut mapped = Mapped::new();
     assert!(matches!(
         gemini::response::Ingress::new(

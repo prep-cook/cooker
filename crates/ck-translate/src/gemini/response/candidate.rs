@@ -218,6 +218,9 @@ impl State {
             Kind::CountTokens,
             Scope::default(),
             |e| {
+                // `countTokens` counts only the request, so its total is the input count.
+                e.bytes(b",\"input_tokens\":")?;
+                doc.write(total, e)?;
                 e.bytes(b",\"total_tokens\":")?;
                 doc.write(total, e)?;
                 e.bytes(b",\"details\":")?;
