@@ -192,7 +192,7 @@ Deleting a media carrier's entire `attributes` object also removes reachability;
 | --- | --- |
 | `input_tokens?`, `output_tokens?`, `total_tokens?` | Inclusive input; inclusive output including reasoning; total if reported or derivable. |
 | `input_uncached_tokens?`, `cache_read_tokens?`, `cache_write_tokens?` | Non-overlapping input components when the source reports them. |
-| `cache_write_by_ttl?` | Map of TTL seconds as decimal strings to counts; Claude keys `300` and `3600`; retain other native buckets in `native`. |
+| `cache_write_by_ttl?` | Map of TTL seconds as decimal strings to counts; Claude keys `300` and `3600`; OpenAI Responses keys `1800` and `43200` (`cache_write_tokens_details.ttl_30m_tokens` and `ttl_12h_tokens`); retain other native buckets in `native`. |
 | `reasoning_tokens?`, `input_audio_tokens?`, `output_audio_tokens?` | Subsets, not additions to inclusive totals. |
 | `details?` | Other mapped Chat token details, including accepted/rejected prediction and modality breakdowns. |
 | `native` | `{protocol, value}` preserving source usage fields and their absence/null distinctions. |
@@ -201,6 +201,7 @@ Deleting a media carrier's entire `attributes` object also removes reachability;
 
 Omitted counts stay absent; explicit zero stays zero; native null stays in `native`, never coerced to zero. A supplied null clears the corresponding known canonical count; omission alone retains the previous value. Recompute a derived total after operand changes and remove it when an operand is no longer known; never replace an explicit native null with a derived value.
 For Claude, inclusive input = uncached input + cache read + cache creation; do not add TTL buckets again to cache creation.
+For Gemini, inclusive input = `promptTokenCount` + `toolUsePromptTokenCount`, and inclusive output = `candidatesTokenCount` + `thoughtsTokenCount`; a null addend leaves the sum unknown.
 Derive `total_tokens` only from known inclusive `input_tokens` and `output_tokens`; derive Claude inclusive input only when uncached, cache-read and cache-creation counts are all known. Never infer an absent operand as zero. Retain disagreeing provider totals with a content-free diagnostic.
 A partial source usage update replaces the fields it supplies in the retained snapshot; it does not add them. Missing fields retain prior known values for that attempt/scope.
 Emit the resulting snapshot. A repeated or corrected snapshot replaces the previous one; accounting never sums successive snapshots or their Chat projections.

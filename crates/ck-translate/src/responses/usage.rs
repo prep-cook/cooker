@@ -68,7 +68,9 @@ impl Usage {
                 e.bytes(b",\"derived\":[\"total_tokens\"]")?;
             }
             write_details(doc, root, e)?;
-            if let Some(ttl) = doc.member(root, "cache_write_by_ttl")? {
+            if !write_ttl(doc, root, e)?
+                && let Some(ttl) = doc.member(root, "cache_write_by_ttl")?
+            {
                 e.bytes(b",\"cache_write_by_ttl\":")?;
                 doc.write(ttl, e)?;
             }
@@ -120,6 +122,94 @@ fn write_details(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result
     Ok(())
 }
 
+/// Writes OpenAI's cache-write TTL counts (`input_tokens_details.cache_write_tokens_details`) as
+/// canonical buckets keyed by their duration in seconds; a null or omitted count, or one that is
+/// not an unsigned integer, stays absent. Returns whether the source reported the details object.
+fn write_ttl(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<bool> {
+    let Some(details) = doc
+        .member(root, "input_tokens_details")?
+        .filter(|&d| matches!(doc.node(d).map(|n| n.value), Ok(Value::Object)))
+        .map(|d| doc.member(d, "cache_write_tokens_details"))
+        .transpose()?
+        .flatten()
+        .filter(|&d| matches!(doc.node(d).map(|n| n.value), Ok(Value::Object)))
+    else {
+        return Ok(false);
+    };
+    let mut first = true;
+    for (native, seconds) in TTL {
+        if let Some(count) = ttl_count(doc, details, native)? {
+            e.bytes(if first { b",\"cache_write_by_ttl\":{" } else { b"," })?;
+            first = false;
+            e.string(seconds)?;
+            e.bytes(b":")?;
+            e.unsigned(count)?;
+        }
+    }
+    if !first {
+        e.bytes(b"}")?;
+    }
+    Ok(true)
+}
+
+/// OpenAI's cache-write TTL members and the canonical bucket each one maps to.
+const TTL: [(&str, &str); 2] = [("ttl_30m_tokens", "1800"), ("ttl_12h_tokens", "43200")];
+
+/// The TTL count `name` of `details` when it is an unsigned integer.
+fn ttl_count(doc: &Document, details: usize, name: &str) -> Result<Option<u64>> {
+    match doc.member(details, name)? {
+        Some(n) => match doc.unsigned(n) {
+            Ok(count) => Ok(Some(count)),
+            Err(crate::codec::Error::Schema) => Ok(None),
+            Err(error) => Err(error),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Writes the canonical TTL buckets over the native value's official
+/// `input_tokens_details.cache_write_tokens_details`, so a normalized change or deletion wins as
+/// for the other counts; a native count the snapshot never mapped (null or malformed) is left
+/// alone. Buckets of other durations have no Responses member.
+fn overlay_ttl(doc: &mut Document, usage: usize, value: usize) -> Result<()> {
+    let object = |doc: &Document, n: usize| matches!(doc.node(n).map(|n| n.value), Ok(Value::Object));
+    let buckets = doc.member(usage, "cache_write_by_ttl")?.filter(|&n| object(doc, n));
+    for (field, seconds) in TTL {
+        let canonical = match buckets {
+            Some(buckets) => doc
+                .member(buckets, seconds)?
+                .filter(|&n| !matches!(doc.node(n).map(|n| n.value), Ok(Value::Null))),
+            None => None,
+        };
+        let details = doc.member(value, "input_tokens_details")?.filter(|&n| object(doc, n));
+        let parent = match details {
+            Some(d) => doc.member(d, "cache_write_tokens_details")?.filter(|&n| object(doc, n)),
+            None => None,
+        };
+        match (canonical, parent) {
+            (Some(count), parent) => {
+                let parent = match (parent, details) {
+                    (Some(p), _) => p,
+                    (None, Some(d)) => doc.set(d, "cache_write_tokens_details", Value::Object)?,
+                    (None, None) => {
+                        let d = doc.set(value, "input_tokens_details", Value::Object)?;
+                        doc.set(d, "cache_write_tokens_details", Value::Object)?
+                    }
+                };
+                let target = doc.set(parent, field, Value::Null)?;
+                doc.transplant(target, count)?;
+            }
+            (None, Some(parent)) => {
+                if ttl_count(doc, parent, field)?.is_some() {
+                    doc.remove(parent, field)?;
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Responses usage for canonical snapshot `usage`: a Responses source's native value, or the
 /// mapped counts.
 pub(super) fn project(doc: &mut Document, usage: usize) -> Result<usize> {
@@ -134,13 +224,7 @@ pub(super) fn project(doc: &mut Document, usage: usize) -> Result<usize> {
         return Ok(value);
     }
     let result = doc.add(None, Value::Object)?;
-    for name in [
-        "input_tokens",
-        "output_tokens",
-        "total_tokens",
-        "input_uncached_tokens",
-        "cache_write_by_ttl",
-    ] {
+    for name in ["input_tokens", "output_tokens", "total_tokens", "input_uncached_tokens"] {
         super::move_field(doc, usage, name, result, name)?;
     }
     for (name, fields) in [
@@ -204,13 +288,13 @@ fn cache_details(doc: &mut Document, usage: usize) -> Result<()> {
 }
 
 /// Canonical counts and the native Responses member each one maps to: `(canonical, details
-/// object, native name)`.
+/// object, native name)`. TTL buckets have no top-level Responses member; [`overlay_ttl`] writes
+/// them into `cache_write_tokens_details`.
 const NATIVE_COUNTS: &[(&str, Option<&str>, &str)] = &[
     ("input_tokens", None, "input_tokens"),
     ("output_tokens", None, "output_tokens"),
     ("total_tokens", None, "total_tokens"),
     ("input_uncached_tokens", None, "input_uncached_tokens"),
-    ("cache_write_by_ttl", None, "cache_write_by_ttl"),
     ("cache_read_tokens", Some("input_tokens_details"), "cached_tokens"),
     ("input_audio_tokens", Some("input_tokens_details"), "audio_tokens"),
     ("reasoning_tokens", Some("output_tokens_details"), "reasoning_tokens"),
@@ -273,5 +357,5 @@ fn overlay(doc: &mut Document, usage: usize, value: usize) -> Result<()> {
             }
         }
     }
-    Ok(())
+    overlay_ttl(doc, usage, value)
 }

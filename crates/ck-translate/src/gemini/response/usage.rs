@@ -60,7 +60,6 @@ pub(super) fn emit(emitter: &mut Emitter, owner: &mut Writer, doc: &Document, fi
             e.bytes(b",\"usage\":{\"final\":")?;
             e.bytes(if final_snapshot { b"true" } else { b"false" })?;
             for (wire, canonical) in [
-                ("promptTokenCount", "input_tokens"),
                 ("totalTokenCount", "total_tokens"),
                 ("cachedContentTokenCount", "cache_read_tokens"),
                 ("thoughtsTokenCount", "reasoning_tokens"),
@@ -74,7 +73,23 @@ pub(super) fn emit(emitter: &mut Emitter, owner: &mut Writer, doc: &Document, fi
                     doc.write(n, e)?;
                 }
             }
-            output(doc, root, e)?;
+            let input = sum(
+                doc,
+                root,
+                "promptTokenCount",
+                "toolUsePromptTokenCount",
+                "input_tokens",
+                e,
+            )?;
+            let output = sum(
+                doc,
+                root,
+                "candidatesTokenCount",
+                "thoughtsTokenCount",
+                "output_tokens",
+                e,
+            )?;
+            derived(&[input, output], e)?;
             modalities(doc, root, e)?;
             e.bytes(b",\"native\":{\"protocol\":\"gemini\",\"value\":")?;
             doc.write(root, e)?;
@@ -93,24 +108,46 @@ fn known(doc: &Document, parent: usize, key: &str) -> Result<Option<u64>> {
     }
 }
 
-/// Inclusive output: `candidatesTokenCount` excludes thoughts, so a reported thought count is
-/// added and marks the sum derived. A null thought count leaves the output unknown.
-fn output(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
-    let Some(candidates) = known(doc, root, "candidatesTokenCount")? else {
-        return Ok(());
+/// Writes `canonical` as the reported `base` plus `addend`: Gemini counts tool-use prompt tokens
+/// apart from the prompt and thoughts apart from the candidates, and bills both. An omitted
+/// addend adds nothing; a null one, or one that is not an unsigned integer, leaves the sum
+/// unknown rather than failing the snapshot. Returns the name when the sum added a reported
+/// addend, so it is derived.
+fn sum(
+    doc: &Document,
+    root: usize,
+    base: &str,
+    addend: &str,
+    canonical: &'static str,
+    e: &mut Encoder<'_, '_>,
+) -> Result<Option<&'static str>> {
+    let Some(base) = known(doc, root, base)? else {
+        return Ok(None);
     };
-    let thoughts = doc.member(root, "thoughtsTokenCount")?;
-    let total = match thoughts {
-        None => candidates,
-        Some(_) => match known(doc, root, "thoughtsTokenCount")? {
-            Some(thoughts) => candidates.checked_add(thoughts).ok_or(Error::Schema)?,
-            None => return Ok(()),
+    let (total, derived) = match doc.member(root, addend)? {
+        None => (base, None),
+        Some(node) => match doc.unsigned(node) {
+            Ok(addend) => (base.checked_add(addend).ok_or(Error::Schema)?, Some(canonical)),
+            Err(Error::Schema) => return Ok(None),
+            Err(error) => return Err(error),
         },
     };
-    e.bytes(b",\"output_tokens\":")?;
+    e.bytes(b",")?;
+    e.string(canonical)?;
+    e.bytes(b":")?;
     e.unsigned(total)?;
-    if thoughts.is_some() {
-        e.bytes(b",\"derived\":[\"output_tokens\"]")?;
+    Ok(derived)
+}
+
+fn derived(names: &[Option<&str>], e: &mut Encoder<'_, '_>) -> Result<()> {
+    let mut first = true;
+    for name in names.iter().flatten() {
+        e.bytes(if first { b",\"derived\":[" } else { b"," })?;
+        first = false;
+        e.string(name)?;
+    }
+    if !first {
+        e.bytes(b"]")?;
     }
     Ok(())
 }

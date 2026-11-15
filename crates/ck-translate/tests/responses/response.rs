@@ -249,3 +249,96 @@ fn interleaved_items_and_content_keep_native_indexes_and_final_order() {
         assert_eq!(body["output"][0]["content"], first["content"]);
     }
 }
+
+/// OpenAI's 30-minute and 12-hour cache writes reach the canonical TTL buckets under their own
+/// durations, never Anthropic's 300 and 3600 seconds, and the Responses client sees its usage
+/// unchanged.
+#[test]
+fn cache_write_ttl_details_reach_their_canonical_buckets() {
+    for (details, buckets) in [
+        (
+            json!({"ttl_30m_tokens":3,"ttl_12h_tokens":4}),
+            json!({"1800":3,"43200":4}),
+        ),
+        (json!({"ttl_30m_tokens":null,"ttl_12h_tokens":4}), json!({"43200":4})),
+        // A malformed count is unknown; it neither fails the snapshot nor changes the client's view.
+        (json!({"ttl_30m_tokens":-1,"ttl_12h_tokens":4}), json!({"43200":4})),
+    ] {
+        let input = json!({"id":"r","model":"m","created_at":42,"status":"completed","output":[{"id":"msg","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":53,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":7,"cache_write_tokens_details":details},"output_tokens":18,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":71}});
+        let (out, events) = response(
+            &serde_json::to_vec(&input).unwrap(),
+            BodyMode::Buffered,
+            BodyMode::Buffered,
+            Operation::Generate,
+        );
+        let usage = events.iter().rev().find_map(|e| e.get("usage")).unwrap();
+        assert_eq!(usage["cache_write_by_ttl"], buckets);
+        assert_eq!(usage["cache_write_tokens"], 7);
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(out["usage"], input["usage"]);
+    }
+}
+
+/// The Responses usage a buffered Responses client receives for one canonical usage payload.
+fn egress_usage(usage: &[u8]) -> Value {
+    use codec::event::{Emitter, Kind, Scope};
+    let mut m = Mapped::new();
+    let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
+    let mut emitter = Emitter::new(identity(Direction::Response));
+    let records: [(Kind, &[u8]); 3] = [
+        (Kind::ResponseStart, br#","id":"r","model":"m","created":1"#),
+        (Kind::Usage, usage),
+        (Kind::Done, b""),
+    ];
+    for (kind, payload) in records {
+        emitter
+            .emit(&mut m.writer, kind, Scope::default(), |e| e.bytes(payload), |_| Ok(()))
+            .unwrap();
+    }
+    let mut egress =
+        responses::egress::Egress::new(&mut m.writer, Operation::Generate, BodyMode::Buffered, |_, _| {}).unwrap();
+    let mut out = Vec::new();
+    while let std::task::Poll::Ready(Some(ck_stream::Read::Record(record))) = reader.try_next() {
+        egress
+            .advance(&mut m.writer, record, |chunk| {
+                out.extend_from_slice(&bytes(&chunk));
+                Ok(())
+            })
+            .unwrap();
+    }
+    egress.finish().unwrap();
+    serde_json::from_slice::<Value>(&out).unwrap()["usage"].clone()
+}
+
+/// A changed or removed canonical TTL bucket wins over the native count, inside the official
+/// `cache_write_tokens_details`.
+#[test]
+fn canonical_ttl_buckets_win_over_the_native_details() {
+    let usage = egress_usage(
+        br#","usage":{"input_tokens":53,"output_tokens":18,"total_tokens":71,"cache_read_tokens":0,"cache_write_tokens":4,"cache_write_by_ttl":{"1800":0},"native":{"protocol":"responses","value":{"input_tokens":53,"output_tokens":18,"total_tokens":71,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":7,"cache_write_tokens_details":{"ttl_30m_tokens":3,"ttl_12h_tokens":4}}}},"final":true}"#,
+    );
+    assert_eq!(
+        usage["input_tokens_details"],
+        json!({"cached_tokens":0,"cache_write_tokens":4,"cache_write_tokens_details":{"ttl_30m_tokens":0}})
+    );
+    // A bucket the native value has no place for creates the official objects.
+    let usage = egress_usage(
+        br#","usage":{"input_tokens":53,"output_tokens":18,"total_tokens":71,"cache_write_tokens":4,"cache_write_by_ttl":{"43200":4},"native":{"protocol":"responses","value":{"input_tokens":53,"output_tokens":18,"total_tokens":71}},"final":true}"#,
+    );
+    assert_eq!(
+        usage["input_tokens_details"]["cache_write_tokens_details"],
+        json!({"ttl_12h_tokens":4})
+    );
+}
+
+/// Another source's TTL buckets have no Responses member: Anthropic's 300 and 3600 seconds are
+/// neither sent as such nor substituted for OpenAI's durations.
+#[test]
+fn foreign_ttl_buckets_stay_out_of_responses_usage() {
+    let usage = egress_usage(
+        br#","usage":{"input_tokens":12,"output_tokens":9,"total_tokens":21,"input_uncached_tokens":2,"cache_read_tokens":3,"cache_write_tokens":7,"cache_write_by_ttl":{"300":4,"3600":3},"native":{"protocol":"anthropic","value":{"input_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":7,"output_tokens":9,"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":3}}},"final":true}"#,
+    );
+    assert_eq!(usage.get("cache_write_by_ttl"), None);
+    assert_eq!(usage["input_tokens_details"].get("cache_write_tokens_details"), None);
+    assert_eq!(usage["input_tokens_details"]["cache_write_tokens"], 7);
+}

@@ -64,3 +64,33 @@ fn null_thoughts_leave_the_output_unknown() {
     ]);
     assert!(usage.get("output_tokens").is_none());
 }
+
+/// `toolUsePromptTokenCount` is billed input (`totalTokenCount` = prompt + tool use + thoughts
+/// + candidates), so canonical input adds it; a Gemini client still sees the native counts.
+#[test]
+fn tool_use_prompt_tokens_count_as_input() {
+    let metadata = json!({"promptTokenCount":100,"toolUsePromptTokenCount":20,"candidatesTokenCount":10,"thoughtsTokenCount":5,"totalTokenCount":135});
+    let (usage, out) = usage(&[
+        json!({"candidates":[{"content":{"parts":[{"text":"a"}]},"finishReason":"STOP"}],"usageMetadata":metadata}),
+    ]);
+    assert_eq!(
+        [&usage["input_tokens"], &usage["output_tokens"], &usage["total_tokens"]],
+        [&json!(120), &json!(15), &json!(135)]
+    );
+    assert_eq!(usage["derived"], json!(["input_tokens", "output_tokens"]));
+    assert_eq!(out["usageMetadata"], metadata);
+}
+
+/// A null or malformed tool-use count leaves the input unknown; the rest of the snapshot is
+/// still published.
+#[test]
+fn unknown_tool_use_count_leaves_the_input_unknown() {
+    for tool_use in [json!(null), json!(-1)] {
+        let (usage, _) = usage(&[
+            json!({"candidates":[{"content":{"parts":[{"text":"a"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"toolUsePromptTokenCount":tool_use,"candidatesTokenCount":10}}),
+        ]);
+        assert!(usage.get("input_tokens").is_none());
+        assert_eq!(usage["output_tokens"], 10);
+        assert!(usage.get("derived").is_none());
+    }
+}
