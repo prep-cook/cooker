@@ -468,6 +468,7 @@ dependencies = [
  "ck-core",
  "ck-stream",
  "ck-wire",
+ "nostd-multipart",
  "rand",
  "regex",
  "serde_json",
@@ -1285,6 +1286,12 @@ dependencies = [
  "memchr",
  "minimal-lexical",
 ]
+
+[[package]]
+name = "nostd-multipart"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ded17c46cc8ed2f41d364590c08eed7bb1ccc71a84fbb5ebdaf60c83b61f7f6"
 
 [[package]]
 name = "nu-ansi-term"
