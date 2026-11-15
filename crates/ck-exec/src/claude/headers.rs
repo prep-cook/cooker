@@ -348,10 +348,6 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
             "User-Agent",
             &format!("CLIProxyAPI/{}", crate::claude::PROXY_VERSION),
         );
-        // Owner ruling: the API-key path identifies as cooker.
-        if p.official {
-            h.set("User-Agent", "cooker");
-        }
         apply_betas(&mut h, &base);
         if !p.session_id.trim().is_empty() {
             h.set("X-Claude-Code-Session-Id", p.session_id.trim());

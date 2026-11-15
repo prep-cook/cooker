@@ -245,7 +245,7 @@ async fn anthropic_requests_reach_the_upstream_as_the_old_route_sent_them() {
         if let ck_core::exec::ResponseBody::Stream(events) = &mut answer.body {
             while events.next().await.is_some() {}
         }
-        let ((new_body, new), (old_body, _)) = (sent(&new), sent(&old));
+        let ((new_body, new), (old_body, old)) = (sent(&new), sent(&old));
         // The Anthropic egress writes members in its own order; every member and value is the
         // old route's.
         assert_eq!(new_body, old_body);
@@ -253,7 +253,10 @@ async fn anthropic_requests_reach_the_upstream_as_the_old_route_sent_them() {
         // A key on an origin other than api.anthropic.com goes as a bearer token.
         assert_eq!(new.header("authorization"), Some("Bearer sk-ant-api03-test"));
         assert_eq!(new.header("anthropic-version"), Some("2023-06-01"));
-        assert_eq!(new.header("user-agent"), Some("cooker"));
+        // The User-Agent stays the old route's until the owner decides Q12.
+        let agent = format!("CLIProxyAPI/{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(new.header("user-agent"), Some(agent.as_str()));
+        assert_eq!(new.header("user-agent"), old.header("user-agent"));
     }
 }
 
@@ -442,7 +445,8 @@ async fn thinking_budgets_and_forced_tools_are_refused_never_adjusted() {
     let schema = |verdict: codec::Result<()>| matches!(verdict, Err(codec::Error::Schema));
     let unsupported = |verdict: codec::Result<()>| matches!(verdict, Err(codec::Error::Unsupported));
     assert!(schema(verdict(SONNET, request(manual(1023), 2048, auto.clone())).await));
-    assert!(schema(verdict(SONNET, request(manual(2048), 2048, auto.clone())).await));
+    // Interleaved thinking allows a budget of at least `max_tokens`; the official API judges.
+    assert!(verdict(SONNET, request(manual(2048), 2048, auto.clone())).await.is_ok());
     assert!(unsupported(
         verdict("claude-opus-4-7", request(manual(2048), 4096, auto)).await
     ));

@@ -161,8 +161,9 @@ impl Capability for AnthropicCapability {
     }
 }
 impl AnthropicCapability {
-    /// Refuses a thinking budget the model or the API would refuse: below the minimum, not
-    /// below `max_tokens`, or sent to an adaptive-only model. Nothing is adjusted.
+    /// Refuses a thinking budget below the minimum or sent to an adaptive-only model; nothing
+    /// is adjusted. A budget of at least `max_tokens` passes: interleaved thinking, a header
+    /// the fence does not see, allows it, so the official API judges.
     fn budget(&self, view: RequestView<'_>) -> Result<()> {
         let (doc, root) = (view.document, view.document.root());
         let Some(thinking) = doc.member(doc.required(root, "x_ck")?, "thinking")? else {
@@ -179,14 +180,7 @@ impl AnthropicCapability {
             Budget::Manual { min } => min.max(1024),
             Budget::Adaptive => return Err(Error::Unsupported),
         };
-        // Encoding writes `max_completion_tokens`, else the default, as `max_tokens`.
-        let stated = doc.member(root, "max_tokens")?;
-        let limit = match stated.or(doc.member(root, "max_completion_tokens")?) {
-            Some(n) => Some(doc.unsigned(n)?),
-            None if view.operation == Operation::Generate => self.default_max_tokens,
-            None => None,
-        };
-        if budget < min || limit.is_some_and(|limit| budget >= limit) {
+        if budget < min {
             return Err(Error::Schema);
         }
         Ok(())
