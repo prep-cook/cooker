@@ -103,9 +103,10 @@ pub(super) fn continues(doc: &Document, previous: usize, message: usize) -> Resu
     }
     Ok(true)
 }
-/// The last call with `id` in the model turn starting at message `run`.
+/// The one call with `id` in the model turn starting at message `run`; none when no call or
+/// several carry it.
 pub(super) fn answered(doc: &Document, run: Option<usize>, id: usize) -> Result<Option<usize>> {
-    let (mut found, mut message) = (None, run);
+    let (mut found, mut count, mut message) = (None, 0, run);
     while let Some(m) = message {
         for call in doc
             .member(m, "tool_calls")?
@@ -115,15 +116,19 @@ pub(super) fn answered(doc: &Document, run: Option<usize>, id: usize) -> Result<
             .flatten()
         {
             if doc.equal_strings(doc.required(call, "id")?, id)? {
-                found = Some(call);
+                (found, count) = (Some(call), count + 1);
             }
         }
-        message = match doc.node(m)?.next {
-            Some(n) if continues(doc, m, n)? => Some(n),
-            _ => None,
-        };
+        message = next_in_turn(doc, m)?;
     }
-    Ok(found)
+    Ok(found.filter(|_| count == 1))
+}
+/// The message after `message` in its model turn.
+pub(super) fn next_in_turn(doc: &Document, message: usize) -> Result<Option<usize>> {
+    Ok(match doc.node(message)?.next {
+        Some(n) if continues(doc, message, n)? => Some(n),
+        _ => None,
+    })
 }
 /// A Chat tool message, or a tool result without Gemini's `result`, answers a call of the
 /// preceding model turn and carries only text.

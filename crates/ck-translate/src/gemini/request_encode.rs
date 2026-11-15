@@ -5,7 +5,7 @@ use crate::codec::{
     document::{Document, Value},
     encode::Encoder,
 };
-use calls::{function_call, function_response, function_result};
+use calls::{function_call, function_response, function_results};
 
 #[path = "request_calls.rs"]
 mod calls;
@@ -39,16 +39,10 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
         if !(results && tool || open) {
             comma(&mut first, e)?;
         }
-        if tool {
-            e.bytes(if results {
-                b","
-            } else {
-                b"{\"role\":\"user\",\"parts\":["
-            })?;
-            e.bytes(b"{")?;
-            function_result(doc, message, run, e)?;
-            e.bytes(b"}")?;
-        } else {
+        if tool && !results {
+            e.bytes(b"{\"role\":\"user\",\"parts\":[")?;
+            function_results(doc, message, run, e)?;
+        } else if !tool {
             let joined = open;
             open = write_message(view, message, false, run, joined, e)?;
             if !joined {
@@ -426,9 +420,7 @@ fn write_message(
             write_part(view, call, None, previous, e)?;
         }
     }
-    if let Some(next) = doc.node(message)?.next
-        && super::request_schema::continues(doc, message, next)?
-    {
+    if super::request_schema::next_in_turn(doc, message)?.is_some() {
         return Ok(true);
     }
     // Only a Gemini client's turns carry Gemini originals, and those are never joined.

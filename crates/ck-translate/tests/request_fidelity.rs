@@ -197,7 +197,7 @@ fn property_ordering_scales_linearly() {
 }
 
 /// A Responses client sends parallel calls as one item each; Gemini receives them as one model
-/// turn and their outputs, in the client's order, as one user turn.
+/// turn and their outputs, in the order of their calls, as one user turn.
 fn rs_parallel(calls: &[(&str, &str)], outputs: &[&str]) -> Value {
     let mut input = vec![json!({"type":"message","role":"user","content":"go"})];
     for (id, name) in calls {
@@ -212,15 +212,14 @@ fn rs_parallel(calls: &[(&str, &str)], outputs: &[&str]) -> Value {
         .collect();
     json!({"model":"gemini-x","input":input,"tools":tools})
 }
-fn gm_parallel(calls: &[(&str, &str)], outputs: &[&str]) -> Value {
-    let name = |id: &&str| calls.iter().find(|(c, _)| c == id).unwrap().1;
+fn gm_parallel(calls: &[(&str, &str)]) -> Value {
+    let results: Vec<Value> = calls
+        .iter()
+        .map(|(id, name)| json!({"functionResponse":{"name":name,"id":id,"response":{"result":format!("out {id}")}}}))
+        .collect();
     let calls: Vec<Value> = calls
         .iter()
         .map(|(id, name)| json!({"functionCall":{"name":name,"id":id,"args":{}}}))
-        .collect();
-    let results: Vec<Value> = outputs
-        .iter()
-        .map(|id| json!({"functionResponse":{"name":name(id),"id":id,"response":{"result":format!("out {id}")}}}))
         .collect();
     json!([{"role":"user","parts":[{"text":"go"}]},{"role":"model","parts":calls},{"role":"user","parts":results}])
 }
@@ -234,8 +233,40 @@ fn responses_parallel_calls_reach_gemini_as_one_turn() {
         (&[("a", "f"), ("b", "g"), ("c", "h")], &["c", "a", "b"]),
     ] {
         let out = translate(P::Responses, P::Gemini, &rs_parallel(calls, outputs)).unwrap();
-        assert_eq!(out["contents"], gm_parallel(calls, outputs), "{calls:?} {outputs:?}");
+        assert_eq!(out["contents"], gm_parallel(calls), "{calls:?} {outputs:?}");
     }
+}
+
+/// Gemini before 3 pairs responses with calls by position, so outputs in completion order are
+/// written in call order; with one function name the city's result stays with its call.
+#[test]
+fn responses_outputs_reach_gemini_in_call_order() {
+    let input = json!({"model":"gemini-x","input":[
+        {"type":"function_call","call_id":"a","name":"weather","arguments":"{\"city\":\"Paris\"}"},
+        {"type":"function_call","call_id":"b","name":"weather","arguments":"{\"city\":\"London\"}"},
+        {"type":"function_call_output","call_id":"b","output":"London: rain"},
+        {"type":"function_call_output","call_id":"a","output":"Paris: sun"}]});
+    let out = translate(P::Responses, P::Gemini, &input).unwrap();
+    assert_eq!(
+        out["contents"],
+        json!([
+            {"role":"model","parts":[
+                {"functionCall":{"name":"weather","id":"a","args":{"city":"Paris"}}},
+                {"functionCall":{"name":"weather","id":"b","args":{"city":"London"}}}]},
+            {"role":"user","parts":[
+                {"functionResponse":{"name":"weather","id":"a","response":{"result":"Paris: sun"}}},
+                {"functionResponse":{"name":"weather","id":"b","response":{"result":"London: rain"}}}]}])
+    );
+}
+
+/// An output whose id two calls of the turn share has no single call to pair with.
+#[test]
+fn responses_output_for_a_shared_call_id_stays_unsupported_at_gemini() {
+    unsupported(translate(
+        P::Responses,
+        P::Gemini,
+        &rs_parallel(&[("a", "f"), ("a", "g")], &["a"]),
+    ));
 }
 
 /// An output answering a call of an earlier model turn has no Gemini form.
