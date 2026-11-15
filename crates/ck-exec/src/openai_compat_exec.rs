@@ -178,6 +178,7 @@ impl OpenAICompatExecutor {
             client: self.client(credential, attempt.cfg),
             base_url,
             key,
+            api_auth: true,
             compat: payload::resolve_compat(credential, attempt.cfg),
         })
     }
@@ -189,6 +190,7 @@ pub(crate) struct Route {
     pub client: wreq::Client,
     pub base_url: String,
     pub key: String,
+    pub api_auth: bool,
     pub compat: Option<payload::Compat>,
 }
 
@@ -268,7 +270,7 @@ async fn send(
     body: Vec<u8>,
     stream: bool,
 ) -> Result<wire::Upstream, ExecError> {
-    let mut headers = compat::base_headers(&route.key, "application/json");
+    let mut headers = crate::openai_compat_headers::base_headers(&route.key, "application/json", route.api_auth);
     let session = ck_wire::session::cpa_session_id(request.client.session);
     for (name, value) in ck_wire::headers::custom_headers(
         &attempt.credential.attributes,
@@ -276,6 +278,9 @@ async fn send(
         session.as_deref(),
     ) {
         headers.set(&name, value);
+    }
+    if route.api_auth {
+        headers.set("User-Agent", compat::USER_AGENT);
     }
     if stream {
         headers.set("Accept", "text/event-stream");

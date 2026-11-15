@@ -18,11 +18,12 @@ use ck_wire::thinking::{self, ModelCaps, RequestThinking, parse_suffix};
 
 use crate::gemini_stream::ClaudeInputTokens;
 use crate::openai_compat_go as go;
+use crate::openai_compat_headers::base_headers;
 use crate::openai_compat_http::{self as wire, Clients, GoHeaders};
 use crate::openai_compat_multipart as multipart;
 use crate::openai_compat_payload as payload;
 
-pub const USER_AGENT: &str = "cli-proxy-openai-compat";
+pub const USER_AGENT: &str = "cooker";
 const COMPACT_ALT: &str = "responses/compact";
 const IMAGES_GENERATIONS: &str = "/images/generations";
 const IMAGES_EDITS: &str = "/images/edits";
@@ -232,16 +233,6 @@ fn apply_thinking(
     .map_err(|e| ExecError::local(400, FailureScope::Request, e.message))
 }
 
-pub(crate) fn base_headers(api_key: &str, content_type: &str) -> GoHeaders {
-    let mut headers = GoHeaders::new();
-    headers.set("Content-Type", content_type);
-    if !api_key.is_empty() {
-        headers.set("Authorization", format!("Bearer {api_key}"));
-    }
-    headers.set("User-Agent", USER_AGENT);
-    headers
-}
-
 /// `util.ApplyCustomHeadersFromAttrs` with the client headers and the canonical session.
 fn apply_custom(headers: &mut GoHeaders, credential: &Credential, req: &ExecRequest) {
     let session = ck_wire::session::cpa_session_id(req.session.as_deref());
@@ -280,7 +271,15 @@ impl OpenAICompatExecutor {
         let (base_url, api_key) = credentials(credential);
         let compat = payload::resolve_compat(credential, cfg);
         let client = self.clients.for_credential(credential, cfg);
-        chat_with(&client, credential, req, cfg, &base_url, &api_key, compat.as_ref()).await
+        chat_with(
+            &client,
+            credential,
+            req,
+            cfg,
+            (&base_url, &api_key, true),
+            compat.as_ref(),
+        )
+        .await
     }
 
     /// `executeImages` / `executeImagesStream`: the body (JSON or multipart) goes to
@@ -329,12 +328,13 @@ impl OpenAICompatExecutor {
         if req.usage.enabled() {
             req.usage.request(Format::OpenAI, &body);
         }
-        let mut headers = base_headers(&api_key, &content_type);
+        let mut headers = base_headers(&api_key, &content_type, true);
         if req.stream {
             headers.set("Accept", "text/event-stream");
             headers.set("Cache-Control", "no-cache");
         }
         apply_custom(&mut headers, credential, &req);
+        headers.set("User-Agent", USER_AGENT);
         let client = self.clients.for_credential(credential, cfg);
         let url = endpoint(&base_url, path);
         let capture = wire::Capture::request(
@@ -393,8 +393,7 @@ pub(crate) async fn chat_with(
     credential: &Credential,
     req: ExecRequest,
     cfg: &Config,
-    base_url: &str,
-    api_key: &str,
+    (base_url, api_key, api_auth): (&str, &str, bool),
     compat: Option<&payload::Compat>,
 ) -> Result<ExecResponse, ExecError> {
     let base_model = parse_suffix(&req.model).model_name;
@@ -447,8 +446,11 @@ pub(crate) async fn chat_with(
     }
     // The payload rules are the last change to the body (868e137).
     body = apply_payload_rules(cfg, &req, &base_model, target, &original, body);
-    let mut headers = base_headers(api_key, "application/json");
+    let mut headers = base_headers(api_key, "application/json", api_auth);
     apply_custom(&mut headers, credential, &req);
+    if api_auth {
+        headers.set("User-Agent", USER_AGENT);
+    }
     if req.stream {
         headers.set("Accept", "text/event-stream");
         headers.set("Cache-Control", "no-cache");

@@ -155,8 +155,7 @@ fn assert_api_key_request(captured: &Captured, path: &str) {
     assert_eq!(captured.method, "POST");
     assert_eq!(captured.path, path);
     assert_eq!(captured.header("x-goog-api-key"), Some(KEY));
-    // The transport's default, as the old path sends it.
-    assert_eq!(captured.header("user-agent"), Some("Go-http-client/1.1"));
+    assert_eq!(captured.header("user-agent"), Some("cooker"));
     assert_eq!(captured.header("content-type"), Some("application/json"));
     assert_eq!(captured.header("authorization"), None);
 }

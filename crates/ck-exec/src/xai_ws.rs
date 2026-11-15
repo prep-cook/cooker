@@ -6,15 +6,15 @@
 //! `codexWebsocketSession` between both executors; xAI keeps its own pool instance. On top
 //! of that, every session has an [`IdState`] (`xaiWebsocketIDState`): xAI reuses response
 //! IDs and loses upstream state when the socket's target changes, so downstream response
-//! IDs are rewritten to stay unique, the conversation transcript is kept to replay it on a
-//! fresh target, and a `compaction_trigger` turn compacts that transcript over HTTP.
+//! IDs are rewritten to stay unique and the conversation transcript is kept to replay it
+//! on a fresh target. Compaction triggers follow the ordinary upstream WebSocket path.
 // ponytail: Go's branch for a WebSocket turn without a downstream WebSocket (SSE encoding
 // and client translation) is unreachable through `XAIAutoExecutor` and not ported, nor
 // are the sessionless ephemeral sockets or `CloseXAIWebsocketSessionsForAuthID`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use bytes::Bytes;
 use ck_core::config::Config;
@@ -24,7 +24,7 @@ use ck_core::exec::{
     UpstreamRequest,
 };
 use ck_core::format::Format;
-use ck_wire::json::{self as gj, GoValue, Kind};
+use ck_wire::json::{self as gj, GoValue};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use tokio::sync::{OwnedMutexGuard, mpsc};
@@ -32,7 +32,7 @@ use tokio::sync::{OwnedMutexGuard, mpsc};
 use crate::codex_ws::{self, Pool, Read, Session, Target, Upstream};
 use crate::openai_compat::status_err;
 use crate::openai_compat_payload::ensure_responses_usage_details;
-use crate::xai::{XaiExecutor, apply_patch_error, compaction_frames, compaction_item, compaction_response_id, creds};
+use crate::xai::{XaiExecutor, apply_patch_error, creds};
 use crate::xai_auth::DEFAULT_API_BASE_URL;
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_request as request;
@@ -142,7 +142,6 @@ struct IdInner {
     downstream_to_upstream: HashMap<String, String>,
     sequence: u64,
     transcript: Vec<Vec<u8>>,
-    replay_compacted_on_reset: bool,
     /// The target of the session's last socket (Go keeps `sess.authID`, `wsURL` and
     /// `proxyURL` after the socket is gone).
     last_target: Option<Target>,
@@ -165,40 +164,20 @@ impl IdState {
         }
     }
 
-    /// `mapDownstreamToUpstream`.
-    fn map(&self, downstream: &str, upstream: &str) {
-        let downstream = downstream.trim();
-        if downstream.is_empty() {
-            return;
-        }
-        self.lock()
-            .downstream_to_upstream
-            .insert(downstream.to_owned(), upstream.trim().to_owned());
-    }
-
-    /// `snapshotTranscriptInput`.
-    fn snapshot(&self) -> Option<Vec<u8>> {
-        let inner = self.lock();
-        (!inner.transcript.is_empty()).then(|| raw_array(&inner.transcript))
-    }
-
     /// The transcript prepended to `payload`'s input.
-    fn prepend(&self, payload: Vec<u8>, only_compacted: bool) -> (Vec<u8>, bool) {
+    fn prepend(&self, payload: Vec<u8>) -> Vec<u8> {
         let prefix = {
             let inner = self.lock();
-            if only_compacted && !inner.replay_compacted_on_reset {
-                return (payload, false);
-            }
             inner.transcript.clone()
         };
         if prefix.is_empty() {
-            return (payload, false);
+            return payload;
         }
         let mut merged = prefix;
         merged.extend(raw_items(&gj::get(&payload, "input")));
         let mut out = payload;
         gj::set_raw(&mut out, "input", raw_array(&merged));
-        (out, true)
+        out
     }
 
     /// `recordTranscriptTurn`.
@@ -211,23 +190,9 @@ impl IdState {
         let mut inner = self.lock();
         if reset {
             inner.transcript.clear();
-            inner.replay_compacted_on_reset = false;
         }
         inner.transcript.extend(input);
         inner.transcript.extend(output);
-    }
-
-    /// `replaceTranscriptWithItems`.
-    fn replace(&self, items: &[&[u8]]) {
-        let next: Vec<Vec<u8>> = items
-            .iter()
-            .map(|item| ck_wire::gostr::trim_space(item))
-            .filter(|item| !item.is_empty() && gj::std_valid(item))
-            .map(<[u8]>::to_vec)
-            .collect();
-        let mut inner = self.lock();
-        inner.replay_compacted_on_reset = !next.is_empty();
-        inner.transcript = next;
     }
 
     /// `websocketSessionTargetChanged`; `live` when the session's socket for the same
@@ -277,7 +242,6 @@ struct IdMapper {
     upstream_previous: String,
     upstream_response: String,
     downstream_response: String,
-    replayed_compacted: bool,
 }
 
 impl IdMapper {
@@ -297,7 +261,6 @@ impl IdMapper {
             upstream_previous,
             upstream_response: String::new(),
             downstream_response: String::new(),
-            replayed_compacted: false,
         }
     }
 
@@ -307,20 +270,13 @@ impl IdMapper {
             return payload;
         }
         if self.downstream_previous == self.upstream_previous {
-            let request_type = text(&gj::get(&payload, "type"));
-            if self.downstream_previous.is_empty() && request_type.trim() == "response.append" {
-                let (out, replayed) = self.state.prepend(payload, true);
-                self.replayed_compacted = replayed;
-                return out;
-            }
             return payload;
         }
         let mut out = payload;
         if self.upstream_previous.is_empty() {
             gj::delete(&mut out, "previous_response_id");
             if !self.downstream_previous.is_empty() {
-                out = self.state.prepend(out, false).0;
-                self.replayed_compacted = true;
+                out = self.state.prepend(out);
             }
             return out;
         }
@@ -674,56 +630,10 @@ fn handshake_headers(credential: &Credential, token: &str, session_id: &str, req
     for (name, value) in ck_wire::headers::custom_headers(&credential.attributes, &req.headers, session.as_deref()) {
         set(&name, &value);
     }
+    if ck_core::registry::dynamic::is_api_key(credential) {
+        set("user-agent", "cooker");
+    }
     headers
-}
-
-// --- compaction (executeCompactionTriggerFromWebsocketContext) ---------------------------
-
-/// `buildXAIWebsocketCompactionPayload`.
-fn compaction_payload(payload: &[u8], transcript: &[u8]) -> Vec<u8> {
-    let mut out = if payload.is_empty() {
-        b"{}".to_vec()
-    } else {
-        payload.to_vec()
-    };
-    gj::set_raw(
-        &mut out,
-        "input",
-        if transcript.is_empty() { &b"[]"[..] } else { transcript },
-    );
-    gj::delete(&mut out, "previous_response_id");
-    out
-}
-
-/// `validateXAIWebsocketCompactionResponse`: the normalized response ID and the
-/// compaction item to keep as the transcript.
-fn validate_compaction(data: &[u8]) -> Result<(String, Vec<u8>), ExecError> {
-    let missing = || status_err(502, "xai websocket compaction response is missing compacted state");
-    if data.is_empty() || !gj::std_valid(data) {
-        return Err(status_err(502, "xai websocket compaction returned invalid JSON"));
-    }
-    let id = gj::get(data, "id");
-    let output = gj::get(data, "output");
-    if id.kind != Kind::String || id.str().trim().is_empty() || !output.exists() || !output.is_array() {
-        return Err(missing());
-    }
-    let items = output.array();
-    let Some(item) = items.first() else {
-        return Err(missing());
-    };
-    let item_type = item.get("type");
-    let encrypted = item.get("encrypted_content");
-    if item.kind != Kind::Json
-        || item_type.kind != Kind::String
-        || item_type.str().trim() != "compaction"
-        || encrypted.kind != Kind::String
-        || encrypted.str().trim().is_empty()
-    {
-        return Err(missing());
-    }
-    let response_id = compaction_response_id(data, SystemTime::now());
-    let item = compaction_item(data, &response_id);
-    Ok((response_id, item))
 }
 
 // --- capture (RecordAPIWebsocket*) ------------------------------------------------------
@@ -1104,20 +1014,6 @@ impl XaiExecutor {
         if state_id.is_empty() {
             state_id.clone_from(&exec_id);
         }
-        // The ID state is taken after the session and its turn lock, as Go builds the
-        // mapper: a credential removal drops both together, so a replacement session
-        // never shares a state that was already dropped.
-        if crate::xai::input_has_item_type(&req.body, "compaction_trigger") {
-            if exec_session.continuation {
-                req.usage.discard();
-                return Err(ExecError::replay_required());
-            }
-            let session = self.ws.pool.session(&exec_id);
-            let _turn = session.turn.clone().lock_owned().await;
-            let mapper = self.ws.state(&state_id).map(|s| IdMapper::new(s, &req.body));
-            return self.ws_compaction(credential, &req, cfg, mapper).await;
-        }
-
         // The official API (or an explicit base_url): cli-chat-proxy refuses upgrades.
         let (token, mut base) = creds(credential);
         if base.is_empty() {
@@ -1156,7 +1052,7 @@ impl XaiExecutor {
         let frame = request_frame(&prepared.body, |b| prepared.finalize(cfg, &req, b));
         let request_type = text(&gj::get(&req.body, "type"));
         let transcript_reset = text(&gj::get(&frame, "previous_response_id")).trim().is_empty()
-            && (request_type.trim() != "response.append" || mapper.as_ref().is_some_and(|m| m.replayed_compacted));
+            && request_type.trim() != "response.append";
         let warmup = generate_false(&frame);
         let message = String::from_utf8_lossy(&frame).into_owned();
         let capture = Arc::new(WsCapture::new(&req, credential, &target.url, &headers, &frame));
@@ -1432,69 +1328,6 @@ async fn dial_once(
     tokio::time::timeout(HANDSHAKE_TIMEOUT, attempt)
         .await
         .unwrap_or_else(|_| Err(Dial::Failed(plain("xai websockets executor: handshake timed out"))))
-}
-
-impl XaiExecutor {
-    /// `executeCompactionTriggerFromWebsocketContext`: compacts the recorded transcript
-    /// (or the turn's own input, or its previous response) over HTTP and keeps only the
-    /// compaction item as the transcript.
-    async fn ws_compaction(
-        &self,
-        credential: &Credential,
-        req: &ExecRequest,
-        cfg: &Config,
-        mapper: Option<IdMapper>,
-    ) -> Result<ExecResponse, ExecError> {
-        // Go's context errors come before executeCompactRequest creates its reporter.
-        let Some(mapper) = mapper else {
-            req.usage.discard();
-            return Err(status_err(400, "xai websocket compaction context is unavailable"));
-        };
-        let payload = match mapper.state.snapshot() {
-            Some(transcript) => compaction_payload(&req.body, &transcript),
-            None => {
-                let filtered = crate::xai::remove_input_items(req.body.to_vec(), "compaction_trigger");
-                let input = gj::get(&filtered, "input");
-                if input.is_array() && !input.array().is_empty() {
-                    let raw = input.raw().to_vec();
-                    compaction_payload(&filtered, &raw)
-                } else {
-                    let mut previous = mapper.upstream_previous.clone();
-                    if previous.is_empty() {
-                        previous = text(&gj::get(&req.body, "previous_response_id")).trim().to_owned();
-                    }
-                    if previous.is_empty() {
-                        req.usage.discard();
-                        return Err(status_err(400, "xai websocket compaction context is empty"));
-                    }
-                    let mut out = crate::xai::remove_input_items(req.body.to_vec(), "compaction_trigger");
-                    gj::set_str(&mut out, "previous_response_id", &previous);
-                    out
-                }
-            }
-        };
-        let mut compact = req.clone();
-        compact.body = Bytes::from(payload);
-        let (prepared, data, mut headers) = self.compact_request(credential, &compact, cfg, true).await?;
-        let (response_id, item) = validate_compaction(&data)?;
-        // Publish(ParseOpenAIUsage(data)): the compact body compact_request reported.
-        compact.usage.publish();
-        mapper.state.replace(&[&item]);
-        mapper.state.map(&response_id, "");
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        let frames: Vec<Result<Bytes, ExecError>> = compaction_frames(&prepared, &data, SystemTime::now())
-            .into_iter()
-            .map(|f| Ok(Bytes::from(f)))
-            .collect();
-        Ok(ExecResponse {
-            status: 200,
-            headers,
-            body: ResponseBody::Stream(futures_util::stream::iter(frames).boxed()),
-        })
-    }
 }
 
 #[cfg(test)]

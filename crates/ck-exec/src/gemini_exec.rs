@@ -139,6 +139,7 @@ impl GeminiExecutor {
         {
             headers.set(&name, value);
         }
+        headers.set("User-Agent", "cooker");
         // Refused before anything is sent, so the key never reaches a host the url crate
         // reads differently from Go.
         crate::xai_url::new_request(&url)?;

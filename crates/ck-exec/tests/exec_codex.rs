@@ -47,10 +47,7 @@ async fn every_client_protocol_goes_out_as_codex_and_comes_back() {
         );
         assert_eq!(captured.header("authorization"), Some("Bearer sk-up"), "{protocol}");
         assert_eq!(captured.header("accept"), Some("text/event-stream"), "{protocol}");
-        assert!(
-            captured.header("user-agent").unwrap().starts_with("codex-tui/"),
-            "{protocol}"
-        );
+        assert_eq!(captured.header("user-agent"), Some("cooker"), "{protocol}");
         let sent = json_body(captured);
         assert_eq!(sent["model"], MODEL, "{protocol}: {sent}");
         assert_eq!(sent["stream"], true, "{protocol}: {sent}");

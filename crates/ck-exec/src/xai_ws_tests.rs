@@ -44,6 +44,7 @@ const GORILLA_CLOSE_TEXT: [&str; 1] = ["upstream_closes_mid_turn"];
 #[derive(Default)]
 struct Recorded {
     upgrades: Vec<String>,
+    user_agents: Vec<String>,
     frames: Vec<String>,
     http: Vec<String>,
     pongs: Vec<String>,
@@ -90,6 +91,14 @@ async fn handler(State(shared): State<Shared>, req: axum::extract::Request) -> R
         lines.sort();
         let reject = {
             let mut script = shared.lock().unwrap();
+            script.recorded.user_agents.push(
+                parts
+                    .headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
             script.recorded.upgrades.push(format!("{uri}\n{}", lines.join("\n")));
             script
                 .turn
@@ -258,12 +267,72 @@ fn error_json(e: &ExecError) -> Value {
 }
 
 #[tokio::test]
+async fn compaction_trigger_is_forwarded_over_websocket() {
+    let completed = r#"{"type":"response.completed","response":{"id":"resp_remote","status":"completed","output":[{"type":"compaction","encrypted_content":"remote-state"}]}}"#;
+    let turn = serde_json::json!({
+        "payload": r#"{"model":"grok-4.3","input":[{"type":"compaction_trigger","threshold":123}],"stream":true}"#,
+        "acts": [{"send": [completed]}]
+    });
+    let shared: Shared = Arc::default();
+    shared.lock().unwrap().turn = Some(turn.clone());
+    let app = axum::Router::new().fallback(handler).with_state(shared.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let executor = XaiExecutor::with_client(wreq::Client::new());
+    let attrs = serde_json::json!({"api_key":"test-key","base_url":"http://UPSTREAM/v1","websockets":"true","header:User-Agent":"configured/1"});
+    let session = ExecSession {
+        id: "remote-compact".into(),
+        continuation: false,
+    };
+    let response = executor
+        .execute_in_session(
+            &credential("remote", &attrs, &addr),
+            request(&turn, &session.id, Default::default()),
+            &Config::default(),
+            &session,
+        )
+        .await
+        .unwrap();
+    let ResponseBody::Stream(mut stream) = response.body else {
+        panic!("expected stream")
+    };
+    let mut chunks = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        chunks.push(chunk.unwrap());
+    }
+    let received = String::from_utf8(chunks.concat()).unwrap();
+    assert!(received.contains("resp_remote"), "{received}");
+    assert!(received.contains("remote-state"), "{received}");
+    assert!(!received.contains("keepalive"), "{received}");
+    let recorded = std::mem::take(&mut shared.lock().unwrap().recorded);
+    assert!(recorded.http.is_empty());
+    assert_eq!(recorded.frames.len(), 1);
+    assert_eq!(recorded.user_agents, ["cooker"]);
+    let sent: Value = serde_json::from_str(&recorded.frames[0]).unwrap();
+    assert_eq!(
+        sent["input"][0],
+        serde_json::json!({"type":"compaction_trigger","threshold":123})
+    );
+    executor.close_session(&session.id);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn turns_match_go() {
     let scenarios: Vec<Value> = serde_json::from_str(FIXTURE).unwrap();
     assert_eq!(scenarios.len(), 49);
     let mut failures = Vec::new();
     for s in &scenarios {
         let name = s["name"].as_str().unwrap();
+        if name.starts_with("compaction_")
+            || name.starts_with("CompactionTrigger")
+            || name == "RequiredUpstreamRejectsCompactionHTTPFallback"
+        {
+            // Q17 retires the gateway-generated compact responses in these Go recordings.
+            continue;
+        }
         let shared: Shared = Arc::default();
         let app = axum::Router::new().fallback(handler).with_state(shared.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -879,134 +948,6 @@ fn write_error_after_message_too_big_stops_retry() {
         String::from_utf8_lossy(&stale.body),
         "xai websockets executor: write failed"
     );
-}
-
-/// TestXAIWebsocketPostCompactionAppendWithoutPreviousReplaysCompactedTranscript.
-#[test]
-fn post_compaction_append_replays_compacted_transcript() {
-    let state = Arc::new(IdState::default());
-    state.replace(&[br#"{"type":"compaction","encrypted_content":"compact-state"}"#]);
-    state.map("resp-compact", "");
-    let input = |body: &[u8]| -> Vec<String> {
-        gj::get(body, "input")
-            .array()
-            .iter()
-            .map(|i| String::from_utf8_lossy(i.raw()).into_owned())
-            .collect()
-    };
-
-    let full = br#"{"type":"response.create","model":"grok-4.3","input":[{"type":"message","id":"msg-full"}]}"#;
-    let out = IdMapper::new(state.clone(), full).upstream_request(full.to_vec());
-    assert_eq!(
-        input(&out).len(),
-        1,
-        "a self-contained response.create replayed the transcript"
-    );
-
-    let append = br#"{"type":"response.append","model":"grok-4.3","input":[{"type":"message","id":"msg-2","role":"user","content":"second"}]}"#;
-    let got = IdMapper::new(state.clone(), append).upstream_request(append.to_vec());
-    let items = input(&got);
-    assert_eq!(items.len(), 2, "{}", String::from_utf8_lossy(&got));
-    assert_eq!(gj::get(items[0].as_bytes(), "type").str(), "compaction");
-    assert_eq!(gj::get(items[1].as_bytes(), "id").str(), "msg-2");
-
-    state.record(
-        &got,
-        br#"{"type":"response.completed","response":{"id":"resp-after-compact","output":[{"type":"message","id":"out-2"}]}}"#,
-        true,
-    );
-    let next = br#"{"type":"response.create","model":"grok-4.3","input":[{"type":"message","id":"msg-3"}]}"#;
-    let out = IdMapper::new(state, next).upstream_request(next.to_vec());
-    let items = input(&out);
-    assert_eq!(
-        items.len(),
-        1,
-        "replay not cleared after success: {}",
-        String::from_utf8_lossy(&out)
-    );
-    assert_eq!(gj::get(items[0].as_bytes(), "id").str(), "msg-3");
-}
-
-/// TestXAIWebsocketPostCompactionWarmupPreservesTranscriptForLaterCompaction.
-#[test]
-fn post_compaction_warmup_preserves_transcript() {
-    let state = Arc::new(IdState::default());
-    state.replace(&[br#"{"type":"compaction","encrypted_content":"compact-state"}"#]);
-    let warmup = br#"{"type":"response.append","model":"grok-4.3","generate":false,"input":[{"type":"message","id":"warmup-context"}]}"#;
-    let mut mapper = IdMapper::new(state.clone(), warmup);
-    let warmup_upstream = mapper.upstream_request(warmup.to_vec());
-    assert!(
-        mapper.replayed_compacted,
-        "post-compaction warmup did not mark the replay"
-    );
-    state.record(
-        &warmup_upstream,
-        br#"{"type":"response.completed","response":{"id":"resp-warmup","output":[]}}"#,
-        true,
-    );
-
-    let append =
-        br#"{"type":"response.append","model":"grok-4.3","input":[{"type":"message","id":"msg-after-warmup"}]}"#;
-    let append_upstream = IdMapper::new(state.clone(), append).upstream_request(append.to_vec());
-    let input = gj::get(&append_upstream, "input");
-    assert_eq!(input.array().len(), 1, "{}", String::from_utf8_lossy(&append_upstream));
-    assert_eq!(input.get("0.id").str(), "msg-after-warmup");
-    state.record(
-        &append_upstream,
-        br#"{"type":"response.completed","response":{"id":"resp-after-warmup","output":[{"type":"message","id":"out-after-warmup"}]}}"#,
-        false,
-    );
-
-    let transcript = state.snapshot().unwrap();
-    let kinds: Vec<String> = gj::parse(&transcript)
-        .array()
-        .iter()
-        .map(|i| i.get("type").str().into_owned())
-        .collect();
-    assert_eq!(kinds, ["compaction", "message", "message", "message"]);
-}
-
-/// TestXAIWebsocketEmptyFullResetClearsPendingCompactionReplay.
-#[test]
-fn empty_full_reset_clears_pending_compaction_replay() {
-    let state = Arc::new(IdState::default());
-    state.replace(&[br#"{"type":"compaction","encrypted_content":"stale-compact-state"}"#]);
-    state.record(
-        br#"{"type":"response.create","model":"grok-4.3","input":[]}"#,
-        br#"{"type":"response.completed","response":{"id":"resp-empty","output":[]}}"#,
-        true,
-    );
-    let append = br#"{"type":"response.append","model":"grok-4.3","input":[{"type":"message","id":"msg-new"}]}"#;
-    let got = IdMapper::new(state, append).upstream_request(append.to_vec());
-    let input = gj::get(&got, "input");
-    assert_eq!(input.array().len(), 1, "{}", String::from_utf8_lossy(&got));
-    assert_eq!(input.get("0.id").str(), "msg-new");
-}
-
-/// TestValidateXAIWebsocketCompactionResponse.
-#[test]
-fn validate_compaction_response_follows_go() {
-    let (id, item) = validate_compaction(
-        br#"{"id":"resp_compact","output":[{"type":"compaction","encrypted_content":"opaque-state"}]}"#,
-    )
-    .unwrap();
-    assert_eq!(id, "resp_compact");
-    assert_eq!(gj::get(&item, "encrypted_content").str(), "opaque-state");
-    for payload in [
-        &b""[..],
-        b"{}",
-        br#"{"id":"resp_empty","output":[]}"#,
-        br#"{"id":123,"output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
-        br#"{"id":"resp_object","output":{"0":{"type":"compaction","encrypted_content":"opaque"}}}"#,
-        br#"{"id":"resp_numeric_state","output":[{"type":"compaction","encrypted_content":123}]}"#,
-        br#"{"id":"resp_missing_state","output":[{"type":"compaction"}]}"#,
-    ] {
-        assert!(
-            validate_compaction(payload).is_err(),
-            "{}",
-            String::from_utf8_lossy(payload)
-        );
-    }
 }
 
 /// TestBuildXAIWebsocketRequestBodySetsStoreAndKeepsPromptCacheKey.

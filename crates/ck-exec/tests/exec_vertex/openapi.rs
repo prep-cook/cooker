@@ -47,7 +47,11 @@ fn service_account(upstream: &StreamUpstream) -> Exchange {
 async fn a_service_account_sends_chat_to_its_project_route() {
     let streams = Streams::new();
     let upstream = StreamUpstream::start([Reply::json(TOKEN), Reply::sse(chat_sse())]).await;
-    let exchange = service_account(&upstream);
+    let mut exchange = service_account(&upstream);
+    exchange
+        .credential
+        .attributes
+        .insert("header:User-Agent".into(), "oauth-client/1".into());
     let body = r#"{"model":"client-model","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let run = run_on(&streams, &exchange, Client::Chat, Operation::Generate, body, 1).await;
     let (outcome, published, mut owner) = produce(&streams, run.started.unwrap()).await;
@@ -63,6 +67,7 @@ async fn a_service_account_sends_chat_to_its_project_route() {
     assert_eq!(chat.header("authorization"), Some("Bearer ya29.vertex-test"));
     assert_eq!(chat.header("accept"), Some("text/event-stream"));
     assert_eq!(chat.header("x-goog-api-key"), None);
+    assert_eq!(chat.header("user-agent"), Some("oauth-client/1"));
     assert_eq!(
         json_body(chat),
         json!({
@@ -104,6 +109,7 @@ async fn an_api_key_reaches_its_relay_with_the_normalized_model() {
     assert_eq!(captured.path, "/api/v1/endpoints/openapi/chat/completions");
     assert_eq!(captured.header("authorization"), Some(&*format!("Bearer {KEY}")));
     assert_eq!(captured.header("x-team"), Some("core"));
+    assert_eq!(captured.header("user-agent"), Some("cooker"));
     let body = json_body(captured);
     assert_eq!(body["model"], "meta/llama-4");
     assert_eq!(body["stream"], true);

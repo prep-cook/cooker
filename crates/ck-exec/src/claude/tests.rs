@@ -1373,6 +1373,10 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
         let names = |h: &[(String, String)]| h.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
         assert_eq!(names(&ours), names(&theirs), "{name}: header names and casing");
         for ((k, a), (_, b)) in ours.iter().zip(&theirs) {
+            if k.eq_ignore_ascii_case("user-agent") && api_key_identity(&ctx, &req, count) {
+                assert_eq!(a, "cooker", "{name}: API-key identity");
+                continue;
+            }
             if k.eq_ignore_ascii_case("x-client-request-id") && b != "9b6a3f8e-1c2d-4e5f-8a9b-0c1d2e3f4a5b" {
                 continue;
             }
@@ -2324,9 +2328,7 @@ impl Usage {
     }
 }
 
-/// The refused-version line is written only when the baseline identity really replaces
-/// the caller's: an API key without cloaking forwards the caller's own User-Agent, so
-/// it never logs; an OAuth account sends the baseline identity, so it does.
+/// The refused-version line applies only to the Claude client identity, not cooker.
 #[tokio::test]
 async fn refused_versions_log_only_when_the_identity_is_replaced() {
     let router = axum::Router::new().fallback(|| async {
@@ -2389,7 +2391,7 @@ async fn refused_versions_log_only_when_the_identity_is_replaced() {
     executor.execute(&api_key, request(), &cfg).await.unwrap();
     assert!(
         !profile::refused_logged(&api_key.id),
-        "the caller's own User-Agent went upstream"
+        "API-key requests do not use the Claude client identity"
     );
     let mut meta = Value::Object(harness_credential().metadata.clone());
     meta["access_token"] = "sk-ant-oat01-FAKE".into();
@@ -2641,4 +2643,9 @@ async fn responses_compaction_capsules_expand() {
         assert!(upstream.is_empty());
         assert_eq!(usage, ["discard"]);
     }
+}
+
+pub(super) fn api_key_identity(ctx: &Ctx<'_>, req: &ExecRequest, count: bool) -> bool {
+    let detection = detect::detect(&req.headers, &utf8(&req.original_body), count, &ctx.settings);
+    !ctx.bearer && !ctx.cli_profile && !detection.confirmed && !ctx.wire_policy(detection.confirmed).0
 }

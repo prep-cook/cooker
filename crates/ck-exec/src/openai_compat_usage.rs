@@ -511,3 +511,32 @@ pub(crate) fn http_capture_problems(events: &[Captured], a: &HttpAttempt<'_>) ->
     }
     problems
 }
+
+/// Applies Q13 to a historical API-key request; body bytes and other headers stay exact.
+pub(crate) fn api_key_request(raw: &[u8]) -> Vec<u8> {
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("HTTP header boundary");
+    let head = std::str::from_utf8(&raw[..end]).unwrap();
+    let mut out = Vec::with_capacity(raw.len());
+    for line in head.split("\r\n") {
+        if line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            continue;
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        if line.starts_with("Host:") {
+            out.extend_from_slice(b"User-Agent: cooker\r\n");
+        }
+    }
+    out.extend_from_slice(&raw[end + 2..]);
+    out
+}
+
+pub(crate) fn api_key_wire(raw: &str) -> String {
+    String::from_utf8(api_key_request(raw.as_bytes())).unwrap()
+}

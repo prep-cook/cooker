@@ -95,7 +95,7 @@ fn uuid_shaped(s: &str) -> bool {
 }
 
 /// Same path, body bytes and header set. Generated session UUIDs only need the same shape.
-fn assert_same_upstream(name: &str, rust: &Captured, go: &Value) {
+fn assert_same_upstream(name: &str, rust: &Captured, go: &Value, api_key: bool) {
     assert_eq!(rust.path, go["path"].as_str().unwrap(), "{name}: path");
     assert_eq!(
         String::from_utf8_lossy(&rust.body),
@@ -108,7 +108,11 @@ fn assert_same_upstream(name: &str, rust: &Captured, go: &Value) {
         if skip(name_) {
             continue;
         }
-        let expected = values[0].as_str().unwrap();
+        let expected = if name_ == "user-agent" && api_key {
+            "cooker"
+        } else {
+            values[0].as_str().unwrap()
+        };
         let actual = rust.header(name_);
         if name_ == "referer" {
             // The previous hop's URL, on each run's own mock port.
@@ -286,12 +290,17 @@ async fn executor_matches_go_on_every_fixture_case() {
                 assert_eq!(captured.len(), hops.len(), "{name}: upstream requests");
                 for (rust, go) in captured.iter().zip(hops) {
                     assert_eq!(rust.method, go["method"].as_str().unwrap(), "{name}: method");
-                    assert_same_upstream(name, rust, go);
+                    assert_same_upstream(name, rust, go, View::new(&credential(case, &mock.url)).api_key);
                 }
             }
             None => {
                 assert_eq!(captured.len(), 1, "{name}: one upstream request");
-                assert_same_upstream(name, &captured[0], &case["upstream"]);
+                assert_same_upstream(
+                    name,
+                    &captured[0],
+                    &case["upstream"],
+                    View::new(&credential(case, &mock.url)).api_key,
+                );
             }
         }
         let output = &case["output"];
@@ -957,7 +966,7 @@ async fn images_match_go_on_every_fixture_case() {
                     assert_eq!(rust_body, go_body, "{name}: upstream body fields");
                     go["body"] = Value::String(String::from_utf8_lossy(&captured[0].body).into_owned());
                 }
-                assert_same_upstream(name, &captured[0], &go);
+                assert_same_upstream(name, &captured[0], &go, View::new(&credential).api_key);
             }
         }
         let output = &case["output"];
@@ -1684,6 +1693,9 @@ async fn siwc_requests_match_go() {
             let host = format!("({}; {})", crate::kimi_http::go_os(), crate::kimi_http::go_arch());
             ua[0] = ua[0].as_str().unwrap().replace("(linux; amd64)", &host).into();
         }
+        if View::new(&credential).api_key {
+            sent_headers["user-agent"] = serde_json::json!(["cooker"]);
+        }
         let go_upstream = serde_json::json!({
             "path": case["path"],
             "body": case["body"],
@@ -1738,7 +1750,12 @@ async fn siwc_requests_match_go() {
             let mut req = request(&synthetic);
             (req.source_format, req.response_format, req.request_path) = (Format::OpenAI, Format::OpenAI, path.into());
             executor.images(&credential, req, path, &cfg).await.unwrap();
-            assert_same_upstream(name, &mock.take().pop().unwrap(), &go_upstream);
+            assert_same_upstream(
+                name,
+                &mock.take().pop().unwrap(),
+                &go_upstream,
+                View::new(&credential).api_key,
+            );
             continue;
         }
         let (path, content_type, reply) = if call == "compact" {
@@ -1767,7 +1784,12 @@ async fn siwc_requests_match_go() {
                 if let ResponseBody::Stream(mut stream) = res.body {
                     while stream.next().await.is_some() {}
                 }
-                assert_same_upstream(name, &mock.take().pop().unwrap(), &go_upstream);
+                assert_same_upstream(
+                    name,
+                    &mock.take().pop().unwrap(),
+                    &go_upstream,
+                    View::new(&credential).api_key,
+                );
             }
             Err(error) => {
                 assert_eq!(error.status as i64, case["status"].as_i64().unwrap(), "{name}: status");

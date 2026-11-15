@@ -96,7 +96,12 @@ impl Execute for MetaExecutor {
         .map_err(encoding)?;
         let url = format!("{}/responses", base.strip_suffix('/').unwrap_or(&base));
         let client = self.clients.get(&Proxy::effective(&enriched, attempt.cfg));
-        let headers = meta::headers(&enriched, request.client.headers, request.client.session, &token);
+        let headers = meta::headers(
+            attempt.credential,
+            request.client.headers,
+            request.client.session,
+            &token,
+        );
         let capture = usage.capture();
         let (auth_type, auth_value) = ck_core::registry::dynamic::account_info(&enriched);
         capture_request(

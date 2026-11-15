@@ -86,6 +86,7 @@ pub mod oauth;
 pub mod openai_compat;
 pub mod openai_compat_exec;
 mod openai_compat_go;
+mod openai_compat_headers;
 mod openai_compat_http;
 pub mod openai_compat_multipart;
 mod openai_compat_payload;

@@ -267,9 +267,7 @@ async fn anthropic_requests_reach_the_upstream_as_the_old_route_sent_them() {
         // A key on an origin other than api.anthropic.com goes as a bearer token.
         assert_eq!(new.header("authorization"), Some("Bearer sk-ant-api03-test"));
         assert_eq!(new.header("anthropic-version"), Some("2023-06-01"));
-        // The User-Agent stays the old route's until the owner decides Q12.
-        let agent = format!("CLIProxyAPI/{}", env!("CARGO_PKG_VERSION"));
-        assert_eq!(new.header("user-agent"), Some(agent.as_str()));
+        assert_eq!(new.header("user-agent"), Some("cooker"));
         assert_eq!(new.header("user-agent"), old.header("user-agent"));
     }
 }

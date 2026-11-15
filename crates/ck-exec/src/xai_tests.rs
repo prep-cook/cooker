@@ -222,6 +222,10 @@ async fn go_reference_scenarios() {
     let mut failures = Vec::new();
     for s in scenarios {
         let name = s["name"].as_str().unwrap();
+        if name == "compaction_trigger_stream" {
+            // Q17 is covered by the loopback regressions in tests/exec_xai/parity.rs.
+            continue;
+        }
         let needs: Vec<&str> = s["needs"]
             .as_array()
             .map(|n| n.iter().filter_map(Value::as_str).collect())
@@ -278,11 +282,15 @@ async fn go_reference_scenarios() {
                 problems.push(format!("url: {url:?} != {:?}", s["url"]));
             }
             let got = mock.request();
-            if got.as_deref() != s["request"].as_str() {
-                problems.push(format!(
-                    "request:\n  rust: {got:?}\n  go:   {:?}",
-                    s["request"].as_str()
-                ));
+            let want = s["request"].as_str().map(|raw| {
+                if ck_core::registry::dynamic::auth_kind(&cred) == Some("apikey") {
+                    crate::openai_compat_usage::api_key_wire(raw)
+                } else {
+                    raw.to_owned()
+                }
+            });
+            if got != want {
+                problems.push(format!("request:\n  rust: {got:?}\n  expected: {want:?}"));
             }
         }
         if op != "count"

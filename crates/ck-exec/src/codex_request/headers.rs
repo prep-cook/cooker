@@ -63,7 +63,7 @@ pub(crate) fn http_headers(
 ) -> HeaderMap {
     let mut h = source_headers(view, settings, client, cache_id, stream);
     routing_hint(&mut h, view, client, body, model);
-    model_header_overrides(&mut h, model);
+    model_header_overrides(&mut h, model, view.api_key);
     h
 }
 
@@ -79,7 +79,7 @@ pub(crate) fn image_headers(
     stream: bool,
 ) -> HeaderMap {
     let mut h = source_headers(view, settings, client, cache_id, stream);
-    model_header_overrides(&mut h, model);
+    model_header_overrides(&mut h, model, view.api_key);
     h
 }
 
@@ -115,8 +115,11 @@ fn source_headers(
     ] {
         ensure_from_client(&mut h, client, name);
     }
-    let default_ua = if view.api_key { "" } else { &settings.default_user_agent };
-    ensure_config_first(&mut h, client, "user-agent", default_ua, USER_AGENT);
+    if view.api_key {
+        set(&mut h, "user-agent", "cooker");
+    } else {
+        ensure_config_first(&mut h, client, "user-agent", &settings.default_user_agent, USER_AGENT);
+    }
     set(
         &mut h,
         "accept",
@@ -187,6 +190,9 @@ fn apply_identity(h: &mut HeaderMap, view: &View<'_>, settings: &Settings, clien
         set(h, "user-agent", USER_AGENT);
         set(h, "originator", ORIGINATOR);
     }
+    if view.api_key {
+        set(h, "user-agent", "cooker");
+    }
 }
 
 /// `applyCodexRoutingHint`: `model=<slug>[;tier=<service_tier>]` for OAuth credentials.
@@ -216,13 +222,15 @@ fn routing_hint(h: &mut HeaderMap, view: &View<'_>, client: &HeaderMap, body: &s
     set(h, ROUTING_HINT, &hint);
 }
 
-fn model_header_overrides(h: &mut HeaderMap, model: &str) {
+fn model_header_overrides(h: &mut HeaderMap, model: &str, api_key: bool) {
     let overrides = model_overrides(model);
     if overrides.is_empty() {
         return;
     }
     for (k, v) in overrides {
-        set(h, &k, &v);
+        if !api_key || !k.eq_ignore_ascii_case("user-agent") {
+            set(h, &k, &v);
+        }
     }
     let has_session = ["session-id", "session_id"]
         .iter()
@@ -253,7 +261,7 @@ pub(crate) fn ws_headers(
     }
     if view.siwc {
         siwc_ws_headers(&mut h, view, settings, client);
-        model_header_overrides(&mut h, model);
+        model_header_overrides(&mut h, model, view.api_key);
         return h;
     }
     let (default_ua, default_beta) = if view.api_key {
@@ -284,10 +292,7 @@ pub(crate) fn ws_headers(
         ensure_from_client(&mut h, client, LITE_HEADER);
     }
     if view.api_key {
-        let ua = header(client, "user-agent").trim();
-        if !ua.is_empty() {
-            set(&mut h, "user-agent", ua);
-        }
+        set(&mut h, "user-agent", "cooker");
     } else {
         ensure_config_first(&mut h, client, "user-agent", default_ua, USER_AGENT);
     }
@@ -299,7 +304,7 @@ pub(crate) fn ws_headers(
     websocket_session(&mut h, view, settings, client, native);
     apply_identity(&mut h, view, settings, client);
     routing_hint(&mut h, view, client, body, model);
-    model_header_overrides(&mut h, model);
+    model_header_overrides(&mut h, model, view.api_key);
     h
 }
 

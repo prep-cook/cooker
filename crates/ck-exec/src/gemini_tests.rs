@@ -680,10 +680,11 @@ async fn go_reference_scenarios() {
             "{name}: stream"
         );
         let request = mock.as_ref().and_then(Mock::request);
-        assert_eq!(request.as_deref(), s["request"].as_str(), "{name}: upstream request");
+        let expected = s["request"].as_str().map(crate::openai_compat_usage::api_key_wire);
+        assert_eq!(request, expected, "{name}: upstream request");
         reports.check(s);
         let mut events: std::collections::VecDeque<Captured> = captures.events().into();
-        if let Some(wire) = s["request"].as_str() {
+        if let Some(wire) = expected.as_deref() {
             let provider = if s["provider"] == "gemini-interactions" {
                 "gemini-interactions"
             } else {

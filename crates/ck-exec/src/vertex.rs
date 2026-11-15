@@ -517,8 +517,8 @@ impl VertexExecutor {
         };
         req.usage
             .delegated_executor(executor, &parse_suffix(&req.model).model_name);
-        let (base_url, token) = credentials?;
-        crate::openai_compat::chat_with(&client, credential, req, cfg, &base_url, &token, None).await
+        let (base_url, token, api_auth) = credentials?;
+        crate::openai_compat::chat_with(&client, credential, req, cfg, (&base_url, &token, api_auth), None).await
     }
 
     /// `resolveOpenAPICredentials`: the route's base URL, then the bearer credential.
@@ -526,9 +526,10 @@ impl VertexExecutor {
         &self,
         client: &wreq::Client,
         credential: &Credential,
-    ) -> Result<(String, String), ExecError> {
+    ) -> Result<(String, String, bool), ExecError> {
         let (base, key) = openapi_route(credential)?;
-        Ok((base, self.openapi_key(client, key).await?))
+        let api_auth = matches!(key, OpenApiKey::Key(_));
+        Ok((base, self.openapi_key(client, key).await?, api_auth))
     }
 
     /// The bearer credential of the `endpoints/openapi` route: the API key, or a fresh access
@@ -588,9 +589,12 @@ impl VertexExecutor {
                 }
                 headers.set("Authorization", format!("Bearer {token}"));
             }
-            None => headers.set("x-goog-api-key", key),
+            None => headers.set("x-goog-api-key", &key),
         }
         g::set_custom_headers(&mut headers, credential, req);
+        if !key.is_empty() {
+            headers.set("User-Agent", "cooker");
+        }
         g::interactions_revision(&mut headers, req);
         g::interactions_exchange(req, credential, PROVIDER, &client, &url, headers, body).await
     }
@@ -616,6 +620,9 @@ impl VertexExecutor {
             }
         }
         g::set_custom_headers(&mut headers, credential, req);
+        if matches!(auth, Auth::ApiKey { .. }) {
+            headers.set("User-Agent", "cooker");
+        }
         Ok(headers)
     }
 

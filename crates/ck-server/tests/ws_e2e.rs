@@ -515,11 +515,26 @@ async fn run(name: &str) {
             let rust_hex: String = rust.raw.iter().map(|b| format!("{b:02x}")).collect();
             assert_eq!(rust_hex, hex, "{name}: upstream bytes #{i}");
         }
-        let go_headers = go["headers"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()));
+        let authorization = go["headers"].as_object().and_then(|headers| {
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .and_then(|(_, value)| value.as_str())
+                .and_then(|value| value.strip_prefix("Bearer "))
+        });
+        let api_key = authorization.is_some_and(|key| {
+            api_keys(scenario)
+                .iter()
+                .any(|credential| credential["attributes"]["api_key"].as_str() == Some(key))
+        });
+        let go_headers = go["headers"].as_object().into_iter().flatten().map(|(k, v)| {
+            let value = if api_key && k.eq_ignore_ascii_case("user-agent") {
+                "cooker"
+            } else {
+                v.as_str().unwrap()
+            };
+            (k.clone(), value.to_owned())
+        });
         assert_eq!(
             compared(rust.headers.clone().into_iter()),
             compared(go_headers),

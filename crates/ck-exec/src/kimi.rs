@@ -306,6 +306,9 @@ pub(crate) fn headers(
     for (name, value) in client_headers(credential, client, session) {
         h.set(&name, value);
     }
+    if ck_core::registry::dynamic::is_api_key(credential) {
+        h.set("User-Agent", "cooker");
+    }
     h
 }
 

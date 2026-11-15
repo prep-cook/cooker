@@ -252,6 +252,7 @@ fn request_headers(credential: &Credential, req: &ExecRequest) -> GoHeaders {
         headers.set("x-goog-api-key", key);
     }
     set_custom_headers(&mut headers, credential, req);
+    headers.set("User-Agent", "cooker");
     headers
 }
 

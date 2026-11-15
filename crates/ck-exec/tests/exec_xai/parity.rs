@@ -75,9 +75,8 @@ const LEFT_OUT: &[(&str, &str)] = &[
     ("shapes_responses_request", "codec refusal"),
     ("custom_tool_history_normalized", "codec refusal"),
     ("replay_responses_turn2_tool_output", "codec refusal"),
-    // The capability refuses a `compaction_trigger` turn, which keeps the old arm until owner
-    // question 16; `compaction_trigger_keeps_the_old_arm` covers it.
-    ("compaction_trigger_stream", "old arm"),
+    // Q17 replaces Go's synthesized compaction with the upstream generation response.
+    ("compaction_trigger_stream", "remote compaction"),
     // A text delta for an item never announced: the ingress refuses it as invalid upstream
     // data (502) before the body ends; `eof_before_completion_fails_like_go` covers the 408.
     ("disconnected_before_completed", "invalid event order"),
@@ -254,47 +253,40 @@ async fn responses_uploads_match_the_go_executor() {
     );
 }
 
-/// A `compaction_trigger` turn keeps the old arm until owner question 16: the new route
-/// refuses it at the fence before any upstream send, and the old arm answers it with the
-/// compact and the synthesized events the Go executor recorded.
 #[tokio::test]
-async fn compaction_trigger_keeps_the_old_arm() {
+async fn compaction_trigger_uses_the_contract_path() {
+    let payload = r#"{"model":"grok-4.3","input":[{"type":"compaction_trigger","threshold":123}],"stream":true}"#;
+    let upstream = StreamUpstream::start([Reply::sse(sse())]).await;
+    let streams = Streams::new();
+    let run = run(&streams, &upstream, Client::Responses, payload, 7).await;
+    let (result, _, mut owner) = produce(&streams, run.started.unwrap()).await;
+    result.unwrap();
+    let delivered = responses_json(&streams, &mut owner);
+    assert_eq!(
+        delivered["id"], "resp_test",
+        "the client sees the pinned local response id"
+    );
+    assert_eq!(delivered["output"][0]["content"][0]["text"], "hello");
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].path, "/v1/responses");
+    assert_eq!(
+        json_body(&captured[0])["input"][0],
+        json!({"type":"compaction_trigger","threshold":123})
+    );
+}
+
+#[tokio::test]
+async fn compaction_trigger_uses_the_upstream_response_on_the_old_path() {
     use futures_util::StreamExt;
 
-    let s = scenarios()
-        .into_iter()
-        .find(|s| s["name"] == "compaction_trigger_stream")
-        .unwrap();
-    let payload = s["payload"].as_str().unwrap();
+    let payload = r#"{"model":"grok-4.3","input":[{"type":"compaction_trigger","threshold":123}],"stream":true}"#;
     let executors = executors();
     let cfg = Config::default();
 
-    let untouched = StreamUpstream::start([Reply::json("{}")]).await;
-    let mut exchange = exchange(&untouched);
-    exchange.credential = scenario_credential(&s, &cfg, &format!("{}/v1", untouched.url()));
-    let streams = Streams::new();
-    let input = (payload, 64, Sessions::default());
-    let run = run_on(
-        &streams,
-        &executors,
-        &exchange,
-        Client::Responses,
-        Operation::Generate,
-        input,
-    )
-    .await;
-    let error = run.started.err().expect("the fence refuses the turn");
-    assert_eq!(error.status, 400);
-    assert_eq!(
-        error.body,
-        "fence: request validated for another destination".as_bytes()
-    );
-    assert!(untouched.captured().is_empty(), "the new route sent a request");
-
-    let up = &s["upstream"];
-    let upstream = StreamUpstream::start([Reply::json(up["body"].as_str().unwrap().to_owned())]).await;
-    let credential = scenario_credential(&s, &cfg, &format!("{}/v1", upstream.url()));
-    let model = s["model"].as_str().unwrap().to_owned();
+    let upstream = StreamUpstream::start([Reply::sse(sse())]).await;
+    let credential = credential(&format!("{}/v1", upstream.url()));
+    let model = MODEL.to_owned();
     let request = ck_core::exec::ExecRequest {
         operation: ck_core::exec::Operation::Generate,
         source_format: ck_core::format::Format::OpenAIResponse,
@@ -329,9 +321,15 @@ async fn compaction_trigger_keeps_the_old_arm() {
     while let Some(chunk) = stream.next().await {
         chunks.push(Value::String(String::from_utf8(chunk.unwrap().to_vec()).unwrap()));
     }
-    assert_eq!(Value::Array(chunks), s["chunks"]);
+    let received = chunks.iter().map(|v| v.as_str().unwrap()).collect::<String>();
+    assert!(received.contains("hello"), "{received}");
+    assert!(received.contains("resp_1"), "{received}");
+    assert!(!received.contains("keepalive"), "{received}");
     let captured = upstream.captured();
     assert_eq!(captured.len(), 1);
-    assert_eq!(captured[0].path, "/v1/responses/compact");
-    assert_eq!(json_body(&captured[0]), recorded_body(s["request"].as_str().unwrap()));
+    assert_eq!(captured[0].path, "/v1/responses");
+    assert_eq!(
+        json_body(&captured[0])["input"][0],
+        json!({"type":"compaction_trigger","threshold":123})
+    );
 }
