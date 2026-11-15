@@ -11,7 +11,7 @@ use ck_stream::{Read, ScratchLease, Terminal, Writer};
 use ck_translate::anthropic;
 use ck_translate::codec::chat;
 use ck_translate::codec::event::Direction;
-use ck_translate::codec::{BodyMode, Operation, RequestIngress, ResponseEgress};
+use ck_translate::codec::{self, BodyMode, Operation, RequestIngress, ResponseEgress};
 use ck_translate::gemini;
 use ck_translate::responses;
 use serde_json::{Value, json};
@@ -155,7 +155,8 @@ fn assert_api_key_request(captured: &Captured, path: &str) {
     assert_eq!(captured.method, "POST");
     assert_eq!(captured.path, path);
     assert_eq!(captured.header("x-goog-api-key"), Some(KEY));
-    assert_eq!(captured.header("user-agent"), Some("cooker"));
+    // The transport's default, as the old path sends it.
+    assert_eq!(captured.header("user-agent"), Some("Go-http-client/1.1"));
     assert_eq!(captured.header("content-type"), Some("application/json"));
     assert_eq!(captured.header("authorization"), None);
 }
@@ -316,16 +317,83 @@ async fn a_gemini_count_with_contents_only_is_sent_as_is() {
     let upstream = StreamUpstream::start([Reply::json(r#"{"totalTokens":7}"#)]).await;
     let body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
     let run = run(&streams, &upstream, Client::Gemini, Operation::CountTokens, body, 1).await;
-    let (outcome, published, mut owner) = produce(&streams, run.started.unwrap()).await;
+    let (outcome, published, _) = produce(&streams, run.started.unwrap()).await;
     outcome.unwrap();
     assert_eq!(published.terminal, Some(Terminal::Done));
     let captured = &upstream.captured()[0];
     assert_api_key_request(captured, "/v1beta/models/gemini-2.5-pro:countTokens");
     assert_eq!(captured.body, body.as_bytes());
+}
+
+/// A native `countTokens` answer with every member the count response has.
+const COUNT: &str =
+    r#"{"totalTokens":9,"cachedContentTokenCount":2,"promptTokensDetails":[{"modality":"TEXT","tokenCount":9}]}"#;
+
+/// Runs a count from `client` against an upstream answering [`COUNT`] and returns the
+/// response stream's allocator for client egress.
+async fn counted(streams: &Streams, client: Client, body: &str) -> Writer {
+    let upstream = StreamUpstream::start([Reply::json(COUNT)]).await;
+    let run = run(streams, &upstream, client, Operation::CountTokens, body, 5).await;
+    let (outcome, published, owner) = produce(streams, run.started.unwrap()).await;
+    outcome.unwrap();
+    assert_eq!(published.terminal, Some(Terminal::Done));
+    owner
+}
+
+#[tokio::test]
+async fn a_gemini_client_receives_the_count_byte_for_byte() {
+    let streams = Streams::new();
+    let body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+    let mut owner = counted(&streams, Client::Gemini, body).await;
     let id = identity(Direction::Response);
     let mut egress =
         gemini::egress::Egress::new(&mut owner, id, Operation::CountTokens, BodyMode::Buffered, |_| {}).unwrap();
-    assert_eq!(deliver(&streams, &mut owner, &mut egress), r#"{"totalTokens":7}"#);
+    assert_eq!(deliver(&streams, &mut owner, &mut egress), COUNT);
+}
+
+#[tokio::test]
+async fn an_anthropic_client_receives_the_count_as_input_tokens() {
+    let streams = Streams::new();
+    let body = r#"{"model":"claude-x","messages":[{"role":"user","content":"hi"}]}"#;
+    let mut owner = counted(&streams, Client::Anthropic, body).await;
+    let id = identity(Direction::Response);
+    let mut egress =
+        anthropic::egress::Egress::new(&mut owner, id, Operation::CountTokens, BodyMode::Buffered, |_| {}).unwrap();
+    assert_eq!(deliver(&streams, &mut owner, &mut egress), r#"{"input_tokens":9}"#);
+}
+
+/// Chat has no count operation: its request ingress refuses one, so no Chat client can
+/// ask, and its response egress refuses to encode one.
+#[tokio::test]
+async fn chat_has_no_count_to_receive() {
+    let streams = Streams::new();
+    let mut writer = streams.request();
+    let id = identity(Direction::Request);
+    let ingress = chat::request::Ingress::new(&mut writer, &streams.store, id, Operation::CountTokens, LIMIT);
+    assert!(matches!(ingress.err(), Some(codec::Error::Unsupported)));
+    let id = identity(Direction::Response);
+    let egress = chat::egress::Egress::new(
+        &mut writer,
+        id,
+        Operation::CountTokens,
+        BodyMode::Buffered,
+        true,
+        |_| {},
+    );
+    assert!(matches!(egress.err(), Some(codec::Error::Unsupported)));
+}
+
+/// Responses has no count operation in the codec: its request ingress refuses one, and its
+/// response egress refuses to encode one.
+#[tokio::test]
+async fn responses_has_no_count_to_receive() {
+    let streams = Streams::new();
+    let mut writer = streams.request();
+    let id = identity(Direction::Request);
+    let ingress = responses::request::Ingress::new(&mut writer, &streams.store, id, Operation::CountTokens, LIMIT);
+    assert!(matches!(ingress.err(), Some(codec::Error::Unsupported)));
+    let egress = responses::egress::Egress::new(&mut writer, Operation::CountTokens, BodyMode::Buffered, |_, _| {});
+    assert!(matches!(egress.err(), Some(codec::Error::Unsupported)));
 }
 
 #[tokio::test]

@@ -131,7 +131,6 @@ impl GeminiExecutor {
         let url = wire::model_url(&models, &call.base_model, method);
         let mut headers = GoHeaders::new();
         headers.set("Content-Type", "application/json");
-        headers.set("User-Agent", wire::USER_AGENT);
         wire::api_key(&mut headers, gemini::api_key(credential));
         let client = &call.request.client;
         let session = ck_wire::session::cpa_session_id(client.session);

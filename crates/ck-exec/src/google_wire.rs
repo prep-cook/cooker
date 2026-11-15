@@ -7,9 +7,6 @@
 
 use crate::proxy::GoHeaders;
 
-/// The `User-Agent` an API-key request sends (owner ruling): the gateway's name only.
-pub(crate) const USER_AGENT: &str = "cooker";
-
 /// A model method of the generative-language API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Method {
