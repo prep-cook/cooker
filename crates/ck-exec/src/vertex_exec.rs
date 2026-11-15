@@ -4,7 +4,8 @@
 //! `generateContent`, or `streamGenerateContent?alt=sse` when the upstream streams, and a token
 //! count to its `countTokens`. The upload is adjusted as the Gemini API executor adjusts its
 //! own ([`Call`]): the model suffix's thinking, the body `model` when the upload names one,
-//! and the payload rules last. Partner and open models, and credentials that opt in, take the
+//! and the payload rules last. Function call and response ids are not sent: Vertex refuses
+//! them, and its calls and responses pair by order and name. Partner and open models, and credentials that opt in, take the
 //! OpenAI-compatible `endpoints/openapi` route through the relay executor's Chat generation and
 //! local count. Imagen models keep the old path until media operations have codecs (Phase E),
 //! and neither route has a native compact.
@@ -13,6 +14,7 @@ use bytes::Bytes;
 use ck_core::exec::ExecError;
 use ck_stream::Writer;
 use ck_translate::codec::chat::response::Ingress as ChatIngress;
+use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::{self, BodyMode, Capability, Operation, RequestEgress, RequestView, ResponseIngress};
 use ck_translate::gemini::request::{Egress, GeminiCapability};
 use ck_translate::gemini::response::Ingress as GeminiIngress;
@@ -53,6 +55,10 @@ impl Capability for VertexCapability {
 
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
         match self {
+            // Vertex's count request has no cached content, which changes the count.
+            Self::Gemini if view.operation == Operation::CountTokens && cached_content(view.document)? => {
+                Err(codec::Error::Unsupported)
+            }
             Self::Gemini => GeminiCapability.validate(view),
             Self::OpenApi if view.operation == Operation::Compact => Err(codec::Error::Unsupported),
             Self::OpenApi => RelayCapability.validate(view),
@@ -178,8 +184,8 @@ impl VertexExecutor {
         let call = Call::new(attempt, request, vertex::PROVIDER, |model| target.resource(model))?;
         let (body, method) = match (count, stream) {
             (true, _) => (count_body(&call, &upload), Method::CountTokens),
-            (false, true) => (call.generate(upload)?, Method::StreamGenerate),
-            (false, false) => (call.generate(upload)?, Method::Generate),
+            (false, true) => (call.generate(vertex::strip_call_ids(upload))?, Method::StreamGenerate),
+            (false, false) => (call.generate(vertex::strip_call_ids(upload))?, Method::Generate),
         };
         let mode = if stream {
             BodyMode::Streaming
@@ -300,10 +306,11 @@ impl Target {
 }
 
 /// A `countTokens` body. Vertex's count request is flat: a Gemini client's
-/// `generateContentRequest` unwraps into it. The generation members it has no field for
-/// (`safetySettings`, `toolConfig`, `cachedContent`, `labels`), which Vertex refuses as
-/// unknown names, are not sent. Then, as for generation, the upstream model and the payload
-/// rules last.
+/// `generateContentRequest` unwraps into it. The generation members it has no field for and
+/// that do not change the count (`safetySettings`, `toolConfig`, `labels`, and a null
+/// `cachedContent`; the fence refuses any other), which Vertex refuses as unknown names, are
+/// not sent, nor are function call and response ids. Then, as for generation, the upstream
+/// model and the payload rules last.
 fn count_body(call: &Call<'_>, upload: &[u8]) -> Vec<u8> {
     let wrapped = gj::get(upload, COUNT_WRAPPER);
     let request = if wrapped.exists() { wrapped.raw() } else { upload };
@@ -314,12 +321,25 @@ fn count_body(call: &Call<'_>, upload: &[u8]) -> Vec<u8> {
         }
         true
     });
-    let original = [b"{".as_slice(), &members.join(b",".as_slice()), b"}"].concat();
+    let original = vertex::strip_call_ids([b"{".as_slice(), &members.join(b",".as_slice()), b"}"].concat());
     let mut body = original.clone();
     if gj::get(&body, "model").exists() {
         call.name_model(&mut body, "model");
     }
     call.rules("", &original, body)
+}
+
+/// Whether the request names cached content: a Gemini client's `cachedContent`, kept as its
+/// native parameter. A null one is unset in protobuf JSON.
+fn cached_content(doc: &Document) -> codec::Result<bool> {
+    let mut node = doc.root();
+    for name in ["x_ck", "provider_parameters", "gemini", "cachedContent"] {
+        match doc.member(node, name)? {
+            Some(member) => node = member,
+            None => return Ok(false),
+        }
+    }
+    Ok(!matches!(doc.node(node)?.value, Value::Null))
 }
 
 /// The `<publisher>/<model>` upstream model of the `endpoints/openapi` route, keeping a

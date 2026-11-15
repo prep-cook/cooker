@@ -460,6 +460,71 @@ fn the_executor_uses_no_old_translation() {
     }
 }
 
+/// Function call and response ids are not sent, whatever the client: Vertex refuses them, and
+/// pairs each response with its call by order and name.
+#[tokio::test]
+async fn tool_call_history_reaches_vertex_without_ids() {
+    let streams = Streams::new();
+    let upstream = StreamUpstream::start([Reply::sse(SSE), Reply::sse(SSE), Reply::sse(SSE)]).await;
+    let chat = concat!(
+        r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"weather?"},"#,
+        r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}},"#,
+        r#"{"id":"call_2","type":"function","function":{"name":"get_time","arguments":"{}"}}]},"#,
+        r#"{"role":"tool","tool_call_id":"call_1","content":"sunny"},{"role":"tool","tool_call_id":"call_2","content":"noon"}]}"#,
+    );
+    // One call: the Responses fence pairs an output only with the message just before it.
+    let responses = concat!(
+        r#"{"model":"m","stream":true,"input":[{"role":"user","content":"weather?"},"#,
+        r#"{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Paris\"}"},"#,
+        r#"{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}"#,
+    );
+    let gemini = concat!(
+        r#"{"contents":[{"role":"user","parts":[{"text":"weather?"}]},"#,
+        r#"{"role":"model","parts":[{"functionCall":{"id":"call_1","name":"get_weather","args":{"city":"Paris"}}},"#,
+        r#"{"functionCall":{"id":"call_2","name":"get_time","args":{}}}]},"#,
+        r#"{"role":"user","parts":[{"functionResponse":{"id":"call_1","name":"get_weather","response":{"r":"sunny"}}},"#,
+        r#"{"functionResponse":{"id":"call_2","name":"get_time","response":{"r":"noon"}}}]}]}"#,
+    );
+    for (client, body) in [
+        (Client::Chat, chat),
+        (Client::Responses, responses),
+        (Client::Gemini, gemini),
+    ] {
+        let run = run(&streams, &upstream, client, Operation::Generate, body, 64).await;
+        produce(&streams, run.started.unwrap()).await.0.unwrap();
+    }
+    let names = |contents: &Value, kind: &str| -> Vec<Value> {
+        let parts = contents
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c["parts"].as_array().unwrap());
+        parts.filter_map(|p| p.get(kind)).map(|f| f["name"].clone()).collect()
+    };
+    let expected = [
+        vec![json!("get_weather"), json!("get_time")],
+        vec![json!("get_weather")],
+    ];
+    for (captured, calls) in upstream
+        .captured()
+        .iter()
+        .zip([&expected[0], &expected[1], &expected[0]])
+    {
+        let upload = String::from_utf8(captured.body.clone()).unwrap();
+        assert!(!upload.contains("call_"), "{upload}");
+        let contents = json_body(captured)["contents"].clone();
+        assert_eq!(contents[1]["role"], "model", "{contents}");
+        assert_eq!(contents[2]["role"], "user", "{contents}");
+        assert_eq!(
+            contents[1]["parts"][0]["functionCall"]["args"],
+            json!({"city": "Paris"})
+        );
+        // Each response answers the call at its position, by name.
+        assert_eq!(&names(&contents, "functionCall"), calls, "{contents}");
+        assert_eq!(&names(&contents, "functionResponse"), calls, "{contents}");
+    }
+}
+
 #[path = "exec_vertex/count.rs"]
 mod count;
 #[path = "exec_vertex/openapi.rs"]

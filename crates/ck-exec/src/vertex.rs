@@ -360,6 +360,12 @@ fn strip_tool_call_ids(body: Vec<u8>, source: Format) -> Vec<u8> {
     if source != Format::OpenAIResponse {
         return body;
     }
+    strip_call_ids(body)
+}
+
+/// Deletes `id` from every `functionCall` and `functionResponse` part of `contents`, which
+/// Vertex refuses; calls and responses still pair by order and name.
+pub(crate) fn strip_call_ids(body: Vec<u8>) -> Vec<u8> {
     let contents = gj::get(&body, "contents");
     if !contents.is_array() {
         return body;
