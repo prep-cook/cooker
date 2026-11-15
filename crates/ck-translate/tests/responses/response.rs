@@ -295,8 +295,18 @@ fn egress_usage(usage: &[u8]) -> Value {
             .emit(&mut m.writer, kind, Scope::default(), |e| e.bytes(payload), |_| Ok(()))
             .unwrap();
     }
-    let mut egress =
-        responses::egress::Egress::new(&mut m.writer, Operation::Generate, BodyMode::Buffered, |_, _| {}).unwrap();
+    let mut egress = responses::egress::Egress::new(
+        &mut m.writer,
+        LocalId::new("resp_test").unwrap(),
+        codec::identity::Producer {
+            provider: LocalId::new("test").unwrap(),
+            credential: [0; 32],
+        },
+        Operation::Generate,
+        BodyMode::Buffered,
+        |_, _| {},
+    )
+    .unwrap();
     let mut out = Vec::new();
     while let std::task::Poll::Ready(Some(ck_stream::Read::Record(record))) = reader.try_next() {
         egress
