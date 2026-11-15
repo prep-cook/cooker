@@ -1,6 +1,7 @@
 use super::super::{is, string};
 use crate::codec::chat::request::gemini::{Outcome, json_mode, outcome};
 use crate::codec::chat::request::json_schema;
+use crate::codec::chat::request_schema::only;
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
@@ -47,13 +48,19 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
             return Err(Error::Unsupported);
         }
     }
-    // ponytail: Chat's nested `allowed_tools` choice is refused; projecting it onto Responses'
-    // flat `mode`/`tools` spelling lifts this.
-    if let Some(choice) = doc.member(root, "tool_choice")?
-        && matches!(doc.node(choice)?.value, Value::Object)
-        && doc.member(choice, "allowed_tools")?.is_some()
+    // Chat `logprobs` would map to `include: ["message.output_text.logprobs"]`, but nothing
+    // translates the returned log probabilities back, so a request for them is refused rather
+    // than dropped. `false` and null ask for the default, which egress leaves unwritten.
+    if let Some(n) = doc.member(root, "logprobs")?
+        && !matches!(doc.node(n)?.value, Value::Null | Value::Bool(false))
     {
         return Err(Error::Unsupported);
+    }
+    if let Some(choice) = doc.member(root, "tool_choice")?
+        && matches!(doc.node(choice)?.value, Value::Object)
+        && let Some(allowed) = doc.member(choice, "allowed_tools")?
+    {
+        nested_allowed(doc, choice, allowed)?;
     }
     if json_schema::from_gemini(doc)? {
         gemini_controls(doc)?;
@@ -101,6 +108,24 @@ fn gemini_controls(doc: &Document) -> Result<()> {
         for tool in doc.children(tools)? {
             json_schema::check_function(doc, doc.required(tool, "function")?, true)?;
         }
+    }
+    Ok(())
+}
+/// A nested allowed-tools choice, which egress writes flat. Responses lists a function or custom
+/// tool by `type` and `name` alone, so any other member is unsupported.
+fn nested_allowed(doc: &Document, choice: usize, allowed: usize) -> Result<()> {
+    only(doc, choice, &["type", "allowed_tools"])?;
+    only(doc, allowed, &["mode", "tools"])?;
+    for tool in doc.children(doc.required(allowed, "tools")?)? {
+        let mut carrier = Err(Error::Unsupported);
+        for kind in ["function", "custom"] {
+            if is(doc, tool, "type", kind)? {
+                carrier = Ok(kind);
+            }
+        }
+        let carrier = carrier?;
+        only(doc, tool, &["type", carrier])?;
+        only(doc, doc.required(tool, carrier)?, &["name"])?;
     }
     Ok(())
 }

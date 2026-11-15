@@ -14,6 +14,10 @@ pub(super) fn write_field(doc: &Document, field: usize, e: &mut Encoder<'_, '_>)
     if doc.name_is(name, "messages")? || doc.name_is(name, "stream")? || doc.name_is(name, "x_ck")? {
         return Ok(());
     }
+    // Chat's `logprobs` has no Responses member; the fence passes only its default values.
+    if doc.name_is(name, "logprobs")? {
+        return Ok(());
+    }
     // Chat's `max_tokens` is the older spelling of the same limit; `max_completion_tokens` wins.
     if doc.name_is(name, "max_tokens")? && doc.member(doc.root(), "max_completion_tokens")?.is_some() {
         return Ok(());
