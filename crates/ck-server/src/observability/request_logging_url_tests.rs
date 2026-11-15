@@ -291,7 +291,9 @@ async fn captured_response_sections_are_redacted_whole() {
             None,
             "Post \"<redacted url>\": EOF",
         ),
-        (vec![long.into_bytes()], None, "http://127.0.0.1/?code=*** tail"),
+        // A spooled section is redacted as it is copied into the log; a reference
+        // longer than the copy's hold limit prints as the placeholder.
+        (vec![long.into_bytes()], None, "\n<redacted url> tail"),
     ];
     for (chunks, fail, want) in rows {
         let content = persisted(true, StatusCode::BAD_GATEWAY, move |log| {

@@ -99,7 +99,7 @@ impl Relay {
         if let Some(usage) = &self.usage {
             usage.response_line(ck_core::format::Format::Claude, line);
         }
-        self.capture.record(ck_core::exec::CaptureEvent::ResponseChunk(line));
+        crate::proxy::capture_line(&self.capture, line);
         let restored = match restore_line(line, &self.reverse) {
             Ok(restored) => restored,
             Err(message) => {
@@ -414,10 +414,10 @@ mod tests {
         assert_eq!(
             run(broken, Arc::default()).await,
             [
-                "chunk event: ping",
-                "chunk data: {}",
-                "chunk ",
-                "chunk partial",
+                "chunk event: ping\n",
+                "chunk data: {}\n",
+                "chunk \n",
+                "chunk partial\n",
                 "error unexpected EOF"
             ]
         );

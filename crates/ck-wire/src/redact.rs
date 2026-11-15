@@ -21,7 +21,31 @@ pub const UNPRINTABLE: &str = "<redacted url>";
 /// (`https:key`), a malformed authority, and an '@' after the authority but before the
 /// path, where a password holding an unescaped '?' or '#' would leave its start as the
 /// host.
+///
+/// A `scheme://` before the query or fragment that does not open `raw` starts a URL of
+/// its own (`/r/https://user:key@host/`), so `raw` is cut where its scheme starts and
+/// each part is rendered alone; a part that cannot be rendered prints as [`UNPRINTABLE`].
 pub fn url(raw: &str) -> String {
+    let end = raw.find(['?', '#']).unwrap_or(raw.len());
+    let mut out = String::new();
+    let mut from = 0;
+    let mut at = 0;
+    while let Some(found) = raw[at..end].find("://") {
+        let colon = at + found;
+        at = colon + 3;
+        let start = colon - raw[..colon].bytes().rev().take_while(|b| scheme_byte(*b)).count();
+        // The scheme that opens `raw` (after its leading spaces) is its own.
+        if raw[from..start].trim_start_matches(' ').is_empty() {
+            continue;
+        }
+        out.push_str(&rendered(&raw[from..start]));
+        from = start;
+    }
+    out.push_str(&rendered(&raw[from..]));
+    out
+}
+
+fn rendered(raw: &str) -> String {
     render(raw).unwrap_or_else(|| UNPRINTABLE.to_owned())
 }
 
@@ -63,6 +87,19 @@ pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
     } else {
         Cow::Owned(out)
     }
+}
+
+/// Copies `input` to `out` with every URL reference rendered by [`url`], as [`bytes`]
+/// renders the whole text, for a capture too large to hold in memory. Memory stays
+/// within a fixed read size and hold limit: a reference still unfinished past the hold
+/// limit (1 MiB) prints as [`UNPRINTABLE`] and the rest of it is dropped.
+pub fn copy(input: &mut dyn std::io::Read, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    scan::copy(input, out, scan::HOLD)
+}
+
+#[cfg(test)]
+fn copy_holding(input: &mut dyn std::io::Read, out: &mut dyn std::io::Write, hold: usize) -> std::io::Result<()> {
+    scan::copy(input, out, hold)
 }
 
 /// A raw query (without its `?`) with every value masked: `name=value` prints as

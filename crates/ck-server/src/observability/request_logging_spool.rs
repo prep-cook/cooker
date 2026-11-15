@@ -1,11 +1,12 @@
 //! Capture files: an upstream [`Section`] of the request log, kept in memory and then
 //! in a [`Spool`] file. Spools hold captured bytes as they arrive; a section's URLs are
-//! redacted once, over the whole section, when the log is written (owner ruling Q18 and
-//! decision 2026-11-15), so no URL split across chunks or writes escapes redaction.
+//! redacted over the whole section as it is copied into the log (owner ruling Q18 and
+//! decisions 2026-11-15 and 2026-11-16), so no URL split across chunks or writes escapes
+//! redaction, and a spooled section is never read into memory whole.
 
 use super::trim;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 
@@ -31,6 +32,14 @@ impl Spool {
             .open(&path)?;
         std::fs::remove_file(&path)?;
         Ok(Self { file })
+    }
+
+    /// Copies everything written to the file into `out`, its URLs redacted
+    /// ([`ck_wire::redact::copy`]), followed by `after`, as one text.
+    pub(super) fn copy_redacted(&self, after: &[u8], out: &mut dyn Write) -> io::Result<()> {
+        let mut file = &self.file;
+        file.seek(io::SeekFrom::Start(0))?;
+        ck_wire::redact::copy(&mut file.chain(after), out)
     }
 
     /// Everything written to the file, read from its start whatever the write position.
@@ -147,16 +156,9 @@ impl Section {
         if self.dropped {
             return out.write_all(DROPPED);
         }
-        let spooled;
-        let text = match &self.spool {
-            Some(spool) => {
-                let mut bytes = spool.contents()?;
-                bytes.extend_from_slice(&self.memory);
-                spooled = bytes;
-                &spooled
-            }
-            None => &self.memory,
-        };
-        out.write_all(&ck_wire::redact::bytes(text))
+        match &self.spool {
+            Some(spool) => spool.copy_redacted(&self.memory, out),
+            None => out.write_all(&ck_wire::redact::bytes(&self.memory)),
+        }
     }
 }

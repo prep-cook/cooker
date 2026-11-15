@@ -160,6 +160,11 @@ impl Capture {
         self.0.record(CaptureEvent::ResponseChunk(bytes));
     }
 
+    /// `AppendAPIResponseChunk` of a scanned line ([`crate::proxy::capture_line`]).
+    pub(crate) fn line(&self, line: &[u8]) {
+        crate::proxy::capture_line(&self.0, line);
+    }
+
     /// `RecordAPIResponseError`.
     pub(crate) fn error(&self, error: &ExecError) {
         if self.0.enabled() {

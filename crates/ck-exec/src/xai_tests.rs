@@ -332,7 +332,9 @@ async fn go_reference_scenarios() {
                     .map(|h| (h[0].as_str().unwrap().to_owned(), h[1].as_str().unwrap().to_owned()))
                     .collect(),
                 body: up["body"].as_str().unwrap(),
-                logged: if op == "stream" && (200..300).contains(&status) {
+                // A stream is logged line by line; a JSON answer (the compact a
+                // compaction trigger runs) is read whole.
+                logged: if op == "stream" && (200..300).contains(&status) && !json_reply(up) {
                     Logged::Lines
                 } else {
                     Logged::Whole
@@ -999,4 +1001,12 @@ async fn a_refused_baseline_alone_does_not_refuse_the_request() {
     assert!(wire.unwrap().contains("hello"));
     s["payload"] = s["original"].clone();
     assert_eq!(run(s).await, (false, None));
+}
+
+/// Whether a recorded upstream reply is a JSON document rather than an event stream.
+fn json_reply(upstream: &serde_json::Value) -> bool {
+    upstream["headers"].as_array().into_iter().flatten().any(|h| {
+        h[0].as_str().is_some_and(|n| n.eq_ignore_ascii_case("content-type"))
+            && h[1].as_str().is_some_and(|v| v.starts_with("application/json"))
+    })
 }

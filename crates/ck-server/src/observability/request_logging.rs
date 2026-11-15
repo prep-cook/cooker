@@ -8,6 +8,7 @@
 use ck_core::gostr::GoStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1154,25 +1155,24 @@ impl Record {
         writeln!(block, "=== RESPONSE ===\nStatus: {}", self.status)?;
         headers(&mut block, &self.response_headers, false)?;
         write_redacted(out, &block)?;
-        let spooled;
-        let body = match &self.response_spool {
-            Some(spool) => {
-                spooled = spool.contents()?;
-                &spooled
+        match &self.response_spool {
+            // A live call's response is at most `live::MAX_BODY`; redacting it whole also
+            // covers a marker split across written chunks.
+            Some(spool) if self.redact_sdp => {
+                let body = spool.contents()?;
+                write_body(out, &ck_exec::codex_live::redact_sdp(&body))?;
             }
-            None => &self.response,
-        };
-        // A live call's response is at most `live::MAX_BODY`; redacting it whole also
-        // covers a marker split across written chunks.
-        let body = if self.redact_sdp && self.response_spool.is_some() {
-            ck_exec::codex_live::redact_sdp(body)
-        } else {
-            std::borrow::Cow::Borrowed(&body[..])
-        };
-        if !(body.starts_with(b"\n") || body.starts_with(b"\r\n")) {
-            out.write_all(b"\n")?;
+            // A streamed response is copied into the log, not read into memory whole.
+            Some(spool) => {
+                let mut first = [0; 2];
+                let n = spool.file.read_at(&mut first, 0)?;
+                if !(first[..n].starts_with(b"\n") || first[..n].starts_with(b"\r\n")) {
+                    out.write_all(b"\n")?;
+                }
+                spool.copy_redacted(&[], out)?;
+            }
+            None => write_body(out, &self.response)?,
         }
-        write_redacted(out, &body)?;
         if let Some(error) = decompress_error {
             write!(out, "\n[DECOMPRESSION ERROR: ")?;
             write_redacted(out, error.as_bytes())?;
@@ -1183,6 +1183,15 @@ impl Record {
         }
         Ok(())
     }
+}
+
+/// Writes a response body, after a line break unless it starts with one, with every URL
+/// in it redacted.
+fn write_body(out: &mut dyn Write, body: &[u8]) -> io::Result<()> {
+    if !(body.starts_with(b"\n") || body.starts_with(b"\r\n")) {
+        out.write_all(b"\n")?;
+    }
+    write_redacted(out, body)
 }
 
 /// Writes one section of a log with every URL in it redacted. The section is redacted as

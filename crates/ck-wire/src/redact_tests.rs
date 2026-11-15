@@ -44,6 +44,21 @@ fn credentials_never_print() {
         ),
         (" HTTP://127.0.0.1:9/v1 ", " HTTP://127.0.0.1:9/v1 "),
         ("https:///v1?k=sk-review-secret", "https:///v1?k=***"),
+        // A `scheme://` inside the path starts a URL of its own.
+        (
+            "http://h.example/r/https://u:sk-review-secret@x.example/a?k=sk-review-secret",
+            "http://h.example/r/https://x.example/a?k=***",
+        ),
+        ("/p_https://u:sk-review-secret@x.example/a", "/p_https://x.example/a"),
+        (
+            "http://h.example/9://u:sk-review-secret@x/",
+            "http://h.example/<redacted url>",
+        ),
+        // Inside the query it is a masked value.
+        (
+            "http://h.example/a?next=https://u:sk-review-secret@x/",
+            "http://h.example/a?next=***",
+        ),
     ] {
         let got = url(raw);
         assert_eq!(got, want, "{raw}");
@@ -285,6 +300,19 @@ fn every_reference_shape_is_redacted() {
             "请访问http://127.0.0.1/?k=***",
         ),
         ("**http://127.0.0.1/?k=sk-review-secret**", "**http://127.0.0.1/?k=***"),
+        // A token holding `://` anywhere is a URL from its scheme on.
+        (
+            "x_https://user:sk-review-secret@host.example/",
+            "x_https://host.example/",
+        ),
+        (
+            "see /p_https://user:sk-review-secret@host.example/a end",
+            "see /p_https://host.example/a end",
+        ),
+        (
+            "see \"http://h.example/x https://u:sk-review-secret@y.example/\" end",
+            "see \"http://h.example/x https://y.example/\" end",
+        ),
     ] {
         let got = urls_in(text);
         assert_eq!(got, want, "{text}");
@@ -303,6 +331,100 @@ fn every_reference_shape_is_redacted() {
     }
     assert_eq!(bytes(b"/x?k=\xffsk-review-secret"), &b"<redacted url>"[..]);
     assert_eq!(bytes(b"\xff\xfe http://h/?k=v"), &b"\xff\xfe http://h/?k=***"[..]);
+}
+
+/// Reads that end where the test says.
+struct Pieces<'a>(std::collections::VecDeque<&'a [u8]>);
+
+impl std::io::Read for Pieces<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // An empty read would mean the end.
+        self.0.retain(|piece| !piece.is_empty());
+        let Some(piece) = self.0.pop_front() else { return Ok(0) };
+        let n = piece.len().min(buf.len());
+        buf[..n].copy_from_slice(&piece[..n]);
+        if n < piece.len() {
+            self.0.push_front(&piece[n..]);
+        }
+        Ok(n)
+    }
+}
+
+fn copied(pieces: &[&[u8]], hold: usize) -> String {
+    let mut out = Vec::new();
+    copy_holding(&mut Pieces(pieces.iter().copied().collect()), &mut out, hold).unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+/// A text copied in pieces is redacted as [`bytes`] redacts it whole, wherever a read
+/// ends, so a secret split across reads at any byte never prints. A reference longer
+/// than the hold limit prints as the placeholder instead.
+#[test]
+fn copied_text_is_redacted_wherever_reads_end() {
+    const BIG: usize = 1 << 20;
+    // (text, hold limit, what one-byte reads give; `None` is what `bytes` gives)
+    for (text, hold, bytewise) in [
+        (
+            "Post \"http://127.0.0.1/?code=prefix\nsk-review-secret\": EOF\nLocation: http://127.0.0.1/?co=sk-review-secret\n",
+            BIG,
+            None,
+        ),
+        (
+            "see http://u:sk-review-secret@127.0.0.1/p?k=sk-review-secret end",
+            BIG,
+            None,
+        ),
+        (
+            "x_https://user:sk-review-secret@host.example/ /p_https://u:sk-review-secret@x/a",
+            BIG,
+            None,
+        ),
+        (
+            "\"/cb?code=sk-review-secret\" 'http://h/?k=sk-review-secret' <http://h/#sk-review-secret> `//u:sk-review-secret@h/`",
+            BIG,
+            None,
+        ),
+        ("don't stop callback?code=sk-review-secret tail", BIG, None),
+        ("请访问http://127.0.0.1/?k=sk-review-secret <b \"a\\\"b\" c", BIG, None),
+        (
+            "see http://127.0.0.1/?code=xxxxxxxxsk-review-secret tail",
+            16,
+            Some("see <redacted url> tail"),
+        ),
+        (
+            "see \"http://127.0.0.1/?code=xx sk-review-secret\" tail",
+            16,
+            Some("see \"<redacted url>\" tail"),
+        ),
+        // A long token that cannot become a reference is written; a later `?` starts
+        // a relative reference of its own.
+        (
+            "see xxxxxxxxxxxxxxxxxxxx?code=sk-review-secret tail",
+            16,
+            Some("see xxxxxxxxxxxxxxxxxxxx<redacted url> tail"),
+        ),
+        (
+            "see qqqqqqqqqqqqqqqqqqqqqqqq/b+c= tail",
+            16,
+            Some("see qqqqqqqqqqqqqqqqqqqqqqqq/b+c= tail"),
+        ),
+        (
+            "see qqqqqqqqqqqqqqqqqqqq://u:sk-review-secret@h/ tail",
+            16,
+            Some("see qqqqqqqqqqqqqqqqqqqq<redacted url> tail"),
+        ),
+    ] {
+        let whole = urls_in(text).into_owned();
+        let bytes_read: Vec<&[u8]> = text.as_bytes().chunks(1).collect();
+        assert_eq!(copied(&bytes_read, hold), bytewise.unwrap_or(&whole), "{text}");
+        for cut in 0..=text.len() {
+            let got = copied(&[&text.as_bytes()[..cut], &text.as_bytes()[cut..]], hold);
+            assert_no_secret(&got, text);
+            if hold == BIG {
+                assert_eq!(got, whole, "{text} cut at {cut}");
+            }
+        }
+    }
 }
 
 #[test]

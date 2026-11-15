@@ -1347,6 +1347,14 @@ pub async fn read_all(
     Ok(out.freeze())
 }
 
+/// Records a line [`lines`] yielded as a captured response chunk, with the `\n` the
+/// scanner removed: chunks join as they are recorded, so each line stays on its own.
+pub(crate) fn capture_line(capture: &ck_core::exec::CaptureSink, line: &[u8]) {
+    if capture.logs_responses() {
+        capture.record(ck_core::exec::CaptureEvent::ResponseChunk(&[line, b"\n"].concat()));
+    }
+}
+
 /// `bufio.Scanner` with `ScanLines` and `Buffer(nil, max)`: one item per line without
 /// its `\n`, a trailing `\r` dropped, the final unterminated line included, and
 /// `bufio.ErrTooLong` when no newline falls within `max` bytes of a line's start (the

@@ -2167,12 +2167,12 @@ async fn request_logs_follow_go_capture_sites() {
     assert_eq!(
         events[2..],
         [
-            "chunk event: message_start",
-            r#"chunk data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":1}}}"#,
-            "chunk ",
-            "chunk event: message_stop",
-            r#"chunk data: {"type":"message_stop"}"#,
-            "chunk ",
+            "chunk event: message_start\n",
+            "chunk data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1}}}\n",
+            "chunk \n",
+            "chunk event: message_stop\n",
+            "chunk data: {\"type\":\"message_stop\"}\n",
+            "chunk \n",
         ]
     );
     // An upstream error: its metadata, then the error body.
