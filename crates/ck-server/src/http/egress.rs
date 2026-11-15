@@ -9,9 +9,10 @@
 
 use axum::http::HeaderMap;
 use axum::response::Response;
-use ck_stream::Writer;
+use ck_stream::{Terminal, Writer};
 use ck_translate::codec::event::Identity;
 use ck_translate::codec::{self, Operation, RequestView};
+use futures_util::FutureExt;
 
 use crate::inference::streams::{Cursor, Exchange, ProtocolEgress, Registry, Replay, Uncommitted, delivery};
 
@@ -90,6 +91,14 @@ pub async fn deliver(
         Ok(first) => first,
         Err(reason) => return Err(Box::new(Failed { exchange, reason })),
     };
+    // A producer that already failed while the first output was encoded loses the race:
+    // its partial response does not commit.
+    if let Some(terminal) = response.cancelled().now_or_never()
+        && terminal != Terminal::Done
+    {
+        let reason = Uncommitted::Terminal(terminal);
+        return Err(Box::new(Failed { exchange, reason }));
+    }
     let id = exchange.commit(streams, response.allocator());
     let mut delivered = delivery(replay, first, output.framing, &id, Cursor::start(output.framing));
     let own = std::mem::replace(delivered.headers_mut(), headers);

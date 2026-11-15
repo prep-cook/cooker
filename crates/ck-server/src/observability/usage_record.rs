@@ -2335,10 +2335,6 @@ impl Tracker {
 
     /// The attempt's canonical usage and response facts (`usage_snapshot::read`); they
     /// replace what the legacy parsers saw. Without a snapshot every count is unreported.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Q1 (temporary): D2's dispatch is the first caller")
-    )]
     pub fn canonical(&mut self, usage: Option<&CanonicalUsage>, facts: &ResponseFacts) {
         self.canonical = Some(Detail::canonical(usage.unwrap_or(&CanonicalUsage::default()), facts));
         if let Some(model) = &facts.model {

@@ -78,8 +78,11 @@ pub fn refence<'a, E: Execute>(
 }
 
 /// Runs the operation of `request` with `executor` and starts the producer on `response`,
-/// which must come from `Store::create_dependent(upload)`. An executor error discards the
-/// response stream (`Terminal::Gone`) and is the attempt's failure.
+/// which must come from `Store::create_dependent(upload)`. An executor error is the attempt's
+/// failure and ends the response stream with `Terminal::UpstreamError`, which keeps its
+/// records, so the attempt's usage reader still reaches a terminal and keeps a snapshot
+/// published before the failure. The caller takes an allocation handle (`Writer::allocator`)
+/// before this call and discards the stream with `finish(Gone)` once its usage reader is done.
 pub async fn start<E: Execute>(
     executor: &E,
     attempt: &Attempt<'_>,
@@ -94,7 +97,7 @@ pub async fn start<E: Execute>(
             last: Last::Other,
         },
         Err(error) => {
-            response.finish(Terminal::Gone);
+            response.finish(Terminal::UpstreamError);
             return Err(stored(&error));
         }
     };
@@ -121,7 +124,7 @@ pub async fn start<E: Execute>(
             producer: tokio::spawn(produce(upstream.body, upstream.ingress, response, published)),
         }),
         Err(error) => {
-            response.finish(Terminal::Gone);
+            response.finish(Terminal::UpstreamError);
             Err(error)
         }
     }

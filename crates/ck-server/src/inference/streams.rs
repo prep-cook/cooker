@@ -14,7 +14,7 @@ mod resume;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use axum::http::HeaderValue;
 use ck_core::exec::Caller;
@@ -81,8 +81,14 @@ pub struct Owner {
     pub scope: Option<String>,
 }
 
-/// One client request from ingress to commitment. Consumed by commitment into a
-/// [`StreamHandle`].
+/// One client request from ingress to commitment, and the owner of its streams until then.
+///
+/// The exchange is the one place that discards streams (contract §7): created together with
+/// its request stream, it holds that stream and the in-flight attempt's response stream. A
+/// new attempt discards the previous one's stream. Dropped without commitment, on any exit
+/// (an answer from the old arm, a refusal, a routing error, a client disconnect or a panic),
+/// it discards the attempt's stream and then the request stream, both once that attempt's
+/// usage is settled ([`Settled`]). Commitment keeps both and disarms the guard.
 pub struct Exchange {
     pub owner: Owner,
     pub output: Output,
@@ -90,23 +96,111 @@ pub struct Exchange {
     /// and each attempt's request egress encodes its upload into its scratch. At commitment
     /// the exchange finishes it with `Terminal::Done` and keeps an allocation handle.
     pub request: Writer,
+    /// The in-flight attempt: an allocation handle on its response stream and its settlement.
+    attempt: Option<(Writer, Arc<Mutex<Settlement>>)>,
+    committed: bool,
+}
+
+/// Streams an attempt's settlement discards once it is done, or at once when it already is.
+#[derive(Default)]
+struct Settlement {
+    settled: bool,
+    discard: Vec<Writer>,
+}
+
+impl Settlement {
+    fn discard(this: &Mutex<Self>, mut stream: Writer) {
+        let mut settlement = this.lock().unwrap_or_else(PoisonError::into_inner);
+        if settlement.settled {
+            stream.finish(Terminal::Gone);
+        } else {
+            settlement.discard.push(stream);
+        }
+    }
+}
+
+/// An attempt's settlement token: dropped once the attempt's usage record is settled, by its
+/// settlement task or by that task's unwinding, and only then may the exchange discard the
+/// attempt's stream.
+pub struct Settled(Arc<Mutex<Settlement>>);
+
+impl Drop for Settled {
+    fn drop(&mut self) {
+        let discard = {
+            let mut settlement = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            settlement.settled = true;
+            std::mem::take(&mut settlement.discard)
+        };
+        for mut stream in discard {
+            stream.finish(Terminal::Gone);
+        }
+    }
 }
 
 impl Exchange {
-    /// Commitment (`docs/EXECUTION-CONTRACT.md` §6): the request stream ends with `Done` and
-    /// the attempt whose egress emitted the first deliverable byte becomes the exchange's
-    /// handle, registered under a fresh id. `response` is that attempt's allocation handle.
-    pub(crate) fn commit(mut self, registry: &Registry, response: Writer) -> StreamId {
+    /// Creates the request stream and its exchange.
+    pub fn new(owner: Owner, output: Output, store: &Store) -> Result<Self, ck_stream::Error> {
+        Ok(Self {
+            owner,
+            output,
+            request: store.create()?,
+            attempt: None,
+            committed: false,
+        })
+    }
+
+    /// Takes ownership of a new attempt's response stream (an allocation handle) and returns
+    /// its settlement token. The previous attempt's stream is discarded.
+    pub fn attempt(&mut self, response: Writer) -> Settled {
+        let settlement = Arc::new(Mutex::new(Settlement::default()));
+        if let Some((previous, settled)) = self.attempt.replace((response, settlement.clone())) {
+            Settlement::discard(&settled, previous);
+        }
+        Settled(settlement)
+    }
+
+    /// Commitment without registration: the request stream ends with `Done` and the exchange
+    /// becomes the handle `id` over `response`, the committing attempt's allocation handle.
+    /// Both streams stay retained.
+    pub fn into_handle(mut self, id: StreamId, response: Writer) -> StreamHandle {
+        self.committed = true;
+        self.attempt = None;
         self.request.finish(Terminal::Done);
-        let id = StreamId::random();
-        registry.register(StreamHandle {
+        StreamHandle {
             id,
-            owner: self.owner,
+            owner: self.owner.clone(),
             output: self.output,
             response,
             request: self.request.allocator(),
-        });
+        }
+    }
+
+    /// Commitment (`docs/EXECUTION-CONTRACT.md` §6): the attempt whose egress emitted the
+    /// first deliverable byte becomes the exchange's handle, registered under a fresh id.
+    pub(crate) fn commit(self, registry: &Registry, response: Writer) -> StreamId {
+        let id = StreamId::random();
+        registry.register(self.into_handle(id, response));
         id
+    }
+}
+
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let request = self.request.allocator();
+        match self.attempt.take() {
+            // The request stream goes after the attempt that depends on it.
+            Some((response, settlement)) => {
+                Settlement::discard(&settlement, response);
+                Settlement::discard(&settlement, request);
+            }
+            None => {
+                let mut request = request;
+                request.finish(Terminal::Gone);
+            }
+        }
     }
 }
 
@@ -144,7 +238,8 @@ pub(crate) struct Attached {
 /// The runtime's stream store, committed handles and stream tasks ([`crate::Runtime::streams`]).
 #[derive(Default)]
 pub struct Registry {
-    store: RwLock<Option<Store>>,
+    /// Shared so an attempt can hold the store across its awaits (`ck_exec::types::Attempt`).
+    store: RwLock<Option<Arc<Store>>>,
     handles: Mutex<Handles>,
     tasks: tokio_util::task::TaskTracker,
     closed: AtomicBool,
@@ -165,16 +260,21 @@ impl Registry {
         if slot.is_some() || self.closed.load(Ordering::Acquire) {
             return Err(store);
         }
-        *slot = Some(store);
+        *slot = Some(Arc::new(store));
         Ok(())
     }
 
     /// Runs `f` on the store. `Closed` after shutdown.
+    pub fn with_store<R>(&self, f: impl FnOnce(&Store) -> R) -> Result<R, ck_stream::Error> {
+        self.store().map(|store| f(&store))
+    }
+
+    /// The store, for an attempt that holds it across awaits. `Closed` after shutdown.
     // ponytail: the store opens at first use from the §6.4 defaults (`$XDG_RUNTIME_DIR/cooker`);
     // Phase F opens it at startup from the deploy-only `stream.*` settings through `install`.
-    pub fn with_store<R>(&self, f: impl FnOnce(&Store) -> R) -> Result<R, ck_stream::Error> {
+    pub fn store(&self) -> Result<Arc<Store>, ck_stream::Error> {
         if let Some(store) = self.store.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
-            return Ok(f(store));
+            return Ok(store.clone());
         }
         let mut slot = self.store.write().unwrap_or_else(PoisonError::into_inner);
         if self.closed.load(Ordering::Acquire) {
@@ -182,9 +282,9 @@ impl Registry {
         }
         if slot.is_none() {
             let config = ck_stream::Config::from_environment().map_err(ck_stream::Error::Io)?;
-            *slot = Some(Store::open(config).map_err(ck_stream::Error::Io)?);
+            *slot = Some(Arc::new(Store::open(config).map_err(ck_stream::Error::Io)?));
         }
-        Ok(f(slot.as_ref().expect("opened above")))
+        Ok(slot.as_ref().expect("opened above").clone())
     }
 
     /// Registers a committed handle under its id. After shutdown began, its response stops
@@ -255,7 +355,16 @@ impl Registry {
     pub async fn finish_shutdown(&self) -> std::io::Result<()> {
         self.begin_shutdown();
         let store = self.store.write().unwrap_or_else(PoisonError::into_inner).take();
-        let stopped = store.map_or(Ok(()), |mut store| store.shutdown());
+        // The listener closed, so no request handler holds the store any more; stream tasks
+        // hold writers, never the store. A holder left over shuts it down when it drops.
+        let stopped = match store.map(Arc::try_unwrap) {
+            None => Ok(()),
+            Some(Ok(mut store)) => store.shutdown(),
+            Some(Err(_)) => {
+                tracing::warn!("stream store still shared at shutdown; it stops when released");
+                Ok(())
+            }
+        };
         self.tasks.close();
         self.tasks.wait().await;
         stopped

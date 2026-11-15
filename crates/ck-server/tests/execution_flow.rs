@@ -321,18 +321,16 @@ async fn live(
     upstream: mpsc::UnboundedSender<Result<Bytes, ExecError>>,
 ) -> (StreamHandle, Vec<u8>) {
     let store = &fixture.store;
-    let mut exchange = Exchange {
-        owner: Owner {
-            caller: fixture.caller.clone(),
-            scope: None,
-        },
-        output: Output {
-            protocol: Protocol::Chat,
-            operation: Operation::Generate,
-            framing: Framing::Sse,
-        },
-        request: store.create().unwrap(),
+    let owner = Owner {
+        caller: fixture.caller.clone(),
+        scope: None,
     };
+    let output = Output {
+        protocol: Protocol::Chat,
+        operation: Operation::Generate,
+        framing: Framing::Sse,
+    };
+    let mut exchange = Exchange::new(owner, output, store).unwrap();
     let mut ingress = request::Ingress::new(
         &mut exchange.request,
         store,
@@ -355,14 +353,7 @@ async fn live(
     started.producer.await.unwrap().unwrap();
 
     // Commitment: the exchange becomes a handle; the request writer finishes.
-    exchange.request.finish(Terminal::Done);
-    let handle = StreamHandle {
-        id: StreamId([7; 16]),
-        owner: exchange.owner,
-        output: exchange.output,
-        response: started.stream,
-        request: exchange.request.allocator(),
-    };
+    let handle = exchange.into_handle(StreamId([7; 16]), started.stream);
     (handle, output)
 }
 

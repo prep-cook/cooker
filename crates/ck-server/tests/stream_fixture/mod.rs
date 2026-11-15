@@ -12,7 +12,7 @@ use ck_core::config::Config;
 use ck_core::exec::Caller;
 use ck_server::Runtime;
 use ck_server::http::egress::{Framing, Output, Protocol};
-use ck_server::inference::streams::{Exchange, Owner, StreamHandle, StreamId};
+use ck_server::inference::streams::{Exchange, Owner, StreamId};
 use ck_stream::{ManualClock, Store, Terminal, Writer};
 use ck_translate::codec::chat::{request, response};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
@@ -41,18 +41,32 @@ impl Fixture {
 
     /// [`Fixture::new`] with the runtime configured from `yaml`.
     pub fn with_config(yaml: &str, configure: impl FnOnce(&mut ck_stream::Config)) -> Self {
+        Self::build(yaml, Vec::new(), "http://127.0.0.1:9", configure)
+    }
+
+    /// [`Fixture::new`] with `credentials` and the Claude executor on `claude`, a loopback URL.
+    pub fn with_credentials(credentials: Vec<ck_core::credential::Credential>, claude: &str) -> Self {
+        Self::build("", credentials, claude, |_| {})
+    }
+
+    fn build(
+        yaml: &str,
+        credentials: Vec<ck_core::credential::Credential>,
+        claude: &str,
+        configure: impl FnOnce(&mut ck_stream::Config),
+    ) -> Self {
         let directory = std::env::temp_dir().join(format!("ck-streams-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let mut config = Config::parse(yaml).unwrap();
         config.api_keys = vec![KEY.into(), OTHER.into()];
         let executors = ck_exec::Executors {
-            claude: ck_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+            claude: ck_exec::claude::ClaudeExecutor::new(claude).unwrap(),
             codex: Default::default(),
             devices: Default::default(),
             openai: Default::default(),
             google: Default::default(),
         };
-        let rt = Arc::new(ck_server::testing::runtime(config, Vec::new(), executors));
+        let rt = Arc::new(ck_server::testing::runtime(config, credentials, executors));
         let mut stream = ck_stream::Config::new(directory.join("pool"));
         stream.pool_bytes = Some(64 * ck_stream::FRAME_BYTES);
         stream.max_metadata_bytes = 4 * 1024 * 1024;
@@ -156,21 +170,10 @@ impl Live {
 /// before commitment. The attempt's id is set at commitment.
 pub fn start(fixture: &Fixture, owner: Owner, output: Output, body: &[u8]) -> (Exchange, Live) {
     let streams = fixture.rt.streams();
-    let (request, writer, ingress) = streams
+    let exchange = exchange(fixture, owner, output, body);
+    let (writer, ingress) = streams
         .with_store(|store| {
-            let mut request = store.create().unwrap();
-            let mut client = request::Ingress::new(
-                &mut request,
-                store,
-                identity(Direction::Request),
-                Operation::Generate,
-                1 << 20,
-            )
-            .unwrap();
-            client.advance(&mut request, body).unwrap();
-            client.finish(&mut request, &request::ChatCapability).unwrap();
-            drop(client);
-            let mut writer = store.create_dependent(&request).unwrap();
+            let mut writer = store.create_dependent(&exchange.request).unwrap();
             let ingress = response::Ingress::new(
                 &mut writer,
                 store,
@@ -180,13 +183,12 @@ pub fn start(fixture: &Fixture, owner: Owner, output: Output, body: &[u8]) -> (E
                 1 << 20,
             )
             .unwrap();
-            (request, writer, ingress)
+            (writer, ingress)
         })
         .unwrap();
     let response = writer.allocator();
     let (sender, receiver) = mpsc::unbounded_channel();
     let producer = streams.spawn(produce(ingress, writer, receiver));
-    let exchange = Exchange { owner, output, request };
     let live = Live {
         id: StreamId([0; 16]),
         response,
@@ -196,6 +198,30 @@ pub fn start(fixture: &Fixture, owner: Owner, output: Output, body: &[u8]) -> (E
     (exchange, live)
 }
 
+/// Runs Chat request ingress for `body`: the exchange before its first attempt.
+pub fn exchange(fixture: &Fixture, owner: Owner, output: Output, body: &[u8]) -> Exchange {
+    fixture
+        .rt
+        .streams()
+        .with_store(|store| {
+            let mut exchange = Exchange::new(owner, output, store).unwrap();
+            let request = &mut exchange.request;
+            let mut client = request::Ingress::new(
+                request,
+                store,
+                identity(Direction::Request),
+                Operation::Generate,
+                1 << 20,
+            )
+            .unwrap();
+            client.advance(request, body).unwrap();
+            client.finish(request, &request::ChatCapability).unwrap();
+            drop(client);
+            exchange
+        })
+        .unwrap()
+}
+
 /// [`start`] for a Chat client, committed at once under a fresh id.
 pub fn commit(fixture: &Fixture, owner: Owner, framing: Framing, body: &[u8]) -> Live {
     let output = Output {
@@ -203,16 +229,10 @@ pub fn commit(fixture: &Fixture, owner: Owner, framing: Framing, body: &[u8]) ->
         operation: Operation::Generate,
         framing,
     };
-    let (mut exchange, mut live) = start(fixture, owner, output, body);
-    exchange.request.finish(Terminal::Done);
+    let (exchange, mut live) = start(fixture, owner, output, body);
     live.id = StreamId::random();
-    fixture.rt.streams().register(StreamHandle {
-        id: live.id,
-        owner: exchange.owner,
-        output,
-        response: live.response.allocator(),
-        request: exchange.request.allocator(),
-    });
+    let handle = exchange.into_handle(live.id, live.response.allocator());
+    fixture.rt.streams().register(handle);
     live
 }
 

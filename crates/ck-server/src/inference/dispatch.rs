@@ -23,6 +23,11 @@ use crate::scheduling::registry::{self, AliasResult, Registry};
 use crate::scheduling::scheduler::{Policy, canonical_model};
 use crate::scheduling::{classify, lcp};
 
+mod attempt;
+
+use attempt::{Arm, Ran};
+pub use attempt::{Arms, Codec};
+
 /// One client request, already parsed by its route.
 #[derive(Clone)]
 pub struct Call {
@@ -931,14 +936,53 @@ pub async fn run(rt: &Arc<Runtime>, call: Call, trace: &Trace) -> Result<Done, R
     run_routed(rt, call, trace, resolved, None).await
 }
 
+/// What a request with a decoded exchange ([`run_exchange`]) came to.
+pub enum Served {
+    /// An old-arm attempt answered; the route renders it as for [`run`].
+    Old(Done),
+    /// A contract-arm attempt committed: the response carries its first deliverable bytes.
+    Committed(axum::response::Response),
+}
+
+/// [`run`] for a request its route decoded into `codec`. Each candidate takes the contract
+/// arm through `arms` or the old arm (D2-PLAN §3.2, §4); both share selection, retry rounds,
+/// the credits fallback and one usage `Facts`.
+pub async fn run_exchange<X: Arms>(
+    rt: &Arc<Runtime>,
+    arms: &X,
+    call: Call,
+    trace: &Trace,
+    codec: Codec<'_>,
+) -> Result<Served, RunError> {
+    let resolved = route(rt, &rt.registry(), &call)?;
+    let mut arm = Arm::new(arms, codec);
+    run_loop(rt, call, trace, resolved, None, Some(&mut arm)).await
+}
+
 /// [`run`] for resolved providers and model.
 async fn run_routed(
     rt: &Arc<Runtime>,
     call: Call,
     trace: &Trace,
-    (providers, model): (Vec<String>, String),
+    resolved: (Vec<String>, String),
     scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
 ) -> Result<Done, RunError> {
+    let old = run_loop::<ck_exec::Executors>(rt, call, trace, resolved, scope, None).await?;
+    match old {
+        Served::Old(done) => Ok(done),
+        Served::Committed(_) => unreachable!("only an exchange commits"),
+    }
+}
+
+/// The selection loop; `arm` is the exchange of a request that may take the contract arm.
+async fn run_loop<X: Arms>(
+    rt: &Arc<Runtime>,
+    call: Call,
+    trace: &Trace,
+    (providers, model): (Vec<String>, String),
+    scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
+    mut arm: Option<&mut Arm<'_, '_, X>>,
+) -> Result<Served, RunError> {
     let (cfg, policy) = rt.request_snapshot();
     let registry = rt.registry();
     let aliases = registry::global_aliases(&cfg);
@@ -1025,6 +1069,8 @@ async fn run_routed(
     let mut upstream: Option<Fault> = None;
     loop {
         let mut last: Option<Fault> = None;
+        // A destination refusal answers only when no candidate failed after sending.
+        let mut skipped: Option<Fault> = None;
         let mut attempted: Vec<String> = Vec::new();
         let pick_failure = loop {
             if policy.max_retry_credentials > 0 && attempted.len() >= policy.max_retry_credentials {
@@ -1100,8 +1146,23 @@ async fn run_routed(
                 compact,
                 keep_model: call.selection_model.is_some(),
             };
-            match attempt(rt, &cfg, &policy, &call, &request, usage.as_ref(), lease, target).await {
-                Attempt::Done(done) => return Ok(done),
+            let ran = attempt(
+                rt,
+                &cfg,
+                &policy,
+                &call,
+                trace,
+                &request,
+                usage.as_ref(),
+                arm.as_deref_mut(),
+                lease,
+                target,
+            )
+            .await;
+            match ran {
+                Attempt::Done(done) => return Ok(Served::Old(done)),
+                Attempt::Committed(response) => return Ok(Served::Committed(response)),
+                Attempt::Skip(fault) => skipped = Some(fault),
                 Attempt::Stop(fault) => {
                     trace.stop();
                     return Err(fault.into_run_error());
@@ -1117,7 +1178,7 @@ async fn run_routed(
         // The round's error decides retries: an attempt error when there was one, else
         // the selection failure. The response reports the latest upstream attempt when
         // there was one (Go executeMixedOnce, preferredExecutionAttemptError).
-        let round_error: RunError = match (last, pick_failure) {
+        let round_error: RunError = match (last.or(skipped), pick_failure) {
             (Some(fault), _) => fault.into_run_error(),
             (None, Some(failure)) => failure.into(),
             (None, None) => Failure::Unavailable {
@@ -1158,8 +1219,10 @@ async fn run_routed(
                     &cfg,
                     &policy,
                     &call,
+                    trace,
                     &request,
                     usage.as_ref(),
+                    arm.as_deref_mut(),
                     terminal(round_error),
                 )
                 .await;
@@ -1175,8 +1238,10 @@ async fn run_routed(
                     &cfg,
                     &policy,
                     &call,
+                    trace,
                     &request,
                     usage.as_ref(),
+                    arm.as_deref_mut(),
                     terminal(round_error),
                 )
                 .await;
@@ -1241,16 +1306,18 @@ impl Credits<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn fallback(
+    async fn fallback<X: Arms>(
         &self,
         rt: &Arc<Runtime>,
         cfg: &Config,
         policy: &Policy,
         call: &Call,
+        trace: &Trace,
         request: &ExecRequest,
         usage: Option<&Arc<crate::observability::usage_record::Facts>>,
+        mut arm: Option<&mut Arm<'_, '_, X>>,
         error: RunError,
-    ) -> Result<Done, RunError> {
+    ) -> Result<Served, RunError> {
         // Go's ExecuteCount has no credits fallback; Execute and ExecuteStream do.
         if request.operation == Operation::CountTokens
             || !self.wanted(cfg, &error)
@@ -1295,8 +1362,23 @@ impl Credits<'_> {
             };
             // ponytail: a 401 inside a credits attempt retries with the refreshed
             // credential, which no longer carries the credits flag.
-            if let Attempt::Done(done) = attempt(rt, cfg, policy, call, request, usage, lease, target).await {
-                return Ok(done);
+            let ran = attempt(
+                rt,
+                cfg,
+                policy,
+                call,
+                trace,
+                request,
+                usage,
+                arm.as_deref_mut(),
+                lease,
+                target,
+            )
+            .await;
+            match ran {
+                Attempt::Done(done) => return Ok(Served::Old(done)),
+                Attempt::Committed(response) => return Ok(Served::Committed(response)),
+                Attempt::Stop(_) | Attempt::Skip(_) | Attempt::Next(_) => {}
             }
         }
         Err(error)
@@ -1305,10 +1387,14 @@ impl Credits<'_> {
 
 enum Attempt {
     Done(Done),
+    /// A contract-arm attempt committed.
+    Committed(axum::response::Response),
     /// Terminal for the whole request.
     Stop(Fault),
     /// Failed over; try the next credential.
     Next(Fault),
+    /// Every model of this credential refused the request before sending; try the next.
+    Skip(Fault),
 }
 
 /// What one selected credential executes.
@@ -1325,13 +1411,15 @@ struct Target<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn attempt(
+async fn attempt<X: Arms>(
     rt: &Arc<Runtime>,
     cfg: &Config,
     policy: &Policy,
     call: &Call,
+    trace: &Trace,
     request: &ExecRequest,
     usage: Option<&Arc<crate::observability::usage_record::Facts>>,
+    mut arm: Option<&mut Arm<'_, '_, X>>,
     mut lease: Lease,
     target: Target<'_>,
 ) -> Attempt {
@@ -1339,7 +1427,7 @@ async fn attempt(
     let mut last = None;
     let mut refreshed = false;
     let session = call.turn.as_ref().map(|turn| &turn.session);
-    for (i, upstream) in target.models.iter().enumerate() {
+    'models: for (i, upstream) in target.models.iter().enumerate() {
         // Go `stateModelForExecution`.
         let state = registry::state_model(target.selection_model, &route_model, upstream, target.pooled);
         lease.execution_model = state.clone();
@@ -1360,95 +1448,133 @@ async fn attempt(
         if let Some(on_selected) = call.on_selected() {
             on_selected(&lease.credential);
         }
-        let start = |credential: &ck_core::credential::Credential, req: &mut ExecRequest| {
-            usage.map(|facts| {
-                let mut tracker = crate::observability::usage_record::Tracker::start(rt, facts, credential, upstream);
-                if let Some(m) = &lcp {
-                    tracker.lcp_session(m);
-                }
-                req.usage = tracker.sink().with_capture(req.capture().clone());
-                tracker
-            })
-        };
-        let mut tracker = start(&lease.credential, &mut req);
-        let execute = |credential: Arc<ck_core::credential::Credential>, req: ExecRequest| async move {
-            let credential = rt.for_executor(&credential);
-            match (session, call.media.as_ref().map(|m| m.kind)) {
-                (Some(session), _) => rt.executors.execute_in_session(&credential, req, cfg, session).await,
-                // The call names the path (Go's request_path metadata).
-                (None, Some(MediaKind::Images)) => {
-                    let path = req.request_path.clone();
-                    rt.executors.images(&credential, req, &path, cfg).await
-                }
-                (None, Some(MediaKind::Videos)) => {
-                    let path = req.request_path.clone();
-                    rt.executors.videos(&credential, req, &path, cfg).await
-                }
-                (None, Some(MediaKind::Speech)) => rt.executors.speech(&credential, req, cfg).await,
-                (None, None) => rt.executors.execute(&credential, req, cfg).await,
-            }
-        };
-        tracing::trace!(target: "cpa_latency", stage = "selected");
-        // Each pooled model is its own upstream dispatch, stamped right before it runs:
-        // after preparation and the after-auth interceptor (Go `nextExecutionSeq`).
-        lease.redispatch();
-        let mut executed = execute(lease.credential.clone(), req.clone()).await;
-        // Go `tryRefreshAfterUnauthorized`: one refresh-and-retry per credential.
-        if let Err(error) = &executed
-            && !refreshed
-            && classify::is_unauthorized(error)
-            && let Some(current) = rt.refresh_after_unauthorized(&lease.credential, cfg).await
-        {
-            refreshed = true;
-            if let Some(t) = tracker.take() {
-                t.fail(error);
-            }
-            lease.credential = current;
-            lease.redispatch();
-            tracker = start(&lease.credential, &mut req);
-            executed = execute(lease.credential.clone(), req).await;
-        }
-        if let (Ok(response), Some(t)) = (&executed, tracker.as_mut()) {
-            t.arrived(&response.headers);
-        }
-        let fault = match executed {
-            Ok(response) => match finish(call, response).await {
-                Ok(done) => {
-                    let done = track_usage(done, tracker.take());
-                    let done = if target.alias.force_mapping && !target.alias.original_alias.is_empty() {
-                        rewrite_model(done, &target.alias.original_alias)
-                    } else {
-                        done
-                    };
-                    return Attempt::Done(match done {
-                        Done::Stream { headers, first, rest } => {
-                            // A good first chunk answers a bounded window's probe now,
-                            // not when the stream ends.
-                            lease.accepted();
-                            Done::Stream {
-                                headers,
-                                first,
-                                rest: Completing::new(rest, lease).boxed(),
-                            }
-                        }
-                        buffered => {
-                            lease.complete(Outcome::Success);
-                            buffered
-                        }
-                    });
-                }
-                Err(fault) => {
-                    if let Some(t) = tracker.take() {
-                        t.fail(&fault.error);
+        let fault = 'arm: {
+            if let Some(arm) = arm.as_deref_mut() {
+                let ran = loop {
+                    let ran = attempt::run(arm, rt, cfg, call, trace, &req, usage, &mut lease, upstream).await;
+                    // Go `tryRefreshAfterUnauthorized`, once per credential, after the failed
+                    // attempt was settled and discarded.
+                    if let Ran::Failed(fault) = &ran
+                        && !refreshed
+                        && classify::is_unauthorized(&fault.error)
+                        && let Some(current) = rt.refresh_after_unauthorized(&lease.credential, cfg).await
+                    {
+                        refreshed = true;
+                        lease.credential = current;
+                        continue;
                     }
-                    fault
+                    break ran;
+                };
+                match ran {
+                    Ran::Old => {}
+                    Ran::Failed(fault) => break 'arm fault,
+                    Ran::Committed(committed) => return Attempt::Committed(committed.spawn(rt, lease)),
+                    Ran::Stop(fault) => {
+                        lease.complete(Outcome::Neutral(fault.error.clone()));
+                        return Attempt::Stop(fault);
+                    }
+                    Ran::Skip(fault) => {
+                        let outcome = Outcome::Neutral(fault.error.clone());
+                        if i + 1 < target.models.len() {
+                            lease.note(&state, &outcome);
+                            continue 'models;
+                        }
+                        lease.complete(outcome);
+                        return last.map_or(Attempt::Skip(fault), Attempt::Next);
+                    }
                 }
-            },
-            Err(error) => {
+            }
+            let start = |credential: &ck_core::credential::Credential, req: &mut ExecRequest| {
+                usage.map(|facts| {
+                    let mut tracker =
+                        crate::observability::usage_record::Tracker::start(rt, facts, credential, upstream);
+                    if let Some(m) = &lcp {
+                        tracker.lcp_session(m);
+                    }
+                    req.usage = tracker.sink().with_capture(req.capture().clone());
+                    tracker
+                })
+            };
+            let mut tracker = start(&lease.credential, &mut req);
+            let execute = |credential: Arc<ck_core::credential::Credential>, req: ExecRequest| async move {
+                let credential = rt.for_executor(&credential);
+                match (session, call.media.as_ref().map(|m| m.kind)) {
+                    (Some(session), _) => rt.executors.execute_in_session(&credential, req, cfg, session).await,
+                    // The call names the path (Go's request_path metadata).
+                    (None, Some(MediaKind::Images)) => {
+                        let path = req.request_path.clone();
+                        rt.executors.images(&credential, req, &path, cfg).await
+                    }
+                    (None, Some(MediaKind::Videos)) => {
+                        let path = req.request_path.clone();
+                        rt.executors.videos(&credential, req, &path, cfg).await
+                    }
+                    (None, Some(MediaKind::Speech)) => rt.executors.speech(&credential, req, cfg).await,
+                    (None, None) => rt.executors.execute(&credential, req, cfg).await,
+                }
+            };
+            tracing::trace!(target: "cpa_latency", stage = "selected");
+            // Each pooled model is its own upstream dispatch, stamped right before it runs:
+            // after preparation and the after-auth interceptor (Go `nextExecutionSeq`).
+            lease.redispatch();
+            let mut executed = execute(lease.credential.clone(), req.clone()).await;
+            // Go `tryRefreshAfterUnauthorized`: one refresh-and-retry per credential.
+            if let Err(error) = &executed
+                && !refreshed
+                && classify::is_unauthorized(error)
+                && let Some(current) = rt.refresh_after_unauthorized(&lease.credential, cfg).await
+            {
+                refreshed = true;
                 if let Some(t) = tracker.take() {
-                    t.fail(&error);
+                    t.fail(error);
                 }
-                Fault { error, bootstrap: None }
+                lease.credential = current;
+                lease.redispatch();
+                tracker = start(&lease.credential, &mut req);
+                executed = execute(lease.credential.clone(), req).await;
+            }
+            if let (Ok(response), Some(t)) = (&executed, tracker.as_mut()) {
+                t.arrived(&response.headers);
+            }
+            match executed {
+                Ok(response) => match finish(call, response).await {
+                    Ok(done) => {
+                        let done = track_usage(done, tracker.take());
+                        let done = if target.alias.force_mapping && !target.alias.original_alias.is_empty() {
+                            rewrite_model(done, &target.alias.original_alias)
+                        } else {
+                            done
+                        };
+                        return Attempt::Done(match done {
+                            Done::Stream { headers, first, rest } => {
+                                // A good first chunk answers a bounded window's probe now,
+                                // not when the stream ends.
+                                lease.accepted();
+                                Done::Stream {
+                                    headers,
+                                    first,
+                                    rest: Completing::new(rest, lease).boxed(),
+                                }
+                            }
+                            buffered => {
+                                lease.complete(Outcome::Success);
+                                buffered
+                            }
+                        });
+                    }
+                    Err(fault) => {
+                        if let Some(t) = tracker.take() {
+                            t.fail(&fault.error);
+                        }
+                        fault
+                    }
+                },
+                Err(error) => {
+                    if let Some(t) = tracker.take() {
+                        t.fail(&error);
+                    }
+                    Fault { error, bootstrap: None }
+                }
             }
         };
         let error = &fault.error;
