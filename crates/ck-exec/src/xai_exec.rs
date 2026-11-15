@@ -5,7 +5,8 @@
 //! (`xai_events`) into the Responses response ingress. A native compact goes buffered to
 //! `/responses/compact` on the official API. A token count is local: xAI's API counts no
 //! Responses request. The executor shapes its own encoded upload, never the client body
-//! (`xai_shape`), with the payload rules last.
+//! (`xai_shape`), with the payload rules last. A request carrying `compaction_trigger` is
+//! refused for this destination, so it keeps the old arm (owner question 16).
 
 use std::borrow::Cow;
 
@@ -14,7 +15,7 @@ use ck_core::config::Config;
 use ck_core::exec::{ExecError, FailureScope};
 use ck_core::format::Format;
 use ck_stream::ScratchLease;
-use ck_translate::codec::document::Document;
+use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::{self, BodyMode, Capability, Operation, RequestEgress, RequestFence, RequestView};
 use ck_translate::responses::request::{Egress, ResponsesCapability};
 use ck_translate::responses::response::Ingress;
@@ -42,6 +43,9 @@ impl Capability for XaiCapability {
     }
 
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
+        if compaction_trigger(view.document)? {
+            return Err(codec::Error::Destination);
+        }
         match view.operation {
             Operation::Generate | Operation::Compact => ResponsesCapability.validate(view),
             // A count is valid exactly when the generation it projects is.
@@ -50,6 +54,50 @@ impl Capability for XaiCapability {
                 ..view
             }),
         }
+    }
+}
+
+/// Whether the request carries a Responses `compaction_trigger` item, which the codec keeps
+/// as an opaque part. The old path answers that turn with a compact it runs itself and
+/// synthesized events (Go `executeCompactionTriggerStream`); until owner question 16 the
+/// request keeps the old arm, before any upstream send.
+fn compaction_trigger(doc: &Document) -> codec::Result<bool> {
+    let Some(messages) = doc.member(doc.root(), "messages")? else {
+        return Ok(false);
+    };
+    for message in doc.children(messages)? {
+        let Some(content) = object_member(doc, message, "content")? else {
+            continue;
+        };
+        if !matches!(doc.node(content)?.value, Value::Array) {
+            continue;
+        }
+        for part in doc.children(content)? {
+            if text_is(doc, part, "type", "opaque")?
+                && text_is(doc, part, "protocol", "responses")?
+                && let Some(value) = object_member(doc, part, "value")?
+                && text_is(doc, value, "type", "compaction_trigger")?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Member `name` of `node` when `node` is an object.
+fn object_member(doc: &Document, node: usize, name: &str) -> codec::Result<Option<usize>> {
+    if !matches!(doc.node(node)?.value, Value::Object) {
+        return Ok(None);
+    }
+    doc.member(node, name)
+}
+
+/// Whether member `name` of `node` is the string `want`.
+fn text_is(doc: &Document, node: usize, name: &str, want: &str) -> codec::Result<bool> {
+    match object_member(doc, node, name)? {
+        Some(v) if matches!(doc.node(v)?.value, Value::String(_) | Value::Text(_)) => doc.string_is(v, want),
+        _ => Ok(false),
     }
 }
 

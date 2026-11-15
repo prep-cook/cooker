@@ -75,9 +75,9 @@ const LEFT_OUT: &[(&str, &str)] = &[
     ("shapes_responses_request", "codec refusal"),
     ("custom_tool_history_normalized", "codec refusal"),
     ("replay_responses_turn2_tool_output", "codec refusal"),
-    // Go answers a `compaction_trigger` turn with a compact it runs itself and six synthesized
-    // events; the executor sends the turn to xAI as the client wrote it.
-    ("compaction_trigger_stream", "no synthesized compaction"),
+    // The capability refuses a `compaction_trigger` turn, which keeps the old arm until owner
+    // question 16; `compaction_trigger_keeps_the_old_arm` covers it.
+    ("compaction_trigger_stream", "old arm"),
     // A text delta for an item never announced: the ingress refuses it as invalid upstream
     // data (502) before the body ends; `eof_before_completion_fails_like_go` covers the 408.
     ("disconnected_before_completed", "invalid event order"),
@@ -221,4 +221,86 @@ async fn responses_uploads_match_the_go_executor() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// A `compaction_trigger` turn keeps the old arm until owner question 16: the new route
+/// refuses it at the fence before any upstream send, and the old arm answers it with the
+/// compact and the synthesized events the Go executor recorded.
+#[tokio::test]
+async fn compaction_trigger_keeps_the_old_arm() {
+    use futures_util::StreamExt;
+
+    let s = scenarios()
+        .into_iter()
+        .find(|s| s["name"] == "compaction_trigger_stream")
+        .unwrap();
+    let payload = s["payload"].as_str().unwrap();
+    let executors = executors();
+    let cfg = Config::default();
+
+    let untouched = StreamUpstream::start([Reply::json("{}")]).await;
+    let mut exchange = exchange(&untouched);
+    exchange.credential = scenario_credential(&s, &cfg, &format!("{}/v1", untouched.url()));
+    let streams = Streams::new();
+    let input = (payload, 64, Sessions::default());
+    let run = run_on(
+        &streams,
+        &executors,
+        &exchange,
+        Client::Responses,
+        Operation::Generate,
+        input,
+    )
+    .await;
+    let error = run.started.err().expect("the fence refuses the turn");
+    assert_eq!(error.status, 400);
+    assert_eq!(
+        error.body,
+        "fence: request validated for another destination".as_bytes()
+    );
+    assert!(untouched.captured().is_empty(), "the new route sent a request");
+
+    let up = &s["upstream"];
+    let upstream = StreamUpstream::start([Reply::json(up["body"].as_str().unwrap().to_owned())]).await;
+    let credential = scenario_credential(&s, &cfg, &format!("{}/v1", upstream.url()));
+    let model = s["model"].as_str().unwrap().to_owned();
+    let request = ck_core::exec::ExecRequest {
+        operation: ck_core::exec::Operation::Generate,
+        source_format: ck_core::format::Format::OpenAIResponse,
+        response_format: ck_core::format::Format::OpenAIResponse,
+        requested_model: model.clone(),
+        model,
+        original_body: bytes::Bytes::new(),
+        body: bytes::Bytes::from(payload.to_owned()),
+        stream: true,
+        alt: None,
+        session: None,
+        execution_session: None,
+        derived_session: None,
+        resolved_model: None,
+        usage: Default::default(),
+        request_path: "/v1/responses".into(),
+        headers: http::HeaderMap::new(),
+        caller: ck_core::exec::Caller {
+            principal: String::new(),
+            source: "authorization",
+            provider: String::new(),
+        },
+    };
+    let response = executors
+        .execute(&credential, request, &cfg)
+        .await
+        .expect("the old arm answers");
+    let ck_core::exec::ResponseBody::Stream(mut stream) = response.body else {
+        panic!("the old arm answers a stream");
+    };
+    let mut chunks = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        chunks.push(Value::String(String::from_utf8(chunk.unwrap().to_vec()).unwrap()));
+    }
+    assert_eq!(Value::Array(chunks), s["chunks"]);
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].path, "/v1/responses/compact");
+    assert_eq!(json_body(&captured[0]), recorded_body(s["request"].as_str().unwrap()));
 }
