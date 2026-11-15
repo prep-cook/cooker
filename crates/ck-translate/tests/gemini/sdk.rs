@@ -195,7 +195,7 @@ fn responses_reasoning_summary_is_unsupported_at_chat() {
 
 /// Responses `reasoning` takes `effort` and `summary` only: another protocol's budget, switch
 /// and native config stay out. Thinking turned on without an effort has no Responses form and
-/// is refused, never dropped; an effort or a disabled setting passes. A Responses source keeps
+/// is refused, never dropped; an effort passes and a disabled setting is `effort: "none"`. A Responses source keeps
 /// its own object.
 #[test]
 fn foreign_thinking_writes_only_responses_reasoning_members() {
@@ -206,7 +206,7 @@ fn foreign_thinking_writes_only_responses_reasoning_members() {
         Err(codec::Error::Unsupported)
     ));
     let disabled = translate(P::Anthropic, P::Responses, &anthropic(json!({"type":"disabled"}))).unwrap();
-    assert!(disabled.get("reasoning").is_none(), "{disabled}");
+    assert_eq!(disabled["reasoning"], json!({"effort":"none"}), "{disabled}");
     let gemini = json!({"contents":[{"parts":[{"text":"2+2?"}],"role":"user"}],"generationConfig":{"thinkingConfig":{"thinkingBudget":1024}}});
     assert!(matches!(
         translate(P::Gemini, P::Responses, &gemini),

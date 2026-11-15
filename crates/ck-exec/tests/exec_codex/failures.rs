@@ -116,3 +116,53 @@ async fn a_cut_body_ends_with_one_error() {
         assert!(records.iter().any(|r| r.contains("lo")), "{records:?}");
     }
 }
+
+/// The outcome, the stream's terminal and its `error` records for one Chat attempt on `body`.
+async fn attempt_on(body: Vec<u8>) -> (Result<(), ck_core::exec::ExecError>, Option<Terminal>, Vec<String>) {
+    let upstream = StreamUpstream::start([Reply::sse(body)]).await;
+    let (streams, exchange) = (Streams::new(), exchange(&upstream));
+    let (started, id, _request) = run(&streams, &exchange, "chat", Operation::Generate, CHAT, 64).await;
+    let (outcome, published, _stream) = finish(&streams, started.unwrap(), id).await;
+    (outcome, published.terminal, records(&published))
+}
+
+/// Invalid UTF-8 in an upstream event is an upstream failure, never repaired text.
+#[tokio::test]
+async fn invalid_utf8_fails_instead_of_being_repaired() {
+    let text = sse();
+    // The `o` of the second delta becomes a byte no UTF-8 text contains.
+    let at = text.find(r#""delta":"lo""#).unwrap() + 10;
+    let mut body = text.into_bytes();
+    body[at] = 0xff;
+    let (outcome, terminal, records) = attempt_on(body).await;
+    assert!(outcome.is_err(), "{records:?}");
+    assert_eq!(terminal, Some(Terminal::UpstreamError));
+    assert_eq!(errors(&records).len(), 1, "{records:?}");
+    assert!(records.iter().all(|r| !r.contains('\u{fffd}')), "{records:?}");
+}
+
+/// A body that ends cleanly without a completion is Go's request-scoped incomplete stream.
+#[tokio::test]
+async fn a_clean_end_without_completion_is_incomplete() {
+    let (outcome, terminal, records) = attempt_on(message_events().into_bytes()).await;
+    let error = outcome.unwrap_err();
+    assert_eq!((error.status, error.scope), (408, FailureScope::Request));
+    assert_eq!(terminal, Some(Terminal::UpstreamError));
+    assert_eq!(errors(&records).len(), 1, "{records:?}");
+}
+
+/// A completion counts only at the end of its SSE event: one cut before its blank line is
+/// incomplete, and a further `data:` line of the same event is not dropped.
+#[tokio::test]
+async fn a_completion_ends_at_its_event_boundary() {
+    let complete = sse();
+    let unterminated = complete.strip_suffix('\n').unwrap().to_owned();
+    let continued = format!("{}data: more\n\n", complete.strip_suffix('\n').unwrap());
+    let (outcome, _, records) = attempt_on(unterminated.into_bytes()).await;
+    let error = outcome.unwrap_err();
+    assert_eq!((error.status, error.scope), (408, FailureScope::Request), "{records:?}");
+    let (outcome, terminal, records) = attempt_on(continued.into_bytes()).await;
+    assert!(outcome.is_err(), "{records:?}");
+    assert_eq!(terminal, Some(Terminal::UpstreamError));
+    assert_eq!(errors(&records).len(), 1, "{records:?}");
+}

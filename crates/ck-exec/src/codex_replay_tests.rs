@@ -142,3 +142,30 @@ fn entries_keep_the_newest_turns() {
     assert_eq!(items[0], br#"{"type":"cpa_codex_replay_turn","id":"t44"}"#);
     assert!(cache.get("m", "other").is_none());
 }
+
+/// One session id keys a different replay entry per caller and per upstream credential, so
+/// a turn cached for one never reaches another.
+#[test]
+fn replay_entries_belong_to_their_caller_and_credential() {
+    let scenario = serde_json::json!({"model": "gpt-5", "headers": {"x-claude-code-session-id": "cc-1"}});
+    let turn = serde_json::json!({"payload": r#"{"model":"gpt-5","messages":[]}"#, "stream": true});
+    let owner = request(&scenario, &turn);
+    let mut other = request(&scenario, &turn);
+    other.caller.principal = "client-key-OTHER".into();
+    let body = r#"{"model":"gpt-5","input":[]}"#;
+    let scope = |req: &ExecRequest, credential: &str| super::scope(req, credential, body.as_bytes());
+    let cache = super::Cache::default();
+    let mine = scope(&owner, "codex-a");
+    let call = br#"{"type":"function_call","call_id":"c","name":"f","arguments":"{}"}"#;
+    let marker = br#"{"type":"cpa_codex_replay_turn","id":"t"}"#;
+    assert!(cache.append(&mine.model, &mine.session, &[marker.to_vec(), call.to_vec()]));
+    assert_eq!(scope(&owner, "codex-a").session, mine.session);
+    for theirs in [scope(&other, "codex-a"), scope(&owner, "codex-b")] {
+        assert!(!theirs.session.is_empty());
+        assert!(
+            cache.get(&theirs.model, &theirs.session).is_none(),
+            "{:?}",
+            theirs.session
+        );
+    }
+}

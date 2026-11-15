@@ -27,12 +27,22 @@ fn client_headers() -> HeaderMap {
     headers
 }
 
-/// The old path's upload for `body` from a Responses client.
-async fn old_path(exchange: &Exchange, body: &[u8], stream: bool) {
+/// The old path's upload for `body` from a `source` client.
+async fn old_path(exchange: &Exchange, body: &[u8], stream: bool, source: Format) {
+    old_path_on(&executor(), exchange, body, stream, source).await;
+}
+
+async fn old_path_on(
+    executor: &ck_exec::codex::CodexExecutor,
+    exchange: &Exchange,
+    body: &[u8],
+    stream: bool,
+    source: Format,
+) {
     let request = ExecRequest {
         operation: ExecOperation::Generate,
-        source_format: Format::OpenAIResponse,
-        response_format: Format::OpenAIResponse,
+        source_format: source,
+        response_format: source,
         requested_model: "client-model".into(),
         model: exchange.model.clone(),
         original_body: Bytes::copy_from_slice(body),
@@ -48,7 +58,7 @@ async fn old_path(exchange: &Exchange, body: &[u8], stream: bool) {
         resolved_model: None,
         usage: Default::default(),
     };
-    let response = executor()
+    let response = executor
         .execute(&exchange.credential, request, &exchange.cfg)
         .await
         .unwrap();
@@ -89,7 +99,7 @@ async fn a_responses_client_matches_the_old_path() {
         )
         .await;
         finish(&streams, started.unwrap(), id).await.0.unwrap();
-        old_path(&exchange, body.as_bytes(), stream).await;
+        old_path(&exchange, body.as_bytes(), stream, Format::OpenAIResponse).await;
         let captured = upstream.captured();
         let (new, old) = (&captured[0], &captured[1]);
         let sent = json_body(new);
@@ -155,4 +165,95 @@ async fn claude_reasoning_is_replayed_within_its_execution_session() {
             .all(|i| i["type"] != "reasoning"),
         "{other}"
     );
+}
+
+/// An explicit thinking switch-off reaches Codex as the old path sent it: Anthropic's
+/// `disabled` and Gemini's zero budget are `effort:"none"`, not the backend default.
+#[tokio::test]
+async fn explicit_thinking_off_reaches_codex_as_the_old_path_sent_it() {
+    let anthropic = br#"{"model":"client-model","max_tokens":64,"stream":true,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hi"}]}"#;
+    let gemini = br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":0}}}"#;
+    for (protocol, source, body) in [
+        ("anthropic", Format::Claude, &anthropic[..]),
+        ("gemini", Format::Gemini, &gemini[..]),
+    ] {
+        let upstream = StreamUpstream::start([Reply::sse(sse()), Reply::sse(sse())]).await;
+        let (streams, exchange) = (Streams::new(), exchange(&upstream));
+        let (started, id, _request) = run(&streams, &exchange, protocol, Operation::Generate, body, 9).await;
+        finish(&streams, started.unwrap(), id).await.0.unwrap();
+        old_path(&exchange, body, true, source).await;
+        let captured = upstream.captured();
+        let (new, old) = (json_body(&captured[0]), json_body(&captured[1]));
+        assert_eq!(new["reasoning"]["effort"], "none", "{protocol}: {new}");
+        assert_eq!(new["reasoning"], old["reasoning"], "{protocol}: {old}");
+    }
+}
+
+/// A replayed turn stays with the caller and the credential that produced it: another caller,
+/// or the same caller on another credential, with the same Claude Code session gets none of
+/// its reasoning.
+#[tokio::test]
+async fn replay_stays_with_its_caller_and_credential() {
+    replay_stays_with_its_owner(false).await;
+    replay_stays_with_its_owner(true).await;
+}
+
+/// Replay isolation on the executor, or with `old` on the old execution path.
+async fn replay_stays_with_its_owner(old: bool) {
+    let first =
+        br#"{"model":"client-model","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let next = br#"{"model":"client-model","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"more"}]}"#;
+    let replies = [
+        Reply::sse(reasoning_turn()),
+        Reply::sse(sse()),
+        Reply::sse(sse()),
+        Reply::sse(sse()),
+    ];
+    let upstream = StreamUpstream::start(replies).await;
+    let streams = Streams::new();
+    let executor = executor();
+    let mut owner = exchange(&upstream);
+    owner
+        .headers
+        .insert("x-claude-code-session-id", HeaderValue::from_static("cc-1"));
+    let mut other_caller = exchange(&upstream);
+    other_caller.headers = owner.headers.clone();
+    other_caller.caller.principal = "sk-client-other".into();
+    let mut other_credential = exchange(&upstream);
+    other_credential.headers = owner.headers.clone();
+    other_credential.credential = crate::support::credential("codex", &upstream.url(), "sk-other");
+    other_credential.credential.id = "codex-other".into();
+    for (exchange, body) in [
+        (&owner, &first[..]),
+        (&other_caller, &next[..]),
+        (&other_credential, &next[..]),
+        (&owner, &next[..]),
+    ] {
+        if old {
+            old_path_on(&executor, exchange, body, true, Format::Claude).await;
+            continue;
+        }
+        let (started, id, _request) = run_on(
+            (&executor, None),
+            &streams,
+            exchange,
+            "anthropic",
+            Operation::Generate,
+            body,
+            64,
+        )
+        .await;
+        finish(&streams, started.unwrap(), id).await.0.unwrap();
+    }
+    let reasoning = |index: usize| {
+        let sent = json_body(&upstream.captured()[index]);
+        sent["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["type"] == "reasoning")
+    };
+    assert!(!reasoning(1), "old {old}: another caller");
+    assert!(!reasoning(2), "old {old}: another credential");
+    assert!(reasoning(3), "old {old}: the owner still gets its turn back");
 }

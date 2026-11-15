@@ -720,8 +720,13 @@ pub(super) struct Replay {
 
 impl Replay {
     /// `applyCodexReasoningReplayCacheRequired`: cached turns inserted into `body`.
-    fn apply(cache: &Arc<crate::codex_replay::Cache>, req: &ExecRequest, body: String) -> (String, Self) {
-        let (body, scope) = crate::codex_replay::apply(cache, req, body);
+    fn apply(
+        cache: &Arc<crate::codex_replay::Cache>,
+        req: &ExecRequest,
+        credential: &str,
+        body: String,
+    ) -> (String, Self) {
+        let (body, scope) = crate::codex_replay::apply(cache, req, credential, body);
         let replay = Self {
             cache: cache.clone(),
             scope,
@@ -1175,7 +1180,7 @@ impl CodexExecutor {
             conflict,
             finalize,
         } = request::shape(&req, view, settings, Call::Websocket)?;
-        let (body, replay) = Replay::apply(&self.replay, &req, body);
+        let (body, replay) = Replay::apply(&self.replay, &req, &view.credential.id, body);
         let (body, cache) = request::prompt_cache(&req, body, Some(&exec_session.id), true);
         let body = turn_body(view, &req, settings, &finalize, body);
         crate::codex::report_request(&req, ck_core::format::Format::Codex, &body);

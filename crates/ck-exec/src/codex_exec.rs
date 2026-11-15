@@ -25,8 +25,9 @@ use crate::codex::{CodexExecutor, ErrorBody};
 use crate::codex_capture::Wire;
 use crate::codex_events::{self as events, Events};
 use crate::codex_replay::Scope;
-use crate::codex_request::{self as request, Call, Inbound, Settings, View};
+use crate::codex_request::{self as request, Call, Settings, View};
 use crate::codex_response::SCANNER_MAX_LINE;
+use crate::codex_shape::{self, Inbound};
 use crate::types::{Attempt, Counted, Execute, Request, Streams, Upstream};
 
 /// The capability key of Codex credentials.
@@ -71,6 +72,7 @@ impl Execute for CodexExecutor {
         let upload = encode(&request.validated, streams.request, true)?;
         let shaped = Shape::new(attempt, request, &upload)?;
         let call = if stream { Call::Stream } else { Call::NonStream };
+        let scratch = streams.response.allocator();
         let ingress = Ingress::new(
             streams.response,
             attempt.identity,
@@ -83,7 +85,7 @@ impl Execute for CodexExecutor {
         let body = shaped.generate(&view, &settings, call, &self.replay)?;
         let upstream = self.post_shaped(&view, &settings, &body, call).await?;
         let replay = Some((self.replay.clone(), body.scope));
-        let rules = Events::new(body.optimized, settings.model_level_cooling, replay);
+        let rules = Events::new(scratch, body.optimized, settings.model_level_cooling, replay);
         Ok(Upstream {
             status: upstream.status,
             headers: upstream.headers,
@@ -294,16 +296,13 @@ impl<'r> Shape<'r> {
         let original = crate::codex_upload::require(self.upload.to_vec());
         let thought = self.think(&original, Format::Codex)?;
         let inbound = self.inbound();
-        let shaped = request::shape_body(&inbound, view, settings, call, thought, original);
+        let shaped = codex_shape::shape_body(&inbound, view, settings, call, thought, original);
         let (body, scope) = if self.source == Format::Claude {
             let client = &self.request.client;
-            crate::codex_replay::apply_upload(
-                replay,
-                self.attempt.model,
-                client.headers,
-                client.execution_session,
-                shaped.body,
-            )
+            let session = codex_shape::replay_session(shaped.body.as_bytes(), client.headers, client.execution_session);
+            let owner = codex_shape::replay_owner(&client.caller.principal, &self.attempt.credential.id);
+            let scope = Scope::of(self.attempt.model, shaped.body.as_bytes(), &session, &owner);
+            crate::codex_replay::insert(replay, scope, shaped.body)
         } else {
             (shaped.body, Scope::default())
         };
@@ -314,7 +313,7 @@ impl<'r> Shape<'r> {
     fn compact(&self, view: &View<'_>, settings: &Settings) -> Result<Shaped<'r>, ExecError> {
         let thought = self.think(self.upload, Format::OpenAIResponse)?;
         let inbound = self.inbound();
-        let shaped = request::shape_body(&inbound, view, settings, Call::Compact, thought, self.upload.to_vec());
+        let shaped = codex_shape::shape_body(&inbound, view, settings, Call::Compact, thought, self.upload.to_vec());
         Ok(self.finish(
             &inbound,
             settings,
@@ -335,7 +334,7 @@ impl<'r> Shape<'r> {
         optimized: bool,
         scope: Scope,
     ) -> Shaped<'r> {
-        let (body, cache) = request::prompt_cache_for(inbound, body, None, false);
+        let (body, cache) = codex_shape::prompt_cache_for(inbound, body, None, false);
         let text = finalize.finish(inbound, settings, request::sanitize_input_ids(body));
         Shaped {
             text,

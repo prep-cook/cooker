@@ -348,7 +348,7 @@ impl CodexExecutor {
             finalize,
             ..
         } = request::shape(&req, view, settings, Call::Stream)?;
-        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, body);
+        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, &view.credential.id, body);
         let (body, cache) = request::prompt_cache(&req, body, ws_session, false);
         let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
         report_request(&req, Format::Codex, &body);
@@ -403,7 +403,7 @@ impl CodexExecutor {
             finalize,
             ..
         } = request::shape(&req, view, settings, Call::NonStream)?;
-        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, body);
+        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, &view.credential.id, body);
         let (body, cache) = request::prompt_cache(&req, body, None, false);
         let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
         report_request(&req, Format::Codex, &body);
