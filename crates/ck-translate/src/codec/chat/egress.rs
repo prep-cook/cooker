@@ -21,7 +21,8 @@ pub struct Egress {
     owner: u64,
     mode: BodyMode,
     identity: Identity,
-    sequence: u64,
+    /// The canonical stream this egress reads; it checks each record's identity and `seq`.
+    binding: internal::Binding,
     terminal: bool,
     failed: bool,
     reduction: Reduction,
@@ -53,7 +54,7 @@ impl Egress {
             owner: owner.id(),
             mode,
             identity,
-            sequence: 0,
+            binding: internal::Binding::new(owner, Some(identity)),
             terminal: false,
             failed: false,
             reduction: Reduction::new(owner)?,
@@ -78,19 +79,10 @@ impl Egress {
         if self.terminal || self.failed {
             return Err(Error::Closed);
         }
-        let (kind, doc) = internal::decode(owner, input)?;
+        let (kind, doc) = self.binding.decode(owner, input)?;
         internal::refuse_uri_media(kind, &doc)?;
         let root = doc.root();
         let x = doc.required(root, "x_ck")?;
-        if doc.unsigned(doc.required(x, "seq")?)? != self.sequence
-            || doc.unsigned(doc.required(x, "attempt")?)? != self.identity.attempt
-            || !doc.string_is(doc.required(x, "request_id")?, self.identity.request_id.as_str())?
-            || !doc.string_is(doc.required(x, "stream_id")?, self.identity.stream_id.as_str())?
-            || !doc.string_is(doc.required(x, "direction")?, "response")?
-        {
-            return Err(Error::Schema);
-        }
-        self.sequence = self.sequence.checked_add(1).ok_or(Error::Limit)?;
         if self.reduction.document.is_none() && !matches!(kind, Kind::ResponseStart | Kind::Error | Kind::Cancelled) {
             return Err(Error::Schema);
         }

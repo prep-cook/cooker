@@ -1,4 +1,9 @@
-use super::{Error, Result, document::Document, event::Kind, source::Source};
+use super::{
+    Error, Result,
+    document::{Document, Value},
+    event::{Direction, Identity, Kind},
+    source::{Source, Span},
+};
 use ck_stream::{Lease, Position, Record, Writer};
 
 const KINDS: &[Kind] = &[
@@ -38,17 +43,28 @@ const KINDS: &[Kind] = &[
 /// Decode a trusted canonical lease, retaining its bytes rather than copying SSE data.
 /// Wire ingress must never call this function on externally assigned record kinds.
 pub fn decode(owner: &mut Writer, lease: Lease) -> Result<(Kind, Document)> {
+    read(owner, lease).map(|(kind, _, doc)| (kind, doc))
+}
+
+/// The correlation members of one record's `x_ck`, found in one walk over its members.
+#[derive(Default)]
+struct Envelope {
+    seq: u64,
+    request_id: Option<usize>,
+    stream_id: Option<usize>,
+    attempt: Option<usize>,
+    direction: Option<usize>,
+}
+
+/// [`decode`], also returning the record's correlation members.
+fn read(owner: &mut Writer, lease: Lease) -> Result<(Kind, Envelope, Document)> {
     let record = lease.record();
     if record.start.generation != owner.id() {
         return Err(Error::Position);
     }
     let kind = *KINDS.get(record.kind as usize).ok_or(Error::Schema)?;
     let mut frame = Frame::new();
-    lease.visit(|chunk| {
-        for &byte in chunk {
-            frame.byte(kind, byte);
-        }
-    })?;
+    lease.visit(|chunk| frame.chunk(kind, chunk))?;
     let start = frame.data_start.ok_or(Error::Schema)?;
     let end = frame.data_end.ok_or(Error::Truncated)?;
     if frame.invalid || end + 2 != record.len() || frame.name_seen != kind.name().is_some() {
@@ -56,15 +72,107 @@ pub fn decode(owner: &mut Writer, lease: Lease) -> Result<(Kind, Document)> {
     }
     let mut source = Source::new(owner)?;
     source.push(lease, advance(record.start, start)?..advance(record.start, end)?)?;
-    let mut doc = Document::parse(owner, source, record.len())?;
-    let x = doc.required(doc.root(), "x_ck")?;
-    if doc.unsigned(doc.required(x, "v")?)? != 1 || Some(doc.unsigned(doc.required(x, "seq")?)?) != frame.sequence {
+    let mut doc = Document::parse_internal(owner, source, record.len())?;
+    let mut envelope = Envelope::default();
+    let (mut v, mut seq) = (None, None);
+    for child in doc.children(doc.required(doc.root(), "x_ck")?)? {
+        let name = doc.node(child)?.name.ok_or(Error::Schema)?;
+        let slot = if doc.name_is(name, "v")? {
+            &mut v
+        } else if doc.name_is(name, "seq")? {
+            &mut seq
+        } else if doc.name_is(name, "request_id")? {
+            &mut envelope.request_id
+        } else if doc.name_is(name, "stream_id")? {
+            &mut envelope.stream_id
+        } else if doc.name_is(name, "attempt")? {
+            &mut envelope.attempt
+        } else if doc.name_is(name, "direction")? {
+            &mut envelope.direction
+        } else {
+            continue;
+        };
+        slot.get_or_insert(child);
+    }
+    envelope.seq = doc.unsigned(seq.ok_or(Error::Schema)?)?;
+    if doc.unsigned(v.ok_or(Error::Schema)?)? != 1 || Some(envelope.seq) != frame.sequence {
         return Err(Error::Schema);
     }
     if kind == Kind::Chunk {
         super::chat::prepare_response(&mut doc)?;
     }
-    Ok((kind, doc))
+    Ok((kind, envelope, doc))
+}
+
+/// Checks every record of one canonical response stream an egress reads: it comes from the
+/// writer generation the egress was built on with the next `seq`, and carries the `request_id`,
+/// `stream_id` and `attempt` of the identity the egress was built with, or, for an egress built
+/// without one, of the stream's first record, with `direction` `response`
+/// (docs/INTERNAL-STREAM.md, §3.2). Any holder of the writer can append a record, so no record's
+/// identity is taken from an earlier one. Ingress replay of published records uses [`decode`].
+pub(crate) struct Binding {
+    generation: u64,
+    identity: Option<Identity>,
+    next: u64,
+}
+
+impl Binding {
+    pub(crate) fn new(owner: &Writer, identity: Option<Identity>) -> Self {
+        Self {
+            generation: owner.id(),
+            identity,
+            next: 0,
+        }
+    }
+
+    /// Decodes the next record of the bound stream.
+    pub(crate) fn decode(&mut self, owner: &mut Writer, lease: Lease) -> Result<(Kind, Document)> {
+        if owner.id() != self.generation {
+            return Err(Error::Position);
+        }
+        let (kind, envelope, doc) = read(owner, lease)?;
+        if envelope.seq != self.next {
+            return Err(Error::Schema);
+        }
+        let field = |slot: Option<usize>| slot.ok_or(Error::Schema);
+        let identity = match self.identity {
+            Some(identity) => identity,
+            None => *self.identity.insert(Identity {
+                request_id: super::identity::local(&doc, field(envelope.request_id)?)?,
+                stream_id: super::identity::local(&doc, field(envelope.stream_id)?)?,
+                attempt: doc.unsigned(field(envelope.attempt)?)?,
+                direction: Direction::Response,
+            }),
+        };
+        if doc.unsigned(field(envelope.attempt)?)? != identity.attempt
+            || !string_equals(&doc, field(envelope.request_id)?, identity.request_id.as_str())?
+            || !string_equals(&doc, field(envelope.stream_id)?, identity.stream_id.as_str())?
+            || !string_equals(&doc, field(envelope.direction)?, "response")?
+        {
+            return Err(Error::Schema);
+        }
+        self.next = envelope.seq.checked_add(1).ok_or(Error::Limit)?;
+        Ok((kind, doc))
+    }
+}
+
+/// Whether string `node` is `value`: one byte comparison when the stored string has no escapes.
+/// Bytes equal to a `value` without a backslash hold no escape, so they decode to `value`.
+fn string_equals(doc: &Document, node: usize, value: &str) -> Result<bool> {
+    if let Value::String(text) = doc.node(node)?.value
+        && !value.contains('\\')
+        && text.span.len() == value.len() as u64 + 2
+        && doc.source(text)?.equals(
+            Span {
+                start: text.span.start + 1,
+                end: text.span.end - 1,
+            },
+            value.as_bytes(),
+        )?
+    {
+        return Ok(true);
+    }
+    doc.string_is(node, value)
 }
 
 /// SSE framing of one canonical record, scanned one byte at a time.
@@ -92,6 +200,20 @@ impl Frame {
             name_seen: false,
             line_start: 0,
             invalid: false,
+        }
+    }
+
+    /// Feeds `bytes`, stepping over the data line's payload, which only a newline ends.
+    fn chunk(&mut self, kind: Kind, mut bytes: &[u8]) {
+        while let Some((&byte, rest)) = bytes.split_first() {
+            if self.data_start.is_some() && self.data_end.is_none() && byte != b'\n' {
+                let payload = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+                self.offset += payload as u64;
+                bytes = &bytes[payload..];
+                continue;
+            }
+            self.byte(kind, byte);
+            bytes = rest;
         }
     }
 

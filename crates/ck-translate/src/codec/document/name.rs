@@ -53,7 +53,15 @@ impl NameHash {
     }
 
     pub(crate) fn of(name: &str) -> u32 {
-        let bytes = name.as_bytes();
+        Self::of_bytes(name.as_bytes())
+    }
+
+    /// The digest of a name stored without escapes, whose stored bytes are its UTF-8.
+    pub(super) fn plain(stored: &[u8]) -> Digest {
+        Digest(Self::of_bytes(stored) & !1)
+    }
+
+    fn of_bytes(bytes: &[u8]) -> u32 {
         let mut hash = Self::default();
         for &byte in &bytes[..bytes.len().min(4)] {
             hash.byte(byte);

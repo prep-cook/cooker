@@ -92,7 +92,7 @@ impl ResponseId {
 }
 
 /// Reads a generated canonical id, which is always a local id.
-fn local(doc: &Document, node: usize) -> Result<LocalId> {
+pub(crate) fn local(doc: &Document, node: usize) -> Result<LocalId> {
     let mut bytes = [0u8; 64];
     let mut len = 0;
     let mut chars = doc.chars(node)?;

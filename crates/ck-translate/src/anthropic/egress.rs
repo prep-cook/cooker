@@ -47,7 +47,8 @@ pub struct Egress {
     identity: Identity,
     operation: Operation,
     mode: BodyMode,
-    sequence: u64,
+    /// The canonical stream this egress reads; it checks each record's identity and `seq`.
+    binding: internal::Binding,
     base: Option<Document>,
     id: ResponseId,
     blocks: Table<Block>,
@@ -86,7 +87,7 @@ impl Egress {
             identity,
             operation,
             mode,
-            sequence: 0,
+            binding: internal::Binding::new(owner, Some(identity)),
             base: None,
             id: ResponseId::new("msg_", owner.id())?,
             blocks: Table::new(owner)?,
@@ -221,19 +222,10 @@ impl Egress {
         if self.terminal || self.failed {
             return Err(Error::Closed);
         }
-        let (kind, mut doc) = internal::decode(owner, lease)?;
+        let (kind, mut doc) = self.binding.decode(owner, lease)?;
         internal::refuse_uri_media(kind, &doc)?;
         let root = doc.root();
         let x = doc.required(root, "x_ck")?;
-        if doc.unsigned(doc.required(x, "seq")?)? != self.sequence
-            || doc.unsigned(doc.required(x, "attempt")?)? != self.identity.attempt
-            || !doc.string_is(doc.required(x, "request_id")?, self.identity.request_id.as_str())?
-            || !doc.string_is(doc.required(x, "stream_id")?, self.identity.stream_id.as_str())?
-            || !doc.string_is(doc.required(x, "direction")?, "response")?
-        {
-            return Err(Error::Schema);
-        }
-        self.sequence = self.sequence.checked_add(1).ok_or(Error::Limit)?;
         let choice = doc.member(x, "choice_index")?.map(|n| doc.unsigned(n)).transpose()?;
         if choice.is_some_and(|index| index != 0) {
             self.drop_event(kind, choice, "single-choice destination selects index zero");
