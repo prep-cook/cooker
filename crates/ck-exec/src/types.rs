@@ -121,7 +121,8 @@ pub trait Execute: Send + Sync {
 
     /// Encodes `request` with the destination's request egress into `streams.request`
     /// scratch, creates the response ingress on `streams.response`, sends the request and
-    /// returns when the upstream answered. Covers `Operation::Generate`.
+    /// returns when the upstream answered. Covers `Operation::Generate`, and the media and
+    /// alpha search operations for a capability that admits them (`Capability::admits`).
     fn execute(
         &self,
         attempt: &Attempt<'_>,

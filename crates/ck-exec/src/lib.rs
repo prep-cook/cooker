@@ -99,6 +99,7 @@ pub mod proxy;
 mod quota;
 mod rawjson;
 mod replay;
+pub mod session;
 #[cfg(test)]
 mod test_tls;
 mod tls;

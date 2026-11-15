@@ -103,7 +103,9 @@ pub async fn start<E: Execute>(
         response: &mut response,
     };
     let upstream = match request.validated.view().operation {
-        Operation::Generate => executor.execute(attempt, request, streams).await,
+        Operation::Generate | Operation::Media(_) | Operation::AlphaSearch => {
+            executor.execute(attempt, request, streams).await
+        }
         Operation::Compact => executor.compact(attempt, request, streams).await,
         Operation::CountTokens => match executor.count_tokens(attempt, request, streams).await {
             Ok(Counted::Upstream(upstream)) => Ok(upstream),

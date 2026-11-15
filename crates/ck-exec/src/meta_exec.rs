@@ -46,6 +46,7 @@ impl Capability for MetaCapability {
                 ..view
             },
             Operation::Compact => return Err(codec::Error::Unsupported),
+            Operation::Media(_) | Operation::AlphaSearch => return Err(codec::Error::Unsupported),
         };
         ck_translate::responses::request::validate_meta(generate)?;
         if custom_apply_patch(view.document)? {

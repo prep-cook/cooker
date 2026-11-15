@@ -50,6 +50,7 @@ impl Capability for XaiCapability {
                 operation: Operation::Generate,
                 ..view
             }),
+            Operation::Media(_) | Operation::AlphaSearch => Err(codec::Error::Unsupported),
         }
     }
 }
