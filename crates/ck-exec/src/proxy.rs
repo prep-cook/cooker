@@ -234,17 +234,12 @@ fn wreq_proxy_url(url: &str) -> String {
 
 pub use crate::upstream::transport_text;
 
-/// `proxyutil.Redact`: a proxy URL safe for logs (no user info).
-pub fn redact(raw: &str) -> String {
-    match url::Url::parse(raw.trim()) {
-        Ok(mut u) => {
-            if !u.username().is_empty() || u.password().is_some() {
-                let _ = u.set_username("xxxxx");
-                let _ = u.set_password(None);
-            }
-            u.to_string()
-        }
-        Err(_) => "<invalid proxy url>".into(),
+/// A proxy as a log names it: the URL redacted ([`ck_wire::redact::url`]), since it can
+/// carry a password, a query key or a fragment.
+fn logged(proxy: &Proxy) -> String {
+    match proxy {
+        Proxy::Url(u) => ck_wire::redact::url(u.trim()),
+        _ => String::new(),
     }
 }
 
@@ -317,7 +312,7 @@ impl GoClients {
             tracing::warn!("unusable proxy configuration; using the default transport");
         }
         self.try_get(proxy).unwrap_or_else(|| {
-            tracing::warn!(proxy = %match proxy { Proxy::Url(u) => redact(u), _ => String::new() }, "proxy client failed; using the default transport");
+            tracing::warn!(proxy = %logged(proxy), "proxy client failed; using the default transport");
             self.default.clone().unwrap_or_else(|| plain_client(self.timed))
         })
     }
@@ -1507,8 +1502,13 @@ mod tests {
         assert_eq!(wreq_proxy_url("SOCKS5://h:1"), "socks5h://h:1");
         assert_eq!(wreq_proxy_url("socks5h://h:1"), "socks5h://h:1");
         assert_eq!(wreq_proxy_url("http://h:1"), "http://h:1");
-        assert_eq!(redact("http://user:secret@p:1/"), "http://xxxxx@p:1/");
-        assert!(!redact("socks5://user:secret@p:1").contains("secret"));
+        // Review of #127, finding 4: the warning for an unbuildable proxy client.
+        let raw = format!(
+            "http://u:{}@127.0.0.1:9/?code=sk-review-secret#sk-review-secret",
+            "p".repeat(70000)
+        );
+        assert_eq!(logged(&Proxy::parse(&raw)), "http://127.0.0.1:9/?code=***#***");
+        assert_eq!(logged(&Proxy::parse("socks5://user:secret@p:1")), "socks5://p:1");
     }
 
     #[test]

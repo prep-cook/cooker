@@ -341,7 +341,8 @@ pub(crate) fn parse_callback_input(input: &str) -> Result<Option<Callback>, Stri
     } else {
         return Err("invalid callback URL".into());
     };
-    let url = url::Url::parse(&candidate).map_err(|e| format!("parse {candidate:?}: {e}"))?;
+    // The pasted URL carries the authorization code: the error names it redacted.
+    let url = url::Url::parse(&candidate).map_err(|e| format!("parse {:?}: {e}", ck_wire::redact::url(&candidate)))?;
     let query = |pairs: url::form_urlencoded::Parse<'_>, key: &str| {
         pairs
             .into_iter()

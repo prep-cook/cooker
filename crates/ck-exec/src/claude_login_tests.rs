@@ -304,3 +304,19 @@ async fn a_busy_port_is_go_port_in_use() {
         assert!(result.is_ok(), "{host}");
     }
 }
+
+/// Review of #127, finding 5: a malformed pasted callback URL is named redacted, so its
+/// authorization code never reaches the login error.
+#[test]
+fn malformed_callback_urls_hide_the_code() {
+    for input in [
+        "http://127.0.0.1:bad/callback?code=sk-review-secret",
+        "127.0.0.1:bad/callback?code=sk-review-secret&state=sk-review-secret",
+    ] {
+        let Err(message) = parse_callback_input(input) else {
+            panic!("{input} parsed");
+        };
+        assert!(message.starts_with("parse "), "{message}");
+        assert!(!message.contains("sk-review-secret"), "{message}");
+    }
+}
