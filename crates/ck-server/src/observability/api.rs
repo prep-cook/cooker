@@ -357,6 +357,11 @@ pub(crate) fn mask_query(raw: &str) -> String {
             let decoded = crate::net::access::unescape(key).unwrap_or_else(|| key.as_bytes().to_owned());
             let lower = ck_wire::gostr::lower_bytes(ck_core::config::go_trim_space(&decoded));
             let lower = lower.strip_suffix("[]").unwrap_or(&lower);
+            // A stream resume cursor (`GET /v1/streams?after=`) is redacted whole, as its
+            // `Last-Event-ID` header is in request capture (docs/INTERNAL-STREAM.md §6.7).
+            if lower == "after" {
+                return format!("{key}=<redacted>");
+            }
             // v8.0.35 adds `value`: deleting a client key passes it as `?value=`.
             if !(lower == "key"
                 || lower == "value"
