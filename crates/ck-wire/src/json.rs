@@ -2429,15 +2429,14 @@ fn append_build(buf: &mut Vec<u8>, array: bool, paths: &[PathPart], raw: &[u8], 
     }
 }
 
-fn delete_tail_item(buf: &mut Vec<u8>) -> bool {
+/// sjson's deleteTailItem: the length the prefix keeps once its last item goes, and whether
+/// the item's trailing comma goes instead of a leading one.
+fn delete_tail_item(buf: &[u8]) -> (usize, bool) {
     let mut i = buf.len() as isize - 1;
     while i >= 0 {
         match buf[i as usize] {
-            b'[' => return true,
-            b',' => {
-                buf.truncate(i as usize);
-                return false;
-            }
+            b'[' => return (buf.len(), true),
+            b',' => return (i as usize, false),
             b':' => {
                 i -= 1;
                 while i >= 0 {
@@ -2453,14 +2452,8 @@ fn delete_tail_item(buf: &mut Vec<u8>) -> bool {
                                 }
                                 while i >= 0 {
                                     match buf[i as usize] {
-                                        b'{' => {
-                                            buf.truncate(i as usize + 1);
-                                            return true;
-                                        }
-                                        b',' => {
-                                            buf.truncate(i as usize);
-                                            return false;
-                                        }
+                                        b'{' => return (i as usize + 1, true),
+                                        b',' => return (i as usize, false),
                                         _ => {}
                                     }
                                     i -= 1;
@@ -2472,14 +2465,16 @@ fn delete_tail_item(buf: &mut Vec<u8>) -> bool {
                     }
                     i -= 1;
                 }
-                return false;
+                return (buf.len(), false);
             }
             _ => {}
         }
         i -= 1;
     }
-    false
+    (buf.len(), false)
 }
+
+mod splice;
 
 enum SetError {
     NoChange,
@@ -2514,7 +2509,9 @@ fn append_raw_paths(
         buf.extend_from_slice(&jstr[..res.index]);
         let mut exidx = 0;
         if del {
-            if delete_tail_item(buf) {
+            let (keep, item) = delete_tail_item(buf);
+            buf.truncate(keep);
+            if item {
                 for (j, &c) in jstr[end..].iter().enumerate() {
                     if c <= b' ' {
                         continue;
@@ -2670,6 +2667,9 @@ fn set_complex(jstr: &[u8], path: &[u8], raw: &[u8], stringify: bool) -> Result<
 /// Applies an edit in place. False exactly when sjson returns an error; a no-op edit (a
 /// missing delete or complex-path target) is a success, as in Go.
 fn apply(out: &mut Vec<u8>, path: &[u8], raw: &[u8], stringify: bool, del: bool) -> bool {
+    if splice::edit(out, path, raw, stringify, del) {
+        return true;
+    }
     match set_impl(out, path, raw, stringify, del) {
         Ok(next) => {
             *out = next;

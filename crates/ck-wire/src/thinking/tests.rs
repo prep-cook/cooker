@@ -192,7 +192,7 @@ fn replay(fn_name: &str, input: &Value) -> Option<Value> {
             &b(&input["body"]),
             s(&input["provider"]),
         )),
-        "strip_thinking" => enc(&strip_thinking_config(&b(&input["body"]), s(&input["provider"]))),
+        "strip_thinking" => enc(&strip_thinking_config(b(&input["body"]), s(&input["provider"]))),
         "parse_suffix" => {
             let r = parse_suffix(s(input));
             serde_json::json!({"model_name": r.model_name, "has_suffix": r.has_suffix, "raw_suffix": r.raw_suffix})
@@ -201,7 +201,7 @@ fn replay(fn_name: &str, input: &Value) -> Option<Value> {
             let info = caps(&input["info"]);
             match apply_provider(
                 s(&input["provider"]),
-                &b(&input["body"]),
+                b(&input["body"]),
                 &config(&input["config"]),
                 info.as_ref(),
             )

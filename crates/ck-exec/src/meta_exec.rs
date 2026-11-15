@@ -203,7 +203,7 @@ fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Resul
     let rules = ck_wire::payload::Rules::from_config(attempt.cfg);
     let base_model = parse_suffix(attempt.model).model_name;
     let caps = attempt.resolved_model.map(|r| ModelCaps::from(&r.info));
-    let original = baseline(&rules, &body);
+    let original = rules.baseline("", &body);
     let mut body = think(attempt.model, caps.as_ref(), body)?;
     meta::set_string_if_different(&mut body, "model", &base_model);
     for key in [
@@ -257,15 +257,6 @@ fn think(model: &str, caps: Option<&ModelCaps>, upload: Vec<u8>) -> Result<Vec<u
         updates_changed: false,
     };
     apply_request_thinking(&request, upload).map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))
-}
-
-/// The upload before thinking, for the payload rules that read it (`default` and
-/// `default-raw`); without them there is none.
-// ponytail: a heap copy, because the rules look its paths up in one contiguous body and a
-// scratch lease is split at `FRAME_BYTES`. Keeping it in the pool needs a segmented reader in
-// ck_wire::json.
-fn baseline(rules: &ck_wire::payload::Rules, body: &[u8]) -> Option<Vec<u8>> {
-    rules.has_defaults().then(|| body.to_vec())
 }
 
 /// The old path's content parts (its request translators): every message item's string content

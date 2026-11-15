@@ -3,17 +3,20 @@
 
 use crate::alloc_count::allocated;
 
-/// The upload before thinking is copied only for the payload rules that read it.
+/// Only default rules keep a baseline of the upload, and only its shape.
 #[test]
 fn the_baseline_stays_only_for_default_rules() {
     let rules = |yaml: &str| ck_wire::payload::Rules::from_config(&ck_core::config::Config::parse(yaml).unwrap());
     let overrides =
         rules("requests:\n  payload:\n    override:\n      - models: [{name: \"m\"}]\n        params: {a: 1}\n");
-    assert_eq!(super::baseline(&overrides, b"{}"), None);
-    assert_eq!(super::baseline(&rules(""), b"{}"), None);
+    assert_eq!(overrides.baseline("", b"{}"), None);
+    assert_eq!(rules("").baseline("", b"{}"), None);
     let defaults =
         rules("requests:\n  payload:\n    default:\n      - models: [{name: \"m\"}]\n        params: {a: 1}\n");
-    assert_eq!(super::baseline(&defaults, b"{}"), Some(b"{}".to_vec()));
+    assert_eq!(
+        defaults.baseline("", br#"{"a":"text","b":2}"#),
+        Some(br#"{"a":""}"#.to_vec())
+    );
 }
 
 /// Every message item's string content becomes one text part; typed parts, other items and

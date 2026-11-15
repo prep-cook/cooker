@@ -360,8 +360,8 @@ fn count_body(call: &Call<'_>, upload: Vec<u8>) -> Vec<u8> {
     drop(upload);
     let mut body = vertex::strip_call_ids(projected);
     // Default rules check the projection as it was before the rules' own rewrites (the Codex
-    // tool normalization); only they need a copy of it.
-    let original = call.rules_read_baseline().then(|| body.clone());
+    // tool normalization).
+    let original = call.baseline("", &body);
     if gj::get(&body, "model").exists() {
         call.name_model(&mut body, "model");
     }
