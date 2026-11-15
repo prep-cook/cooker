@@ -110,7 +110,9 @@ fn tool_choice(doc: &Document, choice: usize) -> Result<()> {
     }
     let kind = doc.required(choice, "type")?;
     if doc.string_is(kind, "allowed_tools")? {
-        let allowed = doc.required(choice, "allowed_tools")?;
+        let Some(allowed) = doc.member(choice, "allowed_tools")? else {
+            return flat_allowed(doc, choice);
+        };
         object(doc, allowed)?;
         enumeration(doc, doc.required(allowed, "mode")?, &["auto", "required"])?;
         let list = doc.required(allowed, "tools")?;
@@ -121,6 +123,43 @@ fn tool_choice(doc: &Document, choice: usize) -> Result<()> {
         return Ok(());
     }
     declared(doc, choice)
+}
+
+/// A Responses request's flat allowed-tools choice, which Chat egress writes nested. A member
+/// or listed tool without a Chat equivalent, such as a hosted tool, is unsupported.
+fn flat_allowed(doc: &Document, choice: usize) -> Result<()> {
+    only(doc, choice, &["type", "mode", "tools"])?;
+    enumeration(doc, doc.required(choice, "mode")?, &["auto", "required"])?;
+    let list = doc.required(choice, "tools")?;
+    array(doc, list)?;
+    for tool in doc.children(list)? {
+        object(doc, tool)?;
+        let kind = doc.required(tool, "type")?;
+        require_string(doc, kind)?;
+        if !doc.string_is(kind, "function")? && !doc.string_is(kind, "custom")? {
+            return Err(Error::Unsupported);
+        }
+        only(doc, tool, &["type", "name"])?;
+        let chosen = doc.required(tool, "name")?;
+        require_string(doc, chosen)?;
+        listed(doc, kind, chosen)?;
+    }
+    Ok(())
+}
+
+/// Refuses a member of object `node` outside `names` as unsupported.
+fn only(doc: &Document, node: usize, names: &[&str]) -> Result<()> {
+    for field in doc.children(node)? {
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        let mut known = false;
+        for allowed in names {
+            known |= doc.name_is(name, allowed)?;
+        }
+        if !known {
+            return Err(Error::Unsupported);
+        }
+    }
+    Ok(())
 }
 
 /// Checks that `choice` names one declared function or custom tool.
@@ -134,6 +173,16 @@ fn declared(doc: &Document, choice: usize) -> Result<()> {
     };
     let chosen = doc.required(doc.required(choice, name)?, "name")?;
     require_string(doc, chosen)?;
+    listed(doc, kind, chosen)
+}
+
+/// Checks that a tool of type `kind` named `chosen` is declared in `tools`.
+fn listed(doc: &Document, kind: usize, chosen: usize) -> Result<()> {
+    let name = if doc.string_is(kind, "custom")? {
+        "custom"
+    } else {
+        "function"
+    };
     let tools = doc.required(doc.root(), "tools")?;
     array(doc, tools)?;
     for tool in doc.children(tools)? {

@@ -43,6 +43,18 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         )
     }
 
+    /// Repeats the request's `tools`, `tool_choice` and `parallel_tool_calls` in a generation's
+    /// response, as the Responses API does; a source without them, such as a Chat upstream,
+    /// otherwise leaves the API defaults. A Responses source's own values replace these by merge.
+    /// Call it before the first record: `Closed` once any output was written.
+    pub fn echo(&mut self, owner: &mut Writer, request: codec::RequestView<'_>) -> Result<()> {
+        crate::boundary::enter(self.owner, owner, self.terminal || self.owed || self.sequence > 0)?;
+        let echoed = super::super::mapped(owner, |e| super::super::request::write_echo(request.document, e))?;
+        let doc = &mut self.document;
+        let node = doc.absorb(echoed)?;
+        super::super::merge(doc, doc.root(), node)
+    }
+
     /// Restores the native identity; `response.created` is owed until `created` publishes it.
     /// Fields the source did not supply keep the response's own values.
     pub(super) fn response_start(&mut self, incoming: Document) -> Result<()> {

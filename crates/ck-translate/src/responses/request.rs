@@ -16,6 +16,7 @@ mod write;
 
 use normalize::normalize;
 use validate::validate;
+pub(super) use write::write_echo;
 use write::write_request;
 
 pub struct Ingress {
