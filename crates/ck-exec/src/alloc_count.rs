@@ -1,6 +1,6 @@
-//! The allocator of the crate's unit tests. Per thread, so parallel tests do not disturb each
-//! other, it counts every byte allocated, and the live allocations of item size of a thread
-//! that turned tracking on, with their peak across tracked threads.
+//! A counting allocator for tests that bound the heap a step spends. Per thread, so parallel
+//! tests do not disturb each other, it counts every byte allocated, and the live allocations
+//! of item size of a thread that turned tracking on, with their peak across tracked threads.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -16,7 +16,7 @@ thread_local! {
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
-/// The bytes this thread has allocated.
+/// The bytes this thread has allocated so far.
 pub(crate) fn allocated() -> usize {
     BYTES.with(Cell::get)
 }

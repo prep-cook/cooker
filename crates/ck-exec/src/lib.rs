@@ -20,6 +20,8 @@
 //! Go sends it and recovers on 401.
 
 pub mod aistudio;
+#[cfg(test)]
+mod alloc_count;
 pub mod antigravity;
 pub mod antigravity_auth;
 mod antigravity_compaction;
@@ -67,10 +69,13 @@ mod gemini_stream;
 mod google_wire;
 pub mod kimi;
 pub mod kimi_auth;
+mod kimi_edit;
+mod kimi_exec;
 #[cfg(test)]
 mod kimi_fixture;
 mod kimi_http;
 mod kimi_replay;
+mod kimi_sse;
 pub mod login_store;
 pub mod meta;
 pub mod meta_auth;
@@ -93,8 +98,6 @@ pub mod proxy;
 mod quota;
 mod rawjson;
 mod replay;
-#[cfg(test)]
-mod test_alloc;
 #[cfg(test)]
 mod test_tls;
 mod tls;
@@ -196,6 +199,7 @@ impl Executors {
             xai::PROVIDER => Some(pipeline::destination(&self.openai.xai, attempt)),
             meta::PROVIDER => Some(pipeline::destination(&self.devices.meta, attempt)),
             p if vertex::handles(p) => vertex_exec::destination(&self.google.vertex, attempt),
+            p if kimi::PROVIDERS.contains(&p) => Some(pipeline::destination(&self.devices.kimi, attempt)),
             _ => None,
         }
     }
@@ -217,6 +221,7 @@ impl Executors {
             xai::PROVIDER => pipeline::fence(&self.openai.xai, attempt, ingress, request),
             meta::PROVIDER => pipeline::fence(&self.devices.meta, attempt, ingress, request),
             p if vertex::handles(p) => pipeline::fence(&self.google.vertex, attempt, ingress, request),
+            p if kimi::PROVIDERS.contains(&p) => pipeline::fence(&self.devices.kimi, attempt, ingress, request),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -235,6 +240,7 @@ impl Executors {
             xai::PROVIDER => pipeline::refence(&self.openai.xai, attempt, view),
             meta::PROVIDER => pipeline::refence(&self.devices.meta, attempt, view),
             p if vertex::handles(p) => pipeline::refence(&self.google.vertex, attempt, view),
+            p if kimi::PROVIDERS.contains(&p) => pipeline::refence(&self.devices.kimi, attempt, view),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -260,6 +266,9 @@ impl Executors {
             xai::PROVIDER => pipeline::start(&self.openai.xai, attempt, request, upload, response).await,
             meta::PROVIDER => pipeline::start(&self.devices.meta, attempt, request, upload, response).await,
             p if vertex::handles(p) => pipeline::start(&self.google.vertex, attempt, request, upload, response).await,
+            p if kimi::PROVIDERS.contains(&p) => {
+                pipeline::start(&self.devices.kimi, attempt, request, upload, response).await
+            }
             provider => {
                 response.finish(ck_stream::Terminal::Gone);
                 Err(no_executor(provider))

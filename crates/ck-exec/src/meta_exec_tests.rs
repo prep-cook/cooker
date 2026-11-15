@@ -1,7 +1,7 @@
 //! The Meta upload shaping that needs no upstream: the payload-rule baseline and the content
 //! parts written in place.
 
-use crate::test_alloc::allocated;
+use crate::alloc_count::allocated;
 
 /// The upload before thinking is copied only for the payload rules that read it.
 #[test]

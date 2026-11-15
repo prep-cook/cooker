@@ -3,7 +3,7 @@ use std::sync::{Arc, Barrier};
 use ck_translate::codec::source::Source;
 
 use super::*;
-use crate::test_alloc;
+use crate::alloc_count;
 
 /// Grok's encrypted reasoning, as the Go recording has it.
 const ENC: &str = "TKwE++a7qP4CXIXITJIj2DYyQCSyR3JuUSrOe758M0CwwzrC2cbGVuOaEQaBqIrN6dvHWTX7FJ0iqroON2AsUyUnrtPc/TZpMRjPoWUeMN4m8PpoZ7WEOcq9ouGU9GXp1dV2okgnwdVvFfliii45xpY2Vr+czC4aqEgQFOmfOkP/1/2QzRooWeLd0i2AVLOOckBWoRQ1jCCa1racBhwpsfYf7Ax5lb393La7xuA7EJm6/n9nslYW3GJXW4GKnsKysoL7Ml0tLwoN1m+lBumus/5uivtkjccC5s5Jrf6Q41NADO7Q4yeiDfkUs7Ro4NVGD/ehf4+8qBtI28X3Gx54Fw";
@@ -226,9 +226,9 @@ fn cache(store: &Store, pool: &ck_stream::Store, json: &str, session: usize, sta
     let mut owner = pool.create().unwrap();
     let doc = parse(&mut owner, json);
     start.wait();
-    test_alloc::track(true);
+    alloc_count::track(true);
     cache_completion(store, &scope(session), &doc, doc.root());
-    test_alloc::track(false);
+    alloc_count::track(false);
 }
 
 /// Live replay allocations never pass the cache's bound: a full cache, then two turns built
@@ -254,7 +254,7 @@ fn concurrent_turns_stay_within_the_cache() {
         builder.join().unwrap();
     }
     assert!(store.get(&scope(100)).is_some() || store.get(&scope(101)).is_some());
-    let peak = test_alloc::peak();
+    let peak = alloc_count::peak();
     assert!(peak <= TOTAL, "{peak} live bytes");
     drop(pool);
     let _ = std::fs::remove_dir_all(directory);
