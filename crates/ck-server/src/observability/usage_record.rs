@@ -15,7 +15,7 @@ use ck_core::format::Format;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Kind, Res};
 
-use super::usage_snapshot::{CanonicalUsage, Dimension, ResponseFacts};
+use super::usage_snapshot::{self, CanonicalUsage, Dimension, ResponseFacts};
 
 /// Go `usage.TokenAccountingQuality`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,9 @@ pub struct Detail {
     pub unreported: Unreported,
     /// Billing dimensions besides the token counts (`usage_snapshot::DIMENSIONS`).
     pub dimensions: Vec<(&'static str, Dimension)>,
+    /// The usage members holding dimensions that the parsed usage reported, present and not
+    /// null, so a streamed update replaces exactly those ([`merge_dimensions`]).
+    pub dimension_members: Vec<&'static str>,
 }
 
 /// Counts an attempt's canonical usage did not report (`docs/EXECUTION-CONTRACT.md` §8):
@@ -121,6 +124,7 @@ impl Detail {
                 total: usage.total_tokens.is_none(),
             },
             dimensions: usage.dimensions.clone(),
+            dimension_members: Vec::new(),
         }
     }
 }
@@ -498,6 +502,50 @@ fn has_openai_token_fields(node: &Res<'_>) -> bool {
     node.exists() && node.is_object() && (node.get("total_tokens").exists() || has_openai_bucket_fields(node))
 }
 
+/// The unsigned integer at `path`. Absent, null, a string, a negative or fractional number and
+/// one beyond `u64` are unknown: their raw text does not parse as `u64`.
+fn uint_at(node: &Res<'_>, path: &str) -> Option<u64> {
+    std::str::from_utf8(node.get(path).raw()).ok()?.parse().ok()
+}
+
+/// The `usage_snapshot::dimension_rows` of `protocol` read from an upstream usage object, as the
+/// canonical reader reads them from a snapshot's native value.
+fn native_dimensions(protocol: &str, node: &Res<'_>) -> Vec<(&'static str, Dimension)> {
+    usage_snapshot::dimension_rows(protocol)
+        .filter_map(|(path, name, count)| {
+            let path = path.join(".");
+            let value = if count {
+                uint_at(node, &path).map(Dimension::Count)
+            } else {
+                let value = node.get(path.as_str());
+                (value.kind == Kind::String).then(|| Dimension::Text(value.str().into_owned()))
+            };
+            value.map(|value| (name, value))
+        })
+        .collect()
+}
+
+/// The usage members of `protocol`'s dimension rows that `node` reports, present and not null.
+fn reported_members(protocol: &str, node: &Res<'_>) -> Vec<&'static str> {
+    let mut members = Vec::new();
+    for (path, _, _) in usage_snapshot::dimension_rows(protocol) {
+        let reported = node.get(path[0]);
+        if reported.exists() && reported.kind != Kind::Null && !members.contains(&path[0]) {
+            members.push(path[0]);
+        }
+    }
+    members
+}
+
+/// The service tier inside an upstream usage object of `protocol`, or empty.
+fn native_tier(protocol: &str, node: &Res<'_>) -> String {
+    usage_snapshot::tier_member(protocol)
+        .map(|member| node.get(member))
+        .filter(|tier| tier.kind == Kind::String)
+        .map(|tier| tier.str().trim().to_owned())
+        .unwrap_or_default()
+}
+
 /// Go `parseOpenAIStyleUsageNode`.
 fn parse_openai_node(node: &Res<'_>) -> Detail {
     let input = first(node, &["prompt_tokens", "input_tokens"]);
@@ -531,6 +579,13 @@ fn parse_openai_node(node: &Res<'_>) -> Detail {
     if creation.exists() {
         d.cache_creation = creation.int();
     }
+    let ttl = |name: &str| {
+        uint_at(node, &format!("input_tokens_details.cache_write_tokens_details.{name}"))
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+    };
+    d.cache_creation_30m = ttl("ttl_30m_tokens");
+    d.cache_creation_12h = ttl("ttl_12h_tokens");
+    d.dimensions = native_dimensions("chat", node);
     let reasoning = first(
         node,
         &[
@@ -630,6 +685,9 @@ fn parse_claude_node(node: &Res<'_>) -> Detail {
             .get("cache_creation.ephemeral_1h_input_tokens")
             .exists()
             .then(|| node.get("cache_creation.ephemeral_1h_input_tokens").int()),
+        response_service_tier: native_tier("anthropic", node),
+        dimensions: native_dimensions("anthropic", node),
+        dimension_members: reported_members("anthropic", node),
         ..Detail::default()
     };
     if d.cached == 0 {
@@ -684,7 +742,7 @@ fn parse_gemini_node(node: &Res<'_>) -> Detail {
         total: node.get("totalTokenCount").int(),
         cached,
         cache_read: cached,
-        response_service_tier: node.get("serviceTier").str().trim().to_owned(),
+        response_service_tier: native_tier("gemini", node),
         ..Detail::default()
     };
     if input.is_none() {
@@ -883,6 +941,23 @@ pub fn parse_body(format: Format, body: &[u8]) -> Detail {
     }
 }
 
+/// Keeps the earlier dimensions of every usage member a streamed update did not report, so the
+/// tier, speed and region of `message_start` survive `message_delta`. A reported member replaces
+/// all its earlier dimensions, even with none the record can name, as the Anthropic SDK replaces
+/// a non-null `server_tool_use` whole.
+fn merge_dimensions(update: &mut Detail, existing: &Detail) {
+    let member = |name: &str| {
+        usage_snapshot::dimension_rows("anthropic")
+            .find(|row| row.1 == name)
+            .map(|row| row.0[0])
+    };
+    for (name, value) in &existing.dimensions {
+        if member(name).is_none_or(|member| !update.dimension_members.contains(&member)) {
+            update.dimensions.push((name, value.clone()));
+        }
+    }
+}
+
 /// Go `StreamUsageBuffer`, fed line by line in one format the way that format's Go
 /// executor feeds it.
 #[derive(Debug, Default)]
@@ -933,6 +1008,7 @@ impl StreamUsage {
         }
         m.cache_creation_5m = m.cache_creation_5m.or(existing.cache_creation_5m);
         m.cache_creation_1h = m.cache_creation_1h.or(existing.cache_creation_1h);
+        merge_dimensions(&mut m, existing);
         let mut cached = m.cache_read + m.cache_creation;
         if cached == 0 {
             cached = m.cached;
@@ -2766,6 +2842,35 @@ mod tests {
         assert_eq!(records[1].get("response_service_tier"), None);
         assert_eq!(records[1]["tokens"].get("cache_creation_30m_tokens"), None);
         assert_eq!(records[2]["response_service_tier"], "flex");
+    }
+
+    /// A malformed legacy dimension or tier is unknown; the token counts still count.
+    #[test]
+    fn legacy_malformed_dimensions_stay_absent() {
+        let detail = parse_claude(
+            br#"{"usage":{"input_tokens":5,"output_tokens":2,"service_tier":7,"speed":42,"server_tool_use":{"web_search_requests":-1,"web_fetch_requests":"3"}}}"#,
+        );
+        assert_eq!((detail.input, detail.output), (5, 2));
+        assert_eq!(detail.response_service_tier, "");
+        assert_eq!(detail.dimensions, Vec::new());
+        let detail = parse_openai(
+            br#"{"usage":{"input_tokens":5,"output_tokens":2,"input_tokens_details":{"cache_write_tokens_details":{"ttl_30m_tokens":1.5,"ttl_12h_tokens":null}}}}"#,
+        );
+        assert_eq!((detail.cache_creation_30m, detail.cache_creation_12h), (None, None));
+    }
+
+    /// Each provider's rows read only that provider's usage: Anthropic fields in an OpenAI usage
+    /// object are not Anthropic dimensions.
+    #[test]
+    fn provider_fields_stay_with_their_provider() {
+        let detail = parse_openai(
+            br#"{"usage":{"prompt_tokens":5,"completion_tokens":2,"speed":"fast","server_tool_use":{"web_search_requests":1}}}"#,
+        );
+        assert_eq!(detail.dimensions, Vec::new());
+        let detail = parse_claude(
+            br#"{"usage":{"input_tokens":5,"output_tokens":2,"prompt_tokens_details":{"audio_tokens":2}}}"#,
+        );
+        assert_eq!(detail.dimensions, Vec::new());
     }
 
     /// Gemini reports its tier inside `usageMetadata`, on the buffered and streamed paths.

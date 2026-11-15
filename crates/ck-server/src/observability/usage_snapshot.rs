@@ -46,41 +46,70 @@ pub enum Dimension {
     Text(String),
 }
 
-/// Where a billing dimension lives in a usage snapshot: the canonical snapshot itself (`None`),
-/// or the `native` value of a source protocol, which keeps provider fields isolated (Q3).
-type Source = Option<&'static str>;
-
-/// The billing dimensions accounting records besides the token counts: `(source, path, record
-/// name, whether a count)`. A provider unit adds a row for each billed unit its usage reports.
-const DIMENSIONS: &[(Source, &[&str], &str, bool)] = &[
-    (None, &["input_audio_tokens"], "input_audio_tokens", true),
-    (None, &["output_audio_tokens"], "output_audio_tokens", true),
+/// The billing dimensions accounting records besides the token counts: `(source protocol, path
+/// in its native usage, record name, whether a count)`. Both accounting paths read these rows:
+/// the canonical snapshot's `native` value, which keeps provider fields isolated (Q3), and the
+/// legacy parsers' upstream usage object. A provider unit adds a row for each billed unit its
+/// usage reports.
+const DIMENSIONS: &[(&str, &[&str], &str, bool)] = &[
     (
-        None,
-        &["details", "accepted_prediction_tokens"],
+        "chat",
+        &["prompt_tokens_details", "audio_tokens"],
+        "input_audio_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["prompt_tokens_details", "text_tokens"],
+        "input_text_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["prompt_tokens_details", "image_tokens"],
+        "input_image_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["completion_tokens_details", "audio_tokens"],
+        "output_audio_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["completion_tokens_details", "text_tokens"],
+        "output_text_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["completion_tokens_details", "image_tokens"],
+        "output_image_tokens",
+        true,
+    ),
+    (
+        "chat",
+        &["completion_tokens_details", "accepted_prediction_tokens"],
         "accepted_prediction_tokens",
         true,
     ),
     (
-        None,
-        &["details", "rejected_prediction_tokens"],
+        "chat",
+        &["completion_tokens_details", "rejected_prediction_tokens"],
         "rejected_prediction_tokens",
         true,
     ),
-    (None, &["details", "input_text_tokens"], "input_text_tokens", true),
-    (None, &["details", "output_text_tokens"], "output_text_tokens", true),
-    (None, &["details", "input_image_tokens"], "input_image_tokens", true),
-    (None, &["details", "output_image_tokens"], "output_image_tokens", true),
-    (Some("anthropic"), &["speed"], "speed", false),
-    (Some("anthropic"), &["inference_geo"], "inference_geo", false),
+    ("anthropic", &["speed"], "speed", false),
+    ("anthropic", &["inference_geo"], "inference_geo", false),
     (
-        Some("anthropic"),
+        "anthropic",
         &["server_tool_use", "web_search_requests"],
         "web_search_requests",
         true,
     ),
     (
-        Some("anthropic"),
+        "anthropic",
         &["server_tool_use", "web_fetch_requests"],
         "web_fetch_requests",
         true,
@@ -89,6 +118,19 @@ const DIMENSIONS: &[(Source, &[&str], &str, bool)] = &[
 
 /// The service tier inside a source's native usage: `(protocol, member)`.
 const TIERS: &[(&str, &str)] = &[("anthropic", "service_tier"), ("gemini", "serviceTier")];
+
+/// The [`DIMENSIONS`] rows of one source protocol: `(path, record name, whether a count)`.
+pub(crate) fn dimension_rows(protocol: &str) -> impl Iterator<Item = (&'static [&'static str], &'static str, bool)> {
+    DIMENSIONS
+        .iter()
+        .filter(move |row| row.0 == protocol)
+        .map(|&(_, path, name, count)| (path, name, count))
+}
+
+/// The usage member holding one source protocol's service tier ([`TIERS`]).
+pub(crate) fn tier_member(protocol: &str) -> Option<&'static str> {
+    TIERS.iter().find(|row| row.0 == protocol).map(|row| row.1)
+}
 
 /// Response facts the usage record keeps besides counts, read from the same stream: the
 /// `response.start` model and the last chunk `service_tier`. A later value replaces an earlier.
@@ -162,17 +204,6 @@ fn snapshot(doc: &Document) -> codec::Result<CanonicalUsage> {
     })
 }
 
-/// The `native.value` of `usage` when its source protocol is `protocol`.
-fn native(doc: &Document, usage: usize, protocol: &str) -> codec::Result<Option<usize>> {
-    let Some(native) = doc.member(usage, "native")? else {
-        return Ok(None);
-    };
-    match doc.member(native, "protocol")? {
-        Some(name) if doc.string_is(name, protocol)? => doc.member(native, "value"),
-        _ => Ok(None),
-    }
-}
-
 /// The node at `path` below `node`, through objects only.
 fn at(doc: &Document, mut node: usize, path: &[&str]) -> codec::Result<Option<usize>> {
     for name in path {
@@ -202,30 +233,40 @@ fn dimension(doc: &Document, node: usize, count: bool) -> codec::Result<Option<D
     }
 }
 
+/// The native value of `usage` and its source protocol.
+fn native(doc: &Document, usage: usize) -> codec::Result<Option<(usize, String)>> {
+    let Some(native) = doc.member(usage, "native")? else {
+        return Ok(None);
+    };
+    match (doc.member(native, "protocol")?, doc.member(native, "value")?) {
+        (Some(protocol), Some(value)) if matches!(doc.node(protocol)?.value, Value::String(_) | Value::Text(_)) => {
+            Ok(Some((value, string(doc, protocol)?)))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn dimensions(doc: &Document, usage: usize) -> codec::Result<Vec<(&'static str, Dimension)>> {
     let mut found = Vec::new();
-    for &(source, path, name, count) in DIMENSIONS {
-        let base = match source {
-            None => Some(usage),
-            Some(protocol) => native(doc, usage, protocol)?,
-        };
-        if let Some(node) = base.map(|base| at(doc, base, path)).transpose()?.flatten()
-            && let Some(value) = dimension(doc, node, count)?
-        {
-            found.push((name, value));
+    if let Some((value, protocol)) = native(doc, usage)? {
+        for (path, name, count) in dimension_rows(&protocol) {
+            if let Some(node) = at(doc, value, path)?
+                && let Some(value) = dimension(doc, node, count)?
+            {
+                found.push((name, value));
+            }
         }
     }
     Ok(found)
 }
 
 fn native_tier(doc: &Document, usage: usize) -> codec::Result<Option<String>> {
-    for &(protocol, member) in TIERS {
-        if let Some(value) = native(doc, usage, protocol)?
-            && let Some(node) = at(doc, value, &[member])?
-            && let Some(Dimension::Text(tier)) = dimension(doc, node, false)?
-        {
-            return Ok(Some(tier));
-        }
+    if let Some((value, protocol)) = native(doc, usage)?
+        && let Some(member) = tier_member(&protocol)
+        && let Some(node) = at(doc, value, &[member])?
+        && let Some(Dimension::Text(tier)) = dimension(doc, node, false)?
+    {
+        return Ok(Some(tier));
     }
     Ok(None)
 }

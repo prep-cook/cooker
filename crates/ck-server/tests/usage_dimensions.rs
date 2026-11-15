@@ -173,10 +173,10 @@ async fn chat_modality_and_prediction_details_reach_accounting() {
         usage.dimensions,
         vec![
             ("input_audio_tokens", Dimension::Count(2)),
+            ("input_text_tokens", Dimension::Count(5)),
             ("output_audio_tokens", Dimension::Count(4)),
             ("accepted_prediction_tokens", Dimension::Count(6)),
             ("rejected_prediction_tokens", Dimension::Count(0)),
-            ("input_text_tokens", Dimension::Count(5)),
         ]
     );
 }
