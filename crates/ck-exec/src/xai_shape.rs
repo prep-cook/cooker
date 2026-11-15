@@ -146,19 +146,21 @@ pub(crate) fn shape(
     let base_model = parse_suffix(inbound.model).model_name;
     // cliproxyauth.ResolvedModelInfo, bound by dispatch for configured xai-api-key models.
     let caps = inbound.resolved.map(|r| ModelCaps::from(&r.info));
-    let mut body = thinking::apply_request_thinking(&RequestThinking {
-        body: &body,
-        payload: inbound.payload,
-        original: inbound.original,
-        model: inbound.model,
-        from: inbound.payload_format.as_str(),
-        // Go passes the executor identifier as the target format.
-        to: PROVIDER,
-        provider: PROVIDER,
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer: false,
-        updates_changed: false,
-    })
+    let mut body = thinking::apply_request_thinking(
+        &RequestThinking {
+            payload: Some(inbound.payload),
+            original: Some(inbound.original),
+            model: inbound.model,
+            from: inbound.payload_format.as_str(),
+            // Go passes the executor identifier as the target format.
+            to: PROVIDER,
+            provider: PROVIDER,
+            resolved: caps.as_ref().map(Some),
+            has_request_transformer: false,
+            updates_changed: false,
+        },
+        body,
+    )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
     set_str_if_different(&mut body, "model", &base_model);
     set_bool_if_different(&mut body, "stream", stream);

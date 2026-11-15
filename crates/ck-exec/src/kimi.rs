@@ -324,18 +324,20 @@ fn thinking(body: &[u8], req: &ExecRequest, to: &str) -> Result<Vec<u8>, ExecErr
     let has_request_transformer = Format::parse(to).is_some_and(|t| ck_translate::pair(req.source_format, t).is_some());
     // Go `cliproxyauth.ResolvedModelInfo`: capabilities bound to this attempt.
     let caps = req.resolved_model.as_ref().map(|r| ModelCaps::from(&r.info));
-    apply_request_thinking(&RequestThinking {
-        body,
-        payload: &req.body,
-        original: original(req),
-        model: &req.model,
-        from: req.source_format.as_str(),
-        to,
-        provider: "kimi",
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer,
-        updates_changed: false,
-    })
+    apply_request_thinking(
+        &RequestThinking {
+            payload: Some(&req.body[..]),
+            original: Some(&original(req)[..]),
+            model: &req.model,
+            from: req.source_format.as_str(),
+            to,
+            provider: "kimi",
+            resolved: caps.as_ref().map(Some),
+            has_request_transformer,
+            updates_changed: false,
+        },
+        body.to_vec(),
+    )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))
 }
 

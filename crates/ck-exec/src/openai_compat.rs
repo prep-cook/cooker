@@ -215,18 +215,20 @@ fn apply_thinking(
     provider: &str,
     resolved: Option<&ModelCaps>,
 ) -> Result<Vec<u8>, ExecError> {
-    thinking::apply_request_thinking(&RequestThinking {
-        body: &body,
-        payload: &req.body,
-        original: &req.original_body,
-        model: &req.model,
-        from: req.source_format.as_str(),
-        to: target.as_str(),
-        provider,
-        resolved: resolved.map(Some),
-        has_request_transformer: ck_translate::pair(req.source_format, target).is_some(),
-        updates_changed: false,
-    })
+    thinking::apply_request_thinking(
+        &RequestThinking {
+            payload: Some(&req.body[..]),
+            original: Some(&req.original_body[..]),
+            model: &req.model,
+            from: req.source_format.as_str(),
+            to: target.as_str(),
+            provider,
+            resolved: resolved.map(Some),
+            has_request_transformer: ck_translate::pair(req.source_format, target).is_some(),
+            updates_changed: false,
+        },
+        body.to_vec(),
+    )
     .map_err(|e| ExecError::local(400, FailureScope::Request, e.message))
 }
 

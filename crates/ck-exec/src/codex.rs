@@ -700,18 +700,20 @@ pub(crate) fn count_tokens_body(req: &ExecRequest, cfg: &Config, model: &str) ->
         crate::codex_client::translate_request(req.source_format, Format::Codex, &ctx, &req.original_body, &client)
             .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))?
     };
-    let body = ck_wire::thinking::apply_request_thinking(&ck_wire::thinking::RequestThinking {
-        body: &translated,
-        payload: &req.body,
-        original: &req.original_body,
-        model: &req.model,
-        from: req.source_format.as_str(),
-        to: Format::Codex.as_str(),
-        provider: "codex",
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer: ck_translate::pair(req.source_format, Format::Codex).is_some(),
-        updates_changed: false,
-    })
+    let body = ck_wire::thinking::apply_request_thinking(
+        &ck_wire::thinking::RequestThinking {
+            payload: Some(&req.body[..]),
+            original: Some(&req.original_body[..]),
+            model: &req.model,
+            from: req.source_format.as_str(),
+            to: Format::Codex.as_str(),
+            provider: "codex",
+            resolved: caps.as_ref().map(Some),
+            has_request_transformer: ck_translate::pair(req.source_format, Format::Codex).is_some(),
+            updates_changed: false,
+        },
+        translated.to_vec(),
+    )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
     let mut body = String::from_utf8_lossy(&body).into_owned();
     body = set_str_if_different(body, "model", model);

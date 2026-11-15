@@ -1,11 +1,9 @@
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
 use ck_translate::codec::source::Source;
 
 use super::*;
+use crate::test_alloc;
 
 /// Grok's encrypted reasoning, as the Go recording has it.
 const ENC: &str = "TKwE++a7qP4CXIXITJIj2DYyQCSyR3JuUSrOe758M0CwwzrC2cbGVuOaEQaBqIrN6dvHWTX7FJ0iqroON2AsUyUnrtPc/TZpMRjPoWUeMN4m8PpoZ7WEOcq9ouGU9GXp1dV2okgnwdVvFfliii45xpY2Vr+czC4aqEgQFOmfOkP/1/2QzRooWeLd0i2AVLOOckBWoRQ1jCCa1racBhwpsfYf7Ax5lb393La7xuA7EJm6/n9nslYW3GJXW4GKnsKysoL7Ml0tLwoN1m+lBumus/5uivtkjccC5s5Jrf6Q41NADO7Q4yeiDfkUs7Ro4NVGD/ehf4+8qBtI28X3Gx54Fw";
@@ -121,69 +119,6 @@ fn oversized_reasoning_is_dropped_unchecked() {
     let _ = std::fs::remove_dir_all(directory);
 }
 
-/// An allocation this large is item-sized; smaller ones are bookkeeping.
-const LARGE: usize = 64 * 1024;
-
-thread_local! {
-    /// Whether this thread's large allocations count.
-    static TRACKED: Cell<bool> = const { Cell::new(false) };
-}
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-/// Counts the live large allocations of tracked threads.
-struct Tracking;
-
-fn tracked(size: usize) -> bool {
-    size >= LARGE && TRACKED.try_with(Cell::get).unwrap_or(false)
-}
-
-fn add(size: usize) {
-    if tracked(size) {
-        let live = LIVE.fetch_add(size, Ordering::SeqCst) + size;
-        PEAK.fetch_max(live, Ordering::SeqCst);
-    }
-}
-
-fn sub(size: usize) {
-    if tracked(size) {
-        let _ = LIVE.try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
-            Some(live.saturating_sub(size))
-        });
-    }
-}
-
-// SAFETY: every call is forwarded unchanged to the system allocator.
-unsafe impl GlobalAlloc for Tracking {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarded unchanged to the system allocator.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            add(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        sub(layout.size());
-        // SAFETY: every pointer came from the system allocator.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        // SAFETY: forwarded unchanged to the system allocator.
-        let new = unsafe { System.realloc(ptr, layout, size) };
-        if !new.is_null() {
-            sub(layout.size());
-            add(size);
-        }
-        new
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Tracking = Tracking;
-
 /// A completed response: a function call to anchor it and 27 assistant messages of 70,000
 /// characters, about 1.9 MB normalized.
 fn completion() -> String {
@@ -211,9 +146,9 @@ fn cache(store: &Store, pool: &ck_stream::Store, json: &str, session: usize, sta
     let mut owner = pool.create().unwrap();
     let doc = parse(&mut owner, json);
     start.wait();
-    TRACKED.with(|t| t.set(true));
+    test_alloc::track(true);
     cache_completion(store, &scope(session), &doc, doc.root());
-    TRACKED.with(|t| t.set(false));
+    test_alloc::track(false);
 }
 
 /// Live replay allocations never pass the cache's bound: a full cache, then two turns built
@@ -239,7 +174,7 @@ fn concurrent_turns_stay_within_the_cache() {
         builder.join().unwrap();
     }
     assert!(store.get(&scope(100)).is_some() || store.get(&scope(101)).is_some());
-    let peak = PEAK.load(Ordering::SeqCst);
+    let peak = test_alloc::peak();
     assert!(peak <= TOTAL, "{peak} live bytes");
     drop(pool);
     let _ = std::fs::remove_dir_all(directory);

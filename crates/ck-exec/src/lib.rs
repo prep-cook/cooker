@@ -75,6 +75,7 @@ pub mod login_store;
 pub mod meta;
 pub mod meta_auth;
 mod meta_codex;
+pub mod meta_exec;
 mod meta_wire;
 pub mod oauth;
 pub mod openai_compat;
@@ -92,6 +93,8 @@ pub mod proxy;
 mod quota;
 mod rawjson;
 mod replay;
+#[cfg(test)]
+mod test_alloc;
 #[cfg(test)]
 mod test_tls;
 mod tls;
@@ -191,6 +194,7 @@ impl Executors {
             p if openai_compat::handles(p) => Some(pipeline::destination(&self.openai.compat, attempt)),
             gemini_exec::PROVIDER => Some(pipeline::destination(&self.google.gemini, attempt)),
             xai::PROVIDER => Some(pipeline::destination(&self.openai.xai, attempt)),
+            meta::PROVIDER => Some(pipeline::destination(&self.devices.meta, attempt)),
             p if vertex::handles(p) => vertex_exec::destination(&self.google.vertex, attempt),
             _ => None,
         }
@@ -211,6 +215,7 @@ impl Executors {
             p if openai_compat::handles(p) => pipeline::fence(&self.openai.compat, attempt, ingress, request),
             gemini_exec::PROVIDER => pipeline::fence(&self.google.gemini, attempt, ingress, request),
             xai::PROVIDER => pipeline::fence(&self.openai.xai, attempt, ingress, request),
+            meta::PROVIDER => pipeline::fence(&self.devices.meta, attempt, ingress, request),
             p if vertex::handles(p) => pipeline::fence(&self.google.vertex, attempt, ingress, request),
             _ => Err(ck_translate::codec::Error::Destination),
         }
@@ -228,6 +233,7 @@ impl Executors {
             p if openai_compat::handles(p) => pipeline::refence(&self.openai.compat, attempt, view),
             gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
             xai::PROVIDER => pipeline::refence(&self.openai.xai, attempt, view),
+            meta::PROVIDER => pipeline::refence(&self.devices.meta, attempt, view),
             p if vertex::handles(p) => pipeline::refence(&self.google.vertex, attempt, view),
             _ => Err(ck_translate::codec::Error::Destination),
         }
@@ -252,6 +258,7 @@ impl Executors {
             }
             gemini_exec::PROVIDER => pipeline::start(&self.google.gemini, attempt, request, upload, response).await,
             xai::PROVIDER => pipeline::start(&self.openai.xai, attempt, request, upload, response).await,
+            meta::PROVIDER => pipeline::start(&self.devices.meta, attempt, request, upload, response).await,
             p if vertex::handles(p) => pipeline::start(&self.google.vertex, attempt, request, upload, response).await,
             provider => {
                 response.finish(ck_stream::Terminal::Gone);

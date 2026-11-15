@@ -30,7 +30,14 @@ fn drain(events: &mut Events) -> Vec<u8> {
 fn announced_items_count_against_the_stream_quota() {
     let (store, directory) = store(4);
     let writer = store.create().unwrap();
-    let mut events = Events::new(writer.allocator(), false, false, None);
+    let mut events = Events::new(
+        writer.allocator(),
+        false,
+        Backend::Codex {
+            model_level_cooling: false,
+        },
+        None,
+    );
     let text = "x".repeat(5 * ck_stream::FRAME_BYTES);
     let item = format!(r#"{{"type":"message","id":"m","content":[{{"type":"output_text","text":"{text}"}}]}}"#);
     let error = events.push(done(0, &item).as_bytes()).unwrap_err();
@@ -45,7 +52,14 @@ fn announced_items_count_against_the_stream_quota() {
 fn an_empty_completed_output_gets_the_announced_items() {
     let (store, directory) = store(16);
     let writer = store.create().unwrap();
-    let mut events = Events::new(writer.allocator(), false, false, None);
+    let mut events = Events::new(
+        writer.allocator(),
+        false,
+        Backend::Codex {
+            model_level_cooling: false,
+        },
+        None,
+    );
     let long = "y".repeat(ck_stream::FRAME_BYTES + 7);
     let first = r#"{"type":"message","id":"a","content":[]}"#;
     let second = format!(r#"{{"type":"message","id":"b","content":[{{"type":"output_text","text":"{long}"}}]}}"#);
@@ -66,7 +80,14 @@ fn an_empty_completed_output_gets_the_announced_items() {
 fn a_listed_output_gets_missing_ids() {
     let (store, directory) = store(16);
     let writer = store.create().unwrap();
-    let mut events = Events::new(writer.allocator(), false, false, None);
+    let mut events = Events::new(
+        writer.allocator(),
+        false,
+        Backend::Codex {
+            model_level_cooling: false,
+        },
+        None,
+    );
     let mut body = done(0, r#"{"type":"message","id":"msg_1","content":[]}"#);
     body +=
         "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[]}]}}\n\n";

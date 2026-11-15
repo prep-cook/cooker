@@ -179,11 +179,11 @@ pub fn apply_summary_config(body: &[u8], format: &str, config: SummaryConfig) ->
 
 /// `ApplySummaryConfigForModel`.
 pub fn apply_summary_config_for_model(body: &[u8], format: &str, model: &str, config: SummaryConfig) -> Vec<u8> {
-    apply_summary_config_for_provider(body, format, model, "", None, config)
+    apply_summary_config_for_provider(body.to_vec(), format, model, "", None, config)
 }
 
 pub(crate) fn apply_summary_config_for_provider(
-    body: &[u8],
+    body: Vec<u8>,
     format: &str,
     model: &str,
     provider: &str,
@@ -191,11 +191,11 @@ pub(crate) fn apply_summary_config_for_provider(
     config: SummaryConfig,
 ) -> Vec<u8> {
     let format = format.trim().go_lower();
-    if config.mode == SummaryMode::Unspecified || !supported(&format) || body.is_empty() || !json::valid(body) {
-        return body.to_vec();
+    if config.mode == SummaryMode::Unspecified || !supported(&format) || body.is_empty() || !json::valid(&body) {
+        return body;
     }
     let enabled = config.mode == SummaryMode::Enabled;
-    let mut body = body.to_vec();
+    let mut body = body;
     match format.as_str() {
         "openai" => {
             if is_openrouter(provider) || json::get(&body, "reasoning.exclude").is_bool() {
