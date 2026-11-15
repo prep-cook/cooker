@@ -1067,6 +1067,8 @@ struct Prepared {
     fast: bool,
     /// The body asks the upstream to stream.
     stream: bool,
+    /// The cloak shaped the request, so a buffered response needs the old path's restore.
+    cloaked: bool,
 }
 
 /// `config.NormalizeClaudeFingerprintProfile`: unknown values are the default ("").
@@ -1471,6 +1473,13 @@ impl<'a> Ctx<'a> {
         })
     }
 
+    /// Whether the old thinking rewrites run: always on the old path and under the cloak. A
+    /// key request on the contract path sends the client's thinking and effort as written;
+    /// the fence refused what the API would (P8 removes the old path).
+    fn legacy_thinking(&self, cloak: bool) -> bool {
+        cloak || !self.contract
+    }
+
     /// `resolveClaudeWirePolicy`: (cloak, strict, sensitive words, cache user id).
     fn wire_policy(&self, confirmed: bool) -> (bool, bool, Vec<String>, bool) {
         let attr = |k: &str| {
@@ -1567,11 +1576,13 @@ impl<'a> Ctx<'a> {
         };
         let mut body = translated;
         body = set_string_if_different(body, "model", &self.upstream_model);
-        body = self.apply_thinking(req, body)?;
+        let (cloak, strict, words, cache_user_id) = self.wire_policy(confirmed);
+        if self.legacy_thinking(cloak) {
+            body = self.apply_thinking(req, body)?;
+        }
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
         }
-        let (cloak, strict, words, cache_user_id) = self.wire_policy(confirmed);
         let cch = signing::enabled(&self.api_key, self.cli_profile, self.first_party);
         // v8.0.27 (eb6a768): the caller owns every breakpoint in explicit cache mode.
         let explicit = cloak::explicit_cache_mode(&[&original, &utf8(req.body), &body]);
@@ -1665,9 +1676,7 @@ impl<'a> Ctx<'a> {
             }
         }
         body = self.ensure_max_tokens(body);
-        // The contract's fence refuses a forced tool with manual thinking instead (P8 removes
-        // this rewrite with Kimi's old path).
-        if !self.contract {
+        if self.legacy_thinking(cloak) {
             body = disable_thinking_if_tool_choice_forced(body);
         }
         body = cloak::reconcile_context_management(body, eligible, caller_owned_cm, injected_cm);
@@ -1693,9 +1702,6 @@ impl<'a> Ctx<'a> {
         if !explicit {
             body = cloak::normalize_ttl(body);
         }
-        // The contract never collects a body, so a cloaked response, whose aliases and
-        // continuity the executor restores line by line, always streams.
-        let upstream_stream = upstream_stream || (self.contract && cloaked);
         // Execute only: ExecuteStream forwards the body's own `stream` field.
         let stream_field = rawjson::get(&body, "stream");
         if !req.stream && (!detection.helper_profile || stream_field.exists() || upstream_stream) {
@@ -1809,6 +1815,7 @@ impl<'a> Ctx<'a> {
             thread,
             fast,
             stream: upstream_stream,
+            cloaked,
         })
     }
 
@@ -1854,11 +1861,13 @@ impl<'a> Ctx<'a> {
         };
         let mut body = utf8(translated).into_owned();
         body = set_string_if_different(body, "model", &self.upstream_model);
-        body = self.apply_thinking(req, body)?;
+        let (cloak, strict, words, _) = self.wire_policy(confirmed);
+        if self.legacy_thinking(cloak) {
+            body = self.apply_thinking(req, body)?;
+        }
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
         }
-        let (cloak, strict, words, _) = self.wire_policy(confirmed);
         let explicit = cloak::explicit_cache_mode(&[&original, &utf8(req.body), &body]);
         if cloak {
             if !strict && let Some(message) = cloak::invalid_system_block(&body) {
@@ -1925,6 +1934,7 @@ impl<'a> Ctx<'a> {
             thread: None,
             fast: false,
             stream: false,
+            cloaked: false,
         })
     }
 

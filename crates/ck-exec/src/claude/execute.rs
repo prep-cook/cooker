@@ -5,7 +5,9 @@
 //! `claude.rs` prepares it as it prepares a Claude client's body: the cloak, identity, cache
 //! policy, betas and headers are those of the old path. The response reaches
 //! `anthropic::response::Ingress` chunk by chunk, after alias restore when the cloak renamed
-//! tools; nothing collects it. Messages has no native compact, so the capability refuses one.
+//! tools. A cloaked or replayed buffered answer is the exception: the old path restores and
+//! stores the whole message, so this one does too. Messages has no native compact, so the
+//! capability refuses one.
 
 use std::borrow::Cow;
 
@@ -131,10 +133,9 @@ impl ClaudeExecutor {
             body,
             ..input
         };
-        // A replay scope stores the response it reads, so that response streams.
-        let mut prepared = ctx
-            .prepare_messages(&input, body, body, stream || scope.is_some())
-            .await?;
+        // As the old path: a foreign client's upstream always streams.
+        let upstream_stream = stream || facts.client_format != Format::Claude;
+        let mut prepared = ctx.prepare_messages(&input, body, body, upstream_stream).await?;
         let mode = if prepared.stream {
             BodyMode::Streaming
         } else {
@@ -254,7 +255,13 @@ fn relay(
     let capture = usage.capture().clone();
     let body = body_of(raw.body);
     if !prepared.stream {
-        return recorded(body, capture)
+        let body = recorded(body, capture.clone());
+        let body = if prepared.cloaked || scope.is_some() {
+            restored(ctx, prepared, &raw.headers, body, scope, capture)
+        } else {
+            body
+        };
+        return body
             .map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)))
             .boxed();
     }
@@ -268,6 +275,36 @@ fn relay(
         Some(scope) => scope.wrap(relayed),
         None => relayed,
     }
+}
+
+/// The old path's buffered answer under the cloak or a replay scope: the whole message,
+/// completed, with the cloak's tool aliases restored, stored for replay.
+fn restored(
+    ctx: &Ctx<'_>,
+    prepared: &mut Prepared,
+    headers: &http::HeaderMap,
+    body: Body,
+    scope: Option<replay::Scope>,
+    capture: ck_core::exec::CaptureSink,
+) -> Body {
+    let completion = ctx.completion(prepared);
+    let request_id = header_value(headers, "request-id");
+    let reverse = prepared.reverse.clone();
+    futures_util::stream::once(async move {
+        let data = super::collect(body).await?;
+        let text = super::utf8(&data);
+        completion.complete(super::rawjson::string(&text, "id").trim(), &request_id);
+        let restored = super::alias::restore_response(&text, &reverse).map_err(|m| {
+            let message = format!("restore Claude OAuth tool name from response: {m}");
+            capture.record(CaptureEvent::ResponseError(&message));
+            super::plain_error(message)
+        })?;
+        if let Some(scope) = scope {
+            scope.store_response(restored.as_bytes());
+        }
+        Ok(bytes::Bytes::from(restored))
+    })
+    .boxed()
 }
 
 /// Records each chunk of a body the executor passes on as read.

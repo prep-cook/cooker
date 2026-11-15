@@ -55,21 +55,53 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// An API key whose `base_url` is the local upstream.
     fn new(upstream: &StreamUpstream, model: &str) -> Self {
+        let key = credential("claude", &upstream.url(), "sk-ant-api03-test");
+        Self::with(key, "http://127.0.0.1:1", model)
+    }
+
+    fn with(credential: ck_core::credential::Credential, origin: &str, model: &str) -> Self {
         Self {
             streams: Streams::new(),
-            exchange: Exchange::new(
-                credential("claude", &upstream.url(), "sk-ant-api03-test"),
-                model,
-                MESSAGES,
-            ),
+            exchange: Exchange::new(credential, model, MESSAGES),
             executors: Executors {
-                claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+                claude: ClaudeExecutor::new(origin).unwrap(),
                 codex: Default::default(),
                 devices: Default::default(),
                 openai: Default::default(),
                 google: Default::default(),
             },
+        }
+    }
+
+    /// `body` through the old route (`ClaudeExecutor::execute`), read to its end.
+    async fn old_route(&self, body: &[u8]) {
+        let value: Value = serde_json::from_slice(body).unwrap();
+        let exchange = &self.exchange;
+        let req = ExecRequest {
+            operation: OldOperation::Generate,
+            source_format: Format::Claude,
+            response_format: Format::Claude,
+            requested_model: value["model"].as_str().unwrap().into(),
+            model: exchange.model.clone(),
+            original_body: Bytes::copy_from_slice(body),
+            body: Bytes::copy_from_slice(body),
+            stream: value["stream"] == true,
+            alt: None,
+            session: None,
+            execution_session: None,
+            derived_session: None,
+            request_path: MESSAGES.into(),
+            headers: exchange.headers.clone(),
+            caller: exchange.caller.clone(),
+            resolved_model: None,
+            usage: UsageSink::default(),
+        };
+        let claude = &self.executors.claude;
+        let mut answer = claude.execute(&exchange.credential, req, &exchange.cfg).await.unwrap();
+        if let ck_core::exec::ResponseBody::Stream(events) = &mut answer.body {
+            while events.next().await.is_some() {}
         }
     }
 
@@ -214,37 +246,7 @@ async fn anthropic_requests_reach_the_upstream_as_the_old_route_sent_them() {
         let (started, _, _request) = fixture.anthropic(&body, Operation::Generate).await;
         started.unwrap().producer.await.unwrap().unwrap();
 
-        let old_fixture = Fixture::new(&old, SONNET);
-        let exchange = &old_fixture.exchange;
-        let req = ExecRequest {
-            operation: OldOperation::Generate,
-            source_format: Format::Claude,
-            response_format: Format::Claude,
-            requested_model: "client-model".into(),
-            model: SONNET.into(),
-            original_body: Bytes::from(body.clone()),
-            body: Bytes::from(body),
-            stream,
-            alt: None,
-            session: None,
-            execution_session: None,
-            derived_session: None,
-            request_path: MESSAGES.into(),
-            headers: exchange.headers.clone(),
-            caller: exchange.caller.clone(),
-            resolved_model: None,
-            usage: UsageSink::default(),
-        };
-        let cfg = exchange.cfg.clone();
-        let mut answer = old_fixture
-            .executors
-            .claude
-            .execute(&exchange.credential, req, &cfg)
-            .await
-            .unwrap();
-        if let ck_core::exec::ResponseBody::Stream(events) = &mut answer.body {
-            while events.next().await.is_some() {}
-        }
+        Fixture::new(&old, SONNET).old_route(&body).await;
         let ((new_body, new), (old_body, old)) = (sent(&new), sent(&old));
         // The Anthropic egress writes members in its own order; every member and value is the
         // old route's.
@@ -554,3 +556,6 @@ async fn request_side_facts_reach_the_usage_sink_and_response_usage_does_not() {
     }
     assert!(!calls.iter().any(|c| c.starts_with("response_")), "{calls:?}");
 }
+
+#[path = "exec_anthropic/parity.rs"]
+mod parity;
