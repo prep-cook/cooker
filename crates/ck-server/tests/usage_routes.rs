@@ -78,42 +78,51 @@ async fn anthropic_tier_speed_region_and_server_tools_reach_the_record() {
     );
 }
 
-/// `message_start` reports the tier, speed and region; `message_delta` replaces the server-tool
-/// counters it reports and keeps the rest. A field the upstream never sent stays absent.
+/// A streamed message's usage merges like the Anthropic SDK's: `message_start` reports the
+/// tier, speed and region, and `message_delta` replaces the server-tool counters whenever it
+/// reports a non-null `server_tool_use`, even one without a counter the record can name. Billing
+/// dimensions are kept whatever the token counts, and a field never sent stays absent.
 #[tokio::test]
 async fn streamed_anthropic_dimensions_merge_like_the_sdk() {
-    let events = [
-        json!({"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","model":"up-model","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":1,"service_tier":"priority","speed":"fast","server_tool_use":{"web_search_requests":0,"web_fetch_requests":4}}}}),
-        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
-        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
-        json!({"type":"content_block_stop","index":0}),
-        json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":4,"server_tool_use":{"web_search_requests":3}}}),
-        json!({"type":"message_stop"}),
-    ];
-    let answer: String = events
-        .iter()
-        .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
-        .collect();
-    let record = record("claude", "/v1/messages", messages(true), SSE, answer).await;
-    assert_eq!(record["response_service_tier"], "priority");
-    assert_eq!(record["dimensions"], json!({"speed":"fast","web_search_requests":3}));
-}
-
-/// A `server_tool_use` the delta reports replaces the earlier one whole, even when it holds no
-/// counter the record can name; a `null` one is not reported and keeps the earlier counters.
-#[tokio::test]
-async fn a_reported_empty_server_tool_use_clears_earlier_counters() {
-    for (delta, dimensions) in [
-        (json!({}), json!(null)),
-        (json!({"web_search_requests":-1}), json!(null)),
-        (json!(null), json!({"web_search_requests":2,"web_fetch_requests":4})),
+    let tools = json!({"web_search_requests":2,"web_fetch_requests":4});
+    for (start, delta, tier, dimensions) in [
+        (
+            json!({"input_tokens":5,"output_tokens":1,"service_tier":"priority","speed":"fast","server_tool_use":{"web_search_requests":0,"web_fetch_requests":4}}),
+            json!({"output_tokens":4,"server_tool_use":{"web_search_requests":3}}),
+            json!("priority"),
+            json!({"speed":"fast","web_search_requests":3}),
+        ),
+        (
+            json!({"input_tokens":0,"output_tokens":0,"service_tier":"priority","speed":"fast"}),
+            json!({"output_tokens":4,"server_tool_use":{"web_search_requests":3}}),
+            json!("priority"),
+            json!({"speed":"fast","web_search_requests":3}),
+        ),
+        (
+            json!({"input_tokens":5,"output_tokens":1,"server_tool_use":tools}),
+            json!({"output_tokens":4,"server_tool_use":{}}),
+            Value::Null,
+            Value::Null,
+        ),
+        (
+            json!({"input_tokens":5,"output_tokens":1,"server_tool_use":tools}),
+            json!({"output_tokens":4,"server_tool_use":{"web_search_requests":-1}}),
+            Value::Null,
+            Value::Null,
+        ),
+        (
+            json!({"input_tokens":5,"output_tokens":1,"server_tool_use":tools}),
+            json!({"output_tokens":4,"server_tool_use":null}),
+            Value::Null,
+            tools.clone(),
+        ),
     ] {
         let events = [
-            json!({"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","model":"up-model","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":1,"server_tool_use":{"web_search_requests":2,"web_fetch_requests":4}}}}),
+            json!({"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","model":"up-model","content":[],"stop_reason":null,"stop_sequence":null,"usage":start}}),
             json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
             json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
             json!({"type":"content_block_stop","index":0}),
-            json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":4,"server_tool_use":delta}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":delta}),
             json!({"type":"message_stop"}),
         ];
         let answer: String = events
@@ -121,11 +130,9 @@ async fn a_reported_empty_server_tool_use_clears_earlier_counters() {
             .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
             .collect();
         let record = record("claude", "/v1/messages", messages(true), SSE, answer).await;
-        assert_eq!(
-            record.get("dimensions").cloned().unwrap_or(Value::Null),
-            dimensions,
-            "{delta}"
-        );
+        let field = |name| record.get(name).cloned().unwrap_or(Value::Null);
+        assert_eq!(field("response_service_tier"), tier, "{start} then {delta}");
+        assert_eq!(field("dimensions"), dimensions, "{start} then {delta}");
     }
 }
 

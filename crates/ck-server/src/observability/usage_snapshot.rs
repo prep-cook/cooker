@@ -127,6 +127,11 @@ pub(crate) fn dimension_rows(protocol: &str) -> impl Iterator<Item = (&'static [
         .map(|&(_, path, name, count)| (path, name, count))
 }
 
+/// The usage member, the first segment of its [`DIMENSIONS`] path, holding the dimension `name`.
+pub(crate) fn dimension_member(name: &str) -> Option<&'static str> {
+    DIMENSIONS.iter().find(|row| row.2 == name).map(|row| row.1[0])
+}
+
 /// The usage member holding one source protocol's service tier ([`TIERS`]).
 pub(crate) fn tier_member(protocol: &str) -> Option<&'static str> {
     TIERS.iter().find(|row| row.0 == protocol).map(|row| row.1)

@@ -432,6 +432,12 @@ pub fn ensure_breakdown(mut d: Detail, provider: &str, executor_type: &str) -> D
 }
 
 /// Go `hasNonZeroTokenUsage`.
+/// The detail reports billing evidence besides token counts. Only the tier reaches the parsers
+/// that drop tokenless updates: Gemini and Interactions have no dimension rows.
+fn has_billing(d: &Detail) -> bool {
+    !d.response_service_tier.trim().is_empty()
+}
+
 fn has_tokens(d: &Detail) -> bool {
     d.input != 0
         || d.output != 0
@@ -586,6 +592,7 @@ fn parse_openai_node(node: &Res<'_>) -> Detail {
     d.cache_creation_30m = ttl("ttl_30m_tokens");
     d.cache_creation_12h = ttl("ttl_12h_tokens");
     d.dimensions = native_dimensions("chat", node);
+    d.dimension_members = reported_members("chat", node);
     let reasoning = first(
         node,
         &[
@@ -789,7 +796,7 @@ fn parse_gemini_stream(line: &[u8]) -> Option<Detail> {
         return None;
     }
     let d = parse_gemini_node(&node);
-    has_tokens(&d).then_some(d)
+    (has_tokens(&d) || has_billing(&d)).then_some(d)
 }
 
 /// Go `ParseAntigravityStreamUsage`: the wrapped `response.usageMetadata` first, and
@@ -911,7 +918,7 @@ fn parse_interactions_stream(line: &[u8]) -> Option<Detail> {
         return None;
     }
     let d = parse_interactions(payload);
-    has_tokens(&d).then_some(d)
+    (has_tokens(&d) || has_billing(&d)).then_some(d)
 }
 
 /// The buffered-response parser for a format (Go's executor for that format).
@@ -941,18 +948,13 @@ pub fn parse_body(format: Format, body: &[u8]) -> Detail {
     }
 }
 
-/// Keeps the earlier dimensions of every usage member a streamed update did not report, so the
-/// tier, speed and region of `message_start` survive `message_delta`. A reported member replaces
-/// all its earlier dimensions, even with none the record can name, as the Anthropic SDK replaces
-/// a non-null `server_tool_use` whole.
+/// Keeps the earlier dimensions of every usage member `update` did not report, so the tier,
+/// speed and region of `message_start` survive `message_delta`. A reported member replaces all
+/// its earlier dimensions, even with none the record can name, as the Anthropic SDK replaces a
+/// non-null `server_tool_use` whole.
 fn merge_dimensions(update: &mut Detail, existing: &Detail) {
-    let member = |name: &str| {
-        usage_snapshot::dimension_rows("anthropic")
-            .find(|row| row.1 == name)
-            .map(|row| row.0[0])
-    };
     for (name, value) in &existing.dimensions {
-        if member(name).is_none_or(|member| !update.dimension_members.contains(&member)) {
+        if usage_snapshot::dimension_member(name).is_none_or(|member| !update.dimension_members.contains(&member)) {
             update.dimensions.push((name, value.clone()));
         }
     }
@@ -967,9 +969,12 @@ pub struct StreamUsage {
 }
 
 impl StreamUsage {
-    /// Go `StreamUsageBuffer.Observe`: the latest usage wins; a tier-only update keeps
-    /// the usage and replaces the tier.
-    fn observe(&mut self, detail: Detail) {
+    /// Every stream observation lands here. Token counts follow Go's
+    /// `StreamUsageBuffer.Observe`: the latest usage wins, and a tier-only update keeps the
+    /// counts and replaces the tier. Billing dimensions are kept apart from that rule: they merge
+    /// ([`merge_dimensions`]) whether or not the update carries tokens.
+    fn observe(&mut self, mut detail: Detail) {
+        merge_dimensions(&mut detail, &self.detail);
         let tier = detail.response_service_tier.trim().to_owned();
         if tier.is_empty() || has_tokens(&detail) {
             let preserved = std::mem::take(&mut self.detail.response_service_tier);
@@ -979,6 +984,7 @@ impl StreamUsage {
             }
         } else {
             self.detail.response_service_tier = tier;
+            self.detail.dimensions = detail.dimensions;
         }
         self.ok = true;
     }
@@ -1008,7 +1014,6 @@ impl StreamUsage {
         }
         m.cache_creation_5m = m.cache_creation_5m.or(existing.cache_creation_5m);
         m.cache_creation_1h = m.cache_creation_1h.or(existing.cache_creation_1h);
-        merge_dimensions(&mut m, existing);
         let mut cached = m.cache_read + m.cache_creation;
         if cached == 0 {
             cached = m.cached;
@@ -2881,6 +2886,63 @@ mod tests {
         let mut stream = StreamUsage::default();
         stream.line(Format::Gemini, &[b"data: ".as_slice(), body].concat());
         assert_eq!(stream.detail().unwrap().response_service_tier, "priority");
+    }
+
+    /// Billing evidence in a stream is kept whatever the token counts: a chunk with a tier but
+    /// no tokens keeps its tier for the later counts, and each usage member's latest dimensions
+    /// replace its earlier ones while an unreported member keeps them.
+    #[test]
+    fn streamed_billing_evidence_is_independent_of_token_counts() {
+        use super::super::usage_snapshot::Dimension::Count;
+        let gemini_counts = r#"{"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}}"#;
+        let chat = |details: &str| format!(r#"{{"usage":{{"prompt_tokens":3,"completion_tokens":1{details}}}}}"#);
+        for (format, lines, tier, dimensions) in [
+            (
+                Format::Gemini,
+                vec![
+                    r#"{"usageMetadata":{"serviceTier":"priority"}}"#.to_owned(),
+                    gemini_counts.to_owned(),
+                ],
+                "priority",
+                vec![],
+            ),
+            (
+                Format::Interactions,
+                vec![
+                    r#"{"interaction":{"service_tier":"priority","usage":{}}}"#.to_owned(),
+                    gemini_counts.to_owned(),
+                ],
+                "priority",
+                vec![],
+            ),
+            (
+                Format::OpenAI,
+                vec![
+                    chat(r#","prompt_tokens_details":{"audio_tokens":2}"#),
+                    chat(r#","prompt_tokens_details":{"audio_tokens":5}"#),
+                ],
+                "",
+                vec![("input_audio_tokens", Count(5))],
+            ),
+            (
+                Format::OpenAI,
+                vec![chat(r#","prompt_tokens_details":{"audio_tokens":2}"#), chat("")],
+                "",
+                vec![("input_audio_tokens", Count(2))],
+            ),
+        ] {
+            let mut stream = StreamUsage::default();
+            for line in &lines {
+                stream.line(format, format!("data: {line}").as_bytes());
+            }
+            let detail = stream.detail().unwrap();
+            assert!(has_tokens(detail), "{lines:?}");
+            assert_eq!(
+                (detail.response_service_tier.as_str(), &detail.dimensions),
+                (tier, &dimensions),
+                "{lines:?}"
+            );
+        }
     }
 
     #[test]
