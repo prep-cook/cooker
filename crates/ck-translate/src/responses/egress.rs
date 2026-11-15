@@ -30,6 +30,8 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     id: codec::identity::ResponseId,
     terminal: bool,
     sequence: u64,
+    /// The canonical stream this egress reads; it checks each record's `seq`.
+    binding: internal::Binding,
     diagnostic: F,
     images: Table<super::image::Projection>,
     audio: Table<super::audio::Projection>,
@@ -70,6 +72,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             id,
             terminal: false,
             sequence: 0,
+            binding: internal::Binding::new(owner, None),
             diagnostic,
             images: Table::new(owner)?,
             audio: Table::new(owner)?,
@@ -217,7 +220,7 @@ impl<F: FnMut(&'static str, u64)> codec::ResponseEgress for Egress<F> {
         mut output: impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         crate::boundary::enter(self.owner, owner, self.terminal)?;
-        let (kind, doc) = internal::decode(owner, input)?;
+        let (kind, doc) = self.binding.decode(owner, input)?;
         internal::refuse_uri_media(kind, &doc)?;
         self.process(owner, kind, doc, &mut output)
     }

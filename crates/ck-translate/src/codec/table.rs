@@ -1,6 +1,15 @@
 use super::{Error, Result};
 use ck_stream::{MetadataPermit, Writer};
 
+/// Sets the charge of `permit` to `bytes`. An unchanged charge takes no stream lock, since
+/// resizing to the same size changes nothing.
+pub(crate) fn charge(permit: &mut MetadataPermit, bytes: usize) -> Result<()> {
+    if bytes != permit.bytes() {
+        permit.resize(bytes)?;
+    }
+    Ok(())
+}
+
 /// The capacity that holds `extra` entries more than `len`: the current capacity while it does,
 /// else the needed length plus a quarter, at least `floor` more. A quarter keeps growth
 /// geometric, so pushes stay amortized O(1), while the charge stays within 1.25 times the use
