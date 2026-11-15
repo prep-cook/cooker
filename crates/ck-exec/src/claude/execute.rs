@@ -1,11 +1,12 @@
 //! The Claude executor over the internal stream (`docs/EXECUTION-CONTRACT.md`): Messages
-//! generation and count_tokens through the Anthropic codecs.
+//! generation, count_tokens and compaction through the Anthropic codecs.
 //!
 //! The upload is the Anthropic request egress of the attempt's fence. The pipeline in
 //! `claude.rs` prepares it as it prepares a Claude client's body: the cloak, identity, cache
 //! policy, betas and headers are those of the old path. The response reaches
-//! `anthropic::response::Ingress` chunk by chunk. Messages has no native compact, so the
-//! capability refuses one (owner question 7).
+//! `anthropic::response::Ingress` chunk by chunk. A compact is Anthropic's native compaction
+//! (owner ruling, Q7 reversal): a buffered Messages call with `"compaction":{"type":"summarize"}`
+//! and the compaction beta, whose one signed block later requests replay unchanged.
 //!
 //! Contract G5: an Anthropic request the OAuth cloak or the Claude Code identity shapes is
 //! prepared from the client's own body ([`crate::types::Client::original`]) exactly as the old
@@ -36,7 +37,7 @@ use crate::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
 /// The capability key of the Anthropic Messages API.
 pub const DESTINATION: &str = "anthropic";
 
-/// The refusal of a compaction, which Messages has no native form of (owner question 7). It
+/// The old route's refusal of a compaction, which only the contract path sends natively. It
 /// names no upstream: members see it.
 pub(super) const NO_COMPACT: &str = "This model does not support compaction; choose a model that does.";
 
@@ -69,12 +70,11 @@ impl Execute for ClaudeExecutor {
 
     async fn compact(
         &self,
-        _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
-        _streams: Streams<'_>,
+        attempt: &Attempt<'_>,
+        request: &Request<'_>,
+        streams: Streams<'_>,
     ) -> Result<Upstream<ClaudeIngress>, ExecError> {
-        // The capability refuses compact at the fence, so no request reaches this.
-        Err(ExecError::local(400, FailureScope::Model, NO_COMPACT))
+        Box::pin(self.messages(attempt, request, streams)).await
     }
 }
 
@@ -123,12 +123,16 @@ pub(super) fn capability(cfg: &Config, model: &str, resolved: Option<&ResolvedMo
 }
 
 impl ClaudeExecutor {
-    /// Whether `attempt` stays on the old route: every credential thinking replay serves.
-    /// Replay stores a response only once it is known complete, which `Execute` cannot see:
-    /// the producer validates the body after the executor returned. The selector answers no
-    /// destination for it, so the server keeps the old `claude` arm (Q1).
-    pub fn old_route_only(&self, attempt: &Attempt<'_>) -> bool {
-        replay::eligible(&gate(&attempt_ctx(self, attempt, &scoped(attempt))))
+    /// Whether the fenced `view` runs on the contract path for `attempt`; the selector's fence,
+    /// re-fence and start refuse it with `Destination` otherwise, and the server keeps the old
+    /// `claude` arm. A request on a credential thinking replay serves stays on the old arm:
+    /// replay stores a response only once it is known complete, which `Execute` cannot see,
+    /// because the producer validates the body after the executor returned (Q1). A compact and
+    /// a request carrying a compaction block run here anyway, since the old arm has no native
+    /// compaction and drops the block; thinking replay does not record their turns.
+    pub fn contract_path(&self, attempt: &Attempt<'_>, view: RequestView<'_>) -> bool {
+        ck_translate::anthropic::compaction::requested(view).unwrap_or(false)
+            || !replay::eligible(&gate(&attempt_ctx(self, attempt, &scoped(attempt))))
     }
 
     async fn messages(
@@ -137,8 +141,9 @@ impl ClaudeExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<ClaudeIngress>, ExecError> {
-        let doc = request.validated.view().document;
+        let (doc, operation) = (request.validated.view().document, request.validated.view().operation);
         let facts = Facts::of(doc).map_err(encoding)?;
+        // The fence refuses a streamed compaction.
         let stream = streaming(doc, facts.client_format).map_err(encoding)?;
         let cfg = scoped(attempt);
         let mut ctx = context(self, attempt, request, &cfg);
@@ -157,8 +162,8 @@ impl ClaudeExecutor {
         };
         let usage = request.client.usage;
         let input = facts.input(request, attempt, original, stream);
-        // As the old path: a foreign client's upstream always streams.
-        let upstream_stream = stream || facts.client_format != Format::Claude;
+        // As the old path: a foreign client's generation always streams upstream.
+        let upstream_stream = stream || (operation == Operation::Generate && facts.client_format != Format::Claude);
         let mut prepared = ctx.prepare_messages(&input, body, body, upstream_stream).await?;
         let mode = if prepared.stream {
             BodyMode::Streaming
@@ -166,8 +171,7 @@ impl ClaudeExecutor {
             BodyMode::Buffered
         };
         let limit = stream::MAX_LINE as u64;
-        let ingress =
-            Ingress::new(streams.response, attempt.identity, Operation::Generate, mode, limit).map_err(encoding)?;
+        let ingress = Ingress::new(streams.response, attempt.identity, operation, mode, limit).map_err(encoding)?;
         report(usage, &ctx, &input, &prepared);
         let capture = usage.capture();
         let sent = self

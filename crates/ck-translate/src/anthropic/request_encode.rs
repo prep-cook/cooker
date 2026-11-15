@@ -18,6 +18,7 @@ pub(super) fn write(view: RequestView<'_>, egress: &super::request::Egress, e: &
     }
     messages(view, root, e)?;
     egress.fill_max_tokens(view, e)?;
+    super::compaction::write_request(view, e)?;
     if view.operation == Operation::Generate {
         e.bytes(b",\"stream\":")?;
         e.bytes(if egress.upstream_stream { b"true" } else { b"false" })?;
@@ -90,20 +91,19 @@ fn messages(view: RequestView<'_>, root: usize, e: &mut Encoder<'_, '_>) -> Resu
     e.bytes(b"\"messages\":[")?;
     let messages = doc.required(root, "messages")?;
     let x = doc.required(root, "x_ck")?;
-    let unbound_replay = match doc.member(x, "replay")? {
-        Some(replay) => doc
-            .children(replay)?
-            .try_fold(false, |any, entry| Ok::<_, Error>(any || doc.origin(entry)?.is_none()))?,
-        None => false,
-    };
+    let unbound_replay = replay::unbound(doc, x)?;
     let mut first_message = true;
     let mut system = None;
+    let replay_from = super::compaction::replay_from(doc)?.unwrap_or(0);
     for (message_index, message) in doc.children(messages)?.enumerate() {
         if super::is(doc, message, "role", "system")? || super::is(doc, message, "role", "developer")? {
             if system.is_some() {
                 return Err(Error::Unsupported);
             }
             system = Some((message_index as u64, message));
+            continue;
+        }
+        if (message_index as u64) < replay_from {
             continue;
         }
         if !first_message {

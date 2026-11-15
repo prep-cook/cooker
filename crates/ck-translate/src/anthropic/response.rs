@@ -4,6 +4,7 @@ use super::{
 };
 
 mod block;
+mod compact;
 mod event;
 use crate::codec::{
     self, BodyMode, Error, Operation, Result,
@@ -62,7 +63,8 @@ impl Ingress {
         mode: BodyMode,
         limit: u64,
     ) -> Result<Self> {
-        if operation == Operation::Compact || (operation == Operation::CountTokens && mode == BodyMode::Streaming) {
+        // Messages answers count_tokens and a compaction in one JSON body only.
+        if operation != Operation::Generate && mode == BodyMode::Streaming {
             return Err(Error::Unsupported);
         }
         Ok(Self {
@@ -284,6 +286,8 @@ impl State {
                 |e| unknown(doc, root, &["input_tokens"], e),
             )?;
             self.finished = true;
+        } else if self.operation == Operation::Compact {
+            self.compaction(owner, doc, root)?;
         } else {
             let content = doc.required(root, "content")?;
             if !matches!(doc.node(content)?.value, Value::Array) {

@@ -489,3 +489,28 @@ async fn a_buffered_cloaked_body_over_the_stream_quota_fails_visibly() {
     assert_eq!(published.terminal, Some(Terminal::StorageExhausted));
     assert!(published.records.is_empty(), "nothing of the body is published");
 }
+
+/// A compaction on an OAuth credential is prepared like any cloaked request and still asks
+/// for native compaction with its beta (D2 plan §2.7).
+#[tokio::test]
+async fn a_cloaked_compaction_keeps_its_request_and_beta() {
+    let (fixture, recorder) = at(ORIGIN, &oauth(), SONNET, &[]);
+    let mut request = fixture.streams.request();
+    let (store, id) = (&fixture.streams.store, identity(Direction::Request));
+    let mut ingress = responses::request::Ingress::new(&mut request, store, id, Operation::Compact, LIMIT).unwrap();
+    let body = br#"{"model":"m","max_output_tokens":4096,"input":[{"role":"user","content":"Explain lifetimes."}]}"#;
+    let (started, _) = fixture.start(&mut ingress, &mut request, body).await;
+    assert!(started.is_err(), "the proxy refuses every connection");
+    let wire = recorder.0.lock().unwrap().pop().expect("the compaction request");
+    let sent: Value = serde_json::from_str(&wire.body).unwrap();
+    assert_eq!(sent["compaction"], json!({"type": "summarize"}));
+    assert_eq!(sent["stream"], false);
+    let betas = wire
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
+        .unwrap();
+    for beta in ["oauth-2025-04-20", "compact-2026-09-04"] {
+        assert!(betas.1.split(',').any(|b| b == beta), "{beta} missing from {}", betas.1);
+    }
+}

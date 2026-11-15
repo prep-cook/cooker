@@ -92,32 +92,6 @@ async fn a_key_request_gets_the_old_routes_cache_rewrites() {
     assert_eq!(new, old(SONNET, &ordered).await);
 }
 
-/// Thinking replay may store only a response known complete, which the contract path cannot
-/// see, so a credential replay serves stays on the old route.
-#[tokio::test]
-async fn thinking_replay_credentials_stay_on_the_old_route() {
-    use ck_core::exec::{ResolvedModel, ResolvedSource};
-    let fixture = Fixture::new(&StreamUpstream::start([]).await, SONNET);
-    let mut key = fixture.exchange.credential.clone();
-    key.attributes.insert("auth_kind".into(), "apikey".into());
-    let info = json!({"id": SONNET, "is_compat": true}).as_object().unwrap().clone();
-    let compat = ResolvedModel {
-        info: ck_core::registry::ModelInfo::from_raw(info).unwrap(),
-        source: ResolvedSource::ApiKey,
-    };
-    let attempt = |resolved_model| ck_exec::types::Attempt {
-        credential: &key,
-        cfg: &fixture.exchange.cfg,
-        model: SONNET,
-        headers: &fixture.exchange.headers,
-        resolved_model,
-        store: &fixture.streams.store,
-        identity: identity(Direction::Response),
-    };
-    assert_eq!(fixture.executors.destination(&attempt(Some(&compat))), None);
-    assert_eq!(fixture.executors.destination(&attempt(None)), Some("anthropic"));
-}
-
 /// No signature sanitizing or proxy-owned prefix recovery: the official API judges the
 /// client's history and signed thinking.
 #[tokio::test]

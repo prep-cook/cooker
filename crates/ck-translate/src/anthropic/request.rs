@@ -194,11 +194,11 @@ pub struct Egress {
     pub default_max_tokens: Option<u64>,
 }
 impl Egress {
-    /// Writes `,"max_tokens":` when a generation request has none: its `max_completion_tokens`,
-    /// else the default.
+    /// Writes `,"max_tokens":` when a generation or compaction request has none: its
+    /// `max_completion_tokens`, else the default.
     pub(super) fn fill_max_tokens(&self, view: RequestView<'_>, e: &mut encode::Encoder<'_, '_>) -> Result<()> {
         let (doc, root) = (view.document, view.document.root());
-        if view.operation != Operation::Generate || doc.member(root, "max_tokens")?.is_some() {
+        if view.operation == Operation::CountTokens || doc.member(root, "max_tokens")?.is_some() {
             return Ok(());
         }
         e.bytes(b",\"max_tokens\":")?;
@@ -212,7 +212,8 @@ impl codec::RequestEgress for Egress {
     fn encode(&self, request: &ValidatedRequest<'_>, owner: &mut Writer) -> Result<ScratchLease> {
         let view = request.for_destination(self.destination)?;
         view.document.check_owner(owner)?;
-        if view.operation == Operation::Compact || (view.operation == Operation::CountTokens && self.upstream_stream) {
+        // Messages answers a compaction in one JSON body only.
+        if view.operation != Operation::Generate && self.upstream_stream {
             return Err(Error::Unsupported);
         }
         encode::scratch(owner, |e| super::request_encode::write(view, self, e))

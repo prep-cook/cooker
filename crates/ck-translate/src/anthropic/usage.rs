@@ -26,12 +26,7 @@ impl Usage {
             )
         })?;
         // Validate every supplied count before publishing authoritative accounting.
-        for key in [
-            "input_tokens",
-            "output_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-        ] {
+        for key in BILLED {
             count(&next, next.root(), key)?;
         }
         if let Some(ttl) = object_member(&next, next.root(), "cache_creation")? {
@@ -52,10 +47,10 @@ impl Usage {
         doc.write(root, e)?;
         e.bytes(b"},\"final\":")?;
         e.bytes(if final_snapshot { b"true" } else { b"false" })?;
-        let uncached = count(doc, root, "input_tokens")?;
-        let read = count(doc, root, "cache_read_input_tokens")?;
-        let write = count(doc, root, "cache_creation_input_tokens")?;
-        let output = count(doc, root, "output_tokens")?;
+        let uncached = billed(doc, root, "input_tokens")?;
+        let read = billed(doc, root, "cache_read_input_tokens")?;
+        let write = billed(doc, root, "cache_creation_input_tokens")?;
+        let output = billed(doc, root, "output_tokens")?;
         let reasoning = reasoning(doc, root)?;
         // An omitted cache component counts as 0 (owner ruling, 2026-11-15).
         let input = match uncached {
@@ -112,6 +107,40 @@ impl Usage {
             e.bytes(b"]")?;
         }
         e.bytes(b"}")
+    }
+}
+/// The token counts a response bills.
+const BILLED: [&str; 4] = [
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+];
+/// A billed count. A response that lists `iterations` bills their sum: an on-demand compaction
+/// reports its tokens only there and leaves the top level at 0, and with server-side compaction
+/// the top level leaves the compaction iterations out. Otherwise the top-level count.
+fn billed(doc: &Document, root: usize, key: &str) -> Result<Option<u64>> {
+    let Some(iterations) = iterations(doc, root)? else {
+        return count(doc, root, key);
+    };
+    let mut total: Option<u64> = None;
+    for entry in doc.children(iterations)? {
+        if let Some(value) = count(doc, entry, key)? {
+            total = Some(total.unwrap_or(0).checked_add(value).ok_or(Error::Schema)?);
+        }
+    }
+    Ok(total)
+}
+/// The non-empty `iterations` list of a usage object.
+fn iterations(doc: &Document, root: usize) -> Result<Option<usize>> {
+    if matches!(doc.node(root)?.value, Value::Null) {
+        return Ok(None);
+    }
+    match doc.member(root, "iterations")? {
+        Some(n) if matches!(doc.node(n)?.value, Value::Array) => Ok(doc.node(n)?.first.map(|_| n)),
+        Some(n) if matches!(doc.node(n)?.value, Value::Null) => Ok(None),
+        Some(_) => Err(Error::Schema),
+        None => Ok(None),
     }
 }
 fn object_member(doc: &Document, node: usize, key: &str) -> Result<Option<usize>> {

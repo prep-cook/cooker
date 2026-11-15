@@ -34,6 +34,8 @@ pub(crate) const EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
 const PROMPT_CACHING_EVICT: &str = "prompt-caching-evict-2026-05-12";
 const CACHE_DIAGNOSIS: &str = "cache-diagnosis-2026-04-07";
 const REDACT_THINKING: &str = "redact-thinking-2026-02-12";
+/// Anthropic native compaction (owner ruling, Q7 reversal).
+const COMPACTION: &str = "compact-2026-09-04";
 const AFK_MODE: &str = "afk-mode-2026-01-31";
 
 /// Sent on every "cli" entrypoint Messages request, after claude-code-20250219.
@@ -358,13 +360,21 @@ pub(crate) fn with_extended_ttl(betas: &str) -> String {
     parts.join(",")
 }
 
-/// Adds the beta required by `thinking.block_binding`, including after custom headers.
-pub(crate) fn with_thinking_binding(betas: &str) -> String {
-    let mut parts = dedup(betas, "");
-    if !parts.iter().any(|p| p == THINKING_BINDING) {
-        parts.push(THINKING_BINDING.into());
+/// The documented betas `body` needs on every path, custom headers included, added to `betas`;
+/// `None` when it needs none, so the header stays as built: thinking binding for
+/// `thinking.block_binding`, and compaction for a body that asks for one (`"compaction"`) or
+/// opens with a compaction block, which Anthropic accepts only first.
+pub(crate) fn documented(betas: &str, body: &str) -> Option<String> {
+    let binding = rawjson::get(body, "thinking.block_binding").exists();
+    let compaction = rawjson::get(body, "compaction").exists()
+        || rawjson::get(body, "messages.0.content.0.type").str() == "compaction";
+    let mut betas = (binding || compaction).then(|| dedup(betas, ""))?;
+    for (needed, beta) in [(binding, THINKING_BINDING), (compaction, COMPACTION)] {
+        if needed && !betas.iter().any(|b| b == beta) {
+            betas.push(beta.into());
+        }
     }
-    parts.join(",")
+    Some(betas.join(","))
 }
 
 /// Removes the recovery beta when the executor performs client-side recovery instead.
