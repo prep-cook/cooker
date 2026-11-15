@@ -1,5 +1,5 @@
 use super::{
-    Table, equal_text, failure, index::Index, is, mapped, member, object, server_result, string, unknown, unknown_at,
+    Table, equal_text, index::Index, is, mapped, member, object, server_result, string, unknown, unknown_at,
     usage::Usage,
 };
 
@@ -96,16 +96,32 @@ impl Ingress {
     fn handle(&mut self, owner: &mut Writer, result: Result<()>) -> Result<()> {
         if let Err(error) = result {
             self.failed = true;
-            if !self.state.terminal && !matches!(error, Error::Storage(_)) {
-                failure(&mut self.state.emitter, owner, false)?;
-                self.state.terminal = true;
+            if !matches!(error, Error::Storage(_)) {
+                self.failure(owner, 502, "upstream")?;
             }
             return Err(error);
         }
         Ok(())
     }
+    fn failure(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> Result<()> {
+        if !self.state.terminal {
+            codec::upstream_failure(&mut self.state.emitter, owner, status, scope)?;
+            self.state.terminal = true;
+        }
+        Ok(())
+    }
 }
 impl codec::ResponseIngress for Ingress {
+    fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> Result<()> {
+        if owner.id() != self.owner {
+            return Err(Error::Position);
+        }
+        if self.failed || self.state.terminal {
+            return Err(Error::Closed);
+        }
+        self.failed = true;
+        self.failure(owner, status, scope)
+    }
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
         if owner.id() != self.owner {
             return Err(Error::Position);

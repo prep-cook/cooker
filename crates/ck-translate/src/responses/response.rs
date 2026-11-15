@@ -72,16 +72,27 @@ impl Ingress {
     fn handle(&mut self, owner: &mut Writer, result: Result<()>) -> Result<()> {
         if let Err(error) = result {
             self.failed = true;
-            if !self.state.terminal && !matches!(error, Error::Storage(_)) {
-                super::failure(&mut self.state.emitter, owner, false)?;
-                self.state.terminal = true;
+            if !matches!(error, Error::Storage(_)) {
+                self.failure(owner, 502, "upstream")?;
             }
             return Err(error);
         }
         Ok(())
     }
+    fn failure(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> Result<()> {
+        if !self.state.terminal {
+            codec::upstream_failure(&mut self.state.emitter, owner, status, scope)?;
+            self.state.terminal = true;
+        }
+        Ok(())
+    }
 }
 impl codec::ResponseIngress for Ingress {
+    fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> Result<()> {
+        crate::boundary::enter(self.owner, owner, self.failed || self.state.terminal)?;
+        self.failed = true;
+        self.failure(owner, status, scope)
+    }
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
         // SSE permits further blank lines after the terminal event.
         let blank = self.scanner.is_some() && bytes.iter().all(|b| matches!(b, b'\r' | b'\n'));

@@ -9,7 +9,8 @@
 //! The producer reads back the records the ingress publishes. A `done` record ends the stream
 //! with `Writer::finish(Done)`. An `error` record, from a decode failure or the upstream's own
 //! error event, ends it with `UpstreamError` and fails the attempt with the record's status
-//! and scope. A body error before `done` ends it with `UpstreamError` and the body error's
+//! and scope. A body error before `done` has the ingress publish the upstream failure
+//! (`ResponseIngress::fail`) and ends the stream with `UpstreamError` and the body error's
 //! scope. `Writer::cancelled` resolving (cancel, shutdown, expiry, eviction) stops reading. A
 //! panic drops the writer, which publishes `stream.producer_lost`, and a gateway defect ends
 //! the stream the same way. Nothing else ends a producer: cancel goes through the allocation
@@ -163,16 +164,26 @@ async fn produce<I: ResponseIngress>(
             chunk = body.next() => match chunk {
                 Some(Ok(bytes)) => (ingress.advance(&mut writer, &bytes), false),
                 // Settling after every call returns at `done`, so the response is incomplete.
-                Some(Err(error)) => {
-                    writer.finish(Terminal::UpstreamError);
-                    return Err(error);
-                }
+                Some(Err(error)) => return cut(ingress, writer, error).await,
                 None => (ingress.finish(&mut writer), true),
             },
         };
         if let Some(outcome) = settle(step, ended, &mut writer, &mut published).await {
             return outcome;
         }
+    }
+}
+
+/// The upstream body failed before `done`: the ingress publishes the upstream failure
+/// without completing the response, and the attempt fails with the body error's own scope.
+async fn cut<I: ResponseIngress>(mut ingress: I, mut writer: Writer, error: ExecError) -> Result<(), ExecError> {
+    match ingress.fail(&mut writer, error.status, "upstream") {
+        Ok(()) => {
+            writer.finish(Terminal::UpstreamError);
+            Err(error)
+        }
+        Err(codec::Error::Storage(failure)) => storage(&mut writer, failure).await,
+        Err(_) => Err(defect(&mut writer)),
     }
 }
 

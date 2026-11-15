@@ -143,21 +143,25 @@ impl codec::ResponseIngress for Ingress {
         })();
         self.handle(owner, result)
     }
+    fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> Result<()> {
+        crate::boundary::enter(self.owner, owner, self.failed || self.state.terminal)?;
+        self.failed = true;
+        // Held audio is published once, without its media end, before the failure.
+        self.state.flush_audio(owner, true)?;
+        self.state.emit_usage(owner, true)?;
+        codec::upstream_failure(&mut self.state.emitter, owner, status, scope)?;
+        self.state.terminal = true;
+        Ok(())
+    }
 }
 impl Ingress {
     fn handle(&mut self, owner: &mut Writer, result: Result<()>) -> Result<()> {
-        if let Err(error) = result {
-            self.failed = true;
-            if !self.state.terminal && !matches!(error, Error::Storage(_)) {
-                // Held audio is published once, without its media end, before the failure.
-                self.state.flush_audio(owner, true)?;
-                self.state.emit_usage(owner, true)?;
-                super::failure(&mut self.state.emitter, owner, "upstream")?;
-                self.state.terminal = true;
-            }
-            return Err(error);
+        let Err(error) = result else { return Ok(()) };
+        if !self.state.terminal && !matches!(error, Error::Storage(_)) {
+            codec::ResponseIngress::fail(self, owner, 502, "upstream")?;
         }
-        Ok(())
+        self.failed = true;
+        Err(error)
     }
 }
 
