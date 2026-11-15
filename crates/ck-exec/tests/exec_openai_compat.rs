@@ -199,12 +199,13 @@ fn json_body(captured: &Captured) -> Value {
 }
 
 /// A Chat client's streamed request reaches the relay as Chat with the upstream model, its key,
-/// the stream headers and usage requested; nothing else of the client body changes.
+/// the stream headers and usage requested; nothing else of the body, `max_completion_tokens` included.
 #[tokio::test]
 async fn a_chat_client_streams_through_the_relay() {
     let upstream = StreamUpstream::start([Reply::sse(sse())]).await;
     let (streams, exchange) = (Streams::new(), exchange(&upstream));
-    let (started, id, _request) = run(&streams, &exchange, "chat", Operation::Generate, CHAT, 1).await;
+    let body = br#"{"model":"client-model","stream":true,"max_completion_tokens":7,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (started, id, _request) = run(&streams, &exchange, "chat", Operation::Generate, body, 1).await;
     let (outcome, published, mut stream) = finish(&streams, started.unwrap(), id).await;
     outcome.unwrap();
     assert_eq!(published.terminal, Some(Terminal::Done));
@@ -217,8 +218,8 @@ async fn a_chat_client_streams_through_the_relay() {
     assert_eq!(captured.header("user-agent"), Some(ck_exec::openai_compat::USER_AGENT));
     assert_eq!(captured.header("accept"), Some("text/event-stream"));
     assert_eq!(
-        String::from_utf8_lossy(&captured.body),
-        r#"{"model":"up-model","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#
+        json_body(captured),
+        json!({"model":"up-model","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":7,"stream":true,"stream_options":{"include_usage":true}})
     );
     let out = egress(&streams, "chat", &mut stream, id, BodyMode::Streaming).await;
     assert!(

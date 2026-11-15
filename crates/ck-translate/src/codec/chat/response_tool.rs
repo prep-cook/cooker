@@ -118,12 +118,14 @@ impl State {
             metadata,
             arguments: None,
             parser: None,
+            invalid: false,
             custom,
             legacy,
         })
     }
 
-    /// Publishes an arguments fragment and feeds a function call's JSON parser.
+    /// Publishes an arguments fragment and feeds a function call's JSON parser until the
+    /// arguments prove not to be JSON.
     fn tool_arguments(
         &mut self,
         owner: &mut Writer,
@@ -152,7 +154,7 @@ impl State {
             |_| Ok(()),
         )?;
         let tool = &mut self.choices[position].tools[tool_position];
-        if !tool.custom {
+        if !tool.custom && !tool.invalid {
             if tool.arguments.is_none() {
                 tool.arguments = Some(Source::new(owner)?);
                 tool.parser = Some(json::Scanner::new(owner, u64::MAX)?);
@@ -168,10 +170,19 @@ impl State {
                 })?;
                 tool.arguments.as_mut().ok_or(Error::Schema)?.push_scratch(lease)?;
             }
-            tool.parser
+            let advanced = tool
+                .parser
                 .as_mut()
                 .ok_or(Error::Schema)?
-                .advance(tool.arguments.as_ref().ok_or(Error::Schema)?)?;
+                .advance(tool.arguments.as_ref().ok_or(Error::Schema)?);
+            match advanced {
+                Err(error) if json::not_json(&error) => {
+                    tool.invalid = true;
+                    tool.parser = None;
+                    tool.arguments = None;
+                }
+                advanced => advanced?,
+            }
         }
         Ok(())
     }

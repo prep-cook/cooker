@@ -184,6 +184,8 @@ struct Tool {
     metadata: Document,
     arguments: Option<Source>,
     parser: Option<json::Scanner>,
+    /// The arguments are not JSON, which official arguments may be: delivered, no longer parsed.
+    invalid: bool,
     custom: bool,
     legacy: bool,
 }

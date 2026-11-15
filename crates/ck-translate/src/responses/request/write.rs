@@ -196,6 +196,7 @@ fn any_part(doc: &Document, content: usize, reasoning: bool) -> Result<bool> {
 }
 fn write_call(doc: &Document, call: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     let custom = is(doc, call, "arguments_format", "text")?;
+    let verbatim = custom || is(doc, call, "arguments_format", "invalid_json")?;
     e.bytes(b"{\"type\":")?;
     e.string(if custom { "custom_tool_call" } else { "function_call" })?;
     e.bytes(b",\"call_id\":")?;
@@ -207,7 +208,7 @@ fn write_call(doc: &Document, call: usize, e: &mut Encoder<'_, '_>) -> Result<()
         e.bytes(b",")?;
         e.string(if custom { "input" } else { "arguments" })?;
         e.bytes(b":")?;
-        if custom {
+        if verbatim {
             doc.write(arguments, e)?;
         } else {
             e.quoted_json(|e| doc.write(arguments, e))?;

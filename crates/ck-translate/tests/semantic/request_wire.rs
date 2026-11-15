@@ -53,18 +53,25 @@ fn request_media_is_normalized_and_not_copied_inline_in_canonical_fields() {
 }
 
 #[test]
-fn request_rejects_duplicate_decoded_keys_inside_argument_json_and_unlinked_results() {
-    for input in [
-        br#"{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{\"a\":1,\"\\u0061\":2}"}}]}]}"#.as_slice(),
-        br#"{"model":"m","messages":[{"role":"tool","tool_call_id":"unknown","content":"x"}]}"#,
-    ] {
-        let mut mapped = Mapped::new();
-        let mut ingress = Ingress::new(&mut mapped.writer, &mapped.store, identity(Direction::Request), Operation::Generate, 1024 * 1024).unwrap();
-        let result = ingress.advance(&mut mapped.writer, input);
-        assert!(result.is_err() || ingress.finish(&mut mapped.writer, &ChatCapability).is_err());
-        let events = mapped.output(&mapped.writer);
-        assert!(!std::str::from_utf8(&events).unwrap().contains("event: x_ck.request.end\n"));
-    }
+fn request_rejects_unlinked_results() {
+    let input = br#"{"model":"m","messages":[{"role":"tool","tool_call_id":"unknown","content":"x"}]}"#;
+    let mut mapped = Mapped::new();
+    let mut ingress = Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        1024 * 1024,
+    )
+    .unwrap();
+    let result = ingress.advance(&mut mapped.writer, input);
+    assert!(result.is_err() || ingress.finish(&mut mapped.writer, &ChatCapability).is_err());
+    let events = mapped.output(&mapped.writer);
+    assert!(
+        !std::str::from_utf8(&events)
+            .unwrap()
+            .contains("event: x_ck.request.end\n")
+    );
 }
 
 #[test]
@@ -88,7 +95,7 @@ fn unsupported_operations_never_create_a_chat_body() {
 #[test]
 fn legacy_functions_and_selection_keep_native_spelling() {
     let (out, _) =
-        request(br#"{"model":"m","messages":[],"functions":[{"name":"a"},{"name":"b"}],"function_call":{"name":"a"}}"#);
+        request(br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"functions":[{"name":"a"},{"name":"b"}],"function_call":{"name":"a"}}"#);
     assert_eq!(out["functions"], serde_json::json!([{"name":"a"},{"name":"b"}]));
     assert_eq!(out["function_call"], serde_json::json!({"name":"a"}));
     assert!(out.get("tool_choice").is_none());
@@ -239,7 +246,10 @@ fn late_destination_rejection_keeps_published_prefix_without_success() {
     )
     .unwrap();
     ingress
-        .advance(&mut mapped.writer, br#"{"model":"m","messages":[],"#)
+        .advance(
+            &mut mapped.writer,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"#,
+        )
         .unwrap();
     assert!(canonical_values(&mapped).iter().any(|e| e["pointer"] == "/model"));
     ingress
@@ -259,10 +269,10 @@ fn late_destination_rejection_keeps_published_prefix_without_success() {
 #[test]
 fn normalized_alias_collisions_fail_in_either_source_order() {
     for input in [
-        br#"{"model":"m","messages":[],"functions":[],"tools":[]}"#.as_slice(),
-        br#"{"model":"m","messages":[],"tools":[],"functions":[]}"#,
-        br#"{"model":"m","messages":[],"function_call":"auto","tool_choice":"none"}"#,
-        br#"{"model":"m","messages":[],"tool_choice":"auto","function_call":"none"}"#,
+        br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"functions":[],"tools":[]}"#.as_slice(),
+        br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[],"functions":[]}"#,
+        br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"function_call":"auto","tool_choice":"none"}"#,
+        br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":"auto","function_call":"none"}"#,
     ] {
         let mut mapped = Mapped::new();
         let mut ingress = Ingress::new(

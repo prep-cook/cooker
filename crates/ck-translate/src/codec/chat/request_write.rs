@@ -193,19 +193,18 @@ fn write_message(view: RequestView<'_>, message: usize, _message_index: u64, e: 
             }
             if legacy {
                 e.bytes(b"\"function_call\":")?;
-                write_function(
-                    doc,
-                    doc.required(doc.node(field)?.first.ok_or(Error::Schema)?, "function")?,
-                    false,
-                    e,
-                )?;
+                let call = doc.node(field)?.first.ok_or(Error::Schema)?;
+                let verbatim = doc.string_is(doc.required(call, "arguments_format")?, "invalid_json")?;
+                write_function(doc, doc.required(call, "function")?, (false, verbatim), e)?;
             } else {
                 e.bytes(b"\"tool_calls\":[")?;
                 for (j, call) in doc.children(field)?.enumerate() {
                     if j != 0 {
                         e.bytes(b",")?;
                     }
-                    let custom = doc.string_is(doc.required(call, "arguments_format")?, "text")?;
+                    let format = doc.required(call, "arguments_format")?;
+                    let custom = doc.string_is(format, "text")?;
+                    let verbatim = custom || doc.string_is(format, "invalid_json")?;
                     e.bytes(b"{")?;
                     let mut first = true;
                     for member in doc.children(call)? {
@@ -220,7 +219,7 @@ fn write_message(view: RequestView<'_>, message: usize, _message_index: u64, e: 
                         if doc.name_is(name, "function")? {
                             e.string(if custom { "custom" } else { "function" })?;
                             e.bytes(b":")?;
-                            write_function(doc, member, custom, e)?;
+                            write_function(doc, member, (custom, verbatim), e)?;
                         } else {
                             doc.write_name(name, e)?;
                             e.bytes(b":")?;
@@ -295,7 +294,14 @@ fn write_reasoning(doc: &Document, content: usize, e: &mut Encoder<'_, '_>) -> R
     }
     if first { Ok(()) } else { e.bytes(b"\"") }
 }
-fn write_function(doc: &Document, function: usize, custom: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+/// `verbatim` arguments are a string written as it is: custom input, or function arguments
+/// that were not JSON.
+fn write_function(
+    doc: &Document,
+    function: usize,
+    (custom, verbatim): (bool, bool),
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
     e.bytes(b"{")?;
     for (i, field) in doc.children(function)?.enumerate() {
         if i != 0 {
@@ -305,7 +311,7 @@ fn write_function(doc: &Document, function: usize, custom: bool, e: &mut Encoder
         if doc.name_is(name, "arguments")? {
             e.string(if custom { "input" } else { "arguments" })?;
             e.bytes(b":")?;
-            if custom {
+            if verbatim {
                 doc.write(field, e)?;
             } else {
                 e.quoted_json(|e| doc.write(field, e))?;

@@ -22,7 +22,7 @@ impl State {
         // The replay reduces published records only, so held audio publishes first.
         self.flush_audio(owner, true)?;
         self.replay(owner)?;
-        self.validate_finishes(owner, doc, choices)?;
+        self.validate_finishes(doc, choices)?;
         let (changes, _seen) = self.snapshot_changes(owner, doc, choices)?;
         for choice in doc.children(choices)? {
             if let Some(message) = doc.member(choice, "message")?
@@ -74,9 +74,9 @@ impl State {
         Ok(())
     }
 
-    /// Rejects a finished choice whose audio is incomplete or whose final arguments are not JSON.
-    fn validate_finishes(&self, owner: &mut Writer, doc: &Document, choices: usize) -> Result<()> {
-        let prior = self.reduction.document.as_ref().ok_or(Error::Schema)?;
+    /// Rejects a finished choice whose audio is incomplete. Final arguments that are not JSON
+    /// are delivered, as official arguments may be.
+    fn validate_finishes(&self, doc: &Document, choices: usize) -> Result<()> {
         for choice in doc.children(choices)? {
             let Some(finish) = doc.member(choice, "finish_reason")? else {
                 continue;
@@ -101,17 +101,6 @@ impl State {
             };
             if !supplied_data && !self.choices[position].audio.complete() {
                 return Err(Error::Truncated);
-            }
-            if doc.string_is(finish, "length")? || doc.string_is(finish, "content_filter")? {
-                continue;
-            }
-            let old = indexed(prior, prior.required(prior.root(), "choices")?, index)?
-                .map(|choice| prior.required(choice, "message"))
-                .transpose()?;
-            if let Some(message) = message {
-                super::validate::validate_completion(owner, prior, old, doc, message)?;
-            } else if let Some(old) = old {
-                super::validate::validate_completion(owner, prior, None, prior, old)?;
             }
         }
         Ok(())
