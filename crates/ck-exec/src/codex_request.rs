@@ -108,13 +108,13 @@ impl Settings {
     /// `resolveCodexModelIsCompat`: the model dispatch bound to the attempt, else the
     /// credential's config entry, where the first model whose name or alias equals the
     /// base or requested model decides; none means not compat.
-    pub fn is_compat(&self, req: &ExecRequest) -> bool {
-        if let Some(resolved) = &req.resolved_model {
+    pub fn is_compat(&self, inbound: &Inbound<'_>) -> bool {
+        if let Some(resolved) = inbound.resolved {
             return resolved.is_compat();
         }
         let fold = |a: &str, b: &str| !b.is_empty() && a.go_eq_fold(b);
-        let requested = req.model.trim();
-        let base = base_model(&req.model);
+        let requested = inbound.model.trim();
+        let base = base_model(inbound.model);
         let target = base.trim();
         self.key_models
             .iter()
@@ -344,10 +344,54 @@ pub(crate) fn is_lite(body: &str, headers: &HeaderMap) -> bool {
 
 /// `helps.IsNativeCodexRequest`: Codex/Responses formats on both sides plus the lite marker.
 pub(crate) fn is_native(req: &ExecRequest) -> bool {
-    let codexish = |f: Format| matches!(f, Format::Codex | Format::OpenAIResponse);
-    codexish(req.source_format)
-        && codexish(req.response_format)
-        && is_lite(&String::from_utf8_lossy(&req.body), &req.headers)
+    Inbound::of(req).native()
+}
+
+/// What the Codex body rules read besides the body they shape. The old execution path takes
+/// it from an `ExecRequest`; the executor (`codex_exec`) from its attempt and request handle,
+/// with its own encoded upload as `payload`, since no executor reads client body bytes.
+pub(crate) struct Inbound<'a> {
+    /// Upstream model, thinking suffix included.
+    pub model: &'a str,
+    /// The model the client asked for (payload rules' `requested_model`).
+    pub requested_model: &'a str,
+    pub source: Format,
+    pub response: Format,
+    /// The body the client-side checks read (lite marker, explicit instructions, prompt
+    /// cache keys): the client body on the old path, the upload on the executor's.
+    pub payload: &'a [u8],
+    pub headers: &'a HeaderMap,
+    pub request_path: &'a str,
+    pub resolved: Option<&'a ck_core::exec::ResolvedModel>,
+    pub execution_session: Option<&'a str>,
+    pub derived_session: Option<&'a str>,
+    pub principal: &'a str,
+}
+
+impl<'a> Inbound<'a> {
+    pub(crate) fn of(req: &'a ExecRequest) -> Self {
+        Self {
+            model: &req.model,
+            requested_model: &req.requested_model,
+            source: req.source_format,
+            response: req.response_format,
+            payload: &req.body,
+            headers: &req.headers,
+            request_path: &req.request_path,
+            resolved: req.resolved_model.as_ref(),
+            execution_session: req.execution_session.as_deref(),
+            derived_session: req.derived_session.as_deref(),
+            principal: &req.caller.principal,
+        }
+    }
+
+    /// `helps.IsNativeCodexRequest`.
+    pub(crate) fn native(&self) -> bool {
+        let codexish = |f: Format| matches!(f, Format::Codex | Format::OpenAIResponse);
+        codexish(self.source)
+            && codexish(self.response)
+            && is_lite(&String::from_utf8_lossy(self.payload), self.headers)
+    }
 }
 
 /// `translateCodexRequestPairWithUpdateIntent` + `helps.ApplyRequestThinking`: the
@@ -431,7 +475,11 @@ pub(crate) struct Finalizer {
 
 impl Finalizer {
     pub(crate) fn apply(&self, req: &ExecRequest, settings: &Settings, body: String) -> String {
-        apply_payload(req, settings, self.call, &base_model(&req.model), body, &self.original)
+        self.finish(&Inbound::of(req), settings, body)
+    }
+
+    pub(crate) fn finish(&self, inbound: &Inbound<'_>, settings: &Settings, body: String) -> String {
+        apply_payload(inbound, settings, self.call, body, &self.original)
     }
 }
 
@@ -439,30 +487,16 @@ impl Finalizer {
 /// its `type` stays `response.steer`.
 pub(crate) fn steer_rules(req: &ExecRequest, settings: &Settings, payload: String) -> String {
     let original = payload.clone().into_bytes();
-    let out = apply_payload(
-        req,
-        settings,
-        Call::Websocket,
-        &base_model(&req.model),
-        payload,
-        &original,
-    );
+    let out = apply_payload(&Inbound::of(req), settings, Call::Websocket, payload, &original);
     set_str(&out, "type", "response.steer")
 }
 
 /// `helps.ApplyPayloadConfigWithRequestForExecutor` for the Codex executors.
-fn apply_payload(
-    req: &ExecRequest,
-    settings: &Settings,
-    call: Call,
-    model: &str,
-    body: String,
-    original: &[u8],
-) -> String {
-    let requested = if req.requested_model.trim().is_empty() {
-        req.model.trim()
+fn apply_payload(inbound: &Inbound<'_>, settings: &Settings, call: Call, body: String, original: &[u8]) -> String {
+    let requested = if inbound.requested_model.trim().is_empty() {
+        inbound.model.trim()
     } else {
-        req.requested_model.trim()
+        inbound.requested_model.trim()
     };
     let rules = ck_wire::payload::Request {
         target_executor: if call == Call::Websocket {
@@ -470,14 +504,14 @@ fn apply_payload(
         } else {
             "codex"
         },
-        model,
+        model: &base_model(inbound.model),
         requested_model: requested,
         protocol: call.target().as_str(),
-        from_protocol: req.source_format.as_str(),
+        from_protocol: inbound.source.as_str(),
         root: "",
         original,
-        request_path: &req.request_path,
-        headers: Some(&req.headers),
+        request_path: inbound.request_path,
+        headers: Some(inbound.headers),
     };
     let out = ck_wire::payload::apply(&settings.payload, &rules, body.into_bytes());
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
@@ -496,7 +530,7 @@ pub(crate) struct Shaped {
     pub finalize: Finalizer,
 }
 
-/// Applies the Codex body rules for `call`.
+/// Applies the Codex body rules for `call` to the old path's translated request.
 // ponytail: the Claude-source reasoning replay cache is not applied here yet.
 // ponytail: each rule that edits the body returns a new copy while the previous one is
 // still alive, so a streamed 1.9 MB /v1/responses request peaks at 16.8 MB of live heap
@@ -508,31 +542,95 @@ pub(crate) struct Shaped {
 // edits into one output buffer (as crates/ck-exec/src/claude/signals.rs does) is the
 // way toward the 3x target.
 pub(crate) fn shape(req: &ExecRequest, view: &View<'_>, settings: &Settings, call: Call) -> Result<Shaped, ExecError> {
-    let model = base_model(&req.model);
+    let inbound = Inbound::of(req);
+    let (body, original) = translate_request(req, call, settings.is_compat(&inbound))?;
+    Ok(shape_body(&inbound, view, settings, call, body, original))
+}
+
+/// The Codex body rules for `call` on a body already in the call's protocol; `original` is
+/// the payload rules' baseline.
+pub(crate) fn shape_body(
+    inbound: &Inbound<'_>,
+    view: &View<'_>,
+    settings: &Settings,
+    call: Call,
+    body: String,
+    original: Vec<u8>,
+) -> Shaped {
+    let model = base_model(inbound.model);
     let model = model.as_str();
-    let is_compat = settings.is_compat(req);
-    let (mut body, original) = translate_request(req, call, is_compat)?;
+    let is_compat = settings.is_compat(inbound);
+    let headers = inbound.headers;
+    let mut body = call_rules(body, call, model);
+    // Go runs this before the instructions default, except on compact: an appended
+    // `tools` key lands before or after an appended `instructions` key accordingly.
+    if call != Call::Compact {
+        body = ensure_web_search_for_history(body, headers);
+    }
+    if view.siwc {
+        // WebSocket turns get theirs after the prompt cache key ([`siwc_request_body`]).
+        if call != Call::Websocket {
+            let explicit = explicit_instructions(inbound.payload);
+            let keep_effort = ck_wire::thinking::has_thinking_suffix(inbound.model);
+            body = siwc_body(body, call, explicit, keep_effort);
+        }
+    } else if !inbound.native() {
+        let mut bytes = body.into_bytes();
+        ck_wire::codex_client::normalize_codex_instructions(&mut bytes);
+        body = String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    }
+    if call == Call::Compact {
+        body = ensure_web_search_for_history(body, headers);
+    }
+    if call != Call::Compact && settings.image_generation && !view.siwc {
+        body = ensure_image_tool(body, model, view, headers);
+    }
+    body = sanitize_reasoning(body, is_compat);
+    body = if call == Call::Websocket {
+        if is_lite(&body, headers) {
+            set_bool_if_different(body, "parallel_tool_calls", false)
+        } else {
+            body
+        }
+    } else {
+        normalize_parallel_tool_calls(body, headers)
+    };
+    let body = normalize_tool_schemas(body);
+    let conflict = ck_wire::codex_client::has_namespace_conflict(body.as_bytes());
+    let (body, optimized) = crate::codex_client::optimize_for_auth(
+        headers,
+        body.as_bytes(),
+        &settings.client,
+        is_compat,
+        crate::codex_client::tools_prepared(inbound.request_path),
+    );
+    let body = String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    Shaped {
+        body,
+        optimized,
+        conflict,
+        finalize: Finalizer { call, original },
+    }
+}
+
+/// The model and the per-call members: what each upstream call accepts.
+fn call_rules(mut body: String, call: Call, model: &str) -> String {
+    const DROPPED: [&str; 4] = [
+        "previous_response_id",
+        "generate",
+        "prompt_cache_retention",
+        "safety_identifier",
+    ];
     match call {
         Call::NonStream => {
             body = set_str_if_different(body, "model", model);
             body = set_bool_if_different(body, "stream", true);
-            for key in [
-                "previous_response_id",
-                "generate",
-                "prompt_cache_retention",
-                "safety_identifier",
-                "stream_options",
-            ] {
+            for key in DROPPED.into_iter().chain(["stream_options"]) {
                 body = delete(&body, key);
             }
         }
         Call::Stream => {
-            for key in [
-                "previous_response_id",
-                "generate",
-                "prompt_cache_retention",
-                "safety_identifier",
-            ] {
+            for key in DROPPED {
                 body = delete(&body, key);
             }
             let delivery = gjson::get(&body, "stream_options.reasoning_summary_delivery");
@@ -561,54 +659,7 @@ pub(crate) fn shape(req: &ExecRequest, view: &View<'_>, settings: &Settings, cal
             body = delete(&body, "stream");
         }
     }
-    // Go runs this before the instructions default, except on compact: an appended
-    // `tools` key lands before or after an appended `instructions` key accordingly.
-    if call != Call::Compact {
-        body = ensure_web_search_for_history(body, &req.headers);
-    }
-    if view.siwc {
-        // WebSocket turns get theirs after the prompt cache key ([`siwc_request_body`]).
-        if call != Call::Websocket {
-            body = siwc_request_body(body, req, call);
-        }
-    } else if !is_native(req) {
-        let instructions = gjson::get(&body, "instructions");
-        if !instructions.exists() || instructions.kind() == Kind::Null {
-            body = set_str(&body, "instructions", "");
-        }
-    }
-    if call == Call::Compact {
-        body = ensure_web_search_for_history(body, &req.headers);
-    }
-    if call != Call::Compact && settings.image_generation && !view.siwc {
-        body = ensure_image_tool(body, model, view, &req.headers);
-    }
-    body = sanitize_reasoning(body, is_compat);
-    body = if call == Call::Websocket {
-        if is_lite(&body, &req.headers) {
-            set_bool_if_different(body, "parallel_tool_calls", false)
-        } else {
-            body
-        }
-    } else {
-        normalize_parallel_tool_calls(body, &req.headers)
-    };
-    let body = normalize_tool_schemas(body);
-    let conflict = ck_wire::codex_client::has_namespace_conflict(body.as_bytes());
-    let (body, optimized) = crate::codex_client::optimize_for_auth(
-        &req.headers,
-        body.as_bytes(),
-        &settings.client,
-        is_compat,
-        crate::codex_client::tools_prepared(&req.request_path),
-    );
-    let body = String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-    Ok(Shaped {
-        body,
-        optimized,
-        conflict,
-        finalize: Finalizer { call, original },
-    })
+    body
 }
 
 /// The Sign in with ChatGPT body rules for `call` (`applyCodexSIWCRequestBodyRules`,
@@ -1305,15 +1356,17 @@ pub(crate) fn provider_session_uuid(kind: &str, id: &str) -> Option<String> {
 /// `ProviderSessionUUID`: the long-lived execution session (the downstream WebSocket
 /// connection) when there is one, else the derived session identity.
 pub(crate) fn session_uuid(req: &ExecRequest, ws_session: Option<&str>) -> Option<String> {
-    let execution = ws_session
-        .or(req.execution_session.as_deref())
-        .filter(|id| !id.trim().is_empty());
-    match execution {
+    sessions_uuid(
+        ws_session.or(req.execution_session.as_deref()),
+        req.derived_session.as_deref(),
+    )
+}
+
+/// [`session_uuid`] over the execution and derived sessions.
+fn sessions_uuid(execution: Option<&str>, derived: Option<&str>) -> Option<String> {
+    match execution.filter(|id| !id.trim().is_empty()) {
         Some(id) => provider_session_uuid("execution-session", id),
-        None => req
-            .derived_session
-            .as_deref()
-            .and_then(|id| provider_session_uuid("derived-session", id)),
+        None => derived.and_then(|id| provider_session_uuid("derived-session", id)),
     }
 }
 
@@ -1336,27 +1389,38 @@ pub(crate) fn prompt_cache(
     ws_session: Option<&str>,
     websocket: bool,
 ) -> (String, Option<String>) {
-    let original = String::from_utf8_lossy(&req.body);
+    prompt_cache_for(&Inbound::of(req), body, ws_session, websocket)
+}
+
+/// [`prompt_cache`] for `inbound`.
+pub(crate) fn prompt_cache_for(
+    inbound: &Inbound<'_>,
+    body: String,
+    ws_session: Option<&str>,
+    websocket: bool,
+) -> (String, Option<String>) {
+    let original = String::from_utf8_lossy(inbound.payload);
     let client_key = gjson::get(&original, "prompt_cache_key");
-    let mut id = match req.source_format {
+    let mut id = match inbound.source {
         Format::Claude => {
             let mut model = gjson::get(&body, "model").str().trim().to_owned();
             if model.is_empty() {
-                model = base_model(&req.model);
+                model = base_model(inbound.model);
             }
-            claude_code_prompt_cache(&model, &req.body, &req.headers).unwrap_or_default()
+            claude_code_prompt_cache(&model, inbound.payload, inbound.headers).unwrap_or_default()
         }
         Format::OpenAIResponse if client_key.exists() => client_key.str().to_owned(),
         Format::OpenAI if client_key.exists() && !websocket => client_key.str().trim().to_owned(),
         _ => String::new(),
     };
     if id.is_empty() {
-        id = session_uuid(req, ws_session).unwrap_or_default();
+        id = sessions_uuid(ws_session.or(inbound.execution_session), inbound.derived_session).unwrap_or_default();
     }
-    if id.is_empty() && !websocket && req.source_format == Format::OpenAI && !req.caller.principal.trim().is_empty() {
+    let principal = inbound.principal.trim();
+    if id.is_empty() && !websocket && inbound.source == Format::OpenAI && !principal.is_empty() {
         id = uuid::Uuid::new_v5(
             &uuid::Uuid::NAMESPACE_OID,
-            format!("cli-proxy-api:codex:prompt-cache:{}", req.caller.principal.trim()).as_bytes(),
+            format!("cli-proxy-api:codex:prompt-cache:{principal}").as_bytes(),
         )
         .to_string();
     }
@@ -1827,8 +1891,11 @@ mod tests {
             key_models: vec![serde_json::json!({"name": name, "is-compat": true})],
             ..Settings::default()
         };
-        assert!(!keyed("mİ").is_compat(&request("mi")), "dotted İ is not i");
-        assert!(keyed("ος").is_compat(&request("ΟΣ")), "final sigma folds");
+        assert!(
+            !keyed("mİ").is_compat(&Inbound::of(&request("mi"))),
+            "dotted İ is not i"
+        );
+        assert!(keyed("ος").is_compat(&Inbound::of(&request("ΟΣ"))), "final sigma folds");
     }
 
     #[test]

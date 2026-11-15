@@ -33,6 +33,8 @@ pub mod claude_login;
 pub mod codex;
 mod codex_capture;
 mod codex_client;
+mod codex_events;
+pub mod codex_exec;
 mod codex_images;
 mod codex_json;
 pub mod codex_live;
@@ -49,6 +51,7 @@ mod codex_sse;
 mod codex_testkit;
 mod codex_tls;
 mod codex_tokens;
+mod codex_upload;
 mod codex_ws;
 pub mod devin;
 pub mod devin_auth;
@@ -171,42 +174,39 @@ pub struct DeviceExecutors {
 /// converted: `destination` answers `None`, and the server takes the old path before fencing.
 impl Executors {
     pub fn destination(&self, attempt: &types::Attempt<'_>) -> Option<&'static str> {
-        #[expect(clippy::match_single_binding, reason = "provider units add their arms")]
         match attempt.credential.provider.as_str() {
+            "codex" => Some(pipeline::destination(&self.codex, attempt)),
             _ => None,
         }
     }
 
     /// Step 1: closes the client fence against the first attempt's destination.
-    #[expect(unused_variables, reason = "provider units add their arms")]
     pub fn fence<'a, I: ck_translate::codec::RequestIngress>(
         &self,
         attempt: &types::Attempt<'_>,
         ingress: &'a mut I,
         request: &mut ck_stream::Writer,
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
-        #[expect(clippy::match_single_binding, reason = "provider units add their arms")]
         match attempt.credential.provider.as_str() {
+            "codex" => pipeline::fence(&self.codex, attempt, ingress, request),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
 
     /// Step 2: re-fences the client view for this attempt's destination.
-    #[expect(unused_variables, reason = "provider units add their arms")]
     pub fn refence<'a>(
         &self,
         attempt: &types::Attempt<'_>,
         view: ck_translate::codec::RequestView<'a>,
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
-        #[expect(clippy::match_single_binding, reason = "provider units add their arms")]
         match attempt.credential.provider.as_str() {
+            "codex" => pipeline::refence(&self.codex, attempt, view),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
 
     /// Runs the operation in the request view and starts the producer on `response`, a
     /// stream created with `Store::create_dependent(upload)`.
-    #[expect(unused_variables, reason = "provider units add their arms")]
     pub async fn start(
         &self,
         attempt: &types::Attempt<'_>,
@@ -214,8 +214,8 @@ impl Executors {
         upload: &mut ck_stream::Writer,
         mut response: ck_stream::Writer,
     ) -> Result<pipeline::Started, ExecError> {
-        #[expect(clippy::match_single_binding, reason = "provider units add their arms")]
         match attempt.credential.provider.as_str() {
+            "codex" => pipeline::start(&self.codex, attempt, request, upload, response).await,
             provider => {
                 response.finish(ck_stream::Terminal::Gone);
                 Err(no_executor(provider))

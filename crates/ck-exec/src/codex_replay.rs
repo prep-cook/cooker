@@ -258,14 +258,20 @@ fn scope(req: &ExecRequest, body: &[u8]) -> Scope {
     if req.source_format != Format::Claude {
         return Scope::default();
     }
-    let mut model = text(&gj::get(body, "model"));
-    if model.is_empty() {
-        model = ck_wire::thinking::parse_suffix(&req.model).model_name;
+    scope_of(&req.model, body, session_key(req, body))
+}
+
+/// The scope of an upstream `body` for `session`; `model` is the upstream model, used when
+/// the body names none.
+fn scope_of(model: &str, body: &[u8], session: String) -> Scope {
+    let mut named = text(&gj::get(body, "model"));
+    if named.is_empty() {
+        named = ck_wire::thinking::parse_suffix(model).model_name;
     }
     let items = gj::get(body, "input").array();
     Scope {
-        model,
-        session: session_key(req, body),
+        model: named,
+        session,
         request_fingerprint: prefix_fingerprint(&items, items.len()),
     }
 }
@@ -289,6 +295,35 @@ fn session_key(req: &ExecRequest, body: &[u8]) -> String {
 /// body. The scope is returned for caching and clearing.
 pub(crate) fn apply(cache: &Cache, req: &ExecRequest, body: String) -> (String, Scope) {
     let scope = scope(req, body.as_bytes());
+    insert(cache, scope, body)
+}
+
+/// [`apply`] for the executor (`codex_exec`), which has no client body: the session comes
+/// from the Claude Code headers, the execution session, then the upload's and the headers'
+/// session ids, Go's order without the client body. `body` is the shaped upload, which
+/// carries the client's `metadata`.
+pub(crate) fn apply_upload(
+    cache: &Cache,
+    model: &str,
+    headers: &http::HeaderMap,
+    execution_session: Option<&str>,
+    body: String,
+) -> (String, Scope) {
+    let payload = body.as_bytes();
+    let session = crate::replay::claude_code_session(payload, headers)
+        .or_else(|| {
+            let execution = execution_session.map(str::trim).unwrap_or_default();
+            (!execution.is_empty()).then(|| format!("execution:{execution}"))
+        })
+        .or_else(|| crate::replay::payload_session(payload))
+        .or_else(|| crate::replay::header_session(headers))
+        .unwrap_or_default();
+    let scope = scope_of(model, payload, session);
+    insert(cache, scope, body)
+}
+
+/// Inserts the cached turns of `scope` into `body`.
+fn insert(cache: &Cache, scope: Scope, body: String) -> (String, Scope) {
     if !scope.valid() {
         return (body, scope);
     }

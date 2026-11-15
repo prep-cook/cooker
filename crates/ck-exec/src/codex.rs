@@ -674,7 +674,7 @@ fn count_tokens(req: &ExecRequest, cfg: &Config) -> Result<ExecResponse, ExecErr
 /// tool `number` schemas (a Codex client's integer normalization applies only to other
 /// executors).
 pub(crate) fn count_tokens_body(req: &ExecRequest, cfg: &Config, model: &str) -> Result<Vec<u8>, ExecError> {
-    use crate::codex_json::{delete, set_bool_if_different, set_str, set_str_if_different};
+    use crate::codex_json::{delete, set_bool_if_different, set_str_if_different};
     // Go reads is-compat only from the attempt's binding here (APIKeyModelIsCompat).
     let is_compat = req.resolved_model.as_ref().is_some_and(|r| r.is_compat());
     let client = crate::codex_client::Client::new(&req.headers, cfg, "codex", is_compat);
@@ -722,11 +722,9 @@ pub(crate) fn count_tokens_body(req: &ExecRequest, cfg: &Config, model: &str) ->
         body = delete(&body, key);
     }
     body = set_bool_if_different(body, "stream", false);
+    let mut body = body.into_bytes();
     if !request::is_native(req) {
-        let instructions = gjson::get(&body, "instructions");
-        if !instructions.exists() || instructions.kind() == gjson::Kind::Null {
-            body = set_str(&body, "instructions", "");
-        }
+        ck_wire::codex_client::normalize_codex_instructions(&mut body);
     }
     Ok(crate::payload_barrier::Barrier {
         executor: "codex",
@@ -735,7 +733,7 @@ pub(crate) fn count_tokens_body(req: &ExecRequest, cfg: &Config, model: &str) ->
         root: "",
         original: &original,
     }
-    .apply(cfg, req, body.into_bytes()))
+    .apply(cfg, req, body))
 }
 
 /// Go reads at most 32 MiB of an Alpha Search response, whatever its status.
@@ -747,7 +745,7 @@ const ALPHA_SEARCH_MAX_RESPONSE: usize = 32 << 20;
 /// except auth/payment/quota fail over without cooldown.
 // ponytail: Go also exempts Cloudflare challenges and invalid_grant bodies from both rules;
 // those classifiers are not ported (M4-0024).
-fn compact_error(mut error: ExecError) -> ExecError {
+pub(crate) fn compact_error(mut error: ExecError) -> ExecError {
     let credential_quota = error.status == 429 && error.scope == FailureScope::Credential;
     if credential_quota || matches!(error.status, 401 | 402 | 403 | 429) || error.scope == FailureScope::Transport {
         return error;
