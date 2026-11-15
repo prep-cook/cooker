@@ -153,7 +153,7 @@ impl CodexExecutor {
         let url = format!("{}{endpoint}", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
         wire.request(&url, &headers, &body);
-        let upstream = match self.post(view, &url, &headers, body).await {
+        let upstream = match self.post(view, &url, &headers, body, None).await {
             Ok(upstream) => upstream,
             Err(error) => {
                 wire.exec_error(&error);

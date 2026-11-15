@@ -526,7 +526,7 @@ impl Duplex {
                 return;
             }
         };
-        let (body, replay) = Replay::apply(&self.initial.replay.cache, &next, body);
+        let (body, replay) = Replay::apply(&self.initial.replay.cache, &next, &self.credential.id, body);
         // ponytail: Go starts a usage record per response; this stream reports every
         // response's events to the bootstrap attempt's record and keeps its request.
         let (body, _) = request::prompt_cache(&next, body, Some(&self.exec_session), true);

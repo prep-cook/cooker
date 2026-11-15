@@ -96,6 +96,17 @@ fn encodings_follow_go_model_prefixes() {
 /// `number` tool parameters stay numbers in the counted body, from Responses and Claude,
 /// with and without an is-compat binding. The integer normalization is for non-Codex
 /// executors only.
+/// A message whose content is one string counts like the same text in one part.
+#[test]
+fn string_message_content_counts_like_a_part() {
+    let count = |body: &str| count_input_tokens(Encoding::O200kBase, body.as_bytes()).unwrap();
+    let string = count(r#"{"input":[{"type":"message","role":"user","content":"hello there"}]}"#);
+    let parts =
+        count(r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello there"}]}]}"#);
+    assert_eq!(string, parts);
+    assert!(string > 0);
+}
+
 #[test]
 fn counted_body_keeps_tool_number_schemas() {
     use ck_core::exec::{ResolvedModel, ResolvedSource};

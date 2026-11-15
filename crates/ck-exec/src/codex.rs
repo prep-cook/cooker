@@ -231,6 +231,7 @@ impl CodexExecutor {
         url: &str,
         headers: &HeaderMap,
         body: Bytes,
+        timing: Option<&ck_core::exec::UsageSink>,
     ) -> Result<crate::proxy::Upstream, ExecError> {
         let transport = &self.transport;
         let (proxy, keep_alive, handshake) = (&view.proxy, view.chatgpt_keep_alive, view.handshake);
@@ -240,7 +241,7 @@ impl CodexExecutor {
                 order: None,
             })
         };
-        crate::proxy::send_routed(&route, url, go_headers(headers), body, None, None).await
+        crate::proxy::send_routed(&route, url, go_headers(headers), body, None, timing).await
     }
 
     /// One POST to the Codex backend, captured as Go's call sites record it: the
@@ -258,11 +259,12 @@ impl CodexExecutor {
         replay: &crate::codex_replay::Scope,
         wire: &Wire,
         error_body: ErrorBody,
+        timing: Option<&ck_core::exec::UsageSink>,
     ) -> Result<crate::proxy::Upstream, ExecError> {
         // The shaped body names the base model, the key of per-model quota snapshots.
         let model = gjson::get(&body, "model").str().to_owned();
         wire.request(&url, &headers, body.as_bytes());
-        let mut upstream = match self.post(view, &url, &headers, Bytes::from(body)).await {
+        let mut upstream = match self.post(view, &url, &headers, Bytes::from(body), timing).await {
             Ok(upstream) => upstream,
             Err(error) => {
                 // ponytail: the text is this executor's transport message, not net/http's
@@ -311,7 +313,7 @@ impl CodexExecutor {
         error_body: ErrorBody,
     ) -> Result<ExecResponse, ExecError> {
         let upstream = self
-            .open(view, settings, url, headers, body, replay, wire, error_body)
+            .open(view, settings, url, headers, body, replay, wire, error_body, None)
             .await?;
         let (status, headers) = (upstream.status, upstream.headers);
         let sse = headers
@@ -348,7 +350,7 @@ impl CodexExecutor {
             finalize,
             ..
         } = request::shape(&req, view, settings, Call::Stream)?;
-        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, body);
+        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, &view.credential.id, body);
         let (body, cache) = request::prompt_cache(&req, body, ws_session, false);
         let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
         report_request(&req, Format::Codex, &body);
@@ -403,7 +405,7 @@ impl CodexExecutor {
             finalize,
             ..
         } = request::shape(&req, view, settings, Call::NonStream)?;
-        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, body);
+        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, &view.credential.id, body);
         let (body, cache) = request::prompt_cache(&req, body, None, false);
         let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
         report_request(&req, Format::Codex, &body);
@@ -421,6 +423,7 @@ impl CodexExecutor {
                     &scope,
                     &wire,
                     ErrorBody::Lossy,
+                    None,
                 )
                 .await?;
             // Go reads the whole body (`io.ReadAll`, whatever its type), records every
@@ -598,7 +601,7 @@ impl CodexExecutor {
         }
         let wire = Wire::new(capture, credential);
         wire.request(&url, &headers, &body);
-        let upstream = match self.post(&view, &url, &headers, Bytes::from(body)).await {
+        let upstream = match self.post(&view, &url, &headers, Bytes::from(body), None).await {
             Ok(upstream) => upstream,
             Err(error) => {
                 wire.exec_error(&error);
@@ -674,7 +677,7 @@ fn count_tokens(req: &ExecRequest, cfg: &Config) -> Result<ExecResponse, ExecErr
 /// tool `number` schemas (a Codex client's integer normalization applies only to other
 /// executors).
 pub(crate) fn count_tokens_body(req: &ExecRequest, cfg: &Config, model: &str) -> Result<Vec<u8>, ExecError> {
-    use crate::codex_json::{delete, set_bool_if_different, set_str, set_str_if_different};
+    use crate::codex_json::{delete, set_bool_if_different, set_str_if_different};
     // Go reads is-compat only from the attempt's binding here (APIKeyModelIsCompat).
     let is_compat = req.resolved_model.as_ref().is_some_and(|r| r.is_compat());
     let client = crate::codex_client::Client::new(&req.headers, cfg, "codex", is_compat);
@@ -722,11 +725,9 @@ pub(crate) fn count_tokens_body(req: &ExecRequest, cfg: &Config, model: &str) ->
         body = delete(&body, key);
     }
     body = set_bool_if_different(body, "stream", false);
+    let mut body = body.into_bytes();
     if !request::is_native(req) {
-        let instructions = gjson::get(&body, "instructions");
-        if !instructions.exists() || instructions.kind() == gjson::Kind::Null {
-            body = set_str(&body, "instructions", "");
-        }
+        ck_wire::codex_client::normalize_codex_instructions(&mut body);
     }
     Ok(crate::payload_barrier::Barrier {
         executor: "codex",
@@ -735,7 +736,7 @@ pub(crate) fn count_tokens_body(req: &ExecRequest, cfg: &Config, model: &str) ->
         root: "",
         original: &original,
     }
-    .apply(cfg, req, body.into_bytes()))
+    .apply(cfg, req, body))
 }
 
 /// Go reads at most 32 MiB of an Alpha Search response, whatever its status.
@@ -747,7 +748,7 @@ const ALPHA_SEARCH_MAX_RESPONSE: usize = 32 << 20;
 /// except auth/payment/quota fail over without cooldown.
 // ponytail: Go also exempts Cloudflare challenges and invalid_grant bodies from both rules;
 // those classifiers are not ported (M4-0024).
-fn compact_error(mut error: ExecError) -> ExecError {
+pub(crate) fn compact_error(mut error: ExecError) -> ExecError {
     let credential_quota = error.status == 429 && error.scope == FailureScope::Credential;
     if credential_quota || matches!(error.status, 401 | 402 | 403 | 429) || error.scope == FailureScope::Transport {
         return error;
