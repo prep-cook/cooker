@@ -13,7 +13,7 @@ impl State {
                     Kind::Heartbeat,
                     Scope::default(),
                     |_| Ok(()),
-                    |e| sse_provenance(source, event, e),
+                    |e| sse_provenance("chat", source, event, e),
                 )?;
             }
             return Ok(());
@@ -40,7 +40,7 @@ impl State {
                             e.bytes(b",\"format\":\"json\",\"value\":")?;
                             doc.write(doc.root(), e)
                         },
-                        |e| sse_provenance(source, event, e),
+                        |e| sse_provenance("chat", source, event, e),
                     )?;
                 }
                 Err(Error::Json | Error::Truncated) => {
@@ -52,7 +52,7 @@ impl State {
                             e.bytes(b",\"format\":\"text\",\"value\":")?;
                             e.quoted_json(|e| event.write_data(source, |b| e.bytes(b)))
                         },
-                        |e| sse_provenance(source, event, e),
+                        |e| sse_provenance("chat", source, event, e),
                     )?;
                 }
                 Err(error) => return Err(error),

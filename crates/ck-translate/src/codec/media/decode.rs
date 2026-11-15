@@ -92,7 +92,7 @@ pub(crate) fn write_base64_fragments(doc: &Document, node: usize, e: &mut Encode
     write_encoded_chunks_checked(doc, texts, e)
 }
 
-pub(super) fn write_encoded_chunks(
+pub(crate) fn write_encoded_chunks(
     doc: &Document,
     texts: impl Iterator<Item = Text>,
     e: &mut Encoder<'_, '_>,

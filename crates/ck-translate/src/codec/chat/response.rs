@@ -328,7 +328,7 @@ impl State {
             },
             |e| {
                 if let Some((source, event)) = wire {
-                    sse_provenance(source, event, e)?;
+                    sse_provenance("chat", source, event, e)?;
                 }
                 super::provenance::unknown(
                     doc,
@@ -505,7 +505,7 @@ pub(super) fn members(doc: &Document, object: usize, e: &mut Encoder<'_, '_>, sk
     Ok(())
 }
 /// Whether an SSE record carries any field besides its data lines.
-fn sse_metadata(source: &Source, event: &sse::Event) -> Result<bool> {
+pub(crate) fn sse_metadata(source: &Source, event: &sse::Event) -> Result<bool> {
     for field in event.fields() {
         if field.comment || !source.equals(field.name, b"data")? {
             return Ok(true);
@@ -513,8 +513,15 @@ fn sse_metadata(source: &Source, event: &sse::Event) -> Result<bool> {
     }
     Ok(false)
 }
-fn sse_provenance(source: &Source, event: &sse::Event, e: &mut Encoder<'_, '_>) -> Result<()> {
-    e.bytes(b",\"source\":{\"protocol\":\"chat\",\"sse\":[")?;
+pub(crate) fn sse_provenance(
+    protocol: &str,
+    source: &Source,
+    event: &sse::Event,
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
+    e.bytes(b",\"source\":{\"protocol\":")?;
+    e.string(protocol)?;
+    e.bytes(b",\"sse\":[")?;
     let mut first = true;
     for field in event.fields() {
         if !field.comment && source.equals(field.name, b"data")? {

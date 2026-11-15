@@ -96,6 +96,7 @@ mod gemini_interactions_response;
 mod gemini_responses;
 mod gemini_responses_response;
 mod gemini_web_search;
+pub mod images;
 mod interactions_claude;
 pub mod meta;
 mod mime;
