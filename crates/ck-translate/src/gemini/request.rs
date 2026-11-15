@@ -281,7 +281,7 @@ fn function_calling(doc: &mut Document, native: usize) -> Result<()> {
         Ok(()) if doc.string_is(mode, "ANY")? => "required",
         Ok(()) => return Ok(()),
     };
-    // Only ANY takes names, and only a nonempty list of strings maps.
+    // ANY and VALIDATED take names; only ANY maps, and only with a nonempty list of strings.
     let unmapped = match names {
         Some(names) => {
             choice != "required"

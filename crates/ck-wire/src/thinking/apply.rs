@@ -320,7 +320,7 @@ pub(super) fn run(
             return Ok(if response_target {
                 strip_responses_effort(body)
             } else {
-                strip_thinking_config(&body, &target)
+                strip_thinking_config(body, &target)
             });
         }
         return Ok(body);
@@ -344,7 +344,7 @@ pub(super) fn run(
             return Ok(body);
         }
         if reads.summary_enabled {
-            body = strip_inferred_claude_summary_activation(&body, Some(info));
+            body = strip_inferred_claude_summary_activation(body, Some(info));
         }
         return Ok(apply_summary_config_for_provider(
             body,
@@ -364,7 +364,7 @@ pub(super) fn run(
         e.body = Some(body.clone());
         e
     })?;
-    let mut applied = apply_fn(&body, &validated, Some(info))?;
+    let mut applied = apply_fn(body, &validated, Some(info))?;
     if fully_disabled(&validated) || native_responses {
         return Ok(applied);
     }
@@ -374,7 +374,7 @@ pub(super) fn run(
         // level: drop a stale block_binding and keep the caller's intent of seeing no
         // thinking, since without an explicit omitted display cloaking would add
         // progress updates (Go ad9e456d).
-        applied = super::without(&applied, "thinking.block_binding");
+        applied = super::without(applied, "thinking.block_binding");
         summary = SummaryConfig {
             mode: SummaryMode::Disabled,
             ..Default::default()
@@ -479,7 +479,7 @@ fn apply_user_defined_model(
         return Ok(body);
     };
     let config = normalize_user_defined_config(config, to);
-    let applied = apply_fn(&body, &config, info)?;
+    let applied = apply_fn(body, &config, info)?;
     if fully_disabled(&config) || native_responses {
         return Ok(applied);
     }
@@ -559,7 +559,7 @@ pub fn collapse_configuration_updates(body: &[u8], keep_top_level_effort: bool) 
     if effort.is_empty() {
         return updated;
     }
-    with_str(&updated, "reasoning.effort", &effort)
+    with_str(updated, "reasoning.effort", &effort)
 }
 
 /// `ExtractTranslatedReasoningEffort`: the final provider payload's effort.

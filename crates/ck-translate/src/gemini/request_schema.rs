@@ -242,7 +242,8 @@ fn controls(doc: &Document) -> Result<()> {
     {
         return Err(Error::Unsupported);
     }
-    // `allowedFunctionNames` holds only with mode ANY, Chat's `required`.
+    // Gemini takes `allowedFunctionNames` with mode ANY or VALIDATED; only ANY, Chat's
+    // `required`, has a Chat counterpart.
     if let Some(choice) = doc.member(root, "tool_choice")?
         && matches!(doc.node(choice)?.value, Value::Object)
         && let Some(allowed) = doc.member(choice, "allowed_tools")?
