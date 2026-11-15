@@ -1473,8 +1473,8 @@ impl<'a> Ctx<'a> {
 
     /// Whether the old content normalizers run: only on the old path. The contract path sends
     /// the client's content as the fence accepted it, and the official API judges the rest:
-    /// no forced-tool or sampling rewrite, no signature sanitizing and no proxy-owned prefix
-    /// recovery. The cache rewrites, which change only the caller's cost, run on both
+    /// no forced-tool or sampling rewrite, no signature sanitizing, no proxy-owned prefix
+    /// recovery and no Kimi attribution stripping. The cache rewrites, which change only the caller's cost, run on both
     /// (owner question 14; P8 removes the old path).
     pub(super) fn legacy_body(&self) -> bool {
         !self.contract
@@ -1769,8 +1769,9 @@ impl<'a> Ctx<'a> {
             };
             body = signing::placeholder(body, &fallback);
         }
-        if self.kimi && !self.cli_profile {
-            // stripDefaultKimiClaudeCodeAttribution: Kimi reads the block as prompt text.
+        if self.kimi && !self.cli_profile && self.legacy_body() {
+            // stripDefaultKimiClaudeCodeAttribution: Kimi reads the block as prompt text. The
+            // contract path never deletes caller content.
             body = strip_attribution_system(&body);
         }
         if self.compaction_summary {

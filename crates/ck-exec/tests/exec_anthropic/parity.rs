@@ -342,3 +342,28 @@ async fn a_claude_code_request_on_a_plain_key_stays_on_the_old_route() {
     let attempt = fixture.exchange.attempt(&fixture.streams.store);
     assert_eq!(fixture.executors.destination(&attempt), Some("anthropic"));
 }
+
+/// A plain key on a Kimi origin keeps the caller's system text, even one that starts like
+/// Claude Code's billing block; only the old route strips that attribution.
+#[tokio::test]
+async fn a_kimi_origin_keeps_the_callers_system_text() {
+    let text = "x-anthropic-billing-header: preserve this caller text";
+    for system in [json!(text), json!([{"type": "text", "text": text}])] {
+        // Requests to the Kimi origin reach the local upstream through it as an HTTP proxy.
+        let upstream = StreamUpstream::start([Reply::json(MESSAGE)]).await;
+        let mut key = credential("claude", "http://api.kimi.com/anthropic", "sk-kimi-test");
+        key.attributes.insert("proxy_url".into(), upstream.url());
+        let fixture = Fixture::with(key, "http://127.0.0.1:1", SONNET);
+        let attempt = fixture.exchange.attempt(&fixture.streams.store);
+        assert_eq!(fixture.executors.destination(&attempt), Some("anthropic"));
+        let body = json!({"model": SONNET, "max_tokens": 1024, "system": system,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let (started, _, _request) = fixture
+            .anthropic(&serde_json::to_vec(&body).unwrap(), Operation::Generate)
+            .await;
+        started.unwrap().producer.await.unwrap().unwrap();
+        let (sent, captured) = sent(&upstream);
+        assert!(captured.path.contains("api.kimi.com"), "{}", captured.path);
+        assert!(sent["system"].to_string().contains(text), "{sent}");
+    }
+}
