@@ -221,12 +221,10 @@ async fn every_reference_shape_in_captured_errors_is_redacted() {
     );
 }
 
-/// A section past the memory limit goes to a spool file, and the
-/// spool never holds a URL credential, even before the log is written.
+/// A section past the memory limit goes to a spool file, which holds the bytes before
+/// they are redacted and so has no name in the log directory.
 #[tokio::test]
-async fn spools_never_hold_url_credentials() {
-    let spooled = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let seen = spooled.clone();
+async fn spools_leave_no_file_in_the_log_directory() {
     let content = persisted(true, StatusCode::OK, move |log| {
         let sink = log.capture_sink();
         let body = vec![b'x'; 65536];
@@ -237,57 +235,84 @@ async fn spools_never_hold_url_credentials() {
         )));
         sink.record(ResponseMetadata(200, &[]));
         sink.record(ResponseChunk(&body));
-        // A URL split across chunks of a spooled section.
-        sink.record(ResponseChunk(b" http://127.0.0.1/?code=sk-review"));
-        sink.record(ResponseChunk(b"-secret end"));
         let guard = log.0.lock().unwrap();
-        let dir = &guard.as_ref().unwrap().state.dir;
-        for entry in std::fs::read_dir(dir).unwrap().flatten() {
-            if entry.path().extension().is_some_and(|e| e == "tmp") {
-                seen.lock().unwrap().push(std::fs::read(entry.path()).unwrap());
-            }
-        }
+        let record = guard.as_ref().unwrap();
+        assert!(record.api_request.spool.is_some() && record.api_response.spool.is_some());
+        let entries: Vec<_> = std::fs::read_dir(&record.state.dir).unwrap().flatten().collect();
+        assert!(entries.is_empty(), "{entries:?}");
     })
     .await;
-    let spooled = spooled.lock().unwrap();
-    assert_eq!(spooled.len(), 2, "both sections spool");
-    for bytes in spooled.iter() {
-        assert!(!String::from_utf8_lossy(bytes).contains(SECRET));
-    }
     let content = String::from_utf8(content).unwrap();
     assert!(!content.contains(SECRET), "{content}");
     line(&content, "Upstream URL: http://127.0.0.1/v1?code=***#***");
-    // The chunks the URL was split across are joined, not separated, so no tail of the
-    // credential prints.
-    assert!(!content.contains("-secret"), "{content}");
-    line(&content, "http://127.0.0.1/?code=*** end");
 }
 
-/// A captured body keeps a quoted reference whole across a line
-/// break, and a reference longer than the hold limit prints as the placeholder.
+/// Makes every later write to the upstream response section's spool fail.
+fn fail_spool(log: &super::RequestLog) {
+    let mut locked = log.0.lock().unwrap();
+    let record = locked.as_mut().unwrap();
+    let file = super::tests::unwritable(&record.state.dir);
+    let spool = record.api_response.spool.as_mut().expect("the section spilled");
+    spool.file = file;
+}
+
+/// A captured response section is redacted as a whole: a URL split across chunks at any
+/// byte, in memory or across a spill, prints redacted, and a section whose spool write
+/// failed prints a marker instead of its content.
 #[tokio::test]
-async fn captured_bodies_keep_references_whole() {
-    let long = format!(
-        "http://127.0.0.1/?code={}sk-review-secret tail",
-        "x".repeat(2 * ck_wire::redact::HOLD_LIMIT)
-    );
-    for (body, want) in [
+async fn captured_response_sections_are_redacted_whole() {
+    let filler = |tail: &[u8]| [&[b'x'; 64 << 10][..], tail].concat();
+    let long = format!("http://127.0.0.1/?code={}sk-review-secret tail", "x".repeat(2 << 20));
+    // (chunks, the spool fails after this many chunks, text the log holds)
+    let rows = vec![
         (
-            b"Post \"http://127.0.0.1/?code=prefix\nsk-review-secret\": EOF".to_vec(),
+            vec![
+                b"see http:/".to_vec(),
+                b"/u:sk-review-secret@127.0.0.1/path end".to_vec(),
+            ],
+            None,
+            "see http://127.0.0.1/path end",
+        ),
+        (
+            vec![filler(b" http:/"), b"/u:sk-review-secret@127.0.0.1/path end".to_vec()],
+            None,
+            "x http://127.0.0.1/path end",
+        ),
+        (
+            vec![
+                filler(b" http://u:sk-review"),
+                [&b"-secret@127.0.0.1/x end "[..], &[b'y'; 64 << 10]].concat(),
+            ],
+            Some(1),
+            "\n[capture dropped: write failed]\n",
+        ),
+        (
+            vec![b"Post \"http://127.0.0.1/?code=prefix\nsk-review-secret\": EOF".to_vec()],
+            None,
             "Post \"<redacted url>\": EOF",
         ),
-        (long.into_bytes(), "<redacted url> tail"),
-    ] {
+        (vec![long.into_bytes()], None, "http://127.0.0.1/?code=*** tail"),
+    ];
+    for (chunks, fail, want) in rows {
         let content = persisted(true, StatusCode::BAD_GATEWAY, move |log| {
             let sink = log.capture_sink();
             sink.record(Request(upstream_request("http://127.0.0.1/v1", &[], b"")));
             sink.record(ResponseMetadata(502, &[]));
-            sink.record(ResponseChunk(&body));
+            for (i, chunk) in chunks.iter().enumerate() {
+                if fail == Some(i) {
+                    fail_spool(log);
+                }
+                sink.record(ResponseChunk(chunk));
+            }
         })
         .await;
         let content = String::from_utf8(content).unwrap();
-        assert!(!content.contains(SECRET), "{}", &content[..content.len().min(4096)]);
-        line(&content, want);
+        let shown = &content[..content.len().min(4096)];
+        assert!(
+            !content.contains(SECRET) && !content.contains("-secret"),
+            "{want}: {shown}"
+        );
+        assert!(content.contains(want), "{want}: {shown}");
     }
 }
 
@@ -324,32 +349,8 @@ async fn relative_references_with_fragments_are_redacted() {
     }
 }
 
-/// Every spool file is written through the redactor: a URL split across writes never
-/// reaches the file with its credential, and ending the spool writes what was held.
-#[test]
-fn spool_files_are_written_redacted() {
-    use std::io::Write as _;
-    let dir = std::env::temp_dir().join(format!("cooker-url-spool-{}", uuid::Uuid::new_v4()));
-    let mut spool = super::Spool::new(&dir, "request-body").unwrap();
-    spool.file.write_all(b"{\"url\":\"http://u:sk-review").unwrap();
-    spool
-        .file
-        .write_all(b"-secret@127.0.0.1/?code=sk-review-secret")
-        .unwrap();
-    assert!(!String::from_utf8_lossy(&std::fs::read(&spool.temp.path).unwrap()).contains("sk-review"));
-    spool.file.write_all(b"\"}").unwrap();
-    spool.file.end().unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&spool.temp.path).unwrap(),
-        "{\"url\":\"http://127.0.0.1/?code=***\"}"
-    );
-    drop(spool);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-/// A content-encoded request body is kept in memory, not spooled, until a forced error
-/// log decodes it: the spool's redactor would corrupt the encoding. The decoded body is
-/// redacted when the log is written.
+/// A content-encoded request body is spooled as read and decoded when a forced error log
+/// is written; the decoded body is redacted then.
 #[tokio::test]
 async fn encoded_request_bodies_reach_forced_logs_decoded() {
     use tokio::io::AsyncReadExt as _;
@@ -391,32 +392,5 @@ async fn encoded_request_bodies_reach_forced_logs_decoded() {
     line(&content, r#"{"url":"http://127.0.0.1/?code=***"}"#);
     drop(app);
     drop(state);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-/// A spooled request body ends its redactor before it is read, so a URL at its very end
-/// is written, redacted.
-#[test]
-fn spooled_request_bodies_end_before_they_are_read() {
-    use std::io::Write as _;
-    let dir = super::tests::scratch();
-    let mut deferred = super::Deferred {
-        spool: Some(super::Spool::new(&dir, "request-body").unwrap()),
-        memory: Vec::new(),
-        length: None,
-        read: 0,
-        captured: 0,
-        eof: true,
-        truncated: false,
-        failed: false,
-    };
-    let spool = deferred.spool.as_mut().unwrap();
-    spool
-        .file
-        .write_all(b"see http://u:sk-review-secret@127.0.0.1/?code=sk-review-secret")
-        .unwrap();
-    let (body, _) = deferred.bytes().unwrap();
-    assert_eq!(String::from_utf8(body).unwrap(), "see http://127.0.0.1/?code=***");
-    drop(deferred);
     std::fs::remove_dir_all(dir).unwrap();
 }

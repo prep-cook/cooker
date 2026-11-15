@@ -5,9 +5,8 @@
 
 use std::borrow::Cow;
 
-#[path = "redact_stream.rs"]
-mod stream;
-pub use stream::{HOLD_LIMIT, Stream, Writer};
+#[path = "redact_scan.rs"]
+mod scan;
 
 /// What each query value and a fragment print as.
 pub const MASK: &str = "***";
@@ -58,7 +57,7 @@ pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
         return Cow::Borrowed(text);
     }
     let mut out = Vec::with_capacity(text.len());
-    stream::whole(text, &mut out);
+    scan::whole(text, &mut out);
     if out == text {
         Cow::Borrowed(text)
     } else {
