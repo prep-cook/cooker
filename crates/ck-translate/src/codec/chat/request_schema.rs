@@ -372,20 +372,6 @@ fn x_ck(doc: &Document, root: usize) -> Result<()> {
     for key in ["session", "provider_parameters"] {
         optional(doc, x, key, object)?;
     }
-    optional(doc, x, "cache_control", |doc, list| {
-        array(doc, list)?;
-        for entry in doc.children(list)? {
-            require_string(doc, doc.required(entry, "pointer")?)?;
-            if let Some(value) = doc.member(entry, "value")?
-                && !matches!(doc.node(value)?.value, Value::Null)
-            {
-                object(doc, value)?;
-                optional(doc, value, "type", require_string)?;
-                optional(doc, value, "ttl", require_string)?;
-            }
-        }
-        Ok(())
-    })?;
     optional(doc, x, "replay", |doc, list| {
         array(doc, list)?;
         for entry in doc.children(list)? {

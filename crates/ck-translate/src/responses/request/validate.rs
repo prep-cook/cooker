@@ -338,11 +338,6 @@ fn document(doc: &Document, part: usize) -> Result<()> {
 }
 /// Refuses gateway extensions a Responses upstream cannot carry.
 fn validate_extensions(doc: &Document, x: usize) -> Result<()> {
-    if let Some(cache) = doc.member(x, "cache_control")?
-        && doc.node(cache)?.first.is_some()
-    {
-        return Err(Error::Unsupported);
-    }
     // Another protocol's parameters, such as Anthropic `top_k`, have no Responses form.
     if let Some(providers) = doc.member(x, "provider_parameters")? {
         for group in doc.children(providers)? {

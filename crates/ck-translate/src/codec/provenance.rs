@@ -15,14 +15,56 @@ use super::{
 use ck_stream::Writer;
 
 /// `x_ck` lists whose entries may carry a trusted `binding`.
-pub const BOUND_LISTS: [&str; 6] = [
-    "original",
-    "cache_control",
-    "replay",
-    "tools",
-    "chat_legacy_calls",
-    "anthropic_order",
-];
+pub const BOUND_LISTS: [&str; 5] = ["original", "replay", "tools", "chat_legacy_calls", "anthropic_order"];
+
+/// Bound lists inside `x_ck.isolated`, as (provider, list). A provider's isolated map holds its
+/// own members that other protocols cannot express (owner ruling Q3, 2026-11-16): only that
+/// provider's request egress reads it, and no other destination writes or refuses it.
+pub const ISOLATED_LISTS: [(&str, &str); 1] = [("anthropic", "cache_control")];
+
+/// The isolated list `key` of `provider`, if ingress recorded one.
+pub fn isolated(doc: &Document, provider: &str, key: &str) -> Result<Option<usize>> {
+    let Some(x) = doc.member(doc.root(), "x_ck")? else {
+        return Ok(None);
+    };
+    let Some(map) = doc.member(x, "isolated")? else {
+        return Ok(None);
+    };
+    match doc.member(map, provider)? {
+        Some(own) => doc.member(own, key),
+        None => Ok(None),
+    }
+}
+
+/// The isolated list `key` of `provider`, created on first use so a request without such
+/// members carries no map.
+pub fn isolated_list(doc: &mut Document, provider: &'static str, key: &'static str) -> Result<usize> {
+    let x = doc.required(doc.root(), "x_ck")?;
+    let map = match doc.member(x, "isolated")? {
+        Some(map) => map,
+        None => doc.set(x, "isolated", Value::Object)?,
+    };
+    let own = match doc.member(map, provider)? {
+        Some(own) => own,
+        None => doc.set(map, provider, Value::Object)?,
+    };
+    match doc.member(own, key)? {
+        Some(list) => Ok(list),
+        None => doc.set(own, key, Value::Array),
+    }
+}
+
+/// Every bound list present in `x`: [`BOUND_LISTS`], then [`ISOLATED_LISTS`].
+pub fn bound_lists(doc: &Document, x: usize) -> Result<[Option<usize>; BOUND_LISTS.len() + ISOLATED_LISTS.len()]> {
+    let mut lists = [None; BOUND_LISTS.len() + ISOLATED_LISTS.len()];
+    for (slot, key) in lists.iter_mut().zip(BOUND_LISTS) {
+        *slot = doc.member(x, key)?;
+    }
+    for (slot, (provider, key)) in lists[BOUND_LISTS.len()..].iter_mut().zip(ISOLATED_LISTS) {
+        *slot = isolated(doc, provider, key)?;
+    }
+    Ok(lists)
+}
 
 /// Native carriers a binding may name. `shape` marks a native result object shape.
 pub const CARRIERS: [&str; 4] = ["image_url", "input_audio", "file", "shape"];
@@ -296,10 +338,7 @@ fn resolve_to(
 /// canonical request fields are published.
 pub fn bindings(doc: &mut Document, owner: &mut Writer) -> Result<()> {
     let x = doc.required(doc.root(), "x_ck")?;
-    for key in BOUND_LISTS {
-        let Some(list) = doc.member(x, key)? else {
-            continue;
-        };
+    for list in bound_lists(doc, x)?.into_iter().flatten() {
         let mut next = doc.node(list)?.first;
         while let Some(entry) = next {
             next = doc.node(entry)?.next;
@@ -321,10 +360,7 @@ pub fn bindings(doc: &mut Document, owner: &mut Writer) -> Result<()> {
 /// Re-bind serialized bindings. Call only on a trusted reconstructed canonical document.
 pub fn restore_bindings(doc: &mut Document) -> Result<()> {
     let x = doc.required(doc.root(), "x_ck")?;
-    for key in BOUND_LISTS {
-        let Some(list) = doc.member(x, key)? else {
-            continue;
-        };
+    for list in bound_lists(doc, x)?.into_iter().flatten() {
         let mut next = doc.node(list)?.first;
         while let Some(entry) = next {
             next = doc.node(entry)?.next;

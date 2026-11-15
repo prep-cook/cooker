@@ -3,7 +3,7 @@ use crate::codec::{
     document::{Document, Value},
     encode,
     encode::Encoder,
-    provenance::{leaf, pointer, write_segment},
+    provenance::{isolated_list, leaf, pointer, write_segment},
 };
 use ck_stream::Writer;
 
@@ -17,17 +17,10 @@ fn list(doc: &mut Document, key: &'static str) -> Result<usize> {
     }
 }
 
-fn entry(
-    doc: &mut Document,
-    owner: &mut Writer,
-    field: usize,
-    key: &'static str,
-    value_key: &'static str,
-) -> Result<usize> {
+fn entry(doc: &mut Document, owner: &mut Writer, field: usize, list: usize, value_key: &'static str) -> Result<usize> {
     let parent = doc.node(field)?.parent.ok_or(Error::Schema)?;
     let lease = encode::scratch(owner, |e| pointer(doc, field, e))?;
     let pointer = doc.import_json(owner, lease)?;
-    let list = list(doc, key)?;
     let entry = doc.add(None, Value::Object)?;
     doc.append(list, entry)?;
     doc.bind_origin(entry, parent, None)?;
@@ -41,10 +34,7 @@ fn entry(
 
 pub(super) fn cache(doc: &mut Document, owner: &mut Writer, parent: usize) -> Result<()> {
     if let Some(value) = doc.member(parent, "cache_control")? {
-        if !matches!(doc.node(value)?.value, Value::Object | Value::Null) {
-            return Err(Error::Schema);
-        }
-        entry(doc, owner, value, "cache_control", "value")?;
+        capture_cache(doc, owner, value)?;
     }
     Ok(())
 }
@@ -112,7 +102,8 @@ fn signature(
     super::request::require_string(doc, value)?;
     let id = doc.required(call, "id")?;
     let id_value = doc.node(id)?.value;
-    let entry = entry(doc, owner, value, "replay", "signature")?;
+    let replay = list(doc, "replay")?;
+    let entry = entry(doc, owner, value, replay, "signature")?;
     doc.set(entry, "message_index", Value::Unsigned(message))?;
     doc.set(entry, "block_index", Value::Unsigned(block))?;
     doc.set(entry, "item_id", id_value)?;
@@ -185,13 +176,6 @@ pub(super) fn destination(doc: &Document) -> Result<()> {
             }
         }
     }
-    if let Some(cache) = doc.member(x, "cache_control")? {
-        for entry in doc.children(cache)? {
-            if doc.member(entry, "value")?.is_some() && doc.origin(entry)?.is_none() {
-                return Err(Error::Unsupported);
-            }
-        }
-    }
     if let Some(tools) = doc.member(doc.root(), "tools")?
         && matches!(doc.node(tools)?.value, Value::Array)
     {
@@ -248,32 +232,30 @@ fn original_protocol_is(doc: &Document, protocol: &str) -> Result<bool> {
 }
 
 pub(super) fn members(doc: &Document, parent: usize, first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<()> {
-    let x = doc.required(doc.root(), "x_ck")?;
+    let replay = doc.member(doc.required(doc.root(), "x_ck")?, "replay")?;
     for entry in doc.origins(parent)? {
-        for (key, value) in [("cache_control", "value"), ("replay", "signature")] {
-            if doc.member(x, key)? != doc.node(entry)?.parent {
-                continue;
-            }
-            let Some(value) = doc.member(entry, value)? else {
-                continue;
-            };
-            let pointer = doc.required(entry, "pointer")?;
-            let name = leaf(doc.chars(pointer)?)?;
-            let mut exists = false;
-            for child in doc.children(parent)? {
-                exists |= name.matches(doc, doc.node(child)?.name.ok_or(Error::Schema)?)?;
-            }
-            if exists {
-                continue;
-            }
-            if !*first {
-                e.bytes(b",")?;
-            }
-            *first = false;
-            write_segment(name, e)?;
-            e.bytes(b":")?;
-            write(doc, value, e)?;
+        if replay != doc.node(entry)?.parent {
+            continue;
         }
+        let Some(value) = doc.member(entry, "signature")? else {
+            continue;
+        };
+        let pointer = doc.required(entry, "pointer")?;
+        let name = leaf(doc.chars(pointer)?)?;
+        let mut exists = false;
+        for child in doc.children(parent)? {
+            exists |= name.matches(doc, doc.node(child)?.name.ok_or(Error::Schema)?)?;
+        }
+        if exists {
+            continue;
+        }
+        if !*first {
+            e.bytes(b",")?;
+        }
+        *first = false;
+        write_segment(name, e)?;
+        e.bytes(b":")?;
+        write(doc, value, e)?;
     }
     Ok(())
 }
@@ -308,7 +290,10 @@ pub(super) fn capture_cache(doc: &mut Document, owner: &mut Writer, value: usize
     if !matches!(doc.node(value)?.value, Value::Object | Value::Null) {
         return Err(Error::Schema);
     }
-    entry(doc, owner, value, "cache_control", "value")
+    // `cache_control` is Anthropic's member: it goes to the Anthropic isolated map, which only
+    // Anthropic request egress reads (owner ruling Q3, 2026-11-16).
+    let list = isolated_list(doc, "anthropic", "cache_control")?;
+    entry(doc, owner, value, list, "value")
 }
 
 fn attached(doc: &Document, mut node: usize) -> Result<bool> {

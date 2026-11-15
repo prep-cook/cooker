@@ -295,11 +295,6 @@ fn extension(doc: &Document, x: usize) -> Result<()> {
             super::string(doc, doc.required(entry, "signature")?)?;
         }
     }
-    if let Some(cache) = doc.member(x, "cache_control")?
-        && doc.node(cache)?.first.is_some()
-    {
-        return Err(Error::Unsupported);
-    }
     if let Some(native) = doc.member(x, "tools")?
         && doc.node(native)?.first.is_some()
         && !super::is(doc, x, "original_protocol", "gemini")?

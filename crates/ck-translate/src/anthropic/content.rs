@@ -311,8 +311,7 @@ pub(super) fn cache(owner: &mut Writer, doc: &mut Document, parent: usize) -> Re
     let Some(cache) = doc.remove(parent, "cache_control")? else {
         return Ok(());
     };
-    let x = doc.required(doc.root(), "x_ck")?;
-    let list = doc.required(x, "cache_control")?;
+    let list = crate::codec::provenance::isolated_list(doc, "anthropic", "cache_control")?;
     super::request::preserve(owner, doc, list, parent, cache, None)
 }
 pub(super) fn register_media(

@@ -3,6 +3,7 @@ use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
     encode::Encoder,
+    provenance,
 };
 #[path = "request_replay.rs"]
 mod replay;
@@ -434,7 +435,8 @@ fn part_value(view: RequestView<'_>, part: usize, at: At, block_index: u64, e: &
     originals(doc, part, e)?;
     e.bytes(b"}")
 }
-/// Writes an unknown block with the cache directive normalization moved to x_ck.cache_control.
+/// Writes an unknown block with the cache directive normalization moved to the Anthropic
+/// isolated map.
 fn opaque_part(doc: &Document, part: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     let value = doc.required(part, "value")?;
     if !matches!(doc.node(value)?.value, Value::Object) || doc.node(value)?.first.is_none() {
@@ -498,36 +500,50 @@ fn shape(doc: &Document, parent: usize, expected: &str) -> Result<bool> {
     }
     Ok(false)
 }
+/// Writes the members bound to `parent` that only Anthropic reads: Anthropic-source original
+/// fields and the Anthropic isolated map. Another protocol's original fields never reach an
+/// Anthropic upstream (owner ruling Q3, 2026-11-16).
 fn originals(doc: &Document, parent: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     let x = doc.required(doc.root(), "x_ck")?;
-    for field in ["original", "cache_control"] {
-        if let Some(original) = doc.member(x, field)? {
-            // Provenance bound to this node, not the whole list.
-            for entry in doc.origins(parent)? {
-                if doc.node(entry)?.parent != Some(original) || doc.origin(entry)? != Some((parent, None)) {
-                    continue;
+    // Provenance bound to this node, not the whole list.
+    let bound = |list: Option<usize>, entry: usize| -> Result<bool> {
+        Ok(list.is_some() && doc.node(entry)?.parent == list && doc.origin(entry)? == Some((parent, None)))
+    };
+    let original = doc.member(x, "original")?;
+    for entry in doc.origins(parent)? {
+        if !bound(original, entry)? || !super::is(doc, entry, "protocol", "anthropic")? {
+            continue;
+        }
+        let pointer = doc.required(entry, "pointer")?;
+        let mut chars = doc.chars(pointer)?;
+        if chars.next_scalar()? != Some('/') {
+            return Err(Error::Schema);
+        }
+        e.bytes(b",\"")?;
+        while let Some(c) = chars.next_scalar()? {
+            let c = if c == '~' {
+                match chars.next_scalar()? {
+                    Some('0') => '~',
+                    Some('1') => '/',
+                    _ => return Err(Error::Schema),
                 }
-                let pointer = doc.required(entry, "pointer")?;
-                let mut chars = doc.chars(pointer)?;
-                if chars.next_scalar()? != Some('/') {
-                    return Err(Error::Schema);
-                }
-                e.bytes(b",\"")?;
-                while let Some(c) = chars.next_scalar()? {
-                    let c = if c == '~' {
-                        match chars.next_scalar()? {
-                            Some('0') => '~',
-                            Some('1') => '/',
-                            _ => return Err(Error::Schema),
-                        }
-                    } else {
-                        c
-                    };
-                    e.escaped(c.encode_utf8(&mut [0; 4]))?;
-                }
-                e.bytes(b"\":")?;
-                doc.write(doc.required(entry, "value")?, e)?;
-            }
+            } else {
+                c
+            };
+            e.escaped(c.encode_utf8(&mut [0; 4]))?;
+        }
+        e.bytes(b"\":")?;
+        doc.write(doc.required(entry, "value")?, e)?;
+    }
+    let cache = provenance::isolated(doc, "anthropic", "cache_control")?;
+    for entry in doc.origins(parent)? {
+        // Chat ingress records an absolute pointer; the member name is fixed.
+        // A normalized mutation that deleted the value wins over the recorded directive.
+        if bound(cache, entry)?
+            && let Some(value) = doc.member(entry, "value")?
+        {
+            e.bytes(b",\"cache_control\":")?;
+            doc.write(value, e)?;
         }
     }
     Ok(())

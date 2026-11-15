@@ -303,7 +303,6 @@ fn envelope(owner: &mut Writer, doc: &mut Document, operation: Operation) -> Res
     )?;
     let original = doc.set(x, "original", Value::Array)?;
     doc.set(x, "replay", Value::Array)?;
-    doc.set(x, "cache_control", Value::Array)?;
     doc.set(x, "anthropic_order", Value::Array)?;
     if let Some(node) = collision {
         preserve(owner, doc, original, root, node, None)?;
