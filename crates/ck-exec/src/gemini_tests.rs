@@ -132,14 +132,15 @@ pub(crate) fn check_refused_capture(name: &str, s: &Value, events: &mut std::col
     else {
         return;
     };
+    // The error names the URL redacted; the request capture holds it as sent.
     let url = message.split('"').nth(1).unwrap();
     assert!(
-        matches!(events.pop_front(), Some(Captured::Request { url: u, .. }) if u == url),
+        matches!(events.pop_front(), Some(Captured::Request { url: u, .. }) if ck_wire::redact::url(&u) == url),
         "{name}: refused request capture"
     );
     assert_eq!(
         events.pop_front(),
-        Some(Captured::Error(crate::xai_url::redacted_go_error(message))),
+        Some(Captured::Error(message.to_owned())),
         "{name}: refused error capture"
     );
 }
@@ -648,7 +649,7 @@ async fn go_reference_scenarios() {
         let want_error = s["error"].as_object().map(|e| {
             (
                 e["status"].as_u64().unwrap() as u16,
-                crate::xai_url::redacted_go_error(e["message"].as_str().unwrap()),
+                e["message"].as_str().unwrap().to_owned(),
             )
         });
         // Go's status 0 is an error without a status code (a scanner error); Rust errors

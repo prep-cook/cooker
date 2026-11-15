@@ -42,3 +42,5 @@ OpenAI chat output v8.0.35 changed (thoughts tokens in `completion_tokens`, ab15
 no `"tool_calls": null` in stream deltas, dfe0a0ef): `go_reference_scenarios` skips
 every base scenario the v8.0.35 file names, and `go_v8_0_35_scenarios` replays it. Its
 `requestId` is random; the replay normalizes it.
+
+URL redaction (owner ruling Q18): error messages that name a URL hold cooker's redacted form, not Go's text. After re-recording, rewrite each URL in a `Post "…"`, `parse "…"` or `must use https: "…"` message as `ck_wire::redact::url` renders it.

@@ -172,7 +172,7 @@ fn endpoint_validation_matches_go_net_url() {
         let want = if case[1].as_bool().unwrap() {
             Ok(case[2].as_str().unwrap().to_owned())
         } else {
-            Err(crate::xai_url::redacted_go_error(case[2].as_str().unwrap()))
+            Err(case[2].as_str().unwrap().to_owned())
         };
         assert_eq!(got, want, "ValidateOAuthEndpoint({raw:?})");
     }

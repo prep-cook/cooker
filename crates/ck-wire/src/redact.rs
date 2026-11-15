@@ -1,6 +1,7 @@
 //! URLs in error and log text. A configured URL can carry credentials in its userinfo
-//! (`https://user:key@host`) or query (`?api_key=`), so every error, capture and
-//! management response that names a URL shows only its scheme, host, port and path.
+//! (`https://user:key@host`), its query (`?key=`) or its fragment, so every error,
+//! capture and request log that names a URL shows only its scheme, host, port and path,
+//! with every query value and a fragment masked (owner ruling Q18, 2026-11-15).
 
 use std::borrow::Cow;
 
@@ -10,11 +11,13 @@ pub const MASK: &str = "***";
 /// What a URL prints as when it cannot be split into those parts safely.
 pub const UNPRINTABLE: &str = "<redacted url>";
 
-/// `raw` for error and log text: the userinfo dropped, and every query value and the
-/// fragment masked. [`UNPRINTABLE`] replaces a URL with control characters, one whose
-/// authority is not a host and numeric port while the URL holds an '@', and one without
-/// a `scheme://` or `//` authority that holds an '@' before its query (Go reads
-/// `user:key@host` as scheme `user`).
+/// `raw` for error and log text: the userinfo dropped, and every query value and a
+/// non-empty fragment masked. A path-absolute reference (`/v1?key=`) keeps its path.
+/// [`UNPRINTABLE`] replaces anything else that is not a `scheme://` or `//` URL with a
+/// host and numeric port: control characters, a bare key or host, an opaque URL
+/// (`https:key`), a malformed authority, and an '@' after the authority but before the
+/// path, where a password holding an unescaped '?' or '#' would leave its start as the
+/// host.
 pub fn url(raw: &str) -> String {
     render(raw).unwrap_or_else(|| UNPRINTABLE.to_owned())
 }
@@ -45,6 +48,63 @@ pub fn urls_in(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// A raw query (without its `?`) with every value masked: `name=value` prints as
+/// `name=***`, and an entry with no value (`token`, `token=`) prints as `***`, since a
+/// bare entry can itself be the key. Empty entries stay empty.
+pub fn query(raw: &str) -> String {
+    raw.split('&')
+        .map(|part| match part.split_once('=') {
+            Some((name, value)) if !value.is_empty() => format!("{name}={MASK}"),
+            _ if part.is_empty() => String::new(),
+            _ => MASK.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// The logged copy of header `name` (lowercase) when its value is or holds a URL:
+/// `Location`, `Content-Location`, `Referer`, `Origin` and the rewrite headers as
+/// [`url`] renders them, each `<target>` of a `Link`, and the `url=` of a `Refresh`.
+/// `None` for every other header. A value that is not UTF-8 prints as [`UNPRINTABLE`].
+pub fn url_header(name: &str, value: &[u8]) -> Option<String> {
+    let render: fn(&str) -> String = match name {
+        "location" | "content-location" | "referer" | "origin" | "x-original-url" | "x-rewrite-url"
+        | "x-forwarded-uri" => url,
+        "link" => link,
+        "refresh" => refresh,
+        _ => return None,
+    };
+    Some(std::str::from_utf8(value).map_or_else(|_| UNPRINTABLE.to_owned(), render))
+}
+
+fn link(value: &str) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(open) = rest.find('<') {
+        let Some(len) = rest[open..].find('>') else {
+            out.push_str(&urls_in(&rest[..open]));
+            out.push_str(UNPRINTABLE);
+            return out;
+        };
+        out.push_str(&urls_in(&rest[..=open]));
+        out.push_str(&url(&rest[open + 1..open + len]));
+        out.push('>');
+        rest = &rest[open + len + 1..];
+    }
+    out.push_str(&urls_in(rest));
+    out
+}
+
+fn refresh(value: &str) -> String {
+    match value.to_ascii_lowercase().find("url=") {
+        Some(i) => {
+            let target = value[i + 4..].trim_matches(|c| matches!(c, ' ' | '"' | '\''));
+            format!("{}{}", &value[..i + 4], url(target))
+        }
+        None => value.to_owned(),
+    }
+}
+
 fn render(raw: &str) -> Option<String> {
     if raw.bytes().any(|b| b < b' ' || b == 0x7f) {
         return None;
@@ -52,52 +112,36 @@ fn render(raw: &str) -> Option<String> {
     // Leading spaces print as written: Go's errors quote such a URL unchanged.
     let body = raw.trim_start_matches(' ');
     let lead = &raw[..raw.len() - body.len()];
+    if body.starts_with('/') && !body.starts_with("//") {
+        let (path, tail) = body.split_at(body.find(['?', '#']).unwrap_or(body.len()));
+        return Some([lead, path, &masked_tail(tail)].concat());
+    }
     let (prefix, rest) = match body.find("://") {
         Some(i) if is_scheme(&body[..i]) => body.split_at(i + 3),
         _ if body.starts_with("//") => body.split_at(2),
-        // No authority (`relay.example/v1`, `https:relay.example`): nothing to drop
-        // unless an '@' stands where Go reads an opaque `user:key@host`.
-        _ => {
-            let head = &body[..body.find(['?', '#']).unwrap_or(body.len())];
-            return (!head.contains('@')).then(|| [lead, head, &masked_tail(&body[head.len()..])].concat());
-        }
+        _ => return None,
     };
-    // The userinfo ends at the last '@' before the path. The search runs past '?' and
-    // '#': a password holding them unescaped is still dropped, and dropping too much is
-    // safer than printing a secret.
-    let path_start = rest.find('/').unwrap_or(rest.len());
-    let rest = rest[..path_start].rfind('@').map_or(rest, |at| &rest[at + 1..]);
+    // The authority ends at the first '/', '?' or '#', as Go and WHATWG read it; query
+    // and fragment bytes never become the host.
     let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
-    // Without an '@' nothing can be userinfo, so an invalid port prints as written
-    // (`https://auth.x.ai:80:90`); with one, `user:key/x@host` leaves `user:key` here.
-    if raw.contains('@') && !valid_authority(authority) {
+    if tail[..tail.find('/').unwrap_or(tail.len())].contains('@') {
+        return None;
+    }
+    let host = authority.rfind('@').map_or(authority, |at| &authority[at + 1..]);
+    if !valid_authority(host) {
         return None;
     }
     let (path, tail) = tail.split_at(tail.find(['?', '#']).unwrap_or(tail.len()));
-    Some([lead, prefix, authority, path, &masked_tail(tail)].concat())
+    Some([lead, prefix, host, path, &masked_tail(tail)].concat())
 }
 
-/// A `?query#fragment` tail with every query value and the fragment masked.
+/// A `?query#fragment` tail with every query value and a non-empty fragment masked.
 fn masked_tail(tail: &str) -> String {
     let (tail, fragment) = tail.split_once('#').map_or((tail, None), |(t, f)| (t, Some(f)));
     let mut out = String::new();
-    if let Some(query) = tail.strip_prefix('?') {
+    if let Some(raw) = tail.strip_prefix('?') {
         out.push('?');
-        for (i, part) in query.split('&').enumerate() {
-            if i > 0 {
-                out.push('&');
-            }
-            match part.split_once('=') {
-                Some((name, _)) => {
-                    out.push_str(name);
-                    out.push('=');
-                    out.push_str(MASK);
-                }
-                // A bare entry is all value.
-                None if !part.is_empty() => out.push_str(MASK),
-                None => {}
-            }
-        }
+        out.push_str(&query(raw));
     }
     if fragment.is_some_and(|f| !f.is_empty()) {
         out.push('#');
@@ -143,83 +187,5 @@ fn valid_authority(authority: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SECRET: &str = "sk-review-secret";
-
-    #[test]
-    fn credentials_never_print() {
-        for (raw, want) in [
-            (
-                "https://user:sk-review-secret@host.example:8443/v1",
-                "https://host.example:8443/v1",
-            ),
-            ("https://:sk-review-secret@host.example/v1", "https://host.example/v1"),
-            ("https://sk-review-secret@host.example", "https://host.example"),
-            (
-                "http://127.0.0.1:9/v1?api_key=sk-review-secret&alt=sse&sk-review-secret&&x=",
-                "http://127.0.0.1:9/v1?api_key=***&alt=***&***&&x=***",
-            ),
-            (
-                "https://host.example/cb#access_token=sk-review-secret",
-                "https://host.example/cb#***",
-            ),
-            ("https://host.example/p?#", "https://host.example/p?"),
-            ("//host.example/x?k=sk-review-secret", "//host.example/x?k=***"),
-            ("https://[::1]:8443/x", "https://[::1]:8443/x"),
-            // A password holding unescaped '?', '#' or '@' is still userinfo.
-            ("https://u:sk?review#sec@ret@host.example/x", "https://host.example/x"),
-            // Path segments keep their '@' (Vertex model versions).
-            (
-                "https://h.example/models/claude@001:rawPredict",
-                "https://h.example/models/claude@001:rawPredict",
-            ),
-            (" HTTP://127.0.0.1:9/v1 ", " HTTP://127.0.0.1:9/v1 "),
-            // Without an '@' nothing is userinfo: Go's own refusals print as written.
-            (
-                "https:relay.example/x?key=sk-review-secret",
-                "https:relay.example/x?key=***",
-            ),
-            ("relay.example/v1#sk-review-secret", "relay.example/v1#***"),
-            ("https://auth.x.ai:80:90/t", "https://auth.x.ai:80:90/t"),
-        ] {
-            assert_eq!(url(raw), want, "{raw}");
-        }
-    }
-
-    #[test]
-    fn unparseable_urls_print_the_placeholder() {
-        for raw in [
-            "http://user:sk-review-secret@127.0.0.1:bad/?api_key=sk-review-secret",
-            // Go reads host `u`, port `sk-review-secret`: the password before a '/'.
-            "http://u:sk-review-secret/x@host.example/",
-            "https:sk-review-secret@relay.example",
-            "user:sk-review-secret@relay.example/v1",
-            "http://h.example/\nsk-review-secret",
-            "http://u@[::1/sk-review-secret",
-        ] {
-            assert_eq!(url(raw), UNPRINTABLE, "{raw:?}");
-        }
-    }
-
-    #[test]
-    fn urls_inside_text_are_rendered_in_place() {
-        let text = format!(
-            r#"Post "http://u:{SECRET}@127.0.0.1:1/v1?key={SECRET}": EOF; retry ftp://{SECRET}@h/ see ://{SECRET}@h"#
-        );
-        let got = urls_in(&text);
-        assert_eq!(
-            got,
-            r#"Post "http://127.0.0.1:1/v1?key=***": EOF; retry ftp://h/ see <redacted url>"#
-        );
-        assert!(!got.contains(SECRET));
-        assert!(matches!(urls_in("no urls here"), Cow::Borrowed(_)));
-        // The token runs past ')' and ':' so no part of the query value survives.
-        let wreq = format!("error sending request for uri (http://h/?api_key={SECRET}/x): client error");
-        assert_eq!(
-            urls_in(&wreq),
-            "error sending request for uri (http://h/?api_key=*** client error"
-        );
-    }
-}
+#[path = "redact_tests.rs"]
+mod tests;

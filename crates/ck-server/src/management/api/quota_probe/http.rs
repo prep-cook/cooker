@@ -30,9 +30,15 @@ pub(super) fn go_preflight(url: &str, parsed: &GoUrl, headers: &Header) -> Resul
 
 /// The `*url.Error` text for a request Go's client refused: `Get "url": cause`. The
 /// URL is redacted ([`ck_wire::redact::url`]) where Go masks only a password: a probe
-/// URL carries the credential's token after `$TOKEN$` substitution.
+/// URL carries the credential's token after `$TOKEN$` substitution. A URL in the cause
+/// (wreq's `for uri (...)`) is redacted too.
 pub(super) fn go_url_error_text(method: &str, url: &str, cause: &str) -> String {
-    format!("{} {}: {cause}", url_error_op(method), quote(ck_wire::redact::url(url)))
+    format!(
+        "{} {}: {}",
+        url_error_op(method),
+        quote(ck_wire::redact::url(url)),
+        ck_wire::redact::urls_in(cause)
+    )
 }
 
 /// The error Go's response body reader reports for `err`.
@@ -162,5 +168,12 @@ mod tests {
             go_url_error_text("", "http://user@h/x", "boom"),
             r#"Get "http://h/x": boom"#
         );
+        // A wreq error with no source prints its URI in the cause.
+        let got = go_url_error_text(
+            "GET",
+            "http://127.0.0.1:1/q?t=sk-review-secret",
+            "error sending request for uri (http://127.0.0.1:1/q?t=sk-review-secret)",
+        );
+        assert!(!got.contains("sk-review-secret"), "{got}");
     }
 }

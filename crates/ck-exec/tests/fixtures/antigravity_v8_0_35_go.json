@@ -214,7 +214,7 @@
       },
       "error": {
         "status": 0,
-        "message": "Post \"https:relay.example/v1internal:streamGenerateContent?alt=sse\": http: no Host in request URL"
+        "message": "Post \"<redacted url>\": http: no Host in request URL"
       },
       "usage": {
         "input_tokens": 0,
@@ -225,7 +225,7 @@
         "response_model": "",
         "reasoning_effort": "",
         "failed": true,
-        "fail_body": "Post \"https:relay.example/v1internal:streamGenerateContent?alt=sse\": http: no Host in request URL"
+        "fail_body": "Post \"<redacted url>\": http: no Host in request URL"
       }
     },
     {
@@ -257,7 +257,7 @@
       },
       "error": {
         "status": 0,
-        "message": "Post \"relay.example/v1internal:countTokens\": unsupported protocol scheme \"\""
+        "message": "Post \"<redacted url>\": unsupported protocol scheme \"\""
       }
     },
     {
