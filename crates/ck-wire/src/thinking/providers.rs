@@ -118,6 +118,13 @@ fn gemini_level(body: Vec<u8>, config: &Config, prefix: &str) -> Vec<u8> {
     }
     let p = |k: &str| format!("{prefix}.{k}");
     let thoughts = include_thoughts(&body, prefix);
+    // Levels are canonical lower case; a Gemini client keeps the spelling it sent.
+    let sent = json::get(&body, &p("thinkingLevel")).str().into_owned();
+    let level = if sent.trim().go_eq_fold(&config.level) {
+        sent.trim()
+    } else {
+        &config.level
+    };
     let mut result = delete_all(
         body,
         &[
@@ -132,7 +139,7 @@ fn gemini_level(body: Vec<u8>, config: &Config, prefix: &str) -> Vec<u8> {
         return without(result, prefix);
     }
     if !config.level.is_empty() || config.mode == Mode::Level {
-        result = with_str(result, &p("thinkingLevel"), &config.level);
+        result = with_str(result, &p("thinkingLevel"), level);
     }
     with_include_thoughts(result, thoughts, prefix)
 }

@@ -477,6 +477,119 @@ fn reasoning_levels_snap_to_model_support() {
 }
 
 #[test]
+fn gemini_thinking_level_case_follows_the_target_provider() {
+    let gemini_body =
+        |level: &str| format!(r#"{{"generationConfig":{{"thinkingConfig":{{"thinkingLevel":"{level}"}}}}}}"#);
+    let levels = |kind: &str, levels: &[&str]| ModelCaps {
+        id: "m".into(),
+        kind: kind.into(),
+        thinking: Some(ThinkingSupport {
+            levels: levels.iter().map(|level| (*level).into()).collect(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    // (source level, target, target body, model levels, output path, expected spelling)
+    for (level, to, target_body, supported, path, expected) in [
+        (
+            "HIGH",
+            "openai",
+            r#"{"model":"m"}"#,
+            &["low", "medium", "high"][..],
+            "/reasoning_effort",
+            "high",
+        ),
+        (
+            "High",
+            "openai",
+            r#"{"model":"m"}"#,
+            &["low", "medium", "high"][..],
+            "/reasoning_effort",
+            "high",
+        ),
+        (
+            "HIGH",
+            "claude",
+            r#"{"model":"m"}"#,
+            &["low", "medium", "high"][..],
+            "/output_config/effort",
+            "high",
+        ),
+        (
+            "HIGH",
+            "kimi",
+            r#"{"model":"m"}"#,
+            &["low", "medium", "high"][..],
+            "/thinking/effort",
+            "high",
+        ),
+        (
+            "MINIMAL",
+            "openai",
+            r#"{"model":"m"}"#,
+            &["low", "high"][..],
+            "/reasoning_effort",
+            "low",
+        ),
+        (
+            "HIGH",
+            "gemini",
+            r#"{"generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}}"#,
+            &["low", "high"][..],
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "HIGH",
+        ),
+        (
+            "high",
+            "gemini",
+            r#"{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}"#,
+            &["low", "high"][..],
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "high",
+        ),
+    ] {
+        let info = levels(to, supported);
+        let source = gemini_body(level);
+        let request = RequestThinking {
+            payload: Some(source.as_bytes()),
+            original: Some(source.as_bytes()),
+            model: "m",
+            from: "gemini",
+            to,
+            provider: to,
+            resolved: Some(Some(&info)),
+            has_request_transformer: true,
+            updates_changed: false,
+        };
+        let out = apply_request_thinking(&request, target_body.as_bytes().to_vec()).unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            out.pointer(path).and_then(Value::as_str),
+            Some(expected),
+            "{level} -> {to}: {out}"
+        );
+    }
+    // An unknown level is still refused, whatever its case.
+    for level in ["ULTRA", "ultra"] {
+        let info = levels("openai", &["low", "high"]);
+        let source = gemini_body(level);
+        let request = RequestThinking {
+            payload: Some(source.as_bytes()),
+            original: Some(source.as_bytes()),
+            model: "m",
+            from: "gemini",
+            to: "openai",
+            provider: "openai",
+            resolved: Some(Some(&info)),
+            has_request_transformer: true,
+            updates_changed: false,
+        };
+        let err = apply_request_thinking(&request, br#"{"model":"m"}"#.to_vec()).unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::UnknownLevel), "{level}");
+    }
+}
+
+#[test]
 fn suffix_and_conversion_edges() {
     assert_eq!(parse_suffix("a(b)(c)").model_name, "a(b)");
     assert!(!parse_suffix("a(b").has_suffix);
