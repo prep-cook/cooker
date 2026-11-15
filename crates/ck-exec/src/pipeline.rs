@@ -6,20 +6,24 @@
 //! a slow or disconnected client never slows or stops upstream reads (§6.6). It schedules
 //! `flush` at the ingress `flush_deadline`.
 //!
-//! Terminal records: a complete upstream publishes `done` and `Writer::finish(Done)`; an
-//! upstream or decode failure publishes `error`; `Writer::cancelled` resolving (cancel,
-//! shutdown, expiry, eviction) stops reading. A panic drops the writer, which publishes
-//! `stream.producer_lost`, and so does a gateway defect. Nothing else ends a producer: cancel
-//! goes through the allocation handle in [`Started::stream`], never through task abort.
+//! The producer reads back the records the ingress publishes. A `done` record ends the stream
+//! with `Writer::finish(Done)`. An `error` record, from a decode failure or the upstream's own
+//! error event, ends it with `UpstreamError` and fails the attempt with the record's status
+//! and scope. A body error before `done` ends it with `UpstreamError` and the body error's
+//! scope. `Writer::cancelled` resolving (cancel, shutdown, expiry, eviction) stops reading. A
+//! panic drops the writer, which publishes `stream.producer_lost`, and a gateway defect ends
+//! the stream the same way. Nothing else ends a producer: cancel goes through the allocation
+//! handle in [`Started::stream`], never through task abort.
 //!
 //! The functions here are generic over one executor; the selector in `lib.rs` calls them
 //! with the provider's implementation.
 
 use std::pin::pin;
+use std::task::Poll;
 use std::time::Duration;
 
 use ck_core::exec::{ExecError, FailureScope};
-use ck_stream::{Terminal, Writer};
+use ck_stream::{Lease, Read, Reader, Terminal, Writer};
 use ck_translate::codec::event::{Emitter, Identity, Kind, Scope};
 use ck_translate::codec::{
     self, Capability, Operation, RequestFence, RequestIngress, RequestView, ResponseIngress, ValidatedRequest,
@@ -28,7 +32,7 @@ use futures_util::StreamExt;
 use http::HeaderMap;
 use tokio::task::JoinHandle;
 
-use crate::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
+use crate::types::{Attempt, Body, Counted, Execute, Request, Streams};
 
 /// The producer task. Its output is the attempt's routing outcome: `Err` carries the
 /// failure scope of an upstream that failed after answering, for the scheduler and
@@ -82,6 +86,17 @@ pub async fn start<E: Execute>(
     upload: &mut Writer,
     mut response: Writer,
 ) -> Result<Started, ExecError> {
+    // Attached before the upstream request, so a refusal costs no upstream call.
+    let published = match attempt.store.reader(response.id(), 0) {
+        Ok(reader) => Published {
+            reader,
+            last: Last::Other,
+        },
+        Err(error) => {
+            response.finish(Terminal::Gone);
+            return Err(stored(&error));
+        }
+    };
     let streams = Streams {
         request: upload,
         response: &mut response,
@@ -96,7 +111,12 @@ pub async fn start<E: Execute>(
         },
     };
     match upstream {
-        Ok(upstream) => Ok(spawn(upstream, response)),
+        Ok(upstream) => Ok(Started {
+            status: upstream.status,
+            headers: upstream.headers,
+            stream: response.allocator(),
+            producer: tokio::spawn(produce(upstream.body, upstream.ingress, response, published)),
+        }),
         Err(error) => {
             response.finish(Terminal::Gone);
             Err(error)
@@ -115,41 +135,43 @@ fn local_count(attempt: &Attempt<'_>, writer: Writer, input_tokens: u64) -> Star
     }
 }
 
-fn spawn<I: ResponseIngress + Send + 'static>(upstream: Upstream<I>, writer: Writer) -> Started {
-    Started {
-        status: upstream.status,
-        headers: upstream.headers,
-        stream: writer.allocator(),
-        producer: tokio::spawn(produce(upstream.body, upstream.ingress, writer)),
-    }
-}
-
-/// Feeds `body` into `ingress` until the stream ends. Expired flush deadlines go first, so a
-/// busy upstream cannot postpone them; a stopped stream goes before both.
-async fn produce<I: ResponseIngress>(mut body: Body, mut ingress: I, mut writer: Writer) -> Result<(), ExecError> {
+/// Feeds `body` into `ingress` until the ingress publishes a terminal record or the stream
+/// stops. A due flush deadline is served before any wait, so a ready body cannot postpone
+/// it; a stopped stream goes before the body.
+async fn produce<I: ResponseIngress>(
+    mut body: Body,
+    mut ingress: I,
+    mut writer: Writer,
+    mut published: Published,
+) -> Result<(), ExecError> {
     let mut stopped = pin!(writer.cancelled());
     loop {
-        let flush = ingress
-            .flush_deadline()
-            .map(|deadline| deadline.saturating_duration_since(writer.now()));
-        let step = tokio::select! {
+        let flush = match ingress.flush_deadline() {
+            Some(deadline) if deadline <= writer.now() => {
+                let flushed = ingress.flush(&mut writer);
+                if let Some(outcome) = settle(flushed, false, &mut writer, &mut published).await {
+                    return outcome;
+                }
+                continue;
+            }
+            deadline => deadline.map(|deadline| deadline.saturating_duration_since(writer.now())),
+        };
+        let (step, ended) = tokio::select! {
             biased;
             terminal = &mut stopped => return stopped_outcome(terminal),
-            () = until(flush) => ingress.flush(&mut writer),
+            () = until(flush) => (ingress.flush(&mut writer), false),
             chunk = body.next() => match chunk {
-                Some(Ok(bytes)) => ingress.advance(&mut writer, &bytes),
-                Some(Err(error)) => return interrupted(ingress, writer, error).await,
-                None => match ingress.finish(&mut writer) {
-                    Ok(()) => {
-                        writer.finish(Terminal::Done);
-                        return Ok(());
-                    }
-                    Err(error) => Err(error),
-                },
+                Some(Ok(bytes)) => (ingress.advance(&mut writer, &bytes), false),
+                // Settling after every call returns at `done`, so the response is incomplete.
+                Some(Err(error)) => {
+                    writer.finish(Terminal::UpstreamError);
+                    return Err(error);
+                }
+                None => (ingress.finish(&mut writer), true),
             },
         };
-        if let Err(error) = step {
-            return refused(writer, error).await;
+        if let Some(outcome) = settle(step, ended, &mut writer, &mut published).await {
+            return outcome;
         }
     }
 }
@@ -162,76 +184,117 @@ async fn until(delay: Option<Duration>) {
     }
 }
 
-/// The upstream body failed: the ingress closes on what it has, so a cut stream publishes
-/// `error`; the attempt fails with the body's own error and scope.
-async fn interrupted<I: ResponseIngress>(
-    mut ingress: I,
-    mut writer: Writer,
-    error: ExecError,
-) -> Result<(), ExecError> {
-    match ingress.finish(&mut writer) {
-        Ok(()) => completed(writer),
-        Err(refusal) if decoding(&refusal) => {
-            writer.finish(Terminal::UpstreamError);
-            Err(error)
-        }
-        Err(refusal) => refused(writer, refusal).await,
-    }
-}
-
-/// The ingress refused input, a flush or the end of input.
+/// Decides from one ingress call and the records it published whether the producer ends.
 ///
-/// - Decode failures: the ingress published `error` (codec contract); the stream ends with
-///   `UpstreamError`.
-/// - `Closed`: the producer stops at the first refusal, so a closed ingress closed itself at
-///   its completion boundary and published `done`; the upstream sent more after it.
-/// - Storage failures follow contract §9; defects end as producer lost (§7).
-async fn refused(mut writer: Writer, error: codec::Error) -> Result<(), ExecError> {
-    match error {
-        _ if decoding(&error) => {
-            writer.finish(Terminal::UpstreamError);
-            Err(invalid())
+/// - `done` published: the response is complete; input refused after it is not part of it.
+/// - `error` published: the upstream failed, with the record's status and scope, whether the
+///   ingress refused the input or accepted a native error event.
+/// - Storage failures follow contract §9.
+/// - A refusal or an ended input without a terminal record is a gateway defect (§7).
+async fn settle(
+    step: codec::Result<()>,
+    ended: bool,
+    writer: &mut Writer,
+    published: &mut Published,
+) -> Option<Result<(), ExecError>> {
+    if let Err(codec::Error::Storage(error)) = step {
+        return Some(storage(writer, error).await);
+    }
+    match published.read() {
+        Last::Done => {
+            if step.is_err() {
+                tracing::warn!("upstream input after the completion boundary ignored");
+            }
+            writer.finish(Terminal::Done);
+            Some(Ok(()))
         }
-        codec::Error::Closed => completed(writer),
-        codec::Error::Storage(error) => storage(writer, error).await,
-        _ => Err(defect(writer)),
+        Last::Error(error) => {
+            writer.finish(Terminal::UpstreamError);
+            Some(Err(error))
+        }
+        Last::Other if step.is_err() || ended => Some(Err(defect(writer))),
+        Last::Other => None,
     }
 }
 
-/// Upstream input the ingress rejected; it published `error` for it.
-fn decoding(error: &codec::Error) -> bool {
-    match error {
-        codec::Error::Json
-        | codec::Error::Truncated
-        | codec::Error::Schema
-        | codec::Error::Utf8
-        | codec::Error::DuplicateKey
-        | codec::Error::Limit
-        | codec::Error::EventTooLarge
-        | codec::Error::Unsupported => true,
-        codec::Error::Closed | codec::Error::Storage(_) | codec::Error::Position | codec::Error::Destination => false,
+/// The ingress's published records, read back from the response stream as they commit, so
+/// the producer learns which terminal record the ingress chose.
+struct Published {
+    reader: Reader,
+    last: Last,
+}
+
+enum Last {
+    Done,
+    Error(ExecError),
+    Other,
+}
+
+impl Published {
+    /// The last record published so far.
+    fn read(&mut self) -> Last {
+        while let Poll::Ready(Some(Read::Record(lease))) = self.reader.try_next() {
+            let kind = lease.record().kind;
+            self.last = if kind == Kind::Done as u32 {
+                Last::Done
+            } else if kind == Kind::Error as u32 {
+                Last::Error(failure(&lease))
+            } else {
+                Last::Other
+            };
+        }
+        std::mem::replace(&mut self.last, Last::Other)
     }
 }
 
-/// The ingress already published `done`: the response is complete, and upstream input or a
-/// body failure after its completion boundary is not part of it.
-fn completed(mut writer: Writer) -> Result<(), ExecError> {
-    tracing::warn!("upstream input after the completion boundary ignored");
-    writer.finish(Terminal::Done);
-    Ok(())
+/// The routing outcome an `error` record states: its status, and its scope mapped to the
+/// scheduler's. An unreadable record is a gateway defect.
+fn failure(lease: &Lease) -> ExecError {
+    #[derive(serde::Deserialize)]
+    struct Failure {
+        status: u16,
+        scope: String,
+        message: String,
+    }
+    let mut record = Vec::with_capacity(lease.record().len() as usize);
+    let visited = lease.visit(|chunk| record.extend_from_slice(chunk));
+    let failure = record
+        .windows(6)
+        .position(|window| window == b"data: ")
+        .and_then(|at| serde_json::from_slice::<Failure>(record[at + 6..].trim_ascii_end()).ok());
+    match (visited, failure) {
+        (Ok(()), Some(failure)) => {
+            let scope = match failure.scope.as_str() {
+                "upstream" => crate::upstream::scope_for(failure.status),
+                _ => FailureScope::Request,
+            };
+            ExecError::local(failure.status, scope, failure.message)
+        }
+        _ => defective(),
+    }
 }
 
 /// Contract §9 storage rows for a failure while the producer runs. ck-stream already ended
 /// the stream on exhaustion, I/O failure and invalidation.
-async fn storage(writer: Writer, error: ck_stream::Error) -> Result<(), ExecError> {
+async fn storage(writer: &mut Writer, error: ck_stream::Error) -> Result<(), ExecError> {
     match error {
-        ck_stream::Error::StorageExhausted | ck_stream::Error::Io(_) => Err(exhausted()),
-        ck_stream::Error::Gone => Err(gone()),
         // The stream already has a terminal; its row applies.
         ck_stream::Error::Closed => stopped_outcome(writer.cancelled().await),
         ck_stream::Error::InvalidPosition | ck_stream::Error::InvalidRecord | ck_stream::Error::IncompleteRecord => {
             Err(defect(writer))
         }
+        error => Err(stored(&error)),
+    }
+}
+
+/// The attempt failure of a storage error.
+fn stored(error: &ck_stream::Error) -> ExecError {
+    match error {
+        ck_stream::Error::StorageExhausted | ck_stream::Error::Io(_) => {
+            ExecError::local(503, FailureScope::Request, "stream.storage_exhausted")
+        }
+        ck_stream::Error::Gone => gone(),
+        _ => defective(),
     }
 }
 
@@ -240,27 +303,20 @@ fn stopped_outcome(terminal: Terminal) -> Result<(), ExecError> {
     match terminal {
         Terminal::Done | Terminal::Cancelled | Terminal::Shutdown => Ok(()),
         Terminal::Gone => Err(gone()),
-        Terminal::StorageExhausted => Err(exhausted()),
-        Terminal::UpstreamError | Terminal::ProducerLost => Err(lost()),
+        Terminal::StorageExhausted => Err(stored(&ck_stream::Error::StorageExhausted)),
+        Terminal::UpstreamError | Terminal::ProducerLost => Err(defective()),
     }
 }
 
 /// A gateway defect after the producer started ends the stream as producer lost (§7).
-fn defect(mut writer: Writer) -> ExecError {
+fn defect(writer: &mut Writer) -> ExecError {
     writer.finish(Terminal::ProducerLost);
-    lost()
+    defective()
 }
 
-fn invalid() -> ExecError {
-    ExecError::local(502, crate::upstream::scope_for(502), "invalid upstream response")
-}
-
-fn lost() -> ExecError {
-    ExecError::local(502, FailureScope::Transport, "stream.producer_lost")
-}
-
-fn exhausted() -> ExecError {
-    ExecError::local(503, FailureScope::Request, "stream.storage_exhausted")
+/// A gateway defect: 500, never failed over, unlike a producer panic's 502.
+fn defective() -> ExecError {
+    ExecError::local(500, FailureScope::Request, "stream.producer_lost")
 }
 
 fn gone() -> ExecError {
@@ -307,7 +363,7 @@ async fn count_locally(
             writer.finish(Terminal::Done);
             Ok(())
         }
-        Err(codec::Error::Storage(error)) => storage(writer, error).await,
-        Err(_) => Err(defect(writer)),
+        Err(codec::Error::Storage(error)) => storage(&mut writer, error).await,
+        Err(_) => Err(defect(&mut writer)),
     }
 }

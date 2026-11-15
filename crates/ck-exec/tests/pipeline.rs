@@ -3,7 +3,7 @@
 //! test feeds over a channel.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,7 @@ use ck_stream::{ManualClock, Read, Store, Terminal, Writer};
 use ck_translate::codec::chat::{request, response};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
 use ck_translate::codec::{self, BodyMode, Capability, Operation, RequestIngress, RequestView, ResponseIngress};
+use ck_translate::responses;
 use futures_util::{StreamExt, stream};
 use http::HeaderMap;
 use tokio::sync::{Notify, mpsc};
@@ -70,14 +71,20 @@ enum Answer {
     Local,
     /// Binds the response ingress to the request stream: a gateway defect.
     Misbound,
+    /// A buffered Chat JSON body.
+    Buffered,
+    /// A streamed Responses body.
+    Responses,
 }
 
-/// The Chat response ingress, with a test-controlled panic and flush deadline.
+/// A response ingress with a test-controlled panic and flush deadline. `early` counts the
+/// input it took while its deadline was set.
 struct Probe {
-    inner: response::Ingress,
+    inner: Box<dyn ResponseIngress + Send>,
     panic: bool,
     deadline: Option<Instant>,
     flushed: Arc<Notify>,
+    early: Arc<AtomicUsize>,
 }
 
 impl ResponseIngress for Probe {
@@ -91,6 +98,9 @@ impl ResponseIngress for Probe {
     }
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> codec::Result<()> {
         assert!(!self.panic, "probe panic");
+        if self.deadline.is_some() {
+            self.early.fetch_add(1, Ordering::AcqRel);
+        }
         self.inner.advance(owner, bytes)
     }
     fn finish(&mut self, owner: &mut Writer) -> codec::Result<()> {
@@ -102,8 +112,10 @@ impl ResponseIngress for Probe {
 struct Stub {
     answer: Answer,
     body: Mutex<Option<mpsc::UnboundedReceiver<Result<Bytes, ExecError>>>>,
-    deadline: AtomicBool,
+    /// Store-clock time from the upstream answer to the probe's flush deadline.
+    deadline: Mutex<Option<Duration>>,
     flushed: Arc<Notify>,
+    early: Arc<AtomicUsize>,
 }
 
 impl Stub {
@@ -112,8 +124,9 @@ impl Stub {
         let stub = Self {
             answer,
             body: Mutex::new(Some(receiver)),
-            deadline: AtomicBool::new(false),
+            deadline: Mutex::new(None),
             flushed: Arc::new(Notify::new()),
+            early: Arc::new(AtomicUsize::new(0)),
         };
         (stub, sender)
     }
@@ -141,15 +154,35 @@ impl Execute for Stub {
         } else {
             &mut *streams.response
         };
-        let inner = response::Ingress::new(
-            owner,
-            attempt.store,
-            attempt.identity,
-            Operation::Generate,
-            BodyMode::Streaming,
-            1024 * 1024,
-        )
-        .unwrap();
+        let (identity, limit) = (attempt.identity, 1024 * 1024);
+        let inner: Box<dyn ResponseIngress + Send> = match self.answer {
+            Answer::Responses => Box::new(
+                responses::response::Ingress::new(owner, identity, Operation::Generate, BodyMode::Streaming, limit)
+                    .unwrap(),
+            ),
+            Answer::Buffered => Box::new(
+                response::Ingress::new(
+                    owner,
+                    attempt.store,
+                    identity,
+                    Operation::Generate,
+                    BodyMode::Buffered,
+                    limit,
+                )
+                .unwrap(),
+            ),
+            _ => Box::new(
+                response::Ingress::new(
+                    owner,
+                    attempt.store,
+                    identity,
+                    Operation::Generate,
+                    BodyMode::Streaming,
+                    limit,
+                )
+                .unwrap(),
+            ),
+        };
         let receiver = self.body.lock().unwrap().take().unwrap();
         let body: Body = stream::unfold(receiver, |mut receiver| async move {
             receiver.recv().await.map(|item| (item, receiver))
@@ -162,8 +195,13 @@ impl Execute for Stub {
             ingress: Probe {
                 inner,
                 panic: self.answer == Answer::Panic,
-                deadline: self.deadline.load(Ordering::Acquire).then(|| streams.response.now()),
+                deadline: self
+                    .deadline
+                    .lock()
+                    .unwrap()
+                    .map(|delay| streams.response.now() + delay),
                 flushed: self.flushed.clone(),
+                early: self.early.clone(),
             },
         })
     }
@@ -312,13 +350,14 @@ async fn finished(started: Started) -> Result<(), ExecError> {
     tokio::time::timeout(WAIT, started.producer).await.unwrap().unwrap()
 }
 
-/// Feeds `chunks` and closes the body; the producer's outcome, records and terminal.
-async fn produce(chunks: &[&[u8]]) -> (Result<(), ExecError>, Vec<String>, Terminal) {
+/// Feeds `items` to an `answer` upstream and closes the body; the producer's outcome, the
+/// records and the terminal.
+async fn feed(answer: Answer, items: Vec<Result<Bytes, ExecError>>) -> (Result<(), ExecError>, Vec<String>, Terminal) {
     let fixture = Fixture::new(4 * 1024 * 1024);
-    let (stub, upstream) = Stub::new(Answer::Stream);
+    let (stub, upstream) = Stub::new(answer);
     let (started, _upload, id) = fixture.launch(&stub, Operation::Generate).await;
-    for chunk in chunks {
-        upstream.send(Ok(Bytes::copy_from_slice(chunk))).unwrap();
+    for item in items {
+        upstream.send(item).unwrap();
     }
     drop(upstream);
     let outcome = finished(started.unwrap()).await;
@@ -326,15 +365,23 @@ async fn produce(chunks: &[&[u8]]) -> (Result<(), ExecError>, Vec<String>, Termi
     (outcome, records, terminal)
 }
 
+fn data(bytes: impl Into<Bytes>) -> Result<Bytes, ExecError> {
+    Ok(bytes.into())
+}
+
+fn cut(status: u16, scope: FailureScope) -> Result<Bytes, ExecError> {
+    Err(ExecError::local(status, scope, "cut"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_one_byte_feed_publishes_what_one_chunk_does() {
     let body = complete();
-    let (whole, expected, terminal) = produce(&[body.as_bytes()]).await;
+    let (whole, expected, terminal) = feed(Answer::Stream, vec![data(body.clone())]).await;
     whole.unwrap();
     assert_eq!(terminal, Terminal::Done);
     assert!(expected.last().unwrap().contains("x_ck.done"));
-    let bytes: Vec<&[u8]> = body.as_bytes().chunks(1).collect();
-    let (split, records, terminal) = produce(&bytes).await;
+    let bytes = body.as_bytes().iter().map(|byte| data(vec![*byte])).collect();
+    let (split, records, terminal) = feed(Answer::Stream, bytes).await;
     split.unwrap();
     assert_eq!(terminal, Terminal::Done);
     assert_eq!(records, expected);
@@ -347,12 +394,8 @@ async fn the_upstream_finishes_while_the_reader_stalls() {
     let (started, _upload, id) = fixture.launch(&stub, Operation::Generate).await;
     // Attached before any upstream byte and never read until the producer ended.
     let stalled = fixture.store.reader(id, 0).unwrap();
-    let mut body = chunk(r#"{"role":"assistant","content":""}"#, "null");
-    for _ in 0..200 {
-        body.push_str(&chunk(r#"{"content":"0123456789"}"#, "null"));
-    }
-    body.push_str(&chunk("{}", r#""stop""#));
-    body.push_str("data: [DONE]\n\n");
+    let deltas = (0..200).map(|_| chunk(r#"{"content":"0123456789"}"#, "null"));
+    let body: String = deltas.chain([complete()]).collect();
     for piece in body.as_bytes().chunks(97) {
         upstream.send(Ok(Bytes::copy_from_slice(piece))).unwrap();
     }
@@ -362,57 +405,6 @@ async fn the_upstream_finishes_while_the_reader_stalls() {
     let (records, terminal) = fixture.records(id).await;
     assert_eq!(terminal, Terminal::Done);
     assert!(records.len() > 200);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn eof_before_the_completion_boundary_publishes_error() {
-    let open = chunk(r#"{"role":"assistant","content":"hel"}"#, "null");
-    let (outcome, records, terminal) = produce(&[open.as_bytes()]).await;
-    let error = outcome.unwrap_err();
-    assert_eq!(error.status, 502);
-    assert_eq!(terminal, Terminal::UpstreamError);
-    assert!(records.last().unwrap().contains("event: x_ck.error"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_body_error_publishes_error_and_keeps_its_scope() {
-    let fixture = Fixture::new(4 * 1024 * 1024);
-    let (stub, upstream) = Stub::new(Answer::Stream);
-    let (started, _upload, id) = fixture.launch(&stub, Operation::Generate).await;
-    let open = chunk(r#"{"role":"assistant","content":"hel"}"#, "null");
-    upstream.send(Ok(Bytes::from(open))).unwrap();
-    upstream
-        .send(Err(ExecError::local(429, FailureScope::Credential, "cut")))
-        .unwrap();
-    let error = finished(started.unwrap()).await.unwrap_err();
-    assert_eq!((error.status, error.scope), (429, FailureScope::Credential));
-    let (records, terminal) = fixture.records(id).await;
-    assert_eq!(terminal, Terminal::UpstreamError);
-    assert!(records.last().unwrap().contains("event: x_ck.error"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_body_error_after_the_completion_boundary_keeps_done() {
-    let fixture = Fixture::new(4 * 1024 * 1024);
-    let (stub, upstream) = Stub::new(Answer::Stream);
-    let (started, _upload, id) = fixture.launch(&stub, Operation::Generate).await;
-    upstream.send(Ok(Bytes::from(complete()))).unwrap();
-    upstream
-        .send(Err(ExecError::local(502, FailureScope::Transport, "reset")))
-        .unwrap();
-    finished(started.unwrap()).await.unwrap();
-    let (records, terminal) = fixture.records(id).await;
-    assert_eq!(terminal, Terminal::Done);
-    assert!(records.last().unwrap().contains("x_ck.done"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn data_after_the_completion_boundary_keeps_done() {
-    let body = format!("{}{}", complete(), chunk(r#"{"content":"late"}"#, "null"));
-    let (outcome, records, terminal) = produce(&[body.as_bytes()]).await;
-    outcome.unwrap();
-    assert_eq!(terminal, Terminal::Done);
-    assert!(records.last().unwrap().contains("x_ck.done"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -451,23 +443,10 @@ async fn a_discarded_stream_fails_the_attempt_as_gone() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_gateway_defect_is_producer_lost() {
-    let fixture = Fixture::new(4 * 1024 * 1024);
-    let (stub, upstream) = Stub::new(Answer::Misbound);
-    let (started, _upload, id) = fixture.launch(&stub, Operation::Generate).await;
-    upstream.send(Ok(Bytes::from(complete()))).unwrap();
-    let error = finished(started.unwrap()).await.unwrap_err();
-    assert_eq!((error.status, error.scope), (502, FailureScope::Transport));
-    let (records, terminal) = fixture.records(id).await;
-    assert!(records.is_empty());
-    assert_eq!(terminal, Terminal::ProducerLost);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flush_deadline_is_served_while_the_upstream_is_idle() {
     let fixture = Fixture::new(4 * 1024 * 1024);
     let (stub, upstream) = Stub::new(Answer::Stream);
-    stub.deadline.store(true, Ordering::Release);
+    *stub.deadline.lock().unwrap() = Some(Duration::from_millis(20));
     let (started, _upload, _) = fixture.launch(&stub, Operation::Generate).await;
     let started = started.unwrap();
     tokio::time::timeout(WAIT, stub.flushed.notified()).await.unwrap();
@@ -519,6 +498,90 @@ async fn the_producer_charges_the_exchange_quota() {
     let error = finished(started.unwrap()).await.unwrap_err();
     assert_eq!((error.status, error.scope), (503, FailureScope::Request));
     assert_eq!(fixture.records(id).await.1, Terminal::StorageExhausted);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_due_flush_goes_before_a_ready_body() {
+    let fixture = Fixture::new(4 * 1024 * 1024);
+    let (stub, upstream) = Stub::new(Answer::Stream);
+    *stub.deadline.lock().unwrap() = Some(Duration::ZERO);
+    for _ in 0..10_000 {
+        upstream.send(Ok(Bytes::from_static(b": keep\n\n"))).unwrap();
+    }
+    upstream.send(Ok(Bytes::from(complete()))).unwrap();
+    drop(upstream);
+    let (started, _upload, _) = fixture.launch(&stub, Operation::Generate).await;
+    finished(started.unwrap()).await.unwrap();
+    assert_eq!(stub.early.load(Ordering::Acquire), 0, "input went before a due flush");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eof_before_the_completion_boundary_publishes_error() {
+    let open = chunk(r#"{"role":"assistant","content":"hel"}"#, "null");
+    let (outcome, records, terminal) = feed(Answer::Stream, vec![data(open)]).await;
+    assert_eq!(outcome.unwrap_err().status, 502);
+    assert_eq!(terminal, Terminal::UpstreamError);
+    assert!(records.last().unwrap().contains("event: x_ck.error"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_error_fails_with_its_own_scope() {
+    let open = chunk(r#"{"role":"assistant","content":"hel"}"#, "null");
+    let items = vec![data(open), cut(429, FailureScope::Credential)];
+    let (outcome, records, terminal) = feed(Answer::Stream, items).await;
+    let error = outcome.unwrap_err();
+    assert_eq!((error.status, error.scope), (429, FailureScope::Credential));
+    assert_eq!(terminal, Terminal::UpstreamError);
+    assert!(records.iter().all(|record| !record.contains("x_ck.done")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_error_after_complete_json_fails() {
+    let json = r#"{"id":"r","object":"chat.completion","model":"m","created":1,"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}"#;
+    let items = vec![data(json), cut(502, FailureScope::Transport)];
+    let (outcome, records, terminal) = feed(Answer::Buffered, items).await;
+    let error = outcome.unwrap_err();
+    assert_eq!((error.status, error.scope), (502, FailureScope::Transport));
+    assert_eq!(terminal, Terminal::UpstreamError);
+    assert!(records.iter().all(|record| !record.contains("x_ck.done")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_error_after_the_completion_boundary_keeps_done() {
+    let items = vec![data(complete()), cut(502, FailureScope::Transport)];
+    let (outcome, records, terminal) = feed(Answer::Stream, items).await;
+    outcome.unwrap();
+    assert_eq!(terminal, Terminal::Done);
+    assert!(records.last().unwrap().contains("x_ck.done"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_after_the_completion_boundary_keeps_done() {
+    let body = format!("{}{}", complete(), chunk(r#"{"content":"late"}"#, "null"));
+    let (outcome, records, terminal) = feed(Answer::Stream, vec![data(body)]).await;
+    outcome.unwrap();
+    assert_eq!(terminal, Terminal::Done);
+    assert!(records.last().unwrap().contains("x_ck.done"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_native_upstream_error_fails_the_attempt() {
+    let event = "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"boom\"}\n\n";
+    let (outcome, records, terminal) = feed(Answer::Responses, vec![data(event)]).await;
+    let error = outcome.unwrap_err();
+    assert_eq!(terminal, Terminal::UpstreamError);
+    let last = records.last().unwrap();
+    assert!(last.contains("event: x_ck.error"));
+    assert!(last.contains(&format!("\"status\":{}", error.status)), "{last}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_defect_is_producer_lost() {
+    let (outcome, records, terminal) = feed(Answer::Misbound, vec![data(complete())]).await;
+    let error = outcome.unwrap_err();
+    assert_eq!((error.status, error.scope), (500, FailureScope::Request));
+    assert!(records.is_empty());
+    assert_eq!(terminal, Terminal::ProducerLost);
 }
 
 /// Grep gate: the pipeline passes upstream chunks on and never collects a body on the heap.

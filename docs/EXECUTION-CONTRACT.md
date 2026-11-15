@@ -88,7 +88,7 @@ Resume looks up the handle, authorizes the caller against `StreamHandle::owner` 
 
 - **Explicit cancel.** `finish(Terminal::Cancelled)` on the response stream's allocator. The producer's `Writer::cancelled` resolves, it stops reading upstream and its writes fail with `Closed`. Shutdown uses `Terminal::Shutdown` the same way.
 - **Discard.** `finish(Terminal::Gone)` on a failed attempt's response writer or allocator invalidates the stream at once and releases its dependency on the request stream. An exchange that ends without commitment discards its request stream the same way.
-- **Producer lost or producer defect.** A dropped producer writer (panic or abort), or a gateway defect after the producer started (`Storage(InvalidPosition, InvalidRecord, IncompleteRecord)`, an ingress bound to another writer), ends the stream with `Terminal::ProducerLost`; the client sees `stream.producer_lost`. Task abort is never a cancel.
+- **Producer lost or producer defect.** A dropped producer writer (panic or abort), or a gateway defect after the producer started (`Storage(InvalidPosition, InvalidRecord, IncompleteRecord)`, an ingress bound to another writer), ends the stream with `Terminal::ProducerLost`; the client sees `stream.producer_lost`. A defect's producer outcome is 500 with scope `Request`, which never fails over; a panic stays 502 with scope `Transport`. Task abort is never a cancel.
 
 ## 8. Usage
 
@@ -109,7 +109,7 @@ Commitment is the first deliverable byte the client's `ResponseEgress` emits. Be
 | `Storage(StorageExhausted)` or `Storage(Io)` in an egress or resume allocation after the producer's terminal | a failure of that one delivery; the stream keeps its terminal | 503 `stream.storage_exhausted`; no failover | that delivery ends its HTTP response with the protocol's error terminal, or with 503 if it has sent nothing yet; other readers and later resumes are unaffected |
 | `Storage(Gone)`: expiry or eviction of a stream the exchange uses | `stream.gone`, 410, scope `resource` | resource error to the client; no failover | attached readers receive `error`; resume answers 410 |
 | `Storage(Closed)` | the stream already has a terminal | follow that terminal's row | follow that terminal's row |
-| `Storage(InvalidPosition, InvalidRecord, IncompleteRecord)` | gateway defect | 500; no failover | delivered as `error`; after the producer started, `stream.producer_lost` (§7) |
+| `Storage(InvalidPosition, InvalidRecord, IncompleteRecord)` | gateway defect | 500, scope `Request`; no failover, also once the producer started | delivered as `error`; after the producer started, `stream.producer_lost` (§7) |
 | Upstream refused or unreachable | `Err(ExecError)` from `Execute` | attempt failure: `ExecError::scope` decides failover and cooldown; the attempt's response stream is discarded (§7) | not reachable: nothing of this attempt was delivered |
 | Upstream body error, invalid upstream data, or EOF before the completion boundary | producer publishes `error` (scope `upstream`) and returns `Err(ExecError)` | attempt failure as above | delivered as `error` in the client's protocol; the scope still updates cooldown |
 | Producer panic or dropped writer | `stream.producer_lost`, 502, scope `upstream` | attempt failure | delivered as `error` |
