@@ -75,8 +75,9 @@ impl Fixture {
         }
     }
 
-    /// `body` through the old route (`ClaudeExecutor::execute`), read to its end.
-    async fn old_route(&self, body: &[u8]) {
+    /// `body` through the old route, read to its end: the selector's old arm
+    /// (`Executors::execute`) when `selector`, else `ClaudeExecutor::execute` itself.
+    async fn old_route(&self, body: &[u8], selector: bool) {
         let value: Value = serde_json::from_slice(body).unwrap();
         let exchange = &self.exchange;
         let req = ExecRequest {
@@ -98,8 +99,13 @@ impl Fixture {
             resolved_model: None,
             usage: UsageSink::default(),
         };
-        let claude = &self.executors.claude;
-        let mut answer = claude.execute(&exchange.credential, req, &exchange.cfg).await.unwrap();
+        let (credential, cfg) = (&exchange.credential, &exchange.cfg);
+        let mut answer = if selector {
+            self.executors.execute(credential, req, cfg).await
+        } else {
+            self.executors.claude.execute(credential, req, cfg).await
+        }
+        .unwrap();
         if let ck_core::exec::ResponseBody::Stream(events) = &mut answer.body {
             while events.next().await.is_some() {}
         }
@@ -246,7 +252,7 @@ async fn anthropic_requests_reach_the_upstream_as_the_old_route_sent_them() {
         let (started, _, _request) = fixture.anthropic(&body, Operation::Generate).await;
         started.unwrap().producer.await.unwrap().unwrap();
 
-        Fixture::new(&old, SONNET).old_route(&body).await;
+        Fixture::new(&old, SONNET).old_route(&body, false).await;
         let ((new_body, new), (old_body, old)) = (sent(&new), sent(&old));
         // The Anthropic egress writes members in its own order; every member and value is the
         // old route's.

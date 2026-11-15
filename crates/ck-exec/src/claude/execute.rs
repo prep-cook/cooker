@@ -4,10 +4,12 @@
 //! The upload is the Anthropic request egress of the attempt's fence. The pipeline in
 //! `claude.rs` prepares it as it prepares a Claude client's body: the cloak, identity, cache
 //! policy, betas and headers are those of the old path. The response reaches
-//! `anthropic::response::Ingress` chunk by chunk, after alias restore when the cloak renamed
-//! tools. A cloaked or replayed buffered answer is the exception: the old path restores and
-//! stores the whole message, so this one does too. Messages has no native compact, so the
+//! `anthropic::response::Ingress` chunk by chunk. Messages has no native compact, so the
 //! capability refuses one.
+//!
+//! Requests the OAuth cloak or the Claude Code identity would shape stay on the old route
+//! ([`ClaudeExecutor::old_route_only`]): the cloak must not change until owner question 13
+//! settles how `Execute` sees the client's own body.
 
 use std::borrow::Cow;
 
@@ -108,6 +110,14 @@ pub(super) fn capability(model: &str, resolved: Option<&ResolvedModel>) -> Anthr
 }
 
 impl ClaudeExecutor {
+    /// Whether `attempt` stays on the old route: see [`Ctx::old_route_only`]. The selector
+    /// answers no destination for it, so the server keeps the old `claude` arm (Q1).
+    pub fn old_route_only(&self, attempt: &Attempt<'_>) -> bool {
+        let cfg = scoped(attempt);
+        let facts = (attempt.model, attempt.resolved_model, None);
+        Ctx::new(self, attempt.credential, facts, &cfg, Delegation::default()).old_route_only()
+    }
+
     async fn messages(
         &self,
         attempt: &Attempt<'_>,
@@ -255,11 +265,10 @@ fn relay(
     let capture = usage.capture().clone();
     let body = body_of(raw.body);
     if !prepared.stream {
-        let body = recorded(body, capture.clone());
-        let body = if prepared.cloaked || scope.is_some() {
-            restored(ctx, prepared, &raw.headers, body, scope, capture)
-        } else {
-            body
+        let body = recorded(body, capture);
+        let body = match scope {
+            Some(scope) => stored(body, scope),
+            None => body,
         };
         return body
             .map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)))
@@ -277,33 +286,28 @@ fn relay(
     }
 }
 
-/// The old path's buffered answer under the cloak or a replay scope: the whole message,
-/// completed, with the cloak's tool aliases restored, stored for replay.
-fn restored(
-    ctx: &Ctx<'_>,
-    prepared: &mut Prepared,
-    headers: &http::HeaderMap,
-    body: Body,
-    scope: Option<replay::Scope>,
-    capture: ck_core::exec::CaptureSink,
-) -> Body {
-    let completion = ctx.completion(prepared);
-    let request_id = header_value(headers, "request-id");
-    let reverse = prepared.reverse.clone();
-    futures_util::stream::once(async move {
-        let data = super::collect(body).await?;
-        let text = super::utf8(&data);
-        completion.complete(super::rawjson::string(&text, "id").trim(), &request_id);
-        let restored = super::alias::restore_response(&text, &reverse).map_err(|m| {
-            let message = format!("restore Claude OAuth tool name from response: {m}");
-            capture.record(CaptureEvent::ResponseError(&message));
-            super::plain_error(message)
-        })?;
-        if let Some(scope) = scope {
-            scope.store_response(restored.as_bytes());
+/// A buffered answer under a replay scope, passed on as read; the scope stores the whole
+/// message once the body ended cleanly, as the old path stores what it collected.
+fn stored(body: Body, scope: replay::Scope) -> Body {
+    let copy = std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+    let seen = copy.clone();
+    let end = futures_util::stream::once(async move {
+        if let Some(message) = copy.lock().ok().and_then(|mut c| c.take()) {
+            scope.store_response(&message);
         }
-        Ok(bytes::Bytes::from(restored))
+        None
+    });
+    body.inspect(move |chunk| {
+        if let Ok(mut held) = seen.lock() {
+            match chunk {
+                Ok(bytes) => held.iter_mut().for_each(|c| c.extend_from_slice(bytes)),
+                Err(_) => *held = None,
+            }
+        }
     })
+    .map(Some)
+    .chain(end)
+    .filter_map(futures_util::future::ready)
     .boxed()
 }
 

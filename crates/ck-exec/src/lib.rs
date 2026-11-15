@@ -173,7 +173,8 @@ pub struct DeviceExecutors {
 impl Executors {
     pub fn destination(&self, attempt: &types::Attempt<'_>) -> Option<&'static str> {
         match attempt.credential.provider.as_str() {
-            "claude" => Some(pipeline::destination(&self.claude, attempt)),
+            // A request the cloak may shape keeps the old route until owner question 13.
+            "claude" if !self.claude.old_route_only(attempt) => Some(pipeline::destination(&self.claude, attempt)),
             gemini_exec::PROVIDER => Some(pipeline::destination(&self.google.gemini, attempt)),
             _ => None,
         }
@@ -187,7 +188,9 @@ impl Executors {
         request: &mut ck_stream::Writer,
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
-            "claude" => pipeline::fence(&self.claude, attempt, ingress, request),
+            "claude" if !self.claude.old_route_only(attempt) => {
+                pipeline::fence(&self.claude, attempt, ingress, request)
+            }
             gemini_exec::PROVIDER => pipeline::fence(&self.google.gemini, attempt, ingress, request),
             _ => Err(ck_translate::codec::Error::Destination),
         }
@@ -200,7 +203,7 @@ impl Executors {
         view: ck_translate::codec::RequestView<'a>,
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
-            "claude" => pipeline::refence(&self.claude, attempt, view),
+            "claude" if !self.claude.old_route_only(attempt) => pipeline::refence(&self.claude, attempt, view),
             gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
             _ => Err(ck_translate::codec::Error::Destination),
         }
@@ -216,7 +219,9 @@ impl Executors {
         mut response: ck_stream::Writer,
     ) -> Result<pipeline::Started, ExecError> {
         match attempt.credential.provider.as_str() {
-            "claude" => pipeline::start(&self.claude, attempt, request, upload, response).await,
+            "claude" if !self.claude.old_route_only(attempt) => {
+                pipeline::start(&self.claude, attempt, request, upload, response).await
+            }
             gemini_exec::PROVIDER => pipeline::start(&self.google.gemini, attempt, request, upload, response).await,
             provider => {
                 response.finish(ck_stream::Terminal::Gone);

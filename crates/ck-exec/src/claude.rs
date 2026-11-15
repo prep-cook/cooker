@@ -1067,8 +1067,6 @@ struct Prepared {
     fast: bool,
     /// The body asks the upstream to stream.
     stream: bool,
-    /// The cloak shaped the request, so a buffered response needs the old path's restore.
-    cloaked: bool,
 }
 
 /// `config.NormalizeClaudeFingerprintProfile`: unknown values are the default ("").
@@ -1473,11 +1471,20 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// Whether the old thinking rewrites run: always on the old path and under the cloak. A
-    /// key request on the contract path sends the client's thinking and effort as written;
-    /// the fence refused what the API would (P8 removes the old path).
-    fn legacy_thinking(&self, cloak: bool) -> bool {
-        cloak || !self.contract
+    /// Whether the old thinking normalizer runs: always on the old path; on the contract path
+    /// only for the operator's model-name thinking suffix, such as `(8192)`. Otherwise the
+    /// client's thinking and effort go upstream as written, and the fence refused what the
+    /// API would (P8 removes the old path).
+    fn legacy_thinking(&self, req: &Input<'_>) -> bool {
+        !self.contract || ck_wire::thinking::parse_suffix(req.model).has_suffix
+    }
+
+    /// Whether the old route keeps this credential: the cloak would shape a request the
+    /// detection does not confirm as Claude Code, or the Claude Code identity applies.
+    /// Confirmation reads the client's own body, which `Execute` does not see (owner question
+    /// 13 removes this split).
+    pub(crate) fn old_route_only(&self) -> bool {
+        self.cli_profile || self.wire_policy(false).0
     }
 
     /// `resolveClaudeWirePolicy`: (cloak, strict, sensitive words, cache user id).
@@ -1576,13 +1583,13 @@ impl<'a> Ctx<'a> {
         };
         let mut body = translated;
         body = set_string_if_different(body, "model", &self.upstream_model);
-        let (cloak, strict, words, cache_user_id) = self.wire_policy(confirmed);
-        if self.legacy_thinking(cloak) {
+        if self.legacy_thinking(req) {
             body = self.apply_thinking(req, body)?;
         }
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
         }
+        let (cloak, strict, words, cache_user_id) = self.wire_policy(confirmed);
         let cch = signing::enabled(&self.api_key, self.cli_profile, self.first_party);
         // v8.0.27 (eb6a768): the caller owns every breakpoint in explicit cache mode.
         let explicit = cloak::explicit_cache_mode(&[&original, &utf8(req.body), &body]);
@@ -1676,13 +1683,13 @@ impl<'a> Ctx<'a> {
             }
         }
         body = self.ensure_max_tokens(body);
-        if self.legacy_thinking(cloak) {
+        // The contract's fence refuses a forced tool with manual thinking instead.
+        if !self.contract {
             body = disable_thinking_if_tool_choice_forced(body);
         }
         body = cloak::reconcile_context_management(body, eligible, caller_owned_cm, injected_cm);
-        // Sampling follows the Claude Code identity the cloak presents; any other request keeps
-        // the client's values, and the API answers an invalid pair itself.
-        if cloaked || !self.contract {
+        // The contract path keeps the client's values; the API answers an invalid pair itself.
+        if !self.contract {
             body = normalize_sampling(body, confirmed);
         }
         // `shouldEnsureCacheControl`.
@@ -1815,7 +1822,6 @@ impl<'a> Ctx<'a> {
             thread,
             fast,
             stream: upstream_stream,
-            cloaked,
         })
     }
 
@@ -1861,13 +1867,13 @@ impl<'a> Ctx<'a> {
         };
         let mut body = utf8(translated).into_owned();
         body = set_string_if_different(body, "model", &self.upstream_model);
-        let (cloak, strict, words, _) = self.wire_policy(confirmed);
-        if self.legacy_thinking(cloak) {
+        if self.legacy_thinking(req) {
             body = self.apply_thinking(req, body)?;
         }
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
         }
+        let (cloak, strict, words, _) = self.wire_policy(confirmed);
         let explicit = cloak::explicit_cache_mode(&[&original, &utf8(req.body), &body]);
         if cloak {
             if !strict && let Some(message) = cloak::invalid_system_block(&body) {
@@ -1934,7 +1940,6 @@ impl<'a> Ctx<'a> {
             thread: None,
             fast: false,
             stream: false,
-            cloaked: false,
         })
     }
 
