@@ -191,7 +191,8 @@ impl Source {
                 self.segments
                     .try_reserve_exact(capacity - self.segments.len())
                     .map_err(|_| Error::Limit)?;
-                self.metadata.resize(self.metadata_bytes())?;
+                let bytes = self.metadata_bytes();
+                super::table::charge(&mut self.metadata, bytes)?;
             }
             self.segments.push(Segment {
                 start: self.len,
