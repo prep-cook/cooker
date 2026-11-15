@@ -1322,6 +1322,9 @@ async fn serve(
     shutdown: impl std::future::Future<Output = ()>,
     listening: Option<tokio::sync::oneshot::Sender<(SocketAddr, bool)>>,
 ) -> anyhow::Result<()> {
+    config_store
+        .ensure_envelope_key()
+        .context("initialize the envelope key ring")?;
     if config.api_keys.is_empty() {
         tracing::warn!("access.api-keys is empty: the proxy API is open to anyone who can reach it");
     }
@@ -2591,6 +2594,71 @@ mod tests {
         let _ = stop.send(());
         server.await.unwrap().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The envelope key is committed before the listener opens: when it cannot be,
+    /// startup fails and nothing listens.
+    #[tokio::test]
+    async fn server_commits_an_envelope_key_before_listening() {
+        let root = credential_test_dir();
+        let db = root.join("service.db");
+        let store = Arc::new(ck_server::testing::config_store(&db).unwrap());
+        store
+            .import_yaml("server:\n  host: 127.0.0.1\n  port: 0\n", "test", "envelope key")
+            .unwrap();
+        let mut config = store.load().unwrap().config;
+        let backend = initialize_credentials(store.clone(), &mut config).unwrap();
+        assert!(store.envelope_keys().signer().is_none());
+        std::fs::rename(&db, root.join("old.db")).unwrap();
+        std::fs::create_dir(&db).unwrap();
+        let (listening, listener) = tokio::sync::oneshot::channel();
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            serve(
+                config.clone(),
+                store.clone(),
+                backend.clone(),
+                "fake-key-password".into(),
+                true,
+                std::future::pending::<()>(),
+                Some(listening),
+            ),
+        )
+        .await
+        .expect("startup must fail instead of serving");
+        assert!(
+            format!("{:#}", failed.unwrap_err()).contains("envelope key ring"),
+            "startup must fail on the key ring"
+        );
+        assert!(listener.await.is_err(), "nothing listens without a signing key");
+        std::fs::remove_dir(&db).unwrap();
+        std::fs::rename(root.join("old.db"), &db).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let (listening, listener) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve(
+            config,
+            store.clone(),
+            backend,
+            "fake-key-password".into(),
+            true,
+            async {
+                let _ = stopped.await;
+            },
+            Some(listening),
+        ));
+        listener.await.unwrap();
+        let kid = store.envelope_keys().signer().map(|signer| signer.kid().to_owned());
+        assert!(kid.is_some(), "a key signs once the server listens");
+        drop(store);
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+        let reopened = ck_server::testing::config_store(&db).unwrap();
+        assert_eq!(
+            reopened.envelope_keys().signer().map(|signer| signer.kid().to_owned()),
+            kid
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Go `TestSIWCManagementRouteAccessControl`: the v8 SIWC bind route answers its

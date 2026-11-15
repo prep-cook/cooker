@@ -4,6 +4,7 @@ use serde_json::json;
 
 mod database;
 mod encoding;
+mod keyring;
 mod operation_resources;
 mod ordered;
 

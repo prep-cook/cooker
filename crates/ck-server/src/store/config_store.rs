@@ -15,6 +15,7 @@ mod commit;
 mod db;
 mod encode;
 mod history;
+mod keyring;
 mod notifications;
 mod published;
 pub mod resources;
@@ -37,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
 
+pub use keyring::{KeyRing, KeyState, Refused, Signer};
 pub use notifications::{ConfigurationChange, ConfigurationSubscription, ConfigurationView};
 pub use published::AlreadyOwned;
 pub use resources::{Fault, Kind, Resource};

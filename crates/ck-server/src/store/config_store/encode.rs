@@ -70,6 +70,9 @@ impl State {
             for (name, value) in &self.metadata {
                 insert.execute(params![name, value])?;
             }
+            for (name, value) in self.envelope_keys.rows() {
+                insert.execute(params![name, value])?;
+            }
         }
         {
             let mut insert = tx.prepare("INSERT INTO credential_cooldown(id,record) VALUES (?1,?2)")?;

@@ -26,6 +26,7 @@ pub(crate) struct State {
     pub documents: BTreeMap<String, Document>,
     pub metadata: BTreeMap<String, String>,
     pub cooldowns: BTreeMap<String, String>,
+    pub envelope_keys: Arc<super::KeyRing>,
 }
 
 impl State {
@@ -77,9 +78,11 @@ impl State {
             })?
             .collect::<Result<_, _>>()?;
         let mut query = conn.prepare("SELECT name, value FROM credential_meta ORDER BY name")?;
-        let metadata = query
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_, _>>()?;
+        let (envelope_keys, metadata) = super::KeyRing::decode(
+            query
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?,
+        )?;
         let mut query = conn.prepare("SELECT id, record FROM credential_cooldown ORDER BY id")?;
         let cooldowns = query
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -91,6 +94,7 @@ impl State {
             documents,
             metadata,
             cooldowns,
+            envelope_keys: Arc::new(envelope_keys),
         })
     }
 
@@ -371,6 +375,7 @@ impl ConfigStore {
         names: &[String],
         pending: &mut Option<Pending>,
     ) -> anyhow::Result<()> {
+        self.check_keys(&candidate, pending)?;
         let configuration = match pending.as_ref() {
             Some(retained) => retained.configuration.clone(),
             None => self.changed_configuration(&candidate)?,
@@ -426,6 +431,7 @@ impl ConfigStore {
     /// Install the complete checkpoint before publication. Only a candidate whose
     /// checkpoint was replaced becomes pending, including metadata-sync failure.
     pub(crate) fn accept(&self, candidate: State, pending: &mut Option<Pending>) -> anyhow::Result<()> {
+        self.check_keys(&candidate, pending)?;
         let retained = Pending {
             configuration: self.changed_configuration(&candidate)?,
             state: Arc::new(candidate),
