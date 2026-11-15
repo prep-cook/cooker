@@ -7,7 +7,7 @@
 //! failure before `message_stop` becomes Go's `unexpected EOF`.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
 use ck_core::exec::{ExecError, ExecStream, FailureScope};
@@ -273,6 +273,41 @@ fn relay_with(
         }
     })
     .boxed()
+}
+
+/// A buffered cloaked body, the one body the Claude relay collects (owner ruling Q20): the
+/// old route restores its tool aliases and reads its message ID from the whole JSON. Its heap
+/// bytes charge the exchange's stream quota like codec bookkeeping, so past the limit
+/// ck-stream ends the response stream with `StorageExhausted` and the attempt fails as
+/// contract §9 states, with no fallback.
+pub(super) fn collected(
+    mut body: ExecStream,
+    response: &mut ck_stream::Writer,
+    reverse: Arc<Reverse>,
+    seen: Arc<Mutex<Option<String>>>,
+) -> ExecStream {
+    let permit = response.reserve_metadata(0);
+    let collect = async move {
+        let mut permit = permit.map_err(|e| crate::pipeline::stored(&e))?;
+        let mut data = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            let len = data.len() + chunk.len();
+            if len > data.capacity() {
+                let capacity = len.max(2 * data.capacity());
+                permit.resize(capacity).map_err(|e| crate::pipeline::stored(&e))?;
+                data.reserve_exact(capacity - data.len());
+            }
+            data.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&data);
+        // The old route completes with the top-level `id`; the ingress commits it at `done`.
+        *seen.lock().expect("message id") = Some(rawjson::string(&text, "id").trim().to_owned());
+        let restored = alias::restore_response(&text, &reverse)
+            .map_err(|m| super::plain_error(format!("restore Claude OAuth tool name from response: {m}")))?;
+        Ok(Bytes::from(restored))
+    };
+    futures_util::stream::once(collect).boxed()
 }
 
 /// `validateClaudeStreamingResponse` for buffered SSE behind a non-stream client.
