@@ -25,11 +25,12 @@ fn messages(view: RequestView<'_>) -> Result<()> {
     let messages = doc.required(root, "messages")?;
     super::array(doc, messages)?;
     let mut system = false;
-    let mut calls = None;
+    let (mut run, mut last) = (None, None);
     for message in doc.children(messages)? {
+        let previous = last.replace(message);
         let role = doc.required(message, "role")?;
         if doc.string_is(role, "tool")? {
-            tool_message(doc, message, calls)?;
+            tool_message(doc, message, run)?;
             continue;
         }
         // Gemini has one system instruction; `developer` (Responses `instructions`) is one too.
@@ -46,7 +47,7 @@ fn messages(view: RequestView<'_>) -> Result<()> {
                 Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
                 Value::Array => {
                     for part in doc.children(content)? {
-                        validate_part(view, part, calls)?;
+                        validate_part(view, part, run)?;
                     }
                 }
                 // OpenAI sends a tool-call message's empty content as null.
@@ -79,25 +80,57 @@ fn messages(view: RequestView<'_>) -> Result<()> {
                 }
             }
         }
-        calls = doc.member(message, "tool_calls")?;
+        run = match previous {
+            Some(p) if continues(doc, p, message)? => run,
+            _ => Some(message),
+        };
     }
     Ok(())
 }
+/// Whether assistant `message` adds its calls to the model turn of assistant `previous`. A
+/// Responses client sends each parallel call as its own item, which ingress wraps in its own
+/// message; Gemini states them as one turn. Both carry a call, so a joined turn already has a
+/// part. Gemini's own turns stay as sent.
+pub(super) fn continues(doc: &Document, previous: usize, message: usize) -> Result<bool> {
+    for m in [previous, message] {
+        let calls = doc.member(m, "tool_calls")?;
+        if !super::is(doc, m, "role", "assistant")?
+            || calls.map(|c| doc.node(c)).transpose()?.and_then(|c| c.first).is_none()
+            || super::origin(doc, m, "parts")?.is_some()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+/// The last call with `id` in the model turn starting at message `run`.
+pub(super) fn answered(doc: &Document, run: Option<usize>, id: usize) -> Result<Option<usize>> {
+    let (mut found, mut message) = (None, run);
+    while let Some(m) = message {
+        for call in doc
+            .member(m, "tool_calls")?
+            .map(|c| doc.children(c))
+            .transpose()?
+            .into_iter()
+            .flatten()
+        {
+            if doc.equal_strings(doc.required(call, "id")?, id)? {
+                found = Some(call);
+            }
+        }
+        message = match doc.node(m)?.next {
+            Some(n) if continues(doc, m, n)? => Some(n),
+            _ => None,
+        };
+    }
+    Ok(found)
+}
 /// A Chat tool message, or a tool result without Gemini's `result`, answers a call of the
-/// preceding message and carries only text.
-fn tool_message(doc: &Document, message: usize, calls: Option<usize>) -> Result<()> {
+/// preceding model turn and carries only text.
+fn tool_message(doc: &Document, message: usize, run: Option<usize>) -> Result<()> {
     let id = doc.required(message, "tool_call_id")?;
     super::string(doc, id)?;
-    let mut answered = false;
-    for call in calls
-        .map(|calls| doc.children(calls))
-        .transpose()?
-        .into_iter()
-        .flatten()
-    {
-        answered |= doc.equal_strings(doc.required(call, "id")?, id)?;
-    }
-    if !answered {
+    if answered(doc, run, id)?.is_none() {
         return Err(Error::Unsupported);
     }
     match doc.member(message, "content")? {
@@ -278,7 +311,7 @@ fn anthropic_parameters(doc: &Document, native: usize) -> Result<()> {
     }
     Ok(())
 }
-fn validate_part(view: RequestView<'_>, part: usize, calls: Option<usize>) -> Result<()> {
+fn validate_part(view: RequestView<'_>, part: usize, run: Option<usize>) -> Result<()> {
     let doc = view.document;
     let kind = doc.required(part, "type")?;
     if doc.string_is(kind, "text")? || doc.string_is(kind, "reasoning")? {
@@ -291,7 +324,7 @@ fn validate_part(view: RequestView<'_>, part: usize, calls: Option<usize>) -> Re
     }
     if doc.string_is(kind, "tool_result")? {
         if doc.member(part, "result")?.is_none() {
-            return tool_message(doc, part, calls);
+            return tool_message(doc, part, run);
         }
         super::string(doc, doc.required(part, "tool_call_id")?)?;
         return Ok(());
