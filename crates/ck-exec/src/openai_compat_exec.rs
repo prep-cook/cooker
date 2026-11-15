@@ -385,19 +385,21 @@ impl<'r> Relay<'r> {
         };
         payload::set_str_if_different(&mut upload, "model", &self.base_model);
         let caps = self.attempt.resolved_model.map(|r| ModelCaps::from(&r.info));
-        let body = thinking::apply_request_thinking(&RequestThinking {
-            body: &upload,
-            payload: &upload,
-            original: &upload,
-            model: self.attempt.model,
-            // The upload is already in the target protocol.
-            from: target.as_str(),
-            to: target.as_str(),
-            provider: &self.attempt.credential.provider,
-            resolved: caps.as_ref().map(Some),
-            has_request_transformer: false,
-            updates_changed: false,
-        })
+        let body = thinking::apply_request_thinking(
+            &RequestThinking {
+                payload: Some(&upload[..]),
+                original: Some(&upload[..]),
+                model: self.attempt.model,
+                // The upload is already in the target protocol.
+                from: target.as_str(),
+                to: target.as_str(),
+                provider: &self.attempt.credential.provider,
+                resolved: caps.as_ref().map(Some),
+                has_request_transformer: false,
+                updates_changed: false,
+            },
+            upload.to_vec(),
+        )
         .map_err(|e| ExecError::local(400, FailureScope::Request, e.message))?;
         Ok((body, upload, requested))
     }

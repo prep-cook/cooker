@@ -212,19 +212,21 @@ impl<'r> Call<'r> {
     /// A generation body: the suffix's thinking, the upstream model, then the payload rules.
     pub(crate) fn generate(&self, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
         let caps = self.attempt.resolved_model.map(|r| ModelCaps::from(&r.info));
-        let mut body = thinking::apply_request_thinking(&RequestThinking {
-            body: &upload,
-            payload: &upload,
-            original: &upload,
-            model: self.attempt.model,
-            // The upload is already in the target protocol.
-            from: Format::Gemini.as_str(),
-            to: Format::Gemini.as_str(),
-            provider: &self.attempt.credential.provider,
-            resolved: caps.as_ref().map(Some),
-            has_request_transformer: false,
-            updates_changed: false,
-        })
+        let mut body = thinking::apply_request_thinking(
+            &RequestThinking {
+                payload: Some(&upload[..]),
+                original: Some(&upload[..]),
+                model: self.attempt.model,
+                // The upload is already in the target protocol.
+                from: Format::Gemini.as_str(),
+                to: Format::Gemini.as_str(),
+                provider: &self.attempt.credential.provider,
+                resolved: caps.as_ref().map(Some),
+                has_request_transformer: false,
+                updates_changed: false,
+            },
+            upload.to_vec(),
+        )
         .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
         if gj::get(&body, "model").exists() {
             self.name_model(&mut body, "model");
