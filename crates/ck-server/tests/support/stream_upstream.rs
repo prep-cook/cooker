@@ -8,7 +8,8 @@
 //! each body was fully written, so a test can prove upstream receipt finished while the
 //! client stalled.
 //!
-//! Every connection serves one exchange and closes (`connection: close`). `ck-exec` tests
+//! Every connection serves one exchange and closes (`connection: close`). Dropping the
+//! upstream closes its listener and every open connection. `ck-exec` tests
 //! include this file through `#[path]` from `ck-exec/tests/support/mod.rs`.
 #![allow(dead_code, reason = "each test target uses a subset of the harness")]
 
@@ -20,7 +21,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 /// The scripted answer to one request.
 #[derive(Clone, Debug)]
@@ -177,9 +178,13 @@ impl StreamUpstream {
         let replies: Arc<[Reply]> = replies.into_iter().collect();
         let state = watch::Sender::new(State::default());
         let shared = state.clone();
+        // The accept task owns every connection task: aborting it drops the set, which
+        // aborts them, so no exchange outlives the upstream.
         let accept = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
             while let Ok((socket, _)) = listener.accept().await {
-                tokio::spawn(serve(socket, replies.clone(), shared.clone()));
+                while connections.try_join_next().is_some() {}
+                connections.spawn(serve(socket, replies.clone(), shared.clone()));
             }
         });
         Self { addr, state, accept }

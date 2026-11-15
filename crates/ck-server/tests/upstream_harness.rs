@@ -152,23 +152,133 @@ async fn cut_ends_the_body_without_a_terminator() {
 }
 
 #[tokio::test]
-async fn byte_cadence_frames_every_byte_and_throttle_paces_writes() {
+async fn byte_cadence_frames_every_byte() {
     let upstream = StreamUpstream::start([Reply::sse(FIXTURE).byte_at_a_time()]).await;
     let response = raw(&upstream, POST).await;
     assert!(response.terminated);
     assert_eq!(response.chunks.len(), FIXTURE.len());
     assert!(response.chunks.iter().all(|c| c.len() == 1));
     assert_eq!(response.chunks.concat(), FIXTURE);
+}
 
-    let upstream = StreamUpstream::start([Reply::sse(&b"0123456789"[..])
-        .first_byte_after(Duration::from_millis(50))
-        .throttle(2, Duration::from_millis(10))])
+/// A response read chunk by chunk as the bytes arrive, so a test can assert that the next
+/// chunk has not arrived yet.
+struct Live {
+    socket: TcpStream,
+    buffer: Vec<u8>,
+}
+
+impl Live {
+    /// Sends `POST` and returns once the response head arrived.
+    async fn open(upstream: &StreamUpstream) -> Self {
+        let mut socket = TcpStream::connect(upstream.addr()).await.unwrap();
+        socket.write_all(POST).await.unwrap();
+        let mut live = Self {
+            socket,
+            buffer: Vec::new(),
+        };
+        while !live.buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+            assert!(live.fill().await, "the connection ended before the response head");
+        }
+        let split = live.buffer.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        live.buffer.drain(..split + 4);
+        live
+    }
+
+    /// Reads more bytes; false at EOF or a reset. Cancel-safe: bytes join the buffer only
+    /// after a read completes.
+    async fn fill(&mut self) -> bool {
+        let mut bytes = [0; 4096];
+        match self.socket.read(&mut bytes).await {
+            Ok(0) | Err(_) => false,
+            Ok(n) => {
+                self.buffer.extend_from_slice(&bytes[..n]);
+                true
+            }
+        }
+    }
+
+    /// The next chunk payload; `None` at the terminating chunk or when the connection ends.
+    async fn chunk(&mut self) -> Option<Vec<u8>> {
+        loop {
+            if let Some(line) = self.buffer.windows(2).position(|w| w == b"\r\n") {
+                let size = usize::from_str_radix(std::str::from_utf8(&self.buffer[..line]).unwrap(), 16).unwrap();
+                if size == 0 {
+                    return None;
+                }
+                if self.buffer.len() >= line + 4 + size {
+                    let chunk = self.buffer[line + 2..line + 2 + size].to_vec();
+                    self.buffer.drain(..line + 4 + size);
+                    return Some(chunk);
+                }
+            }
+            if !self.fill().await {
+                return None;
+            }
+        }
+    }
+
+    /// Asserts that no chunk arrives within `quiet`, then returns the next one.
+    async fn chunk_after(&mut self, quiet: Duration) -> Option<Vec<u8>> {
+        assert!(
+            tokio::time::timeout(quiet, self.chunk()).await.is_err(),
+            "a chunk arrived within {quiet:?}"
+        );
+        self.chunk().await
+    }
+}
+
+/// The margins are half the configured pauses: a busy host only lengthens a pause.
+#[tokio::test]
+async fn first_byte_delay_holds_the_body_after_the_head() {
+    let upstream =
+        StreamUpstream::start([Reply::sse(&b"0123456789"[..]).first_byte_after(Duration::from_millis(400))]).await;
+    let mut live = Live::open(&upstream).await;
+    assert_eq!(
+        live.chunk_after(Duration::from_millis(200)).await.unwrap(),
+        b"0123456789"
+    );
+    assert_eq!(live.chunk().await, None);
+    assert!(upstream.delivered(0).await.complete);
+}
+
+#[tokio::test]
+async fn throttle_paces_every_chunk() {
+    let upstream =
+        StreamUpstream::start([Reply::sse(&b"0123456789"[..]).throttle(2, Duration::from_millis(200))]).await;
+    let mut live = Live::open(&upstream).await;
+    assert_eq!(live.chunk().await.unwrap(), b"01");
+    for expected in [b"23", b"45", b"67", b"89"] {
+        assert_eq!(live.chunk_after(Duration::from_millis(100)).await.unwrap(), expected);
+    }
+    assert_eq!(live.chunk().await, None);
+}
+
+/// Dropping the upstream ends its open exchanges: a client mid-body sees the connection
+/// end without the rest of the body.
+#[tokio::test]
+async fn drop_ends_open_connections() {
+    let upstream =
+        StreamUpstream::start([Reply::sse(&b"still alive"[..]).throttle(1, Duration::from_millis(50))]).await;
+    let mut live = Live::open(&upstream).await;
+    assert_eq!(live.chunk().await.unwrap(), b"s");
+    drop(upstream);
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = live.chunk().await {
+            rest.extend(chunk);
+        }
+    })
     .await;
-    let start = Instant::now();
-    let response = raw(&upstream, POST).await;
-    assert!(start.elapsed() >= Duration::from_millis(90), "{:?}", start.elapsed());
-    assert_eq!(response.chunks.len(), 5);
-    assert_eq!(response.chunks.concat(), b"0123456789");
+    assert!(ended.is_ok(), "the connection stayed open after the drop");
+    assert!(
+        rest.len() < b"till alive".len(),
+        "the body continued after the drop: {rest:?}"
+    );
+    assert!(
+        !live.buffer.windows(5).any(|w| w == b"0\r\n\r\n"),
+        "the terminating chunk arrived after the drop"
+    );
 }
 
 #[tokio::test]
