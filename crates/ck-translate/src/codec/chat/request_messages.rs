@@ -59,7 +59,7 @@ impl Ingress {
             };
             let Some(child) = next else { break };
             let value = scanner.pending_node(self.document.input(), child)?;
-            let key = value.key.ok_or(Error::Schema)?;
+            let mapped = value.name(0).ok_or(Error::Schema)?;
             let existing = self
                 .string
                 .as_ref()
@@ -70,7 +70,7 @@ impl Ingress {
                 .map(|node| self.document.node(node).map(|n| n.name))
                 .transpose()?
                 .flatten()
-                .unwrap_or(Name::Mapped(codec::document::Text { source: 0, span: key }));
+                .unwrap_or(mapped);
             path[2] = Some(Component::Name(name));
             if self.string.as_ref().is_some_and(|s| s.wire == child)
                 || (value.kind == json::Kind::String

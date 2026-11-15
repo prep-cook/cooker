@@ -86,9 +86,7 @@ impl Ingress {
             });
             return Ok(Some(true));
         }
-        let name = wire
-            .key
-            .map(|span| Name::Mapped(codec::document::Text { source: 0, span }));
+        let name = wire.name(0);
         let node = self.document.add(
             name,
             if wire.kind == json::Kind::Object {
@@ -142,10 +140,7 @@ impl Ingress {
                 Component::Name(if let Some(state) = self.trees.get(child).and_then(|s| *s) {
                     self.document.node(state.node)?.name.ok_or(Error::Schema)?
                 } else {
-                    Name::Mapped(codec::document::Text {
-                        source: 0,
-                        span: value.key.ok_or(Error::Schema)?,
-                    })
+                    value.name(0).ok_or(Error::Schema)?
                 })
             });
             if !self.consume_tree(owner, child, state.node, path, depth + 1, publish)? {

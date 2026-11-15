@@ -3,7 +3,7 @@
 use super::super::is;
 use crate::codec::{
     Error, Result,
-    document::{Document, Name, Value},
+    document::{Document, Value},
 };
 
 /// The value of the Responses original field `name` that normalization kept for `target`.
@@ -19,7 +19,7 @@ pub(super) fn native(doc: &Document, target: usize, name: &str) -> Result<Option
             let Value::String(text) = doc.node(doc.required(entry, "pointer")?)?.value else {
                 return Err(Error::Schema);
             };
-            if doc.name_is(Name::Pointer(text), name)? {
+            if doc.name_is(doc.pointer_name(text)?, name)? {
                 return Ok(Some(doc.required(entry, "value")?));
             }
         }

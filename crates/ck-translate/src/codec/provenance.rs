@@ -10,6 +10,7 @@ use super::{
     Error, Result,
     document::{Characters, Document, Name, Value},
     encode::{self, Encoder},
+    source::Span,
 };
 use ck_stream::Writer;
 
@@ -49,17 +50,66 @@ pub fn pointer(doc: &Document, mut node: usize, e: &mut Encoder<'_, '_>) -> Resu
                 .ok_or(Error::Schema)?;
             e.unsigned(index as u64)?;
         } else {
-            let mut name = doc.name_chars(doc.node(node)?.name.ok_or(Error::Schema)?)?;
-            while let Some(c) = name.next_scalar()? {
-                match c {
-                    '~' => e.bytes(b"~0")?,
-                    '/' => e.bytes(b"~1")?,
-                    c => e.escaped(c.encode_utf8(&mut [0; 4]))?,
-                }
-            }
+            write_pointer_segment(doc, doc.node(node)?.name.ok_or(Error::Schema)?, e)?;
         }
     }
     e.bytes(b"\"")
+}
+
+/// Write a member name as one RFC 6901 segment inside a JSON pointer string. A name whose
+/// stored bytes are contiguous and need no JSON escape is copied in unescaped runs; any other
+/// name is decoded one scalar at a time.
+pub(crate) fn write_pointer_segment(doc: &Document, name: Name, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let encoded = matches!(name, Name::Pointer(..));
+    let raw = match name {
+        Name::Static(name) => Some(name.as_bytes()),
+        Name::Mapped(text, _) if text.span.len() >= 2 => doc.source(text)?.slice(Span {
+            start: text.span.start + 1,
+            end: text.span.end - 1,
+        })?,
+        Name::Pointer(text, _) => doc.source(text)?.slice(text.span)?,
+        _ => None,
+    };
+    if let Some(bytes) = raw.filter(|bytes| plain(bytes, encoded)) {
+        if encoded {
+            // A pointer name is the stored pointer's last segment, already encoded.
+            return e.bytes(bytes);
+        }
+        let mut start = 0;
+        for (index, &byte) in bytes.iter().enumerate() {
+            let escape: &[u8] = match byte {
+                b'~' => b"~0",
+                b'/' => b"~1",
+                _ => continue,
+            };
+            e.bytes(&bytes[start..index])?;
+            e.bytes(escape)?;
+            start = index + 1;
+        }
+        return e.bytes(&bytes[start..]);
+    }
+    let mut chars = doc.name_chars(name)?;
+    while let Some(c) = chars.next_scalar()? {
+        match c {
+            '~' => e.bytes(b"~0")?,
+            '/' => e.bytes(b"~1")?,
+            c => e.escaped(c.encode_utf8(&mut [0; 4]))?,
+        }
+    }
+    Ok(())
+}
+
+/// Whether `bytes` hold no JSON escape and no byte that needs one and, once `encoded`, only
+/// valid `~0` and `~1` sequences, so that copying them writes what decoding would.
+fn plain(bytes: &[u8], encoded: bool) -> bool {
+    let mut tilde = false;
+    for &byte in bytes {
+        if byte == b'"' || byte == b'\\' || byte < 0x20 || (tilde && byte != b'0' && byte != b'1') {
+            return false;
+        }
+        tilde = encoded && byte == b'~';
+    }
+    !tilde
 }
 
 #[cfg(test)]

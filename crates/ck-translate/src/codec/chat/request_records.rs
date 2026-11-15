@@ -1,7 +1,7 @@
 use super::index::Index;
 use crate::codec::{
     Error, Result,
-    document::{Document, Name, Text, Value},
+    document::{Document, Text, Value},
     event::{Kind, LocalId},
     internal,
     media::{self, Encoding, Registry},
@@ -232,7 +232,8 @@ fn field(doc: &mut Document, counts: &mut Counts, mut event: Document) -> Result
         counts.replaced(target);
         return Ok(target);
     }
-    let node = doc.copy_adopted(&event, value, adopted, (!array).then_some(Name::Pointer(pointer)))?;
+    let name = if array { None } else { Some(doc.pointer_name(pointer)?) };
+    let node = doc.copy_adopted(&event, value, adopted, name)?;
     doc.append(parent, node)?;
     if let Some((count, last)) = counts.children.get_mut(&parent) {
         *count += 1;
