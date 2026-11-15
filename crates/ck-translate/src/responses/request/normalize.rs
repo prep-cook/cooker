@@ -14,6 +14,7 @@ const ROOT_FIELDS: &[&str] = &[
     "parallel_tool_calls",
     "temperature",
     "top_p",
+    "top_logprobs",
     "max_completion_tokens",
     "stream",
     "response_format",

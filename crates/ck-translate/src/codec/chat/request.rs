@@ -245,6 +245,17 @@ impl Capability for ChatCapability {
         // Capability first: another protocol's valid request that Chat cannot carry, such as
         // Responses encrypted reasoning, is unsupported rather than malformed Chat.
         super::request_controls::destination(view.document)?;
+        // Chat takes `top_logprobs` only beside `logprobs: true`. Nothing translates returned
+        // log probabilities back to another protocol, so none is supplied for it.
+        let (doc, root) = (view.document, view.document.root());
+        if let Some(n) = doc.member(root, "top_logprobs")?
+            && !matches!(doc.node(n)?.value, Value::Null)
+            && !doc
+                .member(root, "logprobs")?
+                .is_some_and(|l| matches!(doc.node(l).map(|l| l.value), Ok(Value::Bool(true))))
+        {
+            return Err(Error::Unsupported);
+        }
         messages::validate(view.document)?;
         super::request_schema::validate(view.document, view.media)
     }
