@@ -35,6 +35,7 @@ An exchange uses one request stream and one response stream per attempt. Every r
 
 Every provider module implements `Execute` once. The selector in `crates/ck-exec/src/lib.rs` matches `Credential::provider` and calls the provider's implementation directly: no trait objects, no second registry.
 
+- `Attempt::identity` is the codec identity of the attempt's response stream (direction `Response`, this attempt's number). The server creates it; executors build their response ingress with it, and the producer publishes a local count with it.
 - `capability(&Attempt) -> Self::Capability` returns the destination capability for the attempt's credential and upstream model. It does no network work and no credential preparation. Configured limits such as Anthropic `default_max_tokens` enter through `Attempt::cfg` and `Attempt::resolved_model`.
 - `execute` and `compact` take `(&Attempt, &Request, Streams)` and return `Result<Upstream<Self::Ingress>, ExecError>` as a `Send` future. The executor encodes the upload with its request egress into `Streams::request`, creates its response ingress on `Streams::response` with `Attempt::store`, sends, and returns when the upstream answered.
 - `Request::validated` is this attempt's fence (§4). An executor encodes only through `RequestEgress`; no executor reads client body bytes.
@@ -48,12 +49,15 @@ Every provider module implements `Execute` once. The selector in `crates/ck-exec
 
 1. **Client fence.** Request ingress `finish` validates the complete request against the first attempt's capability and publishes `request.end`. A failure is 400 with no upstream request.
 2. **Re-fence per attempt.** Every attempt, the first included, builds its `Request::validated` with `RequestFence::default().end(client_fence.view(), &capability)` for its own destination. A re-fence failure is an attempt failure with scope `Model`: nothing was sent.
-3. **Q2 policy hook.** Whether a candidate whose capability key differs from the client fence's key is attempted at all is the owner's Q2 ruling: revalidate per destination (step 2 already does this) or restrict failover to the same key. D2 applies it in one predicate in `inference/dispatch.rs`, `fn admits(fenced: &'static str, candidate: &'static str) -> bool`, before step 2. The predicate's body is the ruling; D2 does not merge without it.
+3. **Q2 policy hook.** Whether a candidate whose capability key differs from the client fence's key is attempted at all is the owner's Q2 ruling: revalidate per destination (step 2 already does this) or restrict failover to the same key. D2 applies it in one predicate in `inference/dispatch.rs`, `fn admits(fenced: &'static str, candidate: &'static str) -> bool`, before step 2, with the fenced key from `ValidatedRequest::destination` and the candidate's key from `Executors::destination`. The predicate's body is the ruling; D2 does not merge without it.
 
 D1 adds these selector methods:
 
 ```rust
 impl Executors {
+    /// The attempt's capability key; `None` while its provider is not converted, in which
+    /// case D2 takes the old execution path before fencing.
+    pub fn destination(&self, attempt: &Attempt<'_>) -> Option<&'static str>;
     /// Step 1: closes the client fence against the first attempt's destination.
     pub fn fence<'a, I: RequestIngress>(&self, attempt: &Attempt<'_>, ingress: &'a mut I, request: &mut Writer)
         -> codec::Result<ValidatedRequest<'a>>;
@@ -84,7 +88,7 @@ Resume looks up the handle, authorizes the caller against `StreamHandle::owner` 
 
 - **Explicit cancel.** `finish(Terminal::Cancelled)` on the response stream's allocator. The producer's `Writer::cancelled` resolves, it stops reading upstream and its writes fail with `Closed`. Shutdown uses `Terminal::Shutdown` the same way.
 - **Discard.** `finish(Terminal::Gone)` on a failed attempt's response writer or allocator invalidates the stream at once and releases its dependency on the request stream. An exchange that ends without commitment discards its request stream the same way.
-- **Producer loss.** Only a dropped producer writer (panic or abort) publishes `stream.producer_lost`. Task abort is never a cancel.
+- **Producer lost or producer defect.** A dropped producer writer (panic or abort), or a gateway defect after the producer started (`Storage(InvalidPosition, InvalidRecord, IncompleteRecord)`, an ingress bound to another writer), ends the stream with `Terminal::ProducerLost`; the client sees `stream.producer_lost`. Task abort is never a cancel.
 
 ## 8. Usage
 
@@ -105,7 +109,7 @@ Commitment is the first deliverable byte the client's `ResponseEgress` emits. Be
 | `Storage(StorageExhausted)` or `Storage(Io)` in an egress or resume allocation after the producer's terminal | a failure of that one delivery; the stream keeps its terminal | 503 `stream.storage_exhausted`; no failover | that delivery ends its HTTP response with the protocol's error terminal, or with 503 if it has sent nothing yet; other readers and later resumes are unaffected |
 | `Storage(Gone)`: expiry or eviction of a stream the exchange uses | `stream.gone`, 410, scope `resource` | resource error to the client; no failover | attached readers receive `error`; resume answers 410 |
 | `Storage(Closed)` | the stream already has a terminal | follow that terminal's row | follow that terminal's row |
-| `Storage(InvalidPosition, InvalidRecord, IncompleteRecord)` | gateway defect | 500; no failover | delivered as `error` |
+| `Storage(InvalidPosition, InvalidRecord, IncompleteRecord)` | gateway defect | 500; no failover | delivered as `error`; after the producer started, `stream.producer_lost` (§7) |
 | Upstream refused or unreachable | `Err(ExecError)` from `Execute` | attempt failure: `ExecError::scope` decides failover and cooldown; the attempt's response stream is discarded (§7) | not reachable: nothing of this attempt was delivered |
 | Upstream body error, invalid upstream data, or EOF before the completion boundary | producer publishes `error` (scope `upstream`) and returns `Err(ExecError)` | attempt failure as above | delivered as `error` in the client's protocol; the scope still updates cooldown |
 | Producer panic or dropped writer | `stream.producer_lost`, 502, scope `upstream` | attempt failure | delivered as `error` |

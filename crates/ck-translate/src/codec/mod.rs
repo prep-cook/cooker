@@ -150,6 +150,9 @@ impl<'a> ValidatedRequest<'a> {
     pub fn view(&self) -> RequestView<'a> {
         self.view
     }
+    pub fn destination(&self) -> &'static str {
+        self.destination
+    }
     pub fn for_destination(&self, destination: &str) -> Result<RequestView<'a>> {
         if self.destination != destination {
             return Err(Error::Destination);
