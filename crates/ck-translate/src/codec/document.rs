@@ -1,3 +1,4 @@
+mod contiguous;
 mod edit;
 mod iter;
 mod name;
@@ -20,7 +21,7 @@ use super::{
     event::LocalId,
     json,
     source::{Source, Span},
-    table::grown,
+    table::{charge, grown},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -108,23 +109,37 @@ impl Document {
         Self::from_scanned(owner, source, scanner)
     }
 
-    pub fn from_scanned(owner: &mut Writer, source: Source, scanner: json::Scanner) -> Result<Self> {
+    /// [`Self::parse`] for JSON this gateway wrote: canonical records and egress scratch. A
+    /// source held in one contiguous slice is read in one pass over that slice; input that pass
+    /// declines goes to the scanner, which returns the same tree or error it always did. Wire
+    /// input stays on [`Self::parse`], so its validation never depends on this path.
+    pub(crate) fn parse_internal(owner: &mut Writer, source: Source, max_bytes: u64) -> Result<Self> {
         source.check_owner(owner)?;
-        let mut doc = Self {
-            sources: Vec::new(),
-            nodes: Vec::new(),
-            ids: Vec::new(),
-            metadata: owner.reserve_metadata(0)?,
-            scratch: std::sync::Mutex::new(Some(owner.reserve_metadata(0)?)),
-            records: None,
-            root: 0,
-        };
+        let mut doc = Self::empty(owner)?;
+        let whole = source.whole();
+        if whole.start == 0
+            && whole.end <= max_bytes
+            && let Some(bytes) = source.slice(whole)?
+            && doc.read_contiguous(bytes)?
+        {
+            doc.sources.push(source);
+            return Ok(doc);
+        }
+        let mut scanner = json::Scanner::new(owner, max_bytes)?;
+        scanner.finish(&source)?;
         doc.import(source, &scanner)?;
         Ok(doc)
     }
 
-    pub(crate) fn streaming(owner: &mut Writer) -> Result<Self> {
-        let mut doc = Self {
+    pub fn from_scanned(owner: &mut Writer, source: Source, scanner: json::Scanner) -> Result<Self> {
+        source.check_owner(owner)?;
+        let mut doc = Self::empty(owner)?;
+        doc.import(source, &scanner)?;
+        Ok(doc)
+    }
+
+    fn empty(owner: &mut Writer) -> Result<Self> {
+        Ok(Self {
             sources: Vec::new(),
             nodes: Vec::new(),
             ids: Vec::new(),
@@ -132,7 +147,11 @@ impl Document {
             scratch: std::sync::Mutex::new(Some(owner.reserve_metadata(0)?)),
             records: None,
             root: 0,
-        };
+        })
+    }
+
+    pub(crate) fn streaming(owner: &mut Writer) -> Result<Self> {
+        let mut doc = Self::empty(owner)?;
         doc.reserve(1, 1, 0)?;
         doc.sources.push(Source::new(owner)?);
         doc.add(None, Value::Object)?;
@@ -200,11 +219,12 @@ impl Document {
         let n = grown(self.nodes.len(), nodes, self.nodes.capacity(), 4)?;
         let s = grown(self.sources.len(), sources, self.sources.capacity(), 4)?;
         let i = grown(self.ids.len(), ids, self.ids.capacity(), 4)?;
-        self.metadata.resize(Self::table_bytes(n, s, i).ok_or(Error::Limit)?)?;
+        charge(&mut self.metadata, Self::table_bytes(n, s, i).ok_or(Error::Limit)?)?;
         let grew = self.grow(n, s, i);
         // Charge what the tables hold now, also when one of them failed to grow after others
         // did, so a failed allocation leaves no charge behind.
-        self.metadata.resize(
+        charge(
+            &mut self.metadata,
             Self::table_bytes(self.nodes.capacity(), self.sources.capacity(), self.ids.capacity())
                 .ok_or(Error::Limit)?,
         )?;

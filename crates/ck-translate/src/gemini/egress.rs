@@ -42,6 +42,9 @@ pub struct Egress {
     array_started: bool,
     /// SSE fields were written without data; the next record completes their event.
     open_event: bool,
+    /// The canonical stream this egress reads; it checks each record's `seq`, and the identity
+    /// given to [`Self::new`].
+    binding: internal::Binding,
     diagnostic: fn(Diagnostic),
 }
 struct Choice {
@@ -59,12 +62,12 @@ struct Choice {
 impl Egress {
     pub fn new(
         owner: &mut Writer,
-        _identity: Identity,
+        identity: Identity,
         operation: Operation,
         mode: BodyMode,
         diagnostic: fn(Diagnostic),
     ) -> Result<Self> {
-        Self::with_framing(
+        let mut egress = Self::with_framing(
             owner,
             operation,
             if mode == BodyMode::Buffered {
@@ -73,7 +76,9 @@ impl Egress {
                 Framing::Sse
             },
             diagnostic,
-        )
+        )?;
+        egress.binding = internal::Binding::new(owner, Some(identity));
+        Ok(egress)
     }
     pub fn with_framing(
         owner: &mut Writer,
@@ -102,6 +107,7 @@ impl Egress {
             failed: false,
             array_started: false,
             open_event: false,
+            binding: internal::Binding::new(owner, None),
             diagnostic,
         })
     }
@@ -413,8 +419,10 @@ impl codec::ResponseEgress for Egress {
         if self.terminal || self.failed {
             return Err(Error::Closed);
         }
-        let result =
-            internal::decode(owner, input).and_then(|(kind, event)| self.accept(owner, kind, event, &mut output));
+        let result = self
+            .binding
+            .decode(owner, input)
+            .and_then(|(kind, event)| self.accept(owner, kind, event, &mut output));
         self.failed = result.is_err();
         result
     }

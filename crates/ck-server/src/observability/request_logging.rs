@@ -1380,8 +1380,10 @@ const REDACTED: &str = "<redacted>";
 /// (util.MaskSensitiveHeaderValue). A session cookie is a credential, so the
 /// whole value of any header whose lowercase name contains "cookie" is
 /// replaced, on both the masked and the unmasked header sections.
-fn cookie(name: &str) -> bool {
-    name.contains("cookie")
+/// Headers whose values never reach a log: cookies, and the stream resume identity and
+/// cursor (`docs/INTERNAL-STREAM.md` §6.7). Names arrive lowercase.
+fn redacted(name: &str) -> bool {
+    name.contains("cookie") || name == crate::inference::streams::STREAM_ID_HEADER || name == "last-event-id"
 }
 
 /// Deliberate difference: Go prints upstream URLs unchanged, and a configured
@@ -1423,7 +1425,7 @@ fn logged_url(url: &str) -> String {
 }
 
 fn masked_header(name: &str, value: &[u8]) -> Vec<u8> {
-    if cookie(name) {
+    if redacted(name) {
         return REDACTED.as_bytes().to_vec();
     }
     if name.contains("authorization") {
@@ -1448,7 +1450,7 @@ fn headers(out: &mut dyn Write, headers: &HeaderMap, mask: bool) -> io::Result<(
         write!(out, "{}: ", header_name(name.as_str()))?;
         if mask {
             out.write_all(&masked_header(name.as_str(), value.as_bytes()))?;
-        } else if cookie(name.as_str()) {
+        } else if redacted(name.as_str()) {
             out.write_all(REDACTED.as_bytes())?;
         } else {
             out.write_all(value.as_bytes())?;
@@ -2095,6 +2097,21 @@ mod tests {
     }
 
     #[test]
+    fn stream_resume_headers_are_redacted_in_every_capture() {
+        for name in ["x-ck-stream-id", "last-event-id"] {
+            assert_eq!(masked_header(name, b"0123456789abcdef"), REDACTED.as_bytes());
+            let mut out = Vec::new();
+            let mut map = HeaderMap::new();
+            map.insert(name, axum::http::HeaderValue::from_static("0123456789abcdef"));
+            for mask in [true, false] {
+                headers(&mut out, &map, mask).unwrap();
+            }
+            upstream_headers(&mut out, &[(name.to_ascii_uppercase(), "0123456789abcdef".into())]);
+            assert!(!String::from_utf8(out).unwrap().contains("0123"));
+        }
+    }
+
+    #[test]
     fn go_masking_collisions_and_retention() {
         let fixture: serde_json::Value = capture_go();
         for case in fixture["masks"].as_array().unwrap() {
@@ -2106,7 +2123,7 @@ mod tests {
                 want = "...".into();
             }
             // Deliberate difference: Go logs cookie values unchanged.
-            if cookie(&name) {
+            if redacted(&name) {
                 want = REDACTED.into();
             }
             assert_eq!(String::from_utf8(masked_header(&name, value.as_bytes())).unwrap(), want);

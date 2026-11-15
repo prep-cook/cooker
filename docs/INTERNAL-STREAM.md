@@ -118,6 +118,7 @@ The source protocol is provenance; internal routing, scheduling, accounting and 
 | `...` | JSON values | Unknown extension members preserved; only registered fields control execution. |
 
 Every record carries correlation, even when its payload is empty. Source IDs are restored by capable egress, not regenerated on each delta.
+An egress checks the correlation of every record it reads: `request_id`, `stream_id`, `attempt` and `direction` against the identity it was built with, or, built without one, against the first record's, and `seq` against the next expected value. Any holder of a writer can append records, so an egress checks every record, not only the first.
 For source protocols without item IDs, allocate stable local items at part/block starts; close them at source stops or a validated choice finish.
 A signature-only Gemini part gets its own item/block even if it contains no text. Do not attach it to the preceding textual part.
 
