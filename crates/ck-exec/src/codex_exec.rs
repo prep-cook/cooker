@@ -283,18 +283,20 @@ impl<'r> Shape<'r> {
             .attempt
             .resolved_model
             .map(|r| ck_wire::thinking::ModelCaps::from(&r.info));
-        let thought = ck_wire::thinking::apply_request_thinking(&ck_wire::thinking::RequestThinking {
-            body,
-            payload: body,
-            original: body,
-            model: self.attempt.model,
-            from: target.as_str(),
-            to: target.as_str(),
-            provider: "codex",
-            resolved: caps.as_ref().map(Some),
-            has_request_transformer: false,
-            updates_changed: false,
-        })
+        let thought = ck_wire::thinking::apply_request_thinking(
+            &ck_wire::thinking::RequestThinking {
+                payload: Some(body),
+                original: Some(body),
+                model: self.attempt.model,
+                from: target.as_str(),
+                to: target.as_str(),
+                provider: "codex",
+                resolved: caps.as_ref().map(Some),
+                has_request_transformer: false,
+                updates_changed: false,
+            },
+            body.to_vec(),
+        )
         .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
         String::from_utf8(thought)
             .map_err(|_| ExecError::local(400, FailureScope::Request, "request body is not valid UTF-8 JSON"))

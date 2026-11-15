@@ -396,18 +396,20 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
     let original_translated = crate::translate::baseline_or_working(original_translated, &body);
     // Go `cliproxyauth.ResolvedModelInfo`: capabilities bound to this attempt.
     let caps = req.resolved_model.as_ref().map(|r| ModelCaps::from(&r.info));
-    let thinking = apply_request_thinking(&RequestThinking {
-        body: &body,
-        payload: &req.body,
-        original: original(req),
-        model: &req.model,
-        from: req.source_format.as_str(),
-        to: "codex",
-        provider: PROVIDER,
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer,
-        updates_changed: false,
-    })
+    let thinking = apply_request_thinking(
+        &RequestThinking {
+            payload: Some(&req.body[..]),
+            original: Some(&original(req)[..]),
+            model: &req.model,
+            from: req.source_format.as_str(),
+            to: "codex",
+            provider: PROVIDER,
+            resolved: caps.as_ref().map(Some),
+            has_request_transformer,
+            updates_changed: false,
+        },
+        body.to_vec(),
+    )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
     body = thinking;
     set_string_if_different(&mut body, "model", &base_model);

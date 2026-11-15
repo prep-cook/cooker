@@ -200,21 +200,21 @@ fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Resul
     let rules = ck_wire::payload::Rules::from_config(attempt.cfg);
     let base_model = parse_suffix(attempt.model).model_name;
     let caps = attempt.resolved_model.map(|r| ModelCaps::from(&r.info));
-    let mut body = apply_request_thinking(&RequestThinking {
-        body: &original,
-        payload: &original,
-        original: &original,
-        model: attempt.model,
-        from: Format::Codex.as_str(),
-        to: Format::Codex.as_str(),
-        provider: PROVIDER,
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer: false,
-        updates_changed: false,
-    })
+    let mut body = apply_request_thinking(
+        &RequestThinking {
+            payload: Some(&original[..]),
+            original: Some(&original[..]),
+            model: attempt.model,
+            from: Format::Codex.as_str(),
+            to: Format::Codex.as_str(),
+            provider: PROVIDER,
+            resolved: caps.as_ref().map(Some),
+            has_request_transformer: false,
+            updates_changed: false,
+        },
+        original.clone(),
+    )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
-    // ponytail: `apply_request_thinking` takes the body by reference and returns a copy, so two
-    // bodies live while it runs; an owned-body ck-wire API would edit the upload in place.
     let original = baseline(&rules, original);
     meta::set_string_if_different(&mut body, "model", &base_model);
     for key in [
