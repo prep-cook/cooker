@@ -20,6 +20,12 @@ use sha2::{Digest, Sha256};
 
 use crate::gemini_payload as payload;
 
+#[cfg(test)]
+thread_local! {
+    // Declaration visits, bulk splices, and path-based replacement rescans.
+    static SCHEMA_WORK: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
 pub(crate) const BASE_URL_DAILY: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub(crate) const GENERATE_PATH: &str = "/v1internal:generateContent";
 pub(crate) const STREAM_PATH: &str = "/v1internal:streamGenerateContent";
@@ -313,6 +319,8 @@ fn sanitize_tool_schema_document(document: Vec<u8>, antigravity_schema: bool, cl
 
 /// The edits [`sanitize_tool_schema_document`] makes to one declaration, in Go's order.
 fn sanitize_declaration(declaration: &[u8], antigravity_schema: bool, claude: bool) -> Vec<u8> {
+    #[cfg(test)]
+    SCHEMA_WORK.update(|(visits, splices, rescans)| (visits + 1, splices, rescans));
     let mut declaration = declaration.to_vec();
     let value = gj::get(&declaration, "parametersJsonSchema");
     if value.exists() {
@@ -568,12 +576,16 @@ fn replace_values(body: Vec<u8>, edits: Vec<Replace>) -> Vec<u8> {
             _ => {
                 let mut body = body;
                 for edit in edits {
+                    #[cfg(test)]
+                    SCHEMA_WORK.update(|(visits, splices, rescans)| (visits, splices, rescans + 1));
                     gj::set_raw(&mut body, &edit.path, edit.raw);
                 }
                 return body;
             }
         }
     }
+    #[cfg(test)]
+    SCHEMA_WORK.update(|(visits, splices, rescans)| (visits, splices + 1, rescans));
     let mut out = Vec::with_capacity(body.len() + edits.iter().map(|e| e.raw.len()).sum::<usize>());
     let mut at = 0;
     for (edit, (start, end)) in edits.iter().zip(spans) {
@@ -1371,12 +1383,12 @@ mod tests {
                 r#"{{"request":{{"tools":[{{"functionDeclarations":[{list}],"function_declarations":[{list}]}},{{"function_declarations":[{list}],"functionDeclarations":[{list}]}}]}}}}"#
             )
         };
-        let started = std::time::Instant::now();
+        SCHEMA_WORK.set((0, 0, 0));
         let many = sanitize_request_schemas(body(declaration).into_bytes(), true, false);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
+        assert_eq!(
+            SCHEMA_WORK.get(),
+            (4_000, 1, 0),
+            "one visit per declaration, one splice, no rescans"
         );
         assert_eq!(String::from_utf8(many).unwrap(), body(&cleaned));
     }

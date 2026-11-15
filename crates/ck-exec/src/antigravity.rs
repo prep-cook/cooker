@@ -124,6 +124,8 @@ pub struct AntigravityExecutor {
     plain: GoClients,
     /// Short quota cooldowns by `auth|model|sc` (`antigravityShortCooldownByAuth`).
     cooldowns: Mutex<HashMap<String, Instant>>,
+    #[cfg(test)]
+    cooldown_now: Option<Instant>,
     /// The sensitive-word matcher for the configured word list.
     matcher: Mutex<Option<(String, Option<Arc<SensitiveWords>>)>>,
     /// Capability probes of registered credentials (`asyncProbeAntigravityCapabilities`).
@@ -232,6 +234,8 @@ impl AntigravityExecutor {
             plain: GoClients::new(hooks.clone()),
             hooks,
             cooldowns: Mutex::default(),
+            #[cfg(test)]
+            cooldown_now: None,
             matcher: Mutex::default(),
             probes: Arc::default(),
         }
@@ -395,13 +399,23 @@ impl AntigravityExecutor {
         built
     }
 
+    fn cooldown_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.cooldown_now {
+            return now;
+        }
+        Instant::now()
+    }
+
     /// `antigravityIsInShortCooldownRequired`: the cooldown left for this credential and
     /// model; an expired entry is removed.
     fn cooldown_remaining(&self, credential: &Credential, model: &str) -> Option<Duration> {
         let key = cooldown_key(credential, model)?;
         let mut cooldowns = self.cooldowns.lock().unwrap_or_else(PoisonError::into_inner);
         let until = *cooldowns.get(&key)?;
-        let remaining = until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
+        let remaining = until
+            .checked_duration_since(self.cooldown_now())
+            .filter(|d| !d.is_zero());
         if remaining.is_none() {
             cooldowns.remove(&key);
         }
@@ -457,7 +471,7 @@ impl AntigravityExecutor {
             self.cooldowns
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(key, Instant::now() + retry);
+                .insert(key, self.cooldown_now() + retry);
         }
     }
 

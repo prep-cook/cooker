@@ -26,6 +26,38 @@ use ck_exec::Executors;
 
 use crate::Runtime;
 
+/// Per-runtime scheduler time, including the wall-clock conversion used by SQLite.
+/// HTTP and storage tasks keep running while cooldown time changes only explicitly.
+pub struct SchedulerClock {
+    elapsed: ck_stream::ManualClock,
+    monotonic: std::time::Instant,
+    wall: std::time::SystemTime,
+}
+
+impl Default for SchedulerClock {
+    fn default() -> Self {
+        Self {
+            elapsed: Default::default(),
+            monotonic: std::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+        }
+    }
+}
+
+impl SchedulerClock {
+    pub fn advance(&self, duration: std::time::Duration) {
+        self.elapsed.advance(duration);
+    }
+
+    pub(crate) fn now(&self) -> std::time::Instant {
+        self.monotonic + ck_stream::Clock::now(&self.elapsed)
+    }
+
+    pub fn wall(&self) -> std::time::SystemTime {
+        self.wall + ck_stream::Clock::now(&self.elapsed)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod installation_effects;
 
@@ -318,6 +350,17 @@ pub fn runtime_with_db(
     executors: Executors,
     db: Arc<crate::store::credential_store::CredentialDb>,
 ) -> Runtime {
+    runtime_with_db_clock(config, credentials, executors, db, None)
+}
+
+/// Installs a manual scheduler clock before startup restores persisted cooldowns.
+pub fn runtime_with_db_clock(
+    config: Config,
+    credentials: Vec<Credential>,
+    executors: Executors,
+    db: Arc<crate::store::credential_store::CredentialDb>,
+    clock: Option<Arc<SchedulerClock>>,
+) -> Runtime {
     use sha2::Digest;
     let read = db
         .documents()
@@ -325,7 +368,7 @@ pub fn runtime_with_db(
         .into_iter()
         .map(|(path, bytes)| (path, sha2::Sha256::digest(bytes).into()))
         .collect();
-    let rt = Runtime::new(config, credentials, executors, db);
+    let rt = Runtime::build(config, credentials, executors, db.clone(), db, clock);
     rt.store().note_loaded(&read);
     rt.deny_external.store(true, Ordering::Relaxed);
     rt

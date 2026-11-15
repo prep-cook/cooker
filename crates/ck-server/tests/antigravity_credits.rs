@@ -27,8 +27,12 @@ async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
     let body = String::from_utf8(body.to_vec()).unwrap();
     seen.lock().unwrap().push((path.clone(), body.clone()));
     if path.contains("loadCodeAssist") {
-        // The executor's credits lookup: no answer that changes the hint.
-        return ([("content-type", "application/json")], "{}").into_response();
+        // A completed lookup must agree with the fallback's available-credit fixture.
+        return (
+            [("content-type", "application/json")],
+            r#"{"paidTier":{"availableCredits":[{"creditType":"GOOGLE_ONE_AI","creditAmount":10,"minimumCreditAmountForUsage":1}]}}"#,
+        )
+            .into_response();
     }
     if !body.contains(r#""enabledCreditTypes":["GOOGLE_ONE_AI"]"#) {
         return (
@@ -66,7 +70,9 @@ async fn proxy(credits: bool) -> (String, Arc<Seen>) {
         metadata.insert(k.into(), v.into());
     }
     let dir = std::path::Path::new("/fixture");
-    let mut credential = ck_core::credential::Credential::from_file(dir, &dir.join("credits.json"), metadata).unwrap();
+    // Credits hints and refresh gates are process-wide, keyed by credential ID.
+    let file = format!("credits-{}.json", uuid::Uuid::new_v4());
+    let mut credential = ck_core::credential::Credential::from_file(dir, &dir.join(file), metadata).unwrap();
     credential.attributes.insert("base_url".into(), up);
     let executors = Executors {
         claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
