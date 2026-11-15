@@ -33,6 +33,8 @@ pub mod claude_login;
 pub mod codex;
 mod codex_capture;
 mod codex_client;
+mod codex_events;
+pub mod codex_exec;
 mod codex_images;
 mod codex_json;
 pub mod codex_live;
@@ -42,6 +44,7 @@ pub mod codex_refresh;
 mod codex_replay;
 mod codex_request;
 mod codex_response;
+mod codex_shape;
 pub mod codex_siwc;
 pub mod codex_siwc_bind;
 mod codex_sse;
@@ -49,6 +52,7 @@ mod codex_sse;
 mod codex_testkit;
 mod codex_tls;
 mod codex_tokens;
+mod codex_upload;
 mod codex_ws;
 pub mod devin;
 pub mod devin_auth;
@@ -180,6 +184,7 @@ pub struct DeviceExecutors {
 impl Executors {
     pub fn destination(&self, attempt: &types::Attempt<'_>) -> Option<&'static str> {
         match attempt.credential.provider.as_str() {
+            "codex" => Some(pipeline::destination(&self.codex, attempt)),
             // A request the cloak may shape keeps the old route until owner question 13.
             "claude" if !self.claude.old_route_only(attempt) => Some(pipeline::destination(&self.claude, attempt)),
             p if openai_compat::handles(p) => Some(pipeline::destination(&self.openai.compat, attempt)),
@@ -197,6 +202,7 @@ impl Executors {
         request: &mut ck_stream::Writer,
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
+            "codex" => pipeline::fence(&self.codex, attempt, ingress, request),
             "claude" if !self.claude.old_route_only(attempt) => {
                 pipeline::fence(&self.claude, attempt, ingress, request)
             }
@@ -214,6 +220,7 @@ impl Executors {
         view: ck_translate::codec::RequestView<'a>,
     ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
         match attempt.credential.provider.as_str() {
+            "codex" => pipeline::refence(&self.codex, attempt, view),
             "claude" if !self.claude.old_route_only(attempt) => pipeline::refence(&self.claude, attempt, view),
             p if openai_compat::handles(p) => pipeline::refence(&self.openai.compat, attempt, view),
             gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
@@ -232,6 +239,7 @@ impl Executors {
         mut response: ck_stream::Writer,
     ) -> Result<pipeline::Started, ExecError> {
         match attempt.credential.provider.as_str() {
+            "codex" => pipeline::start(&self.codex, attempt, request, upload, response).await,
             "claude" if !self.claude.old_route_only(attempt) => {
                 pipeline::start(&self.claude, attempt, request, upload, response).await
             }

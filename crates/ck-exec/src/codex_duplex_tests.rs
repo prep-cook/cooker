@@ -782,7 +782,9 @@ async fn later_invalid_signature_clears_replay() {
             let up = Scripted::start(move |mut c: Peer| {
                 let encrypted = seen.clone();
                 async move {
-                    c.read().await;
+                    if !c.read().await.contains(&encrypted) {
+                        c.error("first create lacks its session's replayed reasoning".into());
+                    }
                     c.write(r#"{"type":"response.created","response":{"id":"first","output":[]}}"#).await;
                     c.write(r#"{"type":"response.completed","response":{"id":"first","output":[]}}"#).await;
                     c.read().await;
@@ -818,10 +820,11 @@ async fn later_invalid_signature_clears_replay() {
             let (first, rejected) = (request("first"), request("rejected"));
             let cache = client.executor.replay.clone();
             let item = format!(r#"{{"type":"reasoning","summary":[],"encrypted_content":"{encrypted}"}}"#);
+            let owner = crate::codex_shape::replay_owner("client-key-FAKE", &credential(&up.url).id);
+            let key = |session: &str| format!("{owner}\0claude:{session}:agent:main");
             for session in ["first", "rejected", "unrelated"] {
-                let scope = format!("claude:{session}:agent:main");
                 assert!(
-                    cache.append(MODEL, &scope, &[item.clone().into_bytes()]),
+                    cache.append(MODEL, &key(session), &[item.clone().into_bytes()]),
                     "cache seed failed"
                 );
             }
@@ -836,12 +839,12 @@ async fn later_invalid_signature_clears_replay() {
                 if event == "response.failed" || event == "error" {
                     failed = true;
                     assert!(
-                        cache.get(MODEL, "claude:rejected:agent:main").is_none(),
+                        cache.get(MODEL, &key("rejected")).is_none(),
                         "{kind}/{started}: rejected scope retained invalid reasoning"
                     );
                     for session in ["first", "unrelated"] {
                         assert!(
-                            cache.get(MODEL, &format!("claude:{session}:agent:main")).is_some(),
+                            cache.get(MODEL, &key(session)).is_some(),
                             "{kind}/{started}: cleared unrelated scope {session}"
                         );
                     }

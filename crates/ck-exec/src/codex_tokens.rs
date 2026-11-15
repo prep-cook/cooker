@@ -17,7 +17,7 @@ pub(crate) fn encoding_for_model(model: &str) -> Encoding {
     }
 }
 
-/// `countCodexInputTokens`: instructions, message text, function calls and outputs, other
+/// `countCodexInputTokens`: instructions, message text (parts or one string), function calls and outputs, other
 /// items' `text`, tool names, descriptions and parameters, and the text format's name
 /// and schema, each trimmed, joined with newlines.
 pub(crate) fn count_input_tokens(encoding: Encoding, body: &[u8]) -> Result<i64, String> {
@@ -43,7 +43,11 @@ pub(crate) fn count_input_tokens(encoding: Encoding, body: &[u8]) -> Result<i64,
             match &*item.get("type").bytes() {
                 b"message" => {
                     let content = item.get("content");
-                    if content.is_array() {
+                    // Go's translators always sent content parts; a Responses message may
+                    // also carry its text as one string.
+                    if content.kind == Kind::String {
+                        push(content.bytes().into_owned());
+                    } else if content.is_array() {
                         for part in content.array() {
                             push(part.get("text").bytes().into_owned());
                         }

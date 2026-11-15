@@ -9,7 +9,8 @@ use crate::codec::{
 /// native config are not Responses members; its `include` is a summary setting as a string,
 /// and Gemini's `includeThoughts: true` asks for `auto` summaries unless thinking is off. A
 /// Chat `reasoning` object, which the fence limits to these two, gives its `effort` and
-/// `summary`.
+/// `summary`. Thinking switched off with no effort given is `effort: "none"`, the Responses
+/// form of the disable.
 pub(super) fn write_reasoning_options(
     doc: &Document,
     x: usize,
@@ -22,6 +23,7 @@ pub(super) fn write_reasoning_options(
         None => false,
     };
     let mut open = false;
+    let mut effort = false;
     for f in doc.children(thinking)? {
         let name = doc.node(f)?.name.ok_or(Error::Schema)?;
         let include = doc.name_is(name, "include")?;
@@ -30,6 +32,7 @@ pub(super) fn write_reasoning_options(
         if !native && !summary && !auto && !doc.name_is(name, "effort")? {
             continue;
         }
+        effort |= !include && doc.name_is(name, "effort")?;
         key(&mut open, e)?;
         if include {
             e.string("summary")?;
@@ -43,10 +46,15 @@ pub(super) fn write_reasoning_options(
             doc.write(f, e)?;
         }
     }
-    if let Some(effort) = chat_effort(doc, x, thinking)? {
+    if let Some(chat) = chat_effort(doc, x, thinking)? {
         key(&mut open, e)?;
         e.bytes(b"\"effort\":")?;
-        doc.write(effort, e)?;
+        doc.write(chat, e)?;
+        effort = true;
+    }
+    if off && !effort {
+        key(&mut open, e)?;
+        e.bytes(b"\"effort\":\"none\"")?;
     }
     if is(doc, x, "original_protocol", "chat")?
         && let Some(object) = doc.member(thinking, "native")?
