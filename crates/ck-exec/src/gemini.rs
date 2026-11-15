@@ -66,7 +66,7 @@ pub(crate) fn bad_gateway() -> ExecError {
 }
 
 /// `geminiAPIKey`: the attribute as stored.
-fn api_key(credential: &Credential) -> &str {
+pub(crate) fn api_key(credential: &Credential) -> &str {
     credential
         .attributes
         .get("api_key")
@@ -75,7 +75,7 @@ fn api_key(credential: &Credential) -> &str {
 }
 
 /// `resolveGeminiBaseURL`.
-fn base_url(credential: &Credential) -> String {
+pub(crate) fn base_url(credential: &Credential) -> String {
     let custom = credential
         .attributes
         .get("base_url")
@@ -463,7 +463,7 @@ impl GeminiExecutor {
         }
     }
 
-    fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
+    pub(crate) fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
         self.clients.get(&Proxy::effective(credential, cfg))
     }
 
