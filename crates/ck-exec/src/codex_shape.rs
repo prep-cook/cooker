@@ -139,14 +139,10 @@ fn call_rules(mut body: String, call: Call, model: &str) -> String {
         "safety_identifier",
     ];
     match call {
-        Call::NonStream => {
-            body = set_str_if_different(body, "model", model);
-            body = set_bool_if_different(body, "stream", true);
-            for key in DROPPED.into_iter().chain(["stream_options"]) {
-                body = delete(&body, key);
+        Call::NonStream | Call::Stream => {
+            if call == Call::NonStream {
+                body = set_bool_if_different(body, "stream", true);
             }
-        }
-        Call::Stream => {
             for key in DROPPED {
                 body = delete(&body, key);
             }

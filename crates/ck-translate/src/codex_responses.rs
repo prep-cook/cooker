@@ -53,7 +53,9 @@ pub(crate) fn convert_with_policy(body: &[u8], policy: Policy) -> Vec<u8> {
 }
 
 fn codex_controls(raw: &mut Vec<u8>) {
-    set_required_bool(raw, "parallel_tool_calls", true);
+    if !matches!(gj::get(raw, "parallel_tool_calls").kind, Kind::True | Kind::False) {
+        gj::set_bool(raw, "parallel_tool_calls", true);
+    }
     set_required_include(raw);
     delete_fields(
         raw,
@@ -80,10 +82,7 @@ fn codex_controls(raw: &mut Vec<u8>) {
             delete_fields(raw, &["service_tier"]);
         }
     }
-    delete_fields(
-        raw,
-        &["truncation", "prompt_cache_options", "prompt_cache_retention", "user"],
-    );
+    delete_fields(raw, &["truncation", "prompt_cache_retention", "user"]);
 }
 
 fn set_required_bool(raw: &mut Vec<u8>, path: &str, value: bool) {
@@ -94,29 +93,28 @@ fn set_required_bool(raw: &mut Vec<u8>, path: &str, value: bool) {
     gj::set_bool(raw, path, value);
 }
 
-/// Go `setCodexRequiredInclude`: `reasoning.encrypted_content`, plus
-/// `web_search_call.action.sources` when the client asked for it.
+/// Encrypted reasoning is required; retain the supported optional inclusions.
 fn set_required_include(raw: &mut Vec<u8>) {
-    const REASONING: &[u8] = b"reasoning.encrypted_content";
-    const SOURCES: &[u8] = b"web_search_call.action.sources";
     let current = gj::get(raw, "include");
-    let mut sources = false;
-    if current.is_array() {
-        let values = current.array();
-        let is = |i: usize, want: &[u8]| values[i].kind == Kind::String && &*values[i].bytes() == want;
-        sources = (0..values.len()).any(|i| is(i, SOURCES));
-        if (!sources && values.len() == 1 && is(0, REASONING))
-            || (sources && values.len() == 2 && is(0, REASONING) && is(1, SOURCES))
-        {
-            return;
-        }
-    }
-    let encoded = if sources {
-        r#"["reasoning.encrypted_content","web_search_call.action.sources"]"#
+    let values = if current.is_array() {
+        current.array()
     } else {
-        r#"["reasoning.encrypted_content"]"#
+        Vec::new()
     };
-    gj::set_raw(raw, "include", encoded);
+    let has = |name: &str| values.iter().any(|v| v.kind == Kind::String && v.str() == name);
+    let sources = has("web_search_call.action.sources");
+    let output = has("output.encrypted_content");
+    let encoded = match (sources, output) {
+        (false, false) => r#"["reasoning.encrypted_content"]"#,
+        (true, false) => r#"["reasoning.encrypted_content","web_search_call.action.sources"]"#,
+        (false, true) => r#"["reasoning.encrypted_content","output.encrypted_content"]"#,
+        (true, true) => {
+            r#"["reasoning.encrypted_content","web_search_call.action.sources","output.encrypted_content"]"#
+        }
+    };
+    if current.raw != encoded.as_bytes() {
+        gj::set_raw(raw, "include", encoded);
+    }
 }
 
 fn delete_fields(raw: &mut Vec<u8>, paths: &[&str]) {

@@ -1,5 +1,7 @@
 #[path = "responses/audio.rs"]
 mod audio;
+#[path = "responses/codex_options.rs"]
+mod codex_options;
 #[path = "responses/cross.rs"]
 mod cross;
 #[path = "responses/events.rs"]

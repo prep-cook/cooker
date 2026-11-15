@@ -75,9 +75,9 @@ async fn a_failure_event_fails_with_the_codex_classification() {
     assert!(records.iter().any(|r| r.contains("hel")), "{records:?}");
 }
 
-/// A `response.incomplete` with no output at all is Go's request-scoped 502.
+/// An incomplete terminal retains its wire status, even without output.
 #[tokio::test]
-async fn an_empty_incomplete_response_fails() {
+async fn c11_empty_incomplete_retains_wire_semantics() {
     let body = event(
         "response.created",
         r#"{"type":"response.created","response":{"id":"resp_1","object":"response","created_at":1,"status":"in_progress","model":"gpt-5","output":[]}}"#,
@@ -87,11 +87,21 @@ async fn an_empty_incomplete_response_fails() {
     );
     let upstream = StreamUpstream::start([Reply::sse(body)]).await;
     let (streams, exchange) = (Streams::new(), exchange(&upstream));
-    let (started, id, _request) = run(&streams, &exchange, "chat", Operation::Generate, CHAT, 64).await;
-    let (outcome, published, _stream) = finish(&streams, started.unwrap(), id).await;
-    let error = outcome.unwrap_err();
-    assert_eq!((error.status, error.scope), (502, FailureScope::Request));
-    assert_eq!(errors(&records(&published)).len(), 1);
+    let (started, id, _request) = run(&streams, &exchange, "responses", Operation::Generate, RESPONSES, 64).await;
+    let (outcome, published, mut stream) = finish(&streams, started.unwrap(), id).await;
+    outcome.unwrap();
+    assert_eq!(published.terminal, Some(Terminal::Done));
+    let out = egress(
+        &streams,
+        "responses",
+        &mut stream,
+        id,
+        ck_translate::codec::BodyMode::Streaming,
+    )
+    .await;
+    assert!(out.contains("response.incomplete"), "{out}");
+    assert!(!out.contains("response.completed"), "{out}");
+    assert_eq!(upstream.captured().len(), 1);
 }
 
 /// A body cut after the upstream answered ends the stream with exactly one `error`, after the

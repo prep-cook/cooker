@@ -49,6 +49,7 @@ pub(super) fn normalize(doc: &mut Document, owner: &mut Writer, operation: Opera
     }
     normalize_input(doc, owner, operation, x, original)?;
     normalize_options(doc, x, original)?;
+    normalize_codex(doc, x)?;
     normalize_tools(doc, owner, x, original)?;
     preserve_unknown(doc, original, root, ROOT_FIELDS)?;
     pointers(doc, owner, original)
@@ -119,7 +120,7 @@ fn normalize_options(doc: &mut Document, x: usize, original: usize) -> Result<()
             nest_schema(doc, format)?;
         }
         if doc.node(text)?.first.is_some() {
-            let provider = provider(doc, x)?;
+            let provider = provider(doc, x, "responses")?;
             doc.append(provider, text)?;
         }
     }
@@ -132,9 +133,16 @@ fn normalize_options(doc: &mut Document, x: usize, original: usize) -> Result<()
         let session = doc.set(x, "session", Value::Object)?;
         doc.append(session, previous)?;
     }
-    for name in ["conversation", "background", "truncation", "include", "max_tool_calls"] {
+    for name in [
+        "conversation",
+        "background",
+        "truncation",
+        "include",
+        "max_tool_calls",
+        "prompt_cache_options",
+    ] {
         if let Some(value) = doc.remove(root, name)? {
-            let provider = provider(doc, x)?;
+            let provider = provider(doc, x, "responses")?;
             doc.append(provider, value)?;
         }
     }
@@ -196,15 +204,34 @@ fn normalize_tools(doc: &mut Document, owner: &mut Writer, x: usize, original: u
     }
     Ok(())
 }
-fn provider(doc: &mut Document, x: usize) -> Result<usize> {
+fn provider(doc: &mut Document, x: usize, name: &'static str) -> Result<usize> {
     let p = match doc.member(x, "provider_parameters")? {
         Some(p) => p,
         None => doc.set(x, "provider_parameters", Value::Object)?,
     };
-    match doc.member(p, "responses")? {
+    match doc.member(p, name)? {
         Some(p) => Ok(p),
-        None => doc.set(p, "responses", Value::Object),
+        None => doc.set(p, name, Value::Object),
     }
+}
+
+/// Proprietary Codex controls cannot be restored by another Responses destination.
+fn normalize_codex(doc: &mut Document, x: usize) -> Result<()> {
+    let root = doc.root();
+    if let Some(stream) = doc.member(root, "stream_options")?
+        && matches!(doc.node(stream)?.value, Value::Object)
+        && let Some(summary) = doc.remove(stream, "reasoning_summary_delivery")?
+    {
+        let codex = provider(doc, x, "codex")?;
+        let options = doc.set(codex, "stream_options", Value::Object)?;
+        doc.append(options, summary)?;
+        doc.detach(root, stream)?;
+        if doc.node(stream)?.first.is_some() {
+            let responses = provider(doc, x, "responses")?;
+            doc.append(responses, stream)?;
+        }
+    }
+    Ok(())
 }
 /// Where normalized input items go, with the counts their records need; every item becomes
 /// exactly one message.

@@ -20,11 +20,7 @@ struct Calls<'a> {
     ordinal: u64,
 }
 
-pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
-    validate_for(view, "responses")
-}
-
-pub(super) fn validate_for(view: RequestView<'_>, destination: &str) -> Result<()> {
+pub(super) fn validate(view: RequestView<'_>, destination: &str) -> Result<()> {
     if view.operation == Operation::CountTokens {
         return Err(Error::Unsupported);
     }
@@ -96,7 +92,7 @@ pub(super) fn validate_for(view: RequestView<'_>, destination: &str) -> Result<(
         Ok(())
     })?;
     if let Some(x) = x {
-        validate_extensions(doc, x)?;
+        validate_extensions(doc, x, destination == "codex")?;
     }
     Ok(())
 }
@@ -337,10 +333,17 @@ fn document(doc: &Document, part: usize) -> Result<()> {
     Ok(())
 }
 /// Refuses gateway extensions a Responses upstream cannot carry.
-fn validate_extensions(doc: &Document, x: usize) -> Result<()> {
+fn validate_extensions(doc: &Document, x: usize, codex: bool) -> Result<()> {
     // Another protocol's parameters, such as Anthropic `top_k`, have no Responses form.
     if let Some(providers) = doc.member(x, "provider_parameters")? {
         for group in doc.children(providers)? {
+            if codex && doc.name_is(doc.node(group)?.name.ok_or(Error::Schema)?, "codex")? {
+                only(doc, group, &["stream_options"])?;
+                if let Some(stream) = doc.member(group, "stream_options")? {
+                    only(doc, stream, &["reasoning_summary_delivery"])?;
+                }
+                continue;
+            }
             if !doc.name_is(doc.node(group)?.name.ok_or(Error::Schema)?, "responses")?
                 && doc.node(group)?.first.is_some()
             {

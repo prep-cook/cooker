@@ -5,14 +5,10 @@
 //! - Data spread over several `data:` lines is joined (`codex_sse`), and each payload is
 //!   trimmed and has the client's `collaboration` names restored when the request renamed
 //!   them (multi-agent v2). Data that is not UTF-8 ends the body with an upstream failure.
-//! - A terminal failure event, or a `response.incomplete` with no output at all, ends the
-//!   body with Go's classified error instead of the event, so the attempt fails with the
-//!   status, scope and retry hint the scheduler and cooldown need. An invalid-signature
+//! - A terminal failure event ends the body with its classified error. An invalid-signature
 //!   failure clears the reasoning replay.
-//! - `response.done` is the completion; a completion whose `output` is empty gets the items
-//!   `response.output_item.done` announced, which the ingress reconciles against. Those
-//!   items wait in scratch leases of the response stream, inside its quota, and are spliced
-//!   in as the completion is passed on. A completed turn is cached for reasoning replay.
+//! - Only `response.completed` and `response.incomplete` end the response. An empty terminal
+//!   output gets the announced items from scratch leases. Only completed turns enter replay.
 //! - The completion counts at the blank line ending its event; nothing after that is read.
 //!   A body that ends before it, with or without a completion, is Go's incomplete stream.
 //!
@@ -43,7 +39,6 @@ pub(crate) struct Events {
     /// Scratch storage on the response stream for the announced items.
     scratch: Writer,
     items: Items,
-    saw_delta: bool,
     /// The request renamed the `collaboration` namespace.
     restore: bool,
     backend: Backend,
@@ -135,7 +130,6 @@ impl Events {
             sse: crate::codex_sse::DataLines::new(SCANNER_MAX_LINE),
             scratch,
             items: Items::default(),
-            saw_delta: false,
             restore,
             backend,
             replay,
@@ -231,23 +225,20 @@ impl Events {
 
     /// Go's rules on one data payload, in Go's order; queues the line it becomes.
     fn payload(&mut self, payload: &str) -> Result<(), ExecError> {
-        let codex = match self.backend {
-            Backend::Codex { model_level_cooling } => {
-                self.codex_failure(payload, model_level_cooling)?;
-                true
+        match self.backend {
+            Backend::Codex { model_level_cooling } => self.codex_failure(payload, model_level_cooling)?,
+            Backend::Meta => {
+                if let Some(error) = crate::meta::stream_event_error(payload.as_bytes()) {
+                    return Err(error);
+                }
             }
-            Backend::Meta => match crate::meta::stream_event_error(payload.as_bytes()) {
-                Some(error) => return Err(error),
-                None => false,
-            },
-        };
+        }
         let kind = gjson::get(payload, "type");
         match kind.str() {
             "response.output_item.done" => self.collect(payload)?,
-            "response.done" if !codex => {}
-            kind @ ("response.completed" | "response.incomplete" | "response.done") => {
+            kind @ ("response.completed" | "response.incomplete") => {
                 let incomplete = kind == "response.incomplete";
-                return self.completion(response::normalize_completion(payload.to_owned()), incomplete);
+                return self.completion(payload.to_owned(), incomplete);
             }
             _ => {}
         }
@@ -257,20 +248,13 @@ impl Events {
         Ok(())
     }
 
-    /// Go's Codex failure rules: a terminal failure event, and a `response.incomplete` with
-    /// no output at all.
+    /// Classify Codex failure events without changing incomplete terminals.
     fn codex_failure(&mut self, payload: &str, model_level_cooling: bool) -> Result<(), ExecError> {
         if let Some((error, body)) = response::terminal_failure(payload, model_level_cooling) {
             if let Some((cache, scope)) = &self.replay {
                 crate::codex_replay::clear_on_invalid_signature(cache, scope, error.status, body.as_bytes());
             }
             return Err(error);
-        }
-        if response::meaningful_delta(payload) {
-            self.saw_delta = true;
-        }
-        if response::empty_incomplete(payload, self.items.len(), self.saw_delta) {
-            return Err(response::request_scoped(502, response::EMPTY_INCOMPLETE_MESSAGE));
         }
         Ok(())
     }

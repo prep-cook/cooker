@@ -81,6 +81,9 @@ pub(crate) fn translate_request(
             payload = cc::rewrite_multi_agent_v2_input(client.headers, &payload, &client.settings, client.is_compat);
         }
     }
+    if from == Format::OpenAIResponse && to == Format::Codex && !codex_target(client.target_executor) {
+        non_codex_options(&mut payload);
+    }
     let compat = client.is_compat.then(|| compat_translator(from, to)).flatten();
     let Some(translate) = compat else {
         return ck_translate::translate_request(from, to, ctx, &payload);
@@ -143,6 +146,31 @@ pub(crate) fn optimize_for_auth(
         body = cc::rewrite_multi_agent_v2_input(headers, &body, settings, true);
     }
     (body, optimized)
+}
+
+/// Keep other executors using the Codex translator on their existing option policy.
+pub(crate) fn non_codex_options(body: &mut Vec<u8>) {
+    use ck_wire::json::{self as gj, Kind};
+    let parallel = gj::get(body, "parallel_tool_calls");
+    if parallel.exists() && parallel.kind != Kind::True {
+        gj::set_bool(body, "parallel_tool_calls", true);
+    }
+    if gj::get(body, "prompt_cache_options").exists() {
+        gj::delete(body, "prompt_cache_options");
+    }
+    let include = gj::get(body, "include");
+    if include.is_array() {
+        let values = include.array();
+        let has = |name: &str| values.iter().any(|v| v.kind == Kind::String && v.str() == name);
+        if has("output.encrypted_content") {
+            let encoded = if has("web_search_call.action.sources") {
+                r#"["reasoning.encrypted_content","web_search_call.action.sources"]"#
+            } else {
+                r#"["reasoning.encrypted_content"]"#
+            };
+            gj::set_raw(body, "include", encoded);
+        }
+    }
 }
 
 #[cfg(test)]

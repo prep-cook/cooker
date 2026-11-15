@@ -5,7 +5,7 @@ use crate::codec::{
 };
 /// Refuse Meta-only unsupported semantics before an attempt sends anything.
 pub fn validate(view: RequestView<'_>) -> codec::Result<()> {
-    super::validate::validate_for(view, "meta")?;
+    super::validate::validate(view, "meta")?;
     let doc = view.document;
     let root = doc.root();
     if let Some(x) = doc.member(root, "x_ck")? {

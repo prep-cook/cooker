@@ -1,6 +1,6 @@
 //! What the Codex backend requires of a Responses request (`ConvertOpenAIResponsesRequestToCodex`,
 //! internal/translator/codex/openai/responses), applied by the executor to its own encoded
-//! upload for every client protocol: `store` off, parallel tool calls on, encrypted reasoning
+//! upload for every client protocol: `store` off, explicit parallel-tool control retained, encrypted reasoning
 //! included, the sampling and limit members the backend refuses removed, the service tier
 //! normalized, prompt cache breakpoints stripped, system input as developer input, and the
 //! preview web search tools under their current name.
@@ -15,18 +15,16 @@ use ck_wire::json::{self as gj, Kind};
 /// The Codex backend's rules on a Responses `upload`.
 pub(crate) fn require(mut raw: Vec<u8>) -> Vec<u8> {
     set_required_bool(&mut raw, "store", false);
-    set_required_bool(&mut raw, "parallel_tool_calls", true);
+    if !matches!(gj::get(&raw, "parallel_tool_calls").kind, Kind::True | Kind::False) {
+        gj::set_bool(&mut raw, "parallel_tool_calls", true);
+    }
     set_required_include(&mut raw);
     delete_fields(
         &mut raw,
         &["max_output_tokens", "max_completion_tokens", "temperature", "top_p"],
     );
     service_tier(&mut raw);
-    delete_fields(
-        &mut raw,
-        &["truncation", "prompt_cache_options", "prompt_cache_retention"],
-    );
-    delete_fields(&mut raw, &["user"]);
+    delete_fields(&mut raw, &["truncation", "prompt_cache_retention", "user"]);
     normalize(raw)
 }
 
@@ -46,29 +44,28 @@ fn set_required_bool(raw: &mut Vec<u8>, path: &str, value: bool) {
     gj::set_bool(raw, path, value);
 }
 
-/// Go `setCodexRequiredInclude`: `reasoning.encrypted_content`, plus
-/// `web_search_call.action.sources` when the client asked for it.
+/// Encrypted reasoning is required; retain the supported optional inclusions.
 fn set_required_include(raw: &mut Vec<u8>) {
-    const REASONING: &[u8] = b"reasoning.encrypted_content";
-    const SOURCES: &[u8] = b"web_search_call.action.sources";
     let current = gj::get(raw, "include");
-    let mut sources = false;
-    if current.is_array() {
-        let values = current.array();
-        let is = |i: usize, want: &[u8]| values[i].kind == Kind::String && &*values[i].bytes() == want;
-        sources = (0..values.len()).any(|i| is(i, SOURCES));
-        if (!sources && values.len() == 1 && is(0, REASONING))
-            || (sources && values.len() == 2 && is(0, REASONING) && is(1, SOURCES))
-        {
-            return;
-        }
-    }
-    let encoded = if sources {
-        r#"["reasoning.encrypted_content","web_search_call.action.sources"]"#
+    let values = if current.is_array() {
+        current.array()
     } else {
-        r#"["reasoning.encrypted_content"]"#
+        Vec::new()
     };
-    gj::set_raw(raw, "include", encoded);
+    let has = |name: &str| values.iter().any(|v| v.kind == Kind::String && v.str() == name);
+    let sources = has("web_search_call.action.sources");
+    let output = has("output.encrypted_content");
+    let encoded = match (sources, output) {
+        (false, false) => r#"["reasoning.encrypted_content"]"#,
+        (true, false) => r#"["reasoning.encrypted_content","web_search_call.action.sources"]"#,
+        (false, true) => r#"["reasoning.encrypted_content","output.encrypted_content"]"#,
+        (true, true) => {
+            r#"["reasoning.encrypted_content","web_search_call.action.sources","output.encrypted_content"]"#
+        }
+    };
+    if current.raw != encoded.as_bytes() {
+        gj::set_raw(raw, "include", encoded);
+    }
 }
 
 /// `priority` (also spelled `fast`) and `ultrafast` are the tiers the backend serves; any
