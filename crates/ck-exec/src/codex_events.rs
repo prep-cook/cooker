@@ -17,6 +17,10 @@
 //!   A body that ends before it, with or without a completion, is Go's incomplete stream.
 //!
 //! Everything else passes line by line; the ingress decodes the result.
+//!
+//! Meta Muse speaks the same wire with its own rules ([`Backend::Meta`]): a failure event is
+//! classified as Meta's executor does, only `response.completed` and `response.incomplete`
+//! complete the response, and there is no empty-incomplete rule, rename or replay.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -42,12 +46,46 @@ pub(crate) struct Events {
     saw_delta: bool,
     /// The request renamed the `collaboration` namespace.
     restore: bool,
-    model_level_cooling: bool,
+    backend: Backend,
     /// Claude clients' reasoning replay for this request.
     replay: Option<(Arc<Cache>, Scope)>,
     /// Processed output not yet passed on.
     out: VecDeque<Piece>,
     phase: Phase,
+}
+
+/// Whose rules the upstream events follow.
+#[derive(Clone, Copy)]
+pub(crate) enum Backend {
+    /// The Codex backend (codex_executor_stream.go).
+    Codex { model_level_cooling: bool },
+    /// Meta Muse (meta_executor.go).
+    Meta,
+}
+
+impl Backend {
+    /// Go's scanner refuses a line past its limit.
+    fn too_long(self) -> ExecError {
+        match self {
+            Self::Codex { .. } => too_long(),
+            Self::Meta => ExecError::local(500, FailureScope::Request, "bufio.Scanner: token too long"),
+        }
+    }
+
+    /// A body that ended before its completion's event did.
+    fn incomplete(self) -> ExecError {
+        match self {
+            Self::Codex { .. } => response::request_scoped(408, response::INCOMPLETE_MESSAGE),
+            Self::Meta => ExecError::local(408, FailureScope::Credential, crate::meta::DISCONNECTED),
+        }
+    }
+
+    fn not_utf8(self) -> ExecError {
+        not_utf8(match self {
+            Self::Codex { .. } => "codex",
+            Self::Meta => "meta",
+        })
+    }
 }
 
 /// Where the body is relative to its completion.
@@ -91,12 +129,7 @@ impl Items {
 }
 
 impl Events {
-    pub(crate) fn new(
-        scratch: Writer,
-        restore: bool,
-        model_level_cooling: bool,
-        replay: Option<(Arc<Cache>, Scope)>,
-    ) -> Self {
+    pub(crate) fn new(scratch: Writer, restore: bool, backend: Backend, replay: Option<(Arc<Cache>, Scope)>) -> Self {
         Self {
             line: Vec::new(),
             sse: crate::codex_sse::DataLines::new(SCANNER_MAX_LINE),
@@ -104,7 +137,7 @@ impl Events {
             items: Items::default(),
             saw_delta: false,
             restore,
-            model_level_cooling,
+            backend,
             replay,
             out: VecDeque::new(),
             phase: Phase::Reading,
@@ -120,7 +153,7 @@ impl Events {
         while !self.completed() {
             let Some(end) = chunk.iter().position(|b| *b == b'\n') else {
                 if self.line.len() + chunk.len() > SCANNER_MAX_LINE {
-                    return Err(too_long());
+                    return Err(self.backend.too_long());
                 }
                 self.line.extend_from_slice(chunk);
                 return Ok(());
@@ -155,7 +188,7 @@ impl Events {
         if self.completed() {
             Ok(())
         } else {
-            Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE))
+            Err(self.backend.incomplete())
         }
     }
 
@@ -191,14 +224,43 @@ impl Events {
             self.text(b"\n");
             return Ok(());
         };
-        let text = std::str::from_utf8(data).map_err(|_| not_utf8())?;
+        let text = std::str::from_utf8(data).map_err(|_| self.backend.not_utf8())?;
         let payload = response::restore(text.trim(), self.restore);
         self.payload(payload.as_ref())
     }
 
     /// Go's rules on one data payload, in Go's order; queues the line it becomes.
     fn payload(&mut self, payload: &str) -> Result<(), ExecError> {
-        if let Some((error, body)) = response::terminal_failure(payload, self.model_level_cooling) {
+        let codex = match self.backend {
+            Backend::Codex { model_level_cooling } => {
+                self.codex_failure(payload, model_level_cooling)?;
+                true
+            }
+            Backend::Meta => match crate::meta::stream_event_error(payload.as_bytes()) {
+                Some(error) => return Err(error),
+                None => false,
+            },
+        };
+        let kind = gjson::get(payload, "type");
+        match kind.str() {
+            "response.output_item.done" => self.collect(payload)?,
+            "response.done" if !codex => {}
+            kind @ ("response.completed" | "response.incomplete" | "response.done") => {
+                let incomplete = kind == "response.incomplete";
+                return self.completion(response::normalize_completion(payload.to_owned()), incomplete);
+            }
+            _ => {}
+        }
+        self.text(b"data: ");
+        self.text(payload.as_bytes());
+        self.text(b"\n");
+        Ok(())
+    }
+
+    /// Go's Codex failure rules: a terminal failure event, and a `response.incomplete` with
+    /// no output at all.
+    fn codex_failure(&mut self, payload: &str, model_level_cooling: bool) -> Result<(), ExecError> {
+        if let Some((error, body)) = response::terminal_failure(payload, model_level_cooling) {
             if let Some((cache, scope)) = &self.replay {
                 crate::codex_replay::clear_on_invalid_signature(cache, scope, error.status, body.as_bytes());
             }
@@ -210,18 +272,6 @@ impl Events {
         if response::empty_incomplete(payload, self.items.len(), self.saw_delta) {
             return Err(response::request_scoped(502, response::EMPTY_INCOMPLETE_MESSAGE));
         }
-        let kind = gjson::get(payload, "type");
-        match kind.str() {
-            "response.output_item.done" => self.collect(payload)?,
-            kind @ ("response.completed" | "response.incomplete" | "response.done") => {
-                let incomplete = kind == "response.incomplete";
-                return self.completion(response::normalize_completion(payload.to_owned()), incomplete);
-            }
-            _ => {}
-        }
-        self.text(b"data: ");
-        self.text(payload.as_bytes());
-        self.text(b"\n");
         Ok(())
     }
 
@@ -382,11 +432,11 @@ fn too_long() -> ExecError {
 }
 
 /// Upstream bytes that are not UTF-8 text are a failed upstream response, never repaired.
-fn not_utf8() -> ExecError {
+fn not_utf8(executor: &str) -> ExecError {
     ExecError::local(
         502,
         crate::upstream::scope_for(502),
-        "codex executor: upstream event is not valid UTF-8",
+        format!("{executor} executor: upstream event is not valid UTF-8"),
     )
 }
 
@@ -471,7 +521,7 @@ pub(crate) fn compaction(upstream: Body, restore: bool) -> Body {
                 return Err(too_long());
             }
         }
-        let text = std::str::from_utf8(&data).map_err(|_| not_utf8())?;
+        let text = std::str::from_utf8(&data).map_err(|_| not_utf8("codex"))?;
         Ok(Bytes::from(response::restore(text, true).into_owned()))
     })
     .boxed()

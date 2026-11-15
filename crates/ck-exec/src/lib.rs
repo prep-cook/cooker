@@ -75,6 +75,7 @@ pub mod login_store;
 pub mod meta;
 pub mod meta_auth;
 mod meta_codex;
+pub mod meta_exec;
 mod meta_wire;
 pub mod oauth;
 pub mod openai_compat;
@@ -183,6 +184,7 @@ impl Executors {
             "claude" if !self.claude.old_route_only(attempt) => Some(pipeline::destination(&self.claude, attempt)),
             p if openai_compat::handles(p) => Some(pipeline::destination(&self.openai.compat, attempt)),
             gemini_exec::PROVIDER => Some(pipeline::destination(&self.google.gemini, attempt)),
+            meta::PROVIDER => Some(pipeline::destination(&self.devices.meta, attempt)),
             _ => None,
         }
     }
@@ -201,6 +203,7 @@ impl Executors {
             }
             p if openai_compat::handles(p) => pipeline::fence(&self.openai.compat, attempt, ingress, request),
             gemini_exec::PROVIDER => pipeline::fence(&self.google.gemini, attempt, ingress, request),
+            meta::PROVIDER => pipeline::fence(&self.devices.meta, attempt, ingress, request),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -216,6 +219,7 @@ impl Executors {
             "claude" if !self.claude.old_route_only(attempt) => pipeline::refence(&self.claude, attempt, view),
             p if openai_compat::handles(p) => pipeline::refence(&self.openai.compat, attempt, view),
             gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
+            meta::PROVIDER => pipeline::refence(&self.devices.meta, attempt, view),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -238,6 +242,7 @@ impl Executors {
                 pipeline::start(&self.openai.compat, attempt, request, upload, response).await
             }
             gemini_exec::PROVIDER => pipeline::start(&self.google.gemini, attempt, request, upload, response).await,
+            meta::PROVIDER => pipeline::start(&self.devices.meta, attempt, request, upload, response).await,
             provider => {
                 response.finish(ck_stream::Terminal::Gone);
                 Err(no_executor(provider))
