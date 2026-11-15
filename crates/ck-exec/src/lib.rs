@@ -67,6 +67,7 @@ mod gemini_stream;
 mod google_wire;
 pub mod kimi;
 pub mod kimi_auth;
+mod kimi_exec;
 #[cfg(test)]
 mod kimi_fixture;
 mod kimi_http;
@@ -185,6 +186,7 @@ impl Executors {
             p if openai_compat::handles(p) => Some(pipeline::destination(&self.openai.compat, attempt)),
             gemini_exec::PROVIDER => Some(pipeline::destination(&self.google.gemini, attempt)),
             p if vertex::handles(p) => vertex_exec::destination(&self.google.vertex, attempt),
+            p if kimi::PROVIDERS.contains(&p) => Some(pipeline::destination(&self.devices.kimi, attempt)),
             _ => None,
         }
     }
@@ -204,6 +206,7 @@ impl Executors {
             p if openai_compat::handles(p) => pipeline::fence(&self.openai.compat, attempt, ingress, request),
             gemini_exec::PROVIDER => pipeline::fence(&self.google.gemini, attempt, ingress, request),
             p if vertex::handles(p) => pipeline::fence(&self.google.vertex, attempt, ingress, request),
+            p if kimi::PROVIDERS.contains(&p) => pipeline::fence(&self.devices.kimi, attempt, ingress, request),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -220,6 +223,7 @@ impl Executors {
             p if openai_compat::handles(p) => pipeline::refence(&self.openai.compat, attempt, view),
             gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
             p if vertex::handles(p) => pipeline::refence(&self.google.vertex, attempt, view),
+            p if kimi::PROVIDERS.contains(&p) => pipeline::refence(&self.devices.kimi, attempt, view),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -243,6 +247,9 @@ impl Executors {
             }
             gemini_exec::PROVIDER => pipeline::start(&self.google.gemini, attempt, request, upload, response).await,
             p if vertex::handles(p) => pipeline::start(&self.google.vertex, attempt, request, upload, response).await,
+            p if kimi::PROVIDERS.contains(&p) => {
+                pipeline::start(&self.devices.kimi, attempt, request, upload, response).await
+            }
             provider => {
                 response.finish(ck_stream::Terminal::Gone);
                 Err(no_executor(provider))

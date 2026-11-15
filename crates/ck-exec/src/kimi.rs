@@ -1,4 +1,7 @@
-//! Kimi executor (internal/runtime/executor/kimi_executor.go).
+//! Kimi executor (internal/runtime/executor/kimi_executor.go): the old execution path. Chat,
+//! Gemini and Responses generations run under the execution contract (`kimi_exec`); this
+//! path keeps what that route sends back here (Claude Messages clients, token counts and
+//! Responses requests carrying a custom `apply_patch` tool) until D2 removes the old arm.
 //!
 //! Three wire paths, chosen by the client format:
 //! - Claude Messages: delegated to the Claude executor against Kimi's Anthropic-compatible
@@ -22,7 +25,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::{Credential, MetadataPatch};
-use ck_core::exec::{ExecError, ExecRequest, ExecResponse, ExecStream, FailureScope, Operation, ResponseBody};
+use ck_core::exec::{
+    ExecError, ExecRequest, ExecResponse, ExecStream, FailureScope, Operation, ResponseBody, UsageSink,
+};
 use ck_core::format::Format;
 use ck_translate::{RequestCtx, ResponseCtx, StreamTranslator, apply_patch_responses};
 use ck_wire::gostr::GoStr;
@@ -33,7 +38,7 @@ use futures_util::StreamExt;
 use crate::claude::{ClaudeExecutor, Delegation};
 use crate::kimi_auth::{self, DeviceFlow};
 use crate::kimi_http::{
-    BUILD_VERSION, credential_headers, go_arch, go_os, hostname, payload_rules, refresh_due, rfc3339_local_now,
+    BUILD_VERSION, client_headers, go_arch, go_os, hostname, payload_rules, refresh_due, rfc3339_local_now,
     status_error,
 };
 use crate::kimi_http::{DeferredUsage, UsageRule, apply_patch_requested, defer_usage, report_model};
@@ -69,6 +74,11 @@ impl KimiExecutor {
             oauth_host: None,
             replay: Arc::default(),
         }
+    }
+
+    /// The HTTP client for `credential`'s effective proxy.
+    pub(crate) fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
+        self.clients.get(&Proxy::effective(credential, cfg))
     }
 
     /// Sends token refreshes to a local mock instead of auth.kimi.com / auth.kimi.ai.
@@ -210,7 +220,7 @@ pub(crate) fn base_url(credential: &Credential) -> String {
     kimi_auth::api_base(kimi_auth::resolve_domain(credential)).to_owned()
 }
 
-fn chat_url(credential: &Credential) -> String {
+pub(crate) fn chat_url(credential: &Credential) -> String {
     let base = base_url(credential);
     if base.ends_with("/v1") {
         format!("{base}/chat/completions")
@@ -219,7 +229,7 @@ fn chat_url(credential: &Credential) -> String {
     }
 }
 
-fn responses_url(credential: &Credential) -> String {
+pub(crate) fn responses_url(credential: &Credential) -> String {
     let base = base_url(credential);
     if base.ends_with("/v1") {
         format!("{base}/responses")
@@ -267,8 +277,14 @@ fn device_id(credential: &Credential) -> String {
         .unwrap_or_else(|_| "cli-proxy-api-device".into())
 }
 
-/// `applyKimiHeadersWithAuth` plus credential custom headers.
-fn headers(credential: &Credential, req: &ExecRequest, stream: bool) -> GoHeaders {
+/// `applyKimiHeadersWithAuth` plus credential custom headers; `client` and `session` are the
+/// client's request headers and canonical session.
+pub(crate) fn headers(
+    credential: &Credential,
+    client: &http::HeaderMap,
+    session: Option<&str>,
+    stream: bool,
+) -> GoHeaders {
     let mut h = GoHeaders::new();
     h.set("Content-Type", "application/json");
     h.set("Authorization", format!("Bearer {}", access_token(credential)));
@@ -286,7 +302,7 @@ fn headers(credential: &Credential, req: &ExecRequest, stream: bool) -> GoHeader
             "application/json"
         },
     );
-    for (name, value) in credential_headers(credential, req, original(req)) {
+    for (name, value) in client_headers(credential, client, session) {
         h.set(&name, value);
     }
     h
@@ -340,21 +356,21 @@ fn thinking(body: &[u8], req: &ExecRequest, to: &str) -> Result<Vec<u8>, ExecErr
 }
 
 /// Go's bufio.Scanner limits: 1 MiB for Chat Completions lines, 50 MiB for Responses.
-const CHAT_LINE_LIMIT: usize = 1_048_576;
-const RESPONSES_LINE_LIMIT: usize = 52_428_800;
+pub(crate) const CHAT_LINE_LIMIT: usize = 1_048_576;
+pub(crate) const RESPONSES_LINE_LIMIT: usize = 52_428_800;
 
 /// One upstream send (kimi_executor.go's four `RecordAPIRequest` sites): the capture of
 /// the request, its response metadata and a rejected response's body, then the send.
-async fn post(
+pub(crate) async fn post(
     client: &wreq::Client,
     credential: &Credential,
-    req: &ExecRequest,
+    usage: &UsageSink,
     url: &str,
     headers: GoHeaders,
     body: Vec<u8>,
 ) -> Result<Upstream, ExecError> {
     use crate::kimi_http::{capture_chunk, capture_error, capture_metadata, capture_request};
-    let capture = req.capture();
+    let capture = usage.capture();
     let (auth_type, auth_value) = ck_core::registry::dynamic::account_info(credential);
     capture_request(
         capture,
@@ -366,14 +382,14 @@ async fn post(
         (auth_type, &auth_value),
     );
     // Go's TrackHTTPClient: the TTFT runs from the request to the first body byte.
-    req.usage.round_trip_started();
+    usage.round_trip_started();
     // Go reads every Kimi body with a scanner or io.ReadAll: one cut short fails with
     // `unexpected EOF`.
     let mut upstream = send_scanned(client, url, headers, Bytes::from(body), None)
         .await
         .inspect_err(|e| capture_error(capture, e))?;
     capture_metadata(capture, upstream.status, &upstream.headers);
-    upstream.body = crate::kimi_http::track_first_byte(upstream.body, &req.usage, false);
+    upstream.body = crate::kimi_http::track_first_byte(upstream.body, usage, false);
     if !(200..300).contains(&upstream.status) {
         let error = status_error(upstream).await;
         // ponytail: the error body is the MAX_ERROR_BODY prefix (proxy.rs ceiling); Go
@@ -453,9 +469,9 @@ async fn execute_chat(
     let upstream = post(
         client,
         credential,
-        &req,
+        &req.usage,
         &chat_url(credential),
-        headers(credential, &req, req.stream),
+        headers(credential, &req.headers, req.session.as_deref(), req.stream),
         body.clone(),
     )
     .await?;
@@ -787,9 +803,9 @@ async fn execute_responses(
     let upstream = post(
         client,
         credential,
-        &req,
+        &req.usage,
         &responses_url(credential),
-        headers(credential, &req, req.stream),
+        headers(credential, &req.headers, req.session.as_deref(), req.stream),
         body.clone(),
     )
     .await?;
@@ -961,7 +977,7 @@ fn fallback_reasoning(msg: &Res<'_>, latest: Option<&[u8]>) -> Vec<u8> {
 
 /// `normalizeKimiToolMessageLinks`: drop empty assistant turns, repair tool_call_id links
 /// and give tool-calling assistant turns reasoning_content.
-fn normalize_tool_message_links(body: Vec<u8>) -> Result<Vec<u8>, ExecError> {
+pub(crate) fn normalize_tool_message_links(body: Vec<u8>) -> Result<Vec<u8>, ExecError> {
     if body.is_empty() || !gj::valid(&body) {
         return Ok(body);
     }
@@ -1061,7 +1077,7 @@ fn normalize_tool_message_links(body: Vec<u8>) -> Result<Vec<u8>, ExecError> {
 }
 
 /// `normalizeKimiTools`: inline local `$ref`s and default the root schema type.
-fn normalize_tools(body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn normalize_tools(body: Vec<u8>) -> Vec<u8> {
     if body.is_empty() {
         return body;
     }
@@ -1126,7 +1142,7 @@ fn normalize_parameters_schema(raw: &[u8]) -> Vec<u8> {
 }
 
 /// `normalizeKimiTemperature`: Kimi accepts only 0.6 without thinking and 1.0 with it.
-fn normalize_temperature(mut body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn normalize_temperature(mut body: Vec<u8>) -> Vec<u8> {
     let temperature = gj::get(&body, "temperature");
     if !temperature.exists() {
         return body;
@@ -1166,7 +1182,7 @@ fn is_tool_output(item: &Res<'_>) -> bool {
 
 /// `NormalizeKimiResponsesInput`: tool outputs must follow their parallel calls directly;
 /// items in between move after the outputs.
-fn normalize_responses_input(body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn normalize_responses_input(body: Vec<u8>) -> Vec<u8> {
     if body.is_empty() || !gj::valid(&body) {
         return body;
     }
