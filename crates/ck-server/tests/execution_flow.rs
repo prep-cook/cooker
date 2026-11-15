@@ -13,7 +13,7 @@ use axum::http::HeaderMap;
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::{Credential, Source};
-use ck_core::exec::{Caller, ExecError, FailureScope};
+use ck_core::exec::{Caller, ExecError, FailureScope, UsageSink};
 use ck_exec::pipeline::Started;
 use ck_exec::types::{Attempt, Client, Counted, Execute, Request, Streams, Upstream};
 use ck_server::http::egress::{Framing, Output, Protocol};
@@ -182,6 +182,7 @@ struct Fixture {
     cfg: Config,
     caller: Caller,
     headers: HeaderMap,
+    usage: UsageSink,
 }
 
 impl Fixture {
@@ -217,6 +218,7 @@ impl Fixture {
                 provider: "config-inline".into(),
             },
             headers: HeaderMap::new(),
+            usage: UsageSink::default(),
         }
     }
 
@@ -239,6 +241,7 @@ impl Fixture {
             session: None,
             execution_session: None,
             derived_session: None,
+            usage: &self.usage,
         }
     }
 }

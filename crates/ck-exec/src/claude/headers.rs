@@ -167,6 +167,9 @@ pub(crate) struct Plan<'a> {
     /// The key's cached session ID (`CachedSessionIDRequired`), resolved by the caller
     /// when [`needs_cached_session`] says so.
     pub cached_session_id: &'a str,
+    /// The execution contract's path: a caller-preserving request sends the caller's own
+    /// betas and adds only documented ones the body needs (P8 drops the old path).
+    pub official: bool,
 }
 
 /// Go `applyClaudeHeaders`: a caller that is neither fingerprinted as Claude Code nor
@@ -240,7 +243,9 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
     if preserve_caller && advisor {
         base = betas::with_advisor(&base);
     }
-    if !betas::supports_effort(p.body) {
+    // The caller's own anthropic-beta reaches the official API unchanged.
+    let caller_owned = preserve_caller && p.official;
+    if !betas::supports_effort(p.body) && !caller_owned {
         base = betas::without(&base, betas::EFFORT);
     }
     let mut existing: std::collections::HashSet<String> = base
@@ -322,7 +327,9 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
             h.set("Anthropic-Beta", b);
         }
     };
-    base = finalize_betas(&base);
+    if !caller_owned {
+        base = finalize_betas(&base);
+    }
     apply_betas(&mut h, &base);
 
     if preserve_caller {
@@ -341,6 +348,10 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
             "User-Agent",
             &format!("CLIProxyAPI/{}", crate::claude::PROXY_VERSION),
         );
+        // Owner ruling: the API-key path identifies as cooker.
+        if p.official {
+            h.set("User-Agent", "cooker");
+        }
         apply_betas(&mut h, &base);
         if !p.session_id.trim().is_empty() {
             h.set("X-Claude-Code-Session-Id", p.session_id.trim());
@@ -653,6 +664,7 @@ mod tests {
             cpa_session: "",
             device_profile: None,
             cached_session_id: "",
+            official: false,
         });
         assert_eq!(
             h.get("Anthropic-Beta"),
@@ -682,6 +694,7 @@ mod tests {
             cpa_session: "",
             device_profile: None,
             cached_session_id: "",
+            official: false,
         });
         assert_eq!(
             h.get("Anthropic-Beta"),
@@ -722,6 +735,7 @@ mod tests {
             cpa_session: "",
             device_profile: None,
             cached_session_id: "",
+            official: false,
         });
         let (pairs, order) = wire(h, true, false);
         let names: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
@@ -795,6 +809,7 @@ mod version_tests {
             cpa_session: "",
             device_profile: None,
             cached_session_id: "",
+            official: false,
         });
         let (pairs, _) = wire(h, true, false);
         let get = |n: &str| pairs.iter().find(|(k, _)| k == n).unwrap().1.clone();

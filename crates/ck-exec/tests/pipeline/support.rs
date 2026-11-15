@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::{Credential, Source};
-use ck_core::exec::{Caller, ExecError, FailureScope};
+use ck_core::exec::{Caller, ExecError, FailureScope, UsageSink};
 use ck_exec::pipeline::{self, Started};
 use ck_exec::types::{Attempt, Body, Client, Counted, Execute, Request, Streams, Upstream};
 use ck_stream::{ManualClock, Read, Store, Terminal, Writer};
@@ -248,6 +248,7 @@ pub struct Fixture {
     cfg: Config,
     caller: Caller,
     headers: HeaderMap,
+    usage: UsageSink,
 }
 
 impl Fixture {
@@ -281,6 +282,7 @@ impl Fixture {
                 provider: "config-inline".into(),
             },
             headers: HeaderMap::new(),
+            usage: UsageSink::default(),
         }
     }
 
@@ -303,6 +305,7 @@ impl Fixture {
             session: None,
             execution_session: None,
             derived_session: None,
+            usage: &self.usage,
         }
     }
 

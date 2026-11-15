@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::{Credential, Source};
-use ck_core::exec::{Caller, ExecError};
+use ck_core::exec::{Caller, ExecError, UsageSink};
 use ck_exec::types::{Attempt, Body, Client, Request};
 use ck_stream::{ManualClock, Read, Reader, Store, Terminal, Writer};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
@@ -194,6 +194,7 @@ pub struct Exchange {
     pub model: String,
     pub caller: Caller,
     pub headers: HeaderMap,
+    pub usage: UsageSink,
     pub route: String,
 }
 
@@ -211,6 +212,7 @@ impl Exchange {
                 provider: "config-inline".into(),
             },
             headers: HeaderMap::new(),
+            usage: UsageSink::default(),
             route: route.into(),
         }
     }
@@ -237,6 +239,7 @@ impl Exchange {
                 session: None,
                 execution_session: None,
                 derived_session: None,
+                usage: &self.usage,
             },
         }
     }
