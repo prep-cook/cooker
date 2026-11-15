@@ -24,7 +24,7 @@ use ck_wire::thinking::parse_suffix;
 use crate::gemini::MAX_LINE;
 use crate::gemini_exec::{COUNT_WRAPPER, Call, copy, encoding, refused, streaming};
 use crate::google_wire::{self as wire, Method};
-use crate::openai_compat_exec::{self as relay, RelayCapability, Route};
+use crate::openai_compat_exec::{self as relay, CHAT_PATH, RelayCapability, Route};
 use crate::proxy::{self, GoHeaders};
 use crate::types::{Attempt, Counted, Execute, Request, Streams, Upstream};
 use crate::vertex::{self, Auth, VertexExecutor};
@@ -183,7 +183,7 @@ impl VertexExecutor {
         let target = Target::new(attempt)?;
         let call = Call::new(attempt, request, vertex::PROVIDER, |model| target.resource(model))?;
         let (body, method) = match (count, stream) {
-            (true, _) => (count_body(&call, &upload), Method::CountTokens),
+            (true, _) => (count_body(&call, upload), Method::CountTokens),
             (false, true) => (call.generate(vertex::strip_call_ids(upload))?, Method::StreamGenerate),
             (false, false) => (call.generate(vertex::strip_call_ids(upload))?, Method::Generate),
         };
@@ -257,8 +257,15 @@ impl VertexExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<VertexIngress>, ExecError> {
+        let (base_url, key) = vertex::openapi_route(attempt.credential)?;
+        // Refused before the token exchange, as the relay refuses it before its send.
+        let url = crate::openai_compat::endpoint(&base_url, CHAT_PATH);
+        crate::xai_url::new_request(&url)?;
+        if let Some(error) = crate::xai_url::transport_refusal(&url) {
+            return Err(error);
+        }
         let client = self.client(attempt.credential, attempt.cfg);
-        let (base_url, key) = self.openapi_credentials(&client, attempt.credential).await?;
+        let key = self.openapi_key(&client, key).await?;
         let route = Route {
             client,
             base_url,
@@ -311,17 +318,27 @@ impl Target {
 /// `cachedContent`; the fence refuses any other), which Vertex refuses as unknown names, are
 /// not sent, nor are function call and response ids. Then, as for generation, the upstream
 /// model and the payload rules last.
-fn count_body(call: &Call<'_>, upload: &[u8]) -> Vec<u8> {
-    let wrapped = gj::get(upload, COUNT_WRAPPER);
-    let request = if wrapped.exists() { wrapped.raw() } else { upload };
-    let mut members = Vec::new();
-    gj::parse(request).each(|key, value| {
-        if COUNT_MEMBERS.iter().any(|m| key.bytes().as_ref() == m.as_bytes()) {
-            members.push([key.raw(), b":", value.raw()].concat());
-        }
-        true
-    });
-    let original = vertex::strip_call_ids([b"{".as_slice(), &members.join(b",".as_slice()), b"}"].concat());
+fn count_body(call: &Call<'_>, upload: Vec<u8>) -> Vec<u8> {
+    let mut projected = Vec::with_capacity(upload.len());
+    {
+        let wrapped = gj::get(&upload, COUNT_WRAPPER);
+        let request = if wrapped.exists() { wrapped.raw() } else { &upload[..] };
+        projected.push(b'{');
+        gj::parse(request).each(|key, value| {
+            if COUNT_MEMBERS.iter().any(|m| key.bytes().as_ref() == m.as_bytes()) {
+                if projected.len() > 1 {
+                    projected.push(b',');
+                }
+                projected.extend_from_slice(key.raw());
+                projected.push(b':');
+                projected.extend_from_slice(value.raw());
+            }
+            true
+        });
+        projected.push(b'}');
+    }
+    drop(upload);
+    let original = vertex::strip_call_ids(projected);
     let mut body = original.clone();
     if gj::get(&body, "model").exists() {
         call.name_model(&mut body, "model");

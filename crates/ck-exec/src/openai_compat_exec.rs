@@ -28,6 +28,9 @@ use crate::types::{Attempt, Counted, Execute, Request, Streams, Upstream};
 /// The capability key of OpenAI-compatible relays.
 pub const DESTINATION: &str = "openai-compat";
 
+/// The Chat generation path under a relay's base URL.
+pub(crate) const CHAT_PATH: &str = "/chat/completions";
+
 /// Chat generation, its token count, and the Responses native compact.
 pub struct RelayCapability;
 
@@ -213,7 +216,7 @@ pub(crate) async fn chat(
         compat::MAX_LINE as u64,
     )
     .map_err(encoding)?;
-    let upstream = send(&route, attempt, request, "/chat/completions", body, stream).await?;
+    let upstream = send(&route, attempt, request, CHAT_PATH, body, stream).await?;
     Ok(Upstream {
         status: upstream.status,
         headers: upstream.headers,
@@ -282,7 +285,7 @@ async fn send(
         return Ok(upstream);
     }
     let (status, headers, body) = wire::read_error_body(upstream).await;
-    Err(compat::status_error(status, headers, &body, true))
+    Err(compat::status_error(status, headers, body, true))
 }
 
 /// What the upload adjustments read besides the upload itself.

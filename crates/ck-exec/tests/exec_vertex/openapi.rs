@@ -224,3 +224,33 @@ async fn the_route_applies_thinking_without_relay_compatibility() {
     assert_eq!(sent["max_tokens"], 9, "{sent}");
     assert!(sent.get("max_completion_tokens").is_none(), "{sent}");
 }
+
+/// A destination URL Go's parser rejects fails before the token exchange.
+#[tokio::test]
+async fn a_malformed_base_url_mints_no_token() {
+    let streams = Streams::new();
+    let upstream = StreamUpstream::start([Reply::json(TOKEN)]).await;
+    let mut exchange = service_account(&upstream);
+    exchange
+        .credential
+        .attributes
+        .insert("base_url".into(), format!("{}/%GG", upstream.url()));
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let run = run_on(&streams, &exchange, Client::Chat, Operation::Generate, body, 64).await;
+    assert!(run.started.is_err());
+    assert_eq!(upstream.requests(), 0);
+}
+
+/// The route's error body reaches the attempt failure as received: empty, and not UTF-8.
+#[tokio::test]
+async fn a_refusal_keeps_the_error_body_as_received() {
+    for reply in [&b""[..], &[101, 255, 114][..]] {
+        let streams = Streams::new();
+        let upstream = StreamUpstream::start([Reply::status(429, "application/json", reply)]).await;
+        let exchange = Exchange::new(credential("vertex", &upstream.url(), KEY), PARTNER, "/client");
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        let run = run_on(&streams, &exchange, Client::Chat, Operation::Generate, body, 64).await;
+        let error = run.started.err().unwrap();
+        assert_eq!((error.status, &error.body[..]), (429, reply));
+    }
+}

@@ -357,6 +357,18 @@ async fn upstream_refusals_fail_the_attempt_before_commitment() {
     assert_eq!(upstream.requests(), 0);
 }
 
+/// The relay's error body reaches the attempt failure as received: empty, and not UTF-8.
+#[tokio::test]
+async fn a_refusal_keeps_the_error_body_as_received() {
+    for body in [&b""[..], &[101, 255, 114][..]] {
+        let upstream = StreamUpstream::start([Reply::status(429, "application/json", body)]).await;
+        let (streams, exchange) = (Streams::new(), exchange(&upstream));
+        let (started, _, _request) = run(&streams, &exchange, "chat", Operation::Generate, CHAT, 64).await;
+        let error = started.err().unwrap();
+        assert_eq!((error.status, &error.body[..]), (429, body));
+    }
+}
+
 /// A count is local: nothing goes upstream, and the stream carries the canonical result.
 #[tokio::test]
 async fn a_count_is_local() {
