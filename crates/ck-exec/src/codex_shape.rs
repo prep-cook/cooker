@@ -65,7 +65,7 @@ impl<'a> Inbound<'a> {
 }
 
 /// The Codex body rules for `call` on a body already in the call's protocol; `original` is
-/// the payload rules' baseline.
+/// the payload rules' baseline, the original request or its `Rules::baseline`.
 pub(crate) fn shape_body(
     inbound: &Inbound<'_>,
     view: &View<'_>,

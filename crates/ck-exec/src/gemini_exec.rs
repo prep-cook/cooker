@@ -211,11 +211,12 @@ impl<'r> Call<'r> {
 
     /// A generation body: the suffix's thinking, the upstream model, then the payload rules.
     pub(crate) fn generate(&self, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
+        let baseline = self.baseline("", &upload);
         let caps = self.attempt.resolved_model.map(|r| ModelCaps::from(&r.info));
         let mut body = thinking::apply_request_thinking(
             &RequestThinking {
-                payload: Some(&upload[..]),
-                original: Some(&upload[..]),
+                payload: None,
+                original: None,
                 model: self.attempt.model,
                 // The upload is already in the target protocol.
                 from: Format::Gemini.as_str(),
@@ -225,13 +226,13 @@ impl<'r> Call<'r> {
                 has_request_transformer: false,
                 updates_changed: false,
             },
-            upload.to_vec(),
+            upload,
         )
         .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
         if gj::get(&body, "model").exists() {
             self.name_model(&mut body, "model");
         }
-        Ok(self.rules("", &upload, body))
+        Ok(self.rules("", baseline.as_deref().unwrap_or_default(), body))
     }
 
     /// A `countTokens` body, shaped in generation's order: the upstream model, then the
@@ -239,15 +240,17 @@ impl<'r> Call<'r> {
     /// system instruction, tools, configuration) carries the whole generation request in
     /// `generateContentRequest`, which names its model unless a payload rule already did.
     fn count(&self, upload: Vec<u8>) -> Vec<u8> {
-        let mut body = upload.clone();
-        if gj::get(&upload, COUNT_WRAPPER).exists() {
+        let mut body = upload;
+        if gj::get(&body, COUNT_WRAPPER).exists() {
+            let baseline = self.baseline(COUNT_WRAPPER, &body);
             self.name_model(&mut body, &format!("{COUNT_WRAPPER}.model"));
-            return self.rules(COUNT_WRAPPER, &upload, body);
+            return self.rules(COUNT_WRAPPER, baseline.as_deref().unwrap_or_default(), body);
         }
+        let baseline = self.baseline("", &body);
         if gj::get(&body, "model").exists() {
             self.name_model(&mut body, "model");
         }
-        let mut body = self.rules("", &upload, body);
+        let mut body = self.rules("", baseline.as_deref().unwrap_or_default(), body);
         let mut contents_only = true;
         gj::parse(&body).each(|key, _| {
             contents_only = key.str() == "contents";
@@ -269,9 +272,10 @@ impl<'r> Call<'r> {
         }
     }
 
-    /// Whether the payload rules read a baseline: only default rules do.
-    pub(crate) fn rules_read_baseline(&self) -> bool {
-        ck_wire::payload::Rules::of(self.attempt.cfg).has_defaults()
+    /// What the default payload rules check of `body` under `root`, kept until they run
+    /// (`Rules::baseline`); `None` without default rules.
+    pub(crate) fn baseline(&self, root: &str, body: &[u8]) -> Option<Vec<u8>> {
+        ck_wire::payload::Rules::of(self.attempt.cfg).baseline(root, body)
     }
 
     /// The configured payload rules under `root`, the last change to the body.
