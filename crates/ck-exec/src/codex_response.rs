@@ -647,7 +647,7 @@ impl OutputItems {
 }
 
 /// Go's 50 MB scanner line limit on the streaming path.
-const SCANNER_MAX_LINE: usize = 52_428_800;
+pub(crate) const SCANNER_MAX_LINE: usize = 52_428_800;
 
 /// Processed lines as one SSE frame; `None` for no lines.
 fn framed(lines: &[String]) -> Option<Bytes> {

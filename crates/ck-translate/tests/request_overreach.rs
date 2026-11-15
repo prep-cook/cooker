@@ -102,12 +102,14 @@ fn gemini_include_thoughts_reaches_responses_as_summary() {
     )
     .unwrap();
     assert_eq!(out["reasoning"], json!({"summary":"auto","effort":"low"}));
+    let out = translate(P::Gemini, P::Responses, &input(json!({"includeThoughts":false}))).unwrap();
+    assert!(out.get("reasoning").is_none(), "{out}");
     for off in [
-        json!({"includeThoughts":false}),
+        json!({"thinkingBudget":0}),
         json!({"includeThoughts":true,"thinkingBudget":0}),
     ] {
         let out = translate(P::Gemini, P::Responses, &input(off)).unwrap();
-        assert!(out.get("reasoning").is_none(), "{out}");
+        assert_eq!(out["reasoning"], json!({"effort":"none"}), "{out}");
     }
     unsupported(translate(
         P::Gemini,

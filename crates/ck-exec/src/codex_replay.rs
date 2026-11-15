@@ -19,7 +19,7 @@ use ck_wire::json::{self as gj, Kind, Res};
 use sha2::{Digest, Sha256};
 
 /// `CodexReasoningReplayTurnType`: the internal turn-boundary marker.
-const TURN_TYPE: &str = "cpa_codex_replay_turn";
+pub(crate) const TURN_TYPE: &str = "cpa_codex_replay_turn";
 const TTL: Duration = Duration::from_secs(3600);
 const MAX_ENTRIES: usize = 10240;
 const MAX_TURNS_PER_ENTRY: usize = 256;
@@ -31,7 +31,7 @@ fn text(r: &Res<'_>) -> String {
     String::from_utf8_lossy(trim_space(&r.bytes())).into_owned()
 }
 
-fn field(item: &Res<'_>, key: &str) -> String {
+pub(crate) fn field(item: &Res<'_>, key: &str) -> String {
     text(&item.get(key))
 }
 
@@ -239,35 +239,49 @@ fn normalize(item: &[u8]) -> Option<Vec<u8>> {
 
 // ------------------------------------------------------------------------------- scope
 
-/// Where one request's replay lives (`codexReasoningReplayScope`).
+/// Where one request's replay lives (`codexReasoningReplayScope`). The session is namespaced
+/// by the turn's owner (`codex_shape::replay_owner`), so one session id never reaches the
+/// turns of another caller or upstream credential.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Scope {
     model: String,
     session: String,
-    request_fingerprint: String,
+    pub(crate) request_fingerprint: String,
 }
 
 impl Scope {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         !self.model.trim().is_empty() && !self.session.trim().is_empty()
+    }
+
+    /// The scope of an upstream `body` for `session`, owned by `owner`; `model` is the
+    /// upstream model, used when the body names none.
+    pub(crate) fn of(model: &str, body: &[u8], session: &str, owner: &str) -> Self {
+        let mut named = text(&gj::get(body, "model"));
+        if named.is_empty() {
+            named = ck_wire::thinking::parse_suffix(model).model_name;
+        }
+        let items = gj::get(body, "input").array();
+        let session = session.trim();
+        Self {
+            model: named,
+            session: if session.is_empty() {
+                String::new()
+            } else {
+                format!("{owner}\0{session}")
+            },
+            request_fingerprint: prefix_fingerprint(&items, items.len()),
+        }
     }
 }
 
 /// `codexReasoningReplayScopeFromRequest`: Claude clients only.
-fn scope(req: &ExecRequest, body: &[u8]) -> Scope {
+fn scope(req: &ExecRequest, credential: &str, body: &[u8]) -> Scope {
     if req.source_format != Format::Claude {
         return Scope::default();
     }
-    let mut model = text(&gj::get(body, "model"));
-    if model.is_empty() {
-        model = ck_wire::thinking::parse_suffix(&req.model).model_name;
-    }
-    let items = gj::get(body, "input").array();
-    Scope {
-        model,
-        session: session_key(req, body),
-        request_fingerprint: prefix_fingerprint(&items, items.len()),
-    }
+    let owner = crate::codex_shape::replay_owner(&req.caller.principal, credential);
+    Scope::of(&req.model, body, &session_key(req, body), &owner)
 }
 
 /// `codexReasoningReplaySessionKey` for a Claude request: the Claude Code agent, the
@@ -285,10 +299,15 @@ fn session_key(req: &ExecRequest, body: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-/// `applyCodexReasoningReplayCacheRequired`: cached turns inserted into the upstream
-/// body. The scope is returned for caching and clearing.
-pub(crate) fn apply(cache: &Cache, req: &ExecRequest, body: String) -> (String, Scope) {
-    let scope = scope(req, body.as_bytes());
+/// `applyCodexReasoningReplayCacheRequired`: cached turns of `credential`'s and the caller's
+/// session inserted into the upstream body. The scope is returned for caching and clearing.
+pub(crate) fn apply(cache: &Cache, req: &ExecRequest, credential: &str, body: String) -> (String, Scope) {
+    let scope = scope(req, credential, body.as_bytes());
+    insert(cache, scope, body)
+}
+
+/// Inserts the cached turns of `scope` into `body`.
+pub(crate) fn insert(cache: &Cache, scope: Scope, body: String) -> (String, Scope) {
     if !scope.valid() {
         return (body, scope);
     }
@@ -301,66 +320,20 @@ pub(crate) fn apply(cache: &Cache, req: &ExecRequest, body: String) -> (String, 
     }
 }
 
-/// `cacheCodexReasoningReplayFromCompleted`: the turn's reasoning and tool calls from a
-/// `response.completed` payload, behind a fingerprinted marker.
+/// `cacheCodexReasoningReplayFromCompleted`: the turn of a `response.completed` payload.
 pub(crate) fn cache_completed(cache: &Cache, scope: &Scope, completed: &[u8]) {
-    if !scope.valid() {
-        return;
-    }
     let output = gj::get(completed, "response.output");
-    if !output.is_array() {
-        return;
+    if output.is_array()
+        && let Some(turn) =
+            crate::codex_shape::replay_turn(scope, output.array().iter().map(|item| item.raw().to_vec()))
+    {
+        keep(cache, scope, &turn);
     }
-    let mut replay: Vec<Vec<u8>> = Vec::new();
-    let mut call_ids = Vec::new();
-    let mut assistant = String::new();
-    for item in output.array() {
-        match field(&item, "type").as_str() {
-            "reasoning" => replay.push(item.raw().to_vec()),
-            "function_call" | "custom_tool_call" => {
-                replay.push(item.raw().to_vec());
-                let id = field(&item, "call_id");
-                if !id.is_empty() {
-                    call_ids.push(id);
-                }
-            }
-            "message" => {
-                let fingerprint = assistant_fingerprint(&item);
-                if !fingerprint.is_empty() {
-                    assistant = fingerprint;
-                }
-            }
-            _ => {}
-        }
-    }
-    if replay.is_empty() {
-        return;
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(scope.request_fingerprint.as_bytes());
-    hasher.update(format!("\0assistant\0{assistant}").as_bytes());
-    for id in &call_ids {
-        hasher.update(format!("\0call\0{id}").as_bytes());
-    }
-    for item in &replay {
-        hasher.update(b"\0item\0");
-        hasher.update(item);
-    }
-    let mut marker = format!(r#"{{"type":"{TURN_TYPE}"}}"#).into_bytes();
-    gj::set_str(&mut marker, "id", hex(&hasher.finalize()));
-    if !assistant.is_empty() {
-        gj::set_str(&mut marker, "assistant_fingerprint", &assistant);
-    }
-    if !scope.request_fingerprint.is_empty() {
-        gj::set_str(&mut marker, "request_fingerprint", &scope.request_fingerprint);
-    }
-    for id in &call_ids {
-        gj::set_str(&mut marker, "call_ids.-1", id);
-    }
-    let mut items = Vec::with_capacity(replay.len() + 1);
-    items.push(marker);
-    items.extend(replay);
-    cache.append(&scope.model, &scope.session, &items);
+}
+
+/// Caches a turn (`codex_shape::replay_turn`).
+pub(crate) fn keep(cache: &Cache, scope: &Scope, turn: &[Vec<u8>]) {
+    cache.append(&scope.model, &scope.session, turn);
 }
 
 /// `clearCodexReasoningReplayOnInvalidSignature`.
@@ -375,7 +348,7 @@ pub(crate) fn clear_on_invalid_signature(cache: &Cache, scope: &Scope, status: u
 
 // --------------------------------------------------------------------------- insertion
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -664,7 +637,7 @@ fn filter_items_for_input(inputs: &[Res<'_>], items: &[Vec<u8>]) -> Vec<Vec<u8>>
 }
 
 /// `codexReplayAssistantMessageFingerprint`: the SHA-256 of an assistant message's text.
-fn assistant_fingerprint(item: &Res<'_>) -> String {
+pub(crate) fn assistant_fingerprint(item: &Res<'_>) -> String {
     let kind = field(item, "type");
     if !kind.is_empty() && kind != "message" {
         return String::new();
