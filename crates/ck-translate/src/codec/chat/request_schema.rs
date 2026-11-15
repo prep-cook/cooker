@@ -17,6 +17,65 @@ pub(super) fn validate(doc: &Document, media: &Registry) -> Result<()> {
     x_ck(doc, root)
 }
 
+/// The documented OpenAI Chat bounds, checked at the Chat client boundary only. A Chat
+/// destination may carry another protocol's valid values, and Chat-compatible upstreams such
+/// as GLM define their own ranges.
+pub(super) fn client(doc: &Document) -> Result<()> {
+    let root = doc.root();
+    if doc.children(doc.required(root, "messages")?)?.next().is_none() {
+        return Err(Error::Schema);
+    }
+    for (key, min, max) in [
+        ("temperature", 0.0, 2.0),
+        ("top_p", 0.0, 1.0),
+        ("presence_penalty", -2.0, 2.0),
+        ("frequency_penalty", -2.0, 2.0),
+        ("top_logprobs", 0.0, 20.0),
+    ] {
+        optional(doc, root, key, |doc, node| within(doc, node, min, max))?;
+    }
+    optional(doc, root, "logit_bias", |doc, node| {
+        doc.children(node)?
+            .try_for_each(|value| within(doc, value, -100.0, 100.0))
+    })?;
+    optional(doc, root, "stop", |doc, node| {
+        let many = matches!(doc.node(node)?.value, Value::Array) && doc.children(node)?.nth(4).is_some();
+        if many { Err(Error::Schema) } else { Ok(()) }
+    })?;
+    optional(doc, root, "modalities", |doc, node| {
+        doc.children(node)?.try_for_each(|value| {
+            if doc.string_is(value, "text")? || doc.string_is(value, "audio")? {
+                Ok(())
+            } else {
+                Err(Error::Schema)
+            }
+        })
+    })
+}
+
+fn within(doc: &Document, node: usize, min: f64, max: f64) -> Result<()> {
+    let value = match doc.node(node)?.value {
+        Value::Unsigned(n) => n as f64,
+        Value::Number(text) => {
+            let mut literal = Vec::new();
+            let mut cursor = doc.source(text)?.cursor(text.span)?;
+            while let Some(byte) = cursor.next_byte()? {
+                literal.push(byte);
+            }
+            std::str::from_utf8(&literal)
+                .ok()
+                .and_then(|literal| literal.parse::<f64>().ok())
+                .ok_or(Error::Schema)?
+        }
+        _ => return Err(Error::Schema),
+    };
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(Error::Schema)
+    }
+}
+
 fn options(doc: &Document, root: usize) -> Result<()> {
     for key in ["temperature", "top_p", "presence_penalty", "frequency_penalty"] {
         optional(doc, root, key, number)?;

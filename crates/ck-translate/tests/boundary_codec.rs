@@ -318,7 +318,10 @@ fn request_end_rejects_late_semantics_before_authorizing_egress() {
     )
     .unwrap();
     ingress
-        .advance(&mut mapped.writer, br#"{"model":"m","messages":[],"modalities":["#)
+        .advance(
+            &mut mapped.writer,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"modalities":["#,
+        )
         .unwrap();
     let prefix = mapped.output(&mapped.writer);
     let prefix = std::str::from_utf8(&prefix).unwrap();

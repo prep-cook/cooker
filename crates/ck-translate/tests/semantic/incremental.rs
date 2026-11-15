@@ -208,14 +208,18 @@ fn unfinished_native_media_publishes_one_lifetime_and_exact_bytes() {
 #[test]
 fn unfinished_nested_strings_remain_logical_and_arguments_are_structured() {
     for (prefix, suffix, pointer) in [
-        (r#"{"model":""#, r#"","messages":[]}"#, "/model"),
         (
-            r#"{"model":"m","messages":[],"prediction":{"type":"content","content":""#,
+            r#"{"model":""#,
+            r#"","messages":[{"role":"user","content":"hi"}]}"#,
+            "/model",
+        ),
+        (
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"prediction":{"type":"content","content":""#,
             r#""}}"#,
             "/prediction/content",
         ),
         (
-            r#"{"model":"m","messages":[],"unknown":{"a/b~é":""#,
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"unknown":{"a/b~é":""#,
             r#""}}"#,
             "/unknown/a~1b~0é",
         ),

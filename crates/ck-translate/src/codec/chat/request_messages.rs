@@ -251,7 +251,12 @@ fn validate_messages(doc: &Document, messages: usize, calls: &mut CallIndex) -> 
                 let function = doc.required(call, "function")?;
                 require_string(doc, doc.required(function, "name")?)?;
                 let format = doc.required(call, "arguments_format")?;
-                if !doc.string_is(format, "json")? && !doc.string_is(format, "text")? {
+                if !["json", "text", "invalid_json"]
+                    .iter()
+                    .try_fold(false, |known, value| {
+                        Ok::<_, Error>(known || doc.string_is(format, value)?)
+                    })?
+                {
                     return Err(Error::Schema);
                 }
             }
@@ -347,7 +352,7 @@ fn normalize_message(
             } else {
                 doc.required(c, "function")?
             };
-            doc.set(c, "arguments_format", Value::Text(if custom { "text" } else { "json" }))?;
+            let mut format = if custom { "text" } else { "json" };
             if let Some(arguments) = doc.member(function, "arguments")? {
                 require_string(doc, arguments)?;
                 if !custom {
@@ -358,10 +363,16 @@ fn normalize_message(
                         }
                         Ok(())
                     })?;
-                    let parsed = doc.import_json(owner, lease)?;
-                    doc.transplant(arguments, parsed)?;
+                    // Official arguments are the model's string and may not be JSON; such a
+                    // string stays as sent, and only destinations taking a string accept it.
+                    match doc.import_json(owner, lease) {
+                        Ok(parsed) => doc.transplant(arguments, parsed)?,
+                        Err(error) if crate::codec::json::not_json(&error) => format = "invalid_json",
+                        Err(error) => return Err(error),
+                    }
                 }
             }
+            doc.set(c, "arguments_format", Value::Text(format))?;
         }
     }
     Ok(())

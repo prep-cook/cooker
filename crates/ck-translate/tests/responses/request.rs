@@ -339,3 +339,20 @@ fn tool_outputs_link_to_an_earlier_call_with_their_call_id() {
         }
     }
 }
+
+/// Official `instructions` is nullable, and compact's `input` is nullable: null means absent.
+#[test]
+fn null_instructions_and_compact_input_mean_absent() {
+    let (output, _) = request(
+        &json!({"model":"m","input":"hello","instructions":null}),
+        Operation::Generate,
+    );
+    assert!(output.get("instructions").is_none(), "{output}");
+    assert!(!output.to_string().contains("developer"), "{output}");
+    let (output, _) = request(
+        &json!({"model":"m","input":null,"instructions":"retain facts"}),
+        Operation::Compact,
+    );
+    assert_eq!(output["input"], json!([]), "{output}");
+    assert_eq!(output["instructions"], "retain facts", "{output}");
+}

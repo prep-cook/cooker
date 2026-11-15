@@ -135,6 +135,7 @@ impl Ingress {
         crate::codec::provenance::bindings(&mut self.document, owner)?;
         messages::validate(&self.document)?;
         super::request_schema::validate(&self.document, &self.media)?;
+        super::request_schema::client(&self.document)?;
         let x = self.document.required(self.document.root(), "x_ck")?;
         let mut path = [None; 128];
         path[0] = Some(Component::Name(Name::Static("x_ck")));
