@@ -26,17 +26,16 @@ pub(super) fn client(doc: &Document) -> Result<()> {
         return Err(Error::Schema);
     }
     for (key, min, max) in [
-        ("temperature", 0.0, 2.0),
-        ("top_p", 0.0, 1.0),
-        ("presence_penalty", -2.0, 2.0),
-        ("frequency_penalty", -2.0, 2.0),
-        ("top_logprobs", 0.0, 20.0),
+        ("temperature", 0, 2),
+        ("top_p", 0, 1),
+        ("presence_penalty", -2, 2),
+        ("frequency_penalty", -2, 2),
+        ("top_logprobs", 0, 20),
     ] {
         optional(doc, root, key, |doc, node| within(doc, node, min, max))?;
     }
     optional(doc, root, "logit_bias", |doc, node| {
-        doc.children(node)?
-            .try_for_each(|value| within(doc, value, -100.0, 100.0))
+        doc.children(node)?.try_for_each(|value| within(doc, value, -100, 100))
     })?;
     optional(doc, root, "stop", |doc, node| {
         let many = matches!(doc.node(node)?.value, Value::Array) && doc.children(node)?.nth(4).is_some();
@@ -53,26 +52,91 @@ pub(super) fn client(doc: &Document) -> Result<()> {
     })
 }
 
-fn within(doc: &Document, node: usize, min: f64, max: f64) -> Result<()> {
-    let value = match doc.node(node)?.value {
-        Value::Unsigned(n) => n as f64,
-        Value::Number(text) => {
-            let mut literal = Vec::new();
-            let mut cursor = doc.source(text)?.cursor(text.span)?;
-            while let Some(byte) = cursor.next_byte()? {
-                literal.push(byte);
-            }
-            std::str::from_utf8(&literal)
-                .ok()
-                .and_then(|literal| literal.parse::<f64>().ok())
-                .ok_or(Error::Schema)?
-        }
-        _ => return Err(Error::Schema),
+/// Checks `min <= value <= max` exactly over the mapped number, in fixed memory whatever the
+/// length of its spelling.
+fn within(doc: &Document, node: usize, min: i64, max: i64) -> Result<()> {
+    // Client JSON numbers are always `Number`; `Unsigned` is set only by codecs.
+    let Value::Number(text) = doc.node(node)?.value else {
+        return Err(Error::Schema);
     };
-    if (min..=max).contains(&value) {
+    let mut cursor = doc.source(text)?.cursor(text.span)?;
+    let value = Decimal::read(|| cursor.next_byte())?;
+    if value.compare(min).is_ge() && value.compare(max).is_le() {
         Ok(())
     } else {
         Err(Error::Schema)
+    }
+}
+
+/// What one pass over a JSON number keeps to compare it exactly with an integer of at most
+/// three digits: its sign, the decimal exponent of its first significant digit, that digit and
+/// the next two, and whether any later significant digit is nonzero.
+#[derive(Default)]
+struct Decimal {
+    negative: bool,
+    digits: [u8; 3],
+    significant: u64,
+    rest: bool,
+    lead: i64,
+}
+
+impl Decimal {
+    fn read(mut next: impl FnMut() -> Result<Option<u8>>) -> Result<Self> {
+        let mut value = Self::default();
+        let (mut integer, mut zeros, mut fraction) = (0i64, 0i64, false);
+        let (mut exponent, mut exponent_part, mut exponent_negative) = (0i64, false, false);
+        while let Some(byte) = next()? {
+            match byte {
+                b'-' if exponent_part => exponent_negative = true,
+                b'-' => value.negative = true,
+                b'.' => fraction = true,
+                b'e' | b'E' => exponent_part = true,
+                b'+' => {}
+                b'0'..=b'9' if exponent_part => {
+                    exponent = exponent.saturating_mul(10).saturating_add(i64::from(byte - b'0'));
+                }
+                b'0'..=b'9' => {
+                    integer += i64::from(!fraction);
+                    let digit = byte - b'0';
+                    if value.significant == 0 && digit == 0 {
+                        zeros += 1;
+                        continue;
+                    }
+                    match value.digits.get_mut(value.significant as usize) {
+                        Some(slot) => *slot = digit,
+                        None => value.rest |= digit != 0,
+                    }
+                    value.significant += 1;
+                }
+                _ => return Err(Error::Schema),
+            }
+        }
+        let exponent = if exponent_negative { -exponent } else { exponent };
+        value.lead = (integer - 1 - zeros).saturating_add(exponent);
+        Ok(value)
+    }
+
+    fn compare(&self, bound: i64) -> std::cmp::Ordering {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        if self.significant == 0 {
+            return 0.cmp(&bound);
+        }
+        match (self.negative, bound < 0) {
+            (false, true) => return Greater,
+            (true, false) => return Less,
+            _ => {}
+        }
+        let magnitude = bound.unsigned_abs();
+        let order = if magnitude == 0 {
+            Greater
+        } else {
+            let lead = magnitude.ilog10() as usize;
+            let bound_digits = [100, 10, 1].map(|unit| (magnitude * 10u64.pow(2 - lead as u32) / unit % 10) as u8);
+            (self.lead.cmp(&(lead as i64)))
+                .then_with(|| self.digits.cmp(&bound_digits))
+                .then(if self.rest { Greater } else { Equal })
+        };
+        if self.negative { order.reverse() } else { order }
     }
 }
 

@@ -13,6 +13,10 @@ use serde_json::{Value, json};
 /// Runs Chat request ingress against `destination` and returns the validated request's
 /// upload for that destination.
 fn fence(input: &Value, destination: &impl Capability) -> codec::Result<Value> {
+    fence_raw(&input.to_string(), destination)
+}
+
+fn fence_raw(input: &str, destination: &impl Capability) -> codec::Result<Value> {
     let mut mapped = Mapped::new();
     let mut ingress = Ingress::new(
         &mut mapped.writer,
@@ -22,7 +26,7 @@ fn fence(input: &Value, destination: &impl Capability) -> codec::Result<Value> {
         1024 * 1024,
     )
     .unwrap();
-    ingress.advance(&mut mapped.writer, input.to_string().as_bytes())?;
+    ingress.advance(&mut mapped.writer, input.as_bytes())?;
     let ready = ingress.finish(&mut mapped.writer, destination)?;
     let lease = match destination.destination() {
         "responses" => ResponsesEgress {
@@ -75,6 +79,38 @@ fn out_of_range_options_fail_the_client_fence() {
     let mut input = with("logprobs", json!(true));
     input["top_logprobs"] = json!(21);
     assert!(matches!(fence(&input, &ChatCapability), Err(codec::Error::Schema)));
+}
+
+/// Bounds compare the number as spelled, exactly, whatever its length or exponent.
+#[test]
+fn bounds_compare_the_exact_decimal_value() {
+    let long_zero = format!("0.{}", "0".repeat(4096));
+    for (member, literal, accepted) in [
+        ("temperature", "2.0000000000000000000001", false),
+        ("temperature", "-1e-400", false),
+        ("temperature", "1e400", false),
+        ("temperature", "200e-2", true),
+        ("temperature", "0.2E+1", true),
+        ("temperature", "-0.0e5", true),
+        ("temperature", long_zero.as_str(), true),
+        ("top_p", "0.00000000000000000000001e23", true),
+        ("top_p", "1.00000000000000000000000000", true),
+        ("top_p", "0.99999999999999999999999999", true),
+        ("presence_penalty", "-2.00000000000000000001", false),
+        ("presence_penalty", "-1.5", true),
+        ("frequency_penalty", "1.5", true),
+    ] {
+        let input = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"{member}":{literal}}}"#);
+        let result = fence_raw(&input, &ChatCapability);
+        if accepted {
+            assert!(result.is_ok(), "{member}: {literal}");
+        } else {
+            assert!(matches!(result, Err(codec::Error::Schema)), "{member}: {literal}");
+        }
+    }
+    let bias =
+        r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"logit_bias":{"1":-100.00000000000000000001}}"#;
+    assert!(matches!(fence_raw(bias, &ChatCapability), Err(codec::Error::Schema)));
 }
 
 #[test]
