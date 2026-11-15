@@ -231,6 +231,7 @@ impl CodexExecutor {
         url: &str,
         headers: &HeaderMap,
         body: Bytes,
+        timing: Option<&ck_core::exec::UsageSink>,
     ) -> Result<crate::proxy::Upstream, ExecError> {
         let transport = &self.transport;
         let (proxy, keep_alive, handshake) = (&view.proxy, view.chatgpt_keep_alive, view.handshake);
@@ -240,7 +241,7 @@ impl CodexExecutor {
                 order: None,
             })
         };
-        crate::proxy::send_routed(&route, url, go_headers(headers), body, None, None).await
+        crate::proxy::send_routed(&route, url, go_headers(headers), body, None, timing).await
     }
 
     /// One POST to the Codex backend, captured as Go's call sites record it: the
@@ -258,11 +259,12 @@ impl CodexExecutor {
         replay: &crate::codex_replay::Scope,
         wire: &Wire,
         error_body: ErrorBody,
+        timing: Option<&ck_core::exec::UsageSink>,
     ) -> Result<crate::proxy::Upstream, ExecError> {
         // The shaped body names the base model, the key of per-model quota snapshots.
         let model = gjson::get(&body, "model").str().to_owned();
         wire.request(&url, &headers, body.as_bytes());
-        let mut upstream = match self.post(view, &url, &headers, Bytes::from(body)).await {
+        let mut upstream = match self.post(view, &url, &headers, Bytes::from(body), timing).await {
             Ok(upstream) => upstream,
             Err(error) => {
                 // ponytail: the text is this executor's transport message, not net/http's
@@ -311,7 +313,7 @@ impl CodexExecutor {
         error_body: ErrorBody,
     ) -> Result<ExecResponse, ExecError> {
         let upstream = self
-            .open(view, settings, url, headers, body, replay, wire, error_body)
+            .open(view, settings, url, headers, body, replay, wire, error_body, None)
             .await?;
         let (status, headers) = (upstream.status, upstream.headers);
         let sse = headers
@@ -421,6 +423,7 @@ impl CodexExecutor {
                     &scope,
                     &wire,
                     ErrorBody::Lossy,
+                    None,
                 )
                 .await?;
             // Go reads the whole body (`io.ReadAll`, whatever its type), records every
@@ -598,7 +601,7 @@ impl CodexExecutor {
         }
         let wire = Wire::new(capture, credential);
         wire.request(&url, &headers, &body);
-        let upstream = match self.post(&view, &url, &headers, Bytes::from(body)).await {
+        let upstream = match self.post(&view, &url, &headers, Bytes::from(body), None).await {
             Ok(upstream) => upstream,
             Err(error) => {
                 wire.exec_error(&error);

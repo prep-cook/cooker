@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use ck_core::exec::{ExecError, FailureScope};
+use ck_core::exec::{ExecError, FailureScope, UsageSink};
 use ck_core::format::Format;
 use ck_stream::ScratchLease;
 use ck_translate::codec::document::{Document, Value};
@@ -83,7 +83,9 @@ impl Execute for CodexExecutor {
         .map_err(encoding)?;
         let (view, settings) = shaped.view();
         let body = shaped.generate(&view, &settings, call, &self.replay)?;
-        let upstream = self.post_shaped(&view, &settings, &body, call).await?;
+        let upstream = self
+            .post_shaped(&view, &settings, &body, call, request.client.usage)
+            .await?;
         let replay = Some((self.replay.clone(), body.scope));
         let rules = Events::new(scratch, body.optimized, settings.model_level_cooling, replay);
         Ok(Upstream {
@@ -141,7 +143,7 @@ impl Execute for CodexExecutor {
         let (view, settings) = shaped.view();
         let body = shaped.compact(&view, &settings)?;
         let upstream = self
-            .post_shaped(&view, &settings, &body, Call::Compact)
+            .post_shaped(&view, &settings, &body, Call::Compact, request.client.usage)
             .await
             .map_err(crate::codex::compact_error)?;
         let restored = events::compaction(upstream.body, body.optimized);
@@ -159,13 +161,15 @@ impl Execute for CodexExecutor {
 
 impl CodexExecutor {
     /// Posts a shaped body with the old path's headers and transport. A non-2xx answer is
-    /// the attempt's failure, classified as Go does.
+    /// the attempt's failure, classified as Go does. The request-side facts and the upstream
+    /// exchange go to `usage` (contract G4); response usage is the canonical stream's.
     async fn post_shaped(
         &self,
         view: &View<'_>,
         settings: &Settings,
         body: &Shaped<'_>,
         call: Call,
+        usage: &UsageSink,
     ) -> Result<crate::proxy::Upstream, ExecError> {
         let generate = call != Call::Compact;
         let headers = request::http_headers(
@@ -183,20 +187,25 @@ impl CodexExecutor {
             _ => ("responses/compact", ErrorBody::Lossy),
         };
         let url = format!("{}/{path}", view.base_url);
-        // ponytail: the contract carries no capture sink yet, so nothing is recorded for
-        // request logging; D3 owns that observability.
-        let wire = Wire::default();
-        self.open(
-            view,
-            settings,
-            url,
-            headers,
-            body.text.clone(),
-            &body.scope,
-            &wire,
-            error_body,
-        )
-        .await
+        report(usage, generate, &body.text);
+        // The request log masks credentials in the captured headers.
+        let wire = Wire::new(usage.capture(), view.credential);
+        usage.round_trip_started();
+        let mut upstream = self
+            .open(
+                view,
+                settings,
+                url,
+                headers,
+                body.text.clone(),
+                &body.scope,
+                &wire,
+                error_body,
+                Some(usage),
+            )
+            .await?;
+        upstream.body = observed(upstream.body, usage.clone(), wire);
+        Ok(upstream)
     }
 }
 
@@ -430,6 +439,40 @@ fn streaming(doc: &Document) -> codec::Result<bool> {
         Some(node) => Ok(matches!(doc.node(node)?.value, Value::Bool(true))),
         None => Ok(source(doc)? == Format::Gemini),
     }
+}
+
+/// The request-side usage facts of a body sent upstream: the body, for the reasoning
+/// effort (as the old path reports it: Codex for generation, Responses for compact), and
+/// the model the upstream is expected to serve.
+fn report(usage: &UsageSink, generate: bool, body: &str) {
+    if !usage.enabled() {
+        return;
+    }
+    let format = if generate {
+        Format::Codex
+    } else {
+        Format::OpenAIResponse
+    };
+    usage.request(format, body.as_bytes());
+    usage.upstream_model(gjson::get(body, "model").str());
+}
+
+/// `body` marking its first byte for `usage` and captured as it arrives.
+fn observed(body: crate::types::Body, usage: UsageSink, wire: Wire) -> crate::types::Body {
+    let logs = usage.capture().logs_responses();
+    let mut first = true;
+    Box::pin(futures_util::StreamExt::inspect(body, move |chunk| {
+        if let Ok(chunk) = chunk
+            && !chunk.is_empty()
+        {
+            if std::mem::take(&mut first) {
+                usage.first_byte();
+            }
+            if logs {
+                wire.chunk(chunk);
+            }
+        }
+    }))
 }
 
 /// The encoded upload as one body; the HTTP client takes ownership of it.

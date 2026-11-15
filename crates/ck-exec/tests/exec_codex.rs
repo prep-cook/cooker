@@ -12,6 +12,8 @@ mod count;
 mod failures;
 #[path = "exec_codex/parity.rs"]
 mod parity;
+#[path = "exec_codex/usage.rs"]
+mod usage;
 
 use ck_stream::Terminal;
 use ck_translate::codec::{BodyMode, Operation};
