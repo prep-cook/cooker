@@ -91,7 +91,7 @@ pub(super) fn write_request(
         write_field(doc, field, e)?;
     }
     if let Some(x) = doc.member(root, "x_ck")? {
-        write_extensions(doc, x, e)?;
+        write_extensions(doc, x, destination == "codex", e)?;
     }
     originals(doc, root, e, &[])?;
     if destination == "meta" {
@@ -100,19 +100,32 @@ pub(super) fn write_request(
     e.bytes(b"}")
 }
 /// Writes the reasoning options, the continuation and the Responses provider parameters.
-fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+fn write_extensions(doc: &Document, x: usize, codex: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
     if let Some(thinking) = doc.member(x, "thinking")? {
         write_reasoning_options(doc, x, thinking, e)?;
     }
     if let Some(session) = doc.member(x, "session")? {
         member(doc, session, "previous_response_id", e)?;
     }
-    if let Some(providers) = doc.member(x, "provider_parameters")?
-        && let Some(p) = doc.member(providers, "responses")?
-    {
+    let providers = doc.member(x, "provider_parameters")?;
+    let codex = if codex {
+        providers.map(|p| doc.member(p, "codex")).transpose()?.flatten()
+    } else {
+        None
+    };
+    let responses = providers.map(|p| doc.member(p, "responses")).transpose()?.flatten();
+    let summary = codex.map(|p| doc.member(p, "stream_options")).transpose()?.flatten();
+    let summary = summary
+        .map(|p| doc.member(p, "reasoning_summary_delivery"))
+        .transpose()?
+        .flatten();
+    if let Some(p) = responses {
         let format = doc.member(doc.root(), "response_format")?.is_some();
         for f in doc.children(p)? {
             let name = doc.node(f)?.name.ok_or(Error::Schema)?;
+            if summary.is_some() && doc.name_is(name, "stream_options")? {
+                continue;
+            }
             if format && doc.name_is(name, "text")? {
                 // Written beside `format` in the same `text` object.
                 continue;
@@ -123,7 +136,34 @@ fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result
             doc.write(f, e)?;
         }
     }
+    if let Some(summary) = summary {
+        write_codex_stream_options(doc, summary, responses, e)?;
+    }
     Ok(())
+}
+
+fn write_codex_stream_options(
+    doc: &Document,
+    summary: usize,
+    responses: Option<usize>,
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
+    e.bytes(b",\"stream_options\":{")?;
+    e.bytes(b"\"reasoning_summary_delivery\":")?;
+    doc.write(summary, e)?;
+    if let Some(options) = responses
+        .map(|p| doc.member(p, "stream_options"))
+        .transpose()?
+        .flatten()
+    {
+        for field in doc.children(options)? {
+            e.bytes(b",")?;
+            doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
+            e.bytes(b":")?;
+            doc.write(field, e)?;
+        }
+    }
+    e.bytes(b"}")
 }
 /// True for the developer message that carries the Responses `instructions` field.
 fn instructions(doc: &Document, message: usize) -> Result<bool> {

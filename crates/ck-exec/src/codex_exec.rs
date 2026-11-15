@@ -18,7 +18,7 @@ use ck_core::format::Format;
 use ck_stream::ScratchLease;
 use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::{self, BodyMode, Capability, Operation, RequestEgress, RequestFence, RequestView};
-use ck_translate::responses::request::{Egress, ResponsesCapability};
+use ck_translate::responses::request::{CodexCapability as CodexRequests, Egress};
 use ck_translate::responses::response::Ingress;
 
 use crate::codex::{CodexExecutor, ErrorBody};
@@ -43,9 +43,9 @@ impl Capability for CodexCapability {
 
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
         match view.operation {
-            Operation::Generate | Operation::Compact => ResponsesCapability.validate(view),
+            Operation::Generate | Operation::Compact => CodexRequests.validate(view),
             // A count is valid exactly when the generation it projects is.
-            Operation::CountTokens => ResponsesCapability.validate(RequestView {
+            Operation::CountTokens => CodexRequests.validate(RequestView {
                 operation: Operation::Generate,
                 ..view
             }),

@@ -190,7 +190,7 @@ async fn deliver<E: ResponseEgress>(mut egress: E, stream: &mut Writer, mut read
                 })
                 .expect("the egress accepts every canonical record"),
             Read::Terminal(terminal) => {
-                assert_eq!(terminal, Terminal::Done);
+                assert!(matches!(terminal, Terminal::Done | Terminal::UpstreamError));
                 egress.finish().unwrap();
             }
         }

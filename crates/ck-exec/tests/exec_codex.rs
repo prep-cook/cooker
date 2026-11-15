@@ -124,23 +124,28 @@ async fn any_split_gives_the_same_response() {
     assert!(seen.iter().all(|records| *records == seen[0]), "{seen:#?}");
 }
 
-/// `response.done` is the backend's completion too; an event after it reaches no client.
+/// An unrecognized done event cannot supply the completion boundary.
 #[tokio::test]
-async fn response_done_completes_the_response() {
-    let body = message_events()
-        + &event(
-            "response.done",
-            r#"{"type":"response.done","response":{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"gpt-5","output":[]}}"#,
-        )
-        + "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n";
-    let upstream = StreamUpstream::start([Reply::sse(body)]).await;
-    let (streams, exchange) = (Streams::new(), exchange(&upstream));
-    let (started, id, _request) = run(&streams, &exchange, "anthropic", Operation::Generate, ANTHROPIC, 64).await;
-    let (outcome, published, mut stream) = finish(&streams, started.unwrap(), id).await;
-    outcome.unwrap();
-    assert_eq!(published.terminal, Some(Terminal::Done));
-    let out = egress(&streams, "anthropic", &mut stream, id, BodyMode::Streaming).await;
-    assert!(out.contains("message_stop") && !out.contains("late"), "{out}");
+async fn c11_response_done_does_not_complete_the_response() {
+    let done = event(
+        "response.done",
+        r#"{"type":"response.done","response":{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"gpt-5","output":[]}}"#,
+    );
+    for body in [done.clone(), message_events() + &done] {
+        let upstream = StreamUpstream::start([Reply::sse(body)]).await;
+        let (streams, exchange) = (Streams::new(), exchange(&upstream));
+        let (started, id, _request) = run(&streams, &exchange, "anthropic", Operation::Generate, ANTHROPIC, 64).await;
+        let (outcome, published, mut stream) = finish(&streams, started.unwrap(), id).await;
+        assert_eq!(
+            outcome.unwrap_err().status,
+            408,
+            "response.done is not a completion boundary"
+        );
+        assert_eq!(published.terminal, Some(Terminal::UpstreamError));
+        let out = egress(&streams, "anthropic", &mut stream, id, BodyMode::Streaming).await;
+        assert!(out.contains("error"), "{out}");
+        assert_eq!(upstream.captured().len(), 1);
+    }
 }
 
 /// The upstream model's thinking suffix becomes the reasoning effort, and the client's own

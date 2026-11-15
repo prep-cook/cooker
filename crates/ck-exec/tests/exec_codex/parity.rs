@@ -29,7 +29,7 @@ fn client_headers() -> HeaderMap {
 
 /// The old path's upload for `body` from a `source` client.
 async fn old_path(exchange: &Exchange, body: &[u8], stream: bool, source: Format) {
-    old_path_on(&executor(), exchange, body, stream, source).await;
+    old_path_on(&executor(), exchange, body, stream, source).await.unwrap();
 }
 
 async fn old_path_on(
@@ -38,7 +38,7 @@ async fn old_path_on(
     body: &[u8],
     stream: bool,
     source: Format,
-) {
+) -> Result<Vec<u8>, ck_core::exec::ExecError> {
     let request = ExecRequest {
         operation: ExecOperation::Generate,
         source_format: source,
@@ -58,12 +58,16 @@ async fn old_path_on(
         resolved_model: None,
         usage: Default::default(),
     };
-    let response = executor
-        .execute(&exchange.credential, request, &exchange.cfg)
-        .await
-        .unwrap();
-    if let ck_core::exec::ResponseBody::Stream(mut events) = response.body {
-        while events.next().await.is_some() {}
+    let response = executor.execute(&exchange.credential, request, &exchange.cfg).await?;
+    match response.body {
+        ck_core::exec::ResponseBody::Buffered(body) => Ok(body.to_vec()),
+        ck_core::exec::ResponseBody::Stream(mut events) => {
+            let mut body = Vec::new();
+            while let Some(event) = events.next().await {
+                body.extend_from_slice(&event?);
+            }
+            Ok(body)
+        }
     }
 }
 
@@ -231,7 +235,9 @@ async fn replay_stays_with_its_owner(old: bool) {
         (&owner, &next[..]),
     ] {
         if old {
-            old_path_on(&executor, exchange, body, true, Format::Claude).await;
+            old_path_on(&executor, exchange, body, true, Format::Claude)
+                .await
+                .unwrap();
             continue;
         }
         let (started, id, _request) = run_on(
@@ -257,4 +263,180 @@ async fn replay_stays_with_its_owner(old: bool) {
     assert!(!reasoning(1), "old {old}: another caller");
     assert!(!reasoning(2), "old {old}: another credential");
     assert!(reasoning(3), "old {old}: the owner still gets its turn back");
+}
+
+async fn supported_option(key: &str, value: serde_json::Value, tools: bool, source: Format) {
+    for (stream, siwc) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut body = serde_json::json!({"model":"client-model","stream":stream,"input":"hi",
+            "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]});
+        if !tools {
+            body.as_object_mut().unwrap().remove("tools");
+        }
+        let protocol = if source == Format::OpenAI {
+            body.as_object_mut().unwrap().remove("input");
+            body["messages"] = serde_json::json!([{"role":"user","content":"hi"}]);
+            if tools {
+                body["tools"] = serde_json::json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]);
+            }
+            "chat"
+        } else {
+            "responses"
+        };
+        body[key] = value.clone();
+        let body = serde_json::to_vec(&body).unwrap();
+        let upstream = StreamUpstream::start([Reply::sse(sse()), Reply::sse(sse())]).await;
+        let (streams, mut exchange) = (Streams::new(), exchange(&upstream));
+        if siwc {
+            exchange.credential.attributes.insert("use_siwc".into(), "true".into());
+            exchange
+                .credential
+                .metadata
+                .insert("siwc".into(), serde_json::json!({"access_token":"fake-siwc"}));
+        }
+        let (started, id, _request) = run(&streams, &exchange, protocol, Operation::Generate, &body, 9).await;
+        finish(&streams, started.unwrap(), id).await.0.unwrap();
+        old_path(&exchange, &body, stream, source).await;
+        let captured = upstream.captured();
+        assert_eq!(captured.len(), 2, "both execution paths must send upstream");
+        for captured in captured {
+            let sent = json_body(&captured);
+            if key == "include" {
+                assert!(sent[key].as_array().unwrap().contains(&value[0]), "{sent}");
+                assert!(
+                    sent[key]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::json!("reasoning.encrypted_content")),
+                    "{sent}"
+                );
+            } else {
+                assert_eq!(sent[key], value, "stream {stream}: {sent}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn c4_prompt_cache_options() {
+    supported_option(
+        "prompt_cache_options",
+        serde_json::json!({"ttl":"24h"}),
+        true,
+        Format::OpenAIResponse,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn c5_output_encrypted_content() {
+    supported_option(
+        "include",
+        serde_json::json!(["output.encrypted_content"]),
+        true,
+        Format::OpenAIResponse,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn c6_explicit_parallel_false() {
+    for source in [Format::OpenAIResponse, Format::OpenAI] {
+        for tools in [true, false] {
+            supported_option("parallel_tool_calls", serde_json::json!(false), tools, source).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn c8_buffered_reasoning_summary_delivery() {
+    supported_option(
+        "stream_options",
+        serde_json::json!({"reasoning_summary_delivery":"sequential_cutoff"}),
+        true,
+        Format::OpenAIResponse,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn c11_legacy_terminals_preserve_completion_boundaries() {
+    for stream in [true, false] {
+        for (kind, status, succeeds) in [
+            ("response.done", "completed", false),
+            ("response.completed", "completed", true),
+            ("response.incomplete", "incomplete", true),
+        ] {
+            let reply = event(
+                kind,
+                &serde_json::json!({"type":kind,"response":{
+                "id":"resp_1","object":"response","created_at":1,"status":status,
+                "model":MODEL,"output":[]}})
+                .to_string(),
+            );
+            let upstream = StreamUpstream::start([Reply::sse(reply)]).await;
+            let exchange = exchange(&upstream);
+            let outcome = old_path_on(&executor(), &exchange, RESPONSES, stream, Format::OpenAIResponse).await;
+            assert_eq!(outcome.is_ok(), succeeds, "{kind}, stream {stream}");
+            assert_eq!(upstream.captured().len(), 1);
+            if succeeds {
+                let output = String::from_utf8(outcome.unwrap()).unwrap();
+                if stream {
+                    assert!(output.contains(kind), "{output}");
+                } else {
+                    let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+                    assert_eq!(output["status"], status);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn c11_incomplete_turns_never_enter_reasoning_replay() {
+    let first =
+        br#"{"model":"client-model","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let next = br#"{"model":"client-model","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"more"}]}"#;
+    for old in [true, false] {
+        let upstream = StreamUpstream::start([
+            Reply::sse(reasoning_turn().replace("completed", "incomplete")),
+            Reply::sse(sse()),
+        ])
+        .await;
+        let (streams, mut exchange) = (Streams::new(), exchange(&upstream));
+        exchange.headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("incomplete-session"),
+        );
+        let executor = executor();
+        for body in [&first[..], &next[..]] {
+            if old {
+                old_path_on(&executor, &exchange, body, true, Format::Claude)
+                    .await
+                    .unwrap();
+            } else {
+                let (started, id, _request) = run_on(
+                    (&executor, None),
+                    &streams,
+                    &exchange,
+                    "anthropic",
+                    Operation::Generate,
+                    body,
+                    64,
+                )
+                .await;
+                finish(&streams, started.unwrap(), id).await.0.unwrap();
+            }
+        }
+        let captured = upstream.captured();
+        assert_eq!(captured.len(), 2);
+        let sent = json_body(&captured[1]);
+        assert!(
+            sent["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning"),
+            "{sent}"
+        );
+    }
 }

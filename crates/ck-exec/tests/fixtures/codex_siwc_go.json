@@ -1,4 +1,5 @@
 {
+  "contract_updates": "F32: retain Codex prompt_cache_options; other expectations remain Go recordings.",
   "cases": [
     {
       "name": "stream_strips_fields",
@@ -24,7 +25,7 @@
       },
       "payload": "{\"model\":\"gpt-6.1-sol\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}],\"instructions\":\"\",\"store\":true,\"stream\":false,\"temperature\":0.2,\"max_output_tokens\":100,\"max_completion_tokens\":50,\"prompt_cache_retention\":\"24h\",\"prompt_cache_options\":{\"mode\":\"x\"},\"prompt_cache_key\":\"pck-1\"}",
       "path": "/responses",
-      "body": "{\"model\":\"gpt-6.1-sol\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}],\"store\":false,\"stream\":true,\"prompt_cache_key\":\"pck-1\",\"include\":[\"reasoning.encrypted_content\"]}",
+      "body": "{\"model\":\"gpt-6.1-sol\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}],\"store\":false,\"stream\":true,\"prompt_cache_options\":{\"mode\":\"x\"},\"prompt_cache_key\":\"pck-1\",\"include\":[\"reasoning.encrypted_content\"]}",
       "sent_headers": {
         "accept": [
           "text/event-stream"

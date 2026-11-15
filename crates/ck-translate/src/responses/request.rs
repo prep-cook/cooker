@@ -79,11 +79,15 @@ impl Ingress {
         self.media.relocate_ingress(document, 0)?;
         super::content::register(document, owner, &mut self.media)?;
         self.media.relocate_ingress(document, 0)?;
-        validate(RequestView {
-            document,
-            media: &self.media,
-            operation: self.operation,
-        })?;
+        // Parse the known Codex controls; the destination fence still authorizes them.
+        validate(
+            RequestView {
+                document,
+                media: &self.media,
+                operation: self.operation,
+            },
+            "codex",
+        )?;
         bindings(document, owner)?;
         let root = document.root();
         publish_fields(
@@ -194,7 +198,18 @@ impl Capability for ResponsesCapability {
         "responses"
     }
     fn validate(&self, request: RequestView<'_>) -> Result<()> {
-        validate(request)
+        validate(request, "responses")
+    }
+}
+
+/// Responses semantics with the isolated Codex request controls enabled.
+pub struct CodexCapability;
+impl Capability for CodexCapability {
+    fn destination(&self) -> &'static str {
+        "codex"
+    }
+    fn validate(&self, request: RequestView<'_>) -> Result<()> {
+        validate(request, "codex")
     }
 }
 
@@ -209,7 +224,7 @@ impl codec::RequestEgress for Egress {
         if self.destination == "meta" {
             meta::validate(view)?;
         } else {
-            validate(view)?;
+            validate(view, self.destination)?;
         }
         if view.operation == Operation::Compact && self.upstream_stream {
             return Err(Error::Unsupported);
