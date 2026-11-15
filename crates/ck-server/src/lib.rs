@@ -77,6 +77,8 @@ fn api(rt: Arc<Runtime>) -> Router {
         .route("/openai/v1/videos/{video_id}", get(videos::retrieve))
         .route("/v1/messages", post(claude::messages))
         .route("/v1/messages/count_tokens", post(claude::count_tokens))
+        // Resume of a committed response; the stream identity travels only in `X-Ck-Stream-Id`.
+        .route("/v1/streams", get(inference::streams::resume))
         .route("/v1/responses", post(openai::responses))
         .route("/v1/responses/compact", post(openai::compact))
         .route("/backend-api/codex/responses", post(openai::responses))

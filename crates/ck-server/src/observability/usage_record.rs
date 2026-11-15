@@ -15,6 +15,8 @@ use ck_core::format::Format;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Kind, Res};
 
+use super::usage_snapshot::{CanonicalUsage, ResponseFacts};
+
 /// Go `usage.TokenAccountingQuality`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Quality {
@@ -49,6 +51,67 @@ pub struct Detail {
     pub total: i64,
     pub breakdown: Option<Breakdown>,
     pub response_service_tier: String,
+    pub unreported: Unreported,
+}
+
+/// Counts an attempt's canonical usage did not report (`docs/EXECUTION-CONTRACT.md` §8):
+/// the queued record omits them instead of writing zero. The legacy per-protocol parsers
+/// report every count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Unreported {
+    pub input: bool,
+    pub output: bool,
+    pub reasoning: bool,
+    pub cache_read: bool,
+    pub cache_creation: bool,
+    pub total: bool,
+}
+
+impl Detail {
+    /// The record of an attempt's canonical usage. Canonical counts are inclusive, cache
+    /// reads and writes inside input and reasoning inside output, so the breakdown is Go's
+    /// subset one whatever the provider.
+    pub fn canonical(usage: &CanonicalUsage, facts: &ResponseFacts) -> Self {
+        let count = |n: Option<u64>| n.map_or(0, |n| i64::try_from(n).unwrap_or(i64::MAX));
+        let (input, output, total) = (
+            count(usage.input_tokens),
+            count(usage.output_tokens),
+            count(usage.total_tokens),
+        );
+        let (cache_read, cache_write, reasoning) = (
+            count(usage.cache_read_tokens),
+            count(usage.cache_write_tokens),
+            count(usage.reasoning_tokens),
+        );
+        // ponytail: an unreported cache or reasoning count enters the breakdown as none, as
+        // Go's accounting did; the stored counts keep it absent.
+        let breakdown = if usage.input_tokens.is_some() && usage.output_tokens.is_some() {
+            subset(input, cache_read, cache_write, output, reasoning, total)
+        } else {
+            unclassified(total)
+        };
+        Self {
+            input,
+            output,
+            reasoning,
+            cached: cache_read,
+            cache_read,
+            cache_creation: cache_write,
+            cache_creation_5m: usage.cache_write_5m_tokens.map(|n| count(Some(n))),
+            cache_creation_1h: usage.cache_write_1h_tokens.map(|n| count(Some(n))),
+            total,
+            breakdown: Some(breakdown),
+            response_service_tier: facts.service_tier.clone().unwrap_or_default(),
+            unreported: Unreported {
+                input: usage.input_tokens.is_none(),
+                output: usage.output_tokens.is_none(),
+                reasoning: usage.reasoning_tokens.is_none(),
+                cache_read: usage.cache_read_tokens.is_none(),
+                cache_creation: usage.cache_write_tokens.is_none(),
+                total: usage.total_tokens.is_none(),
+            },
+        }
+    }
 }
 
 /// Go `nonNegativeSum`.
@@ -782,6 +845,10 @@ fn parse_interactions_stream(line: &[u8]) -> Option<Detail> {
 }
 
 /// The buffered-response parser for a format (Go's executor for that format).
+// Q1 (temporary): the per-protocol parsers and `StreamUsage` serve executors that still
+// report through `UsageSink::response_*` and dispatch's `Tracker::body`/`event`. Each
+// provider unit (P1–P9) removes its executor's calls and D2 removes dispatch's; the last
+// of them deletes these parsers.
 pub fn parse_body(format: Format, body: &[u8]) -> Detail {
     match format {
         Format::Claude => parse_claude(body),
@@ -1476,21 +1543,32 @@ pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
     w.str("resolved_client_ip", &client.resolved_client_ip);
     w.str("x_forwarded_for", &client.x_forwarded_for);
     w.str("user_agent", &client.user_agent);
+    let unreported = detail.unreported;
     w.object("tokens", |t| {
-        t.int("input_tokens", detail.input);
-        t.int("output_tokens", detail.output);
-        t.int("reasoning_tokens", detail.reasoning);
-        t.int("cached_tokens", detail.cached);
-        t.int("cache_read_tokens", detail.cache_read);
-        t.bool("cache_read_tokens_present", true);
-        t.int("cache_creation_tokens", detail.cache_creation);
+        for (name, value, absent) in [
+            ("input_tokens", detail.input, unreported.input),
+            ("output_tokens", detail.output, unreported.output),
+            ("reasoning_tokens", detail.reasoning, unreported.reasoning),
+            ("cached_tokens", detail.cached, unreported.cache_read),
+            ("cache_read_tokens", detail.cache_read, unreported.cache_read),
+        ] {
+            if !absent {
+                t.int(name, value);
+            }
+        }
+        t.bool("cache_read_tokens_present", !unreported.cache_read);
+        if !unreported.cache_creation {
+            t.int("cache_creation_tokens", detail.cache_creation);
+        }
         if let Some(n) = detail.cache_creation_5m {
             t.int("cache_creation_5m_tokens", n);
         }
         if let Some(n) = detail.cache_creation_1h {
             t.int("cache_creation_1h_tokens", n);
         }
-        t.int("total_tokens", detail.total);
+        if !unreported.total {
+            t.int("total_tokens", detail.total);
+        }
     });
     w.bool("failed", record.failed);
     if let Some(observed) = record.usage_observed {
@@ -1646,6 +1724,8 @@ impl Facts {
 // ponytail: Chat Completions, Antigravity and Interactions bodies get none (their system
 // prompt is a message or sits in an envelope); add a lookup when a client of theirs
 // needs one.
+// Q1 (temporary): D2 switches dispatch to `usage_snapshot::prompt_prefix` over the request
+// view and deletes this.
 pub(crate) fn prompt_prefix(format: Format, body: &[u8]) -> String {
     use sha2::Digest;
     let system: &[&[u8]] = match format {
@@ -1990,6 +2070,9 @@ pub struct Tracker {
     observer: std::sync::Arc<Observer>,
     stream: StreamUsage,
     body: Option<Detail>,
+    /// The attempt's canonical usage ([`Tracker::canonical`]). It is the record's usage on
+    /// success and on failure alike, whatever the provider.
+    canonical: Option<Detail>,
     model: ResponseModel,
     first: Option<std::time::Duration>,
     published: bool,
@@ -2064,6 +2147,7 @@ impl Tracker {
             }),
             stream: StreamUsage::default(),
             body: None,
+            canonical: None,
             model: ResponseModel::default(),
             first: None,
             published: false,
@@ -2089,6 +2173,7 @@ impl Tracker {
 
     /// The buffered client-format body (or the joined events of a stream the client
     /// did not ask to stream).
+    // Q1 (temporary): D2 removes `body` and `event` with dispatch's byte-level accounting.
     pub fn body(&mut self, body: &[u8]) {
         if body.trim_ascii_start().first() == Some(&b'{') {
             self.body = Some(parse_body(self.facts.format, body));
@@ -2116,6 +2201,19 @@ impl Tracker {
         self.model.observe(line, &self.observer.provider);
     }
 
+    /// The attempt's canonical usage and response facts (`usage_snapshot::read`); they
+    /// replace what the legacy parsers saw. Without a snapshot every count is unreported.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Q1 (temporary): D2's dispatch is the first caller")
+    )]
+    pub fn canonical(&mut self, usage: Option<&CanonicalUsage>, facts: &ResponseFacts) {
+        self.canonical = Some(Detail::canonical(usage.unwrap_or(&CanonicalUsage::default()), facts));
+        if let Some(model) = &facts.model {
+            self.model.set(model);
+        }
+    }
+
     pub fn succeed(mut self) {
         self.publish(Ending::Done);
     }
@@ -2131,11 +2229,12 @@ impl Tracker {
         if std::mem::replace(&mut self.published, true) {
             return;
         }
-        let queue = self.queue.usage_queue();
+        let rt = self.queue.clone();
+        let queue = rt.usage_queue();
         if !queue.accepts() {
             return;
         }
-        let reported = std::mem::take(&mut *self.observer.lock());
+        let mut reported = std::mem::take(&mut *self.observer.lock());
         if reported.discarded {
             return;
         }
@@ -2146,89 +2245,36 @@ impl Tracker {
         if let Some((executor_type, model)) = reported.delegated.clone() {
             (record.executor_type, record.model) = (executor_type, model);
         }
-        let (latency, ttft);
-        if let Some(outcome) = reported.outcome {
-            record.failed = outcome.failed;
-            record.fail_status = outcome.status;
-            record.fail_body = outcome.body;
-            record.detail = outcome.detail;
-            record.response_model = outcome.model;
-            (latency, ttft) = (outcome.latency, outcome.ttft);
-        } else {
-            let usage = if reported.seen {
-                reported.usage()
-            } else {
-                self.body.take().or_else(|| self.stream.detail().cloned())
-            };
-            let detail = match ending {
-                Ending::Done if reported.usage_required && usage.is_none() => {
-                    if reported.claude_cache.is_none() {
-                        return;
-                    }
-                    // Keep activity and timestamps even when a Claude stream never
-                    // returns usage.
-                    record.usage_observed = Some(false);
-                    Detail::default()
-                }
-                Ending::Done => usage.unwrap_or_default(),
-                Ending::Failed(error) => {
-                    record.failed = true;
-                    record.fail_status = i64::from(crate::scheduling::classify::go_status(error));
-                    record.fail_body = crate::scheduling::classify::error_text(error);
-                    if record.response_headers.is_empty() {
-                        record.response_headers = go_headers(&error.headers);
-                    }
-                    if self.observer.provider == "claude" {
-                        usage.unwrap_or_default()
-                    } else {
-                        Detail::default()
-                    }
-                }
-            };
-            record.detail = detail;
-            record.response_model = if reported.seen || !reported.model.get().is_empty() {
-                reported.model.get().to_owned()
-            } else {
-                self.model.get().to_owned()
-            };
-            latency = self.started.elapsed();
-            ttft = if reported.ttft.tracked {
-                reported.ttft.get()
-            } else {
-                self.first.unwrap_or_default()
-            };
-        }
+        let (latency, ttft) = match reported.outcome.take() {
+            Some(outcome) => {
+                record.failed = outcome.failed;
+                record.fail_status = outcome.status;
+                record.fail_body = outcome.body;
+                record.detail = outcome.detail;
+                record.response_model = outcome.model;
+                (outcome.latency, outcome.ttft)
+            }
+            None => match self.observed(&reported, ending, &mut record) {
+                Some(times) => times,
+                None => return,
+            },
+        };
         record.latency_ms = latency.as_millis() as i64;
         record.ttft_ms = ttft.as_millis() as i64;
         if let Some((five, hour)) = returned_cache {
             record.detail.cache_creation_5m = five;
             record.detail.cache_creation_1h = hour;
         }
+        // Canonical usage, once recorded, is the attempt's usage over every executor outcome
+        // and legacy observation; failure still sets the status and body above.
+        if let Some(canonical) = self.canonical.take() {
+            record.detail = canonical;
+        }
         record.timings = self.timings(&reported.exchange);
         record.prompt_prefix_hash = self.facts.prompt_prefix_hash.clone();
-        if let Some(mut cache) = reported.claude_cache {
-            let at = |instant: Option<std::time::Instant>| {
-                instant.map(|instant| {
-                    let offset = instant.saturating_duration_since(self.started).as_millis() as i64;
-                    self.requested_at.timestamp_millis().saturating_add(offset)
-                })
-            };
-            cache.request_start_unix_ms = at(reported.exchange.started);
-            cache.first_response_byte_unix_ms = at(reported.exchange.first_byte);
-            // Completion of this upstream attempt, not the downstream socket flush.
-            cache.end_unix_ms = Some(self.requested_at.timestamp_millis().saturating_add(record.latency_ms));
-            cache.attempt = self.attempt;
-            if self.client.as_ref().unwrap_or(&self.facts.client).is_compaction {
-                cache.base_request_type = "compaction".into();
-                if cache.request_type != "retry" {
-                    cache.request_type = "compaction".into();
-                }
-            }
-            if self.attempt > 0 {
-                cache.request_type = "retry".into();
-            }
-            record.claude_cache = Some(cache);
-        }
+        record.claude_cache = reported
+            .claude_cache
+            .map(|cache| self.claude_cache(cache, &reported.exchange, record.latency_ms));
         if let Some(effort) = reported.effort {
             record.reasoning_effort = effort;
         }
@@ -2240,6 +2286,86 @@ impl Tracker {
 }
 
 impl Tracker {
+    /// The record's usage, failure and model from what the attempt observed, when the
+    /// executor published no outcome of its own; its latency and TTFT. `None` publishes
+    /// nothing: a stream that had to report usage ended without it.
+    fn observed(
+        &mut self,
+        reported: &Reported,
+        ending: Ending<'_>,
+        record: &mut Record,
+    ) -> Option<(std::time::Duration, std::time::Duration)> {
+        let usage = if reported.seen {
+            reported.usage()
+        } else {
+            self.body.take().or_else(|| self.stream.detail().cloned())
+        };
+        record.detail = match ending {
+            Ending::Done if reported.usage_required && usage.is_none() && self.canonical.is_none() => {
+                reported.claude_cache.as_ref()?;
+                // Keep activity and timestamps even when a Claude stream never
+                // returns usage.
+                record.usage_observed = Some(false);
+                Detail::default()
+            }
+            Ending::Done => usage.unwrap_or_default(),
+            Ending::Failed(error) => {
+                record.failed = true;
+                record.fail_status = i64::from(crate::scheduling::classify::go_status(error));
+                record.fail_body = crate::scheduling::classify::error_text(error);
+                if record.response_headers.is_empty() {
+                    record.response_headers = go_headers(&error.headers);
+                }
+                if self.observer.provider == "claude" {
+                    usage.unwrap_or_default()
+                } else {
+                    Detail::default()
+                }
+            }
+        };
+        record.response_model = if reported.seen || !reported.model.get().is_empty() {
+            reported.model.get().to_owned()
+        } else {
+            self.model.get().to_owned()
+        };
+        let ttft = if reported.ttft.tracked {
+            reported.ttft.get()
+        } else {
+            self.first.unwrap_or_default()
+        };
+        Some((self.started.elapsed(), ttft))
+    }
+
+    /// Claude cache telemetry with this attempt's wall-clock marks, number and request type.
+    fn claude_cache(
+        &self,
+        mut cache: ck_core::exec::ClaudeCacheTelemetry,
+        exchange: &Exchange,
+        latency_ms: i64,
+    ) -> ck_core::exec::ClaudeCacheTelemetry {
+        let at = |instant: Option<std::time::Instant>| {
+            instant.map(|instant| {
+                let offset = instant.saturating_duration_since(self.started).as_millis() as i64;
+                self.requested_at.timestamp_millis().saturating_add(offset)
+            })
+        };
+        cache.request_start_unix_ms = at(exchange.started);
+        cache.first_response_byte_unix_ms = at(exchange.first_byte);
+        // Completion of this upstream attempt, not the downstream socket flush.
+        cache.end_unix_ms = Some(self.requested_at.timestamp_millis().saturating_add(latency_ms));
+        cache.attempt = self.attempt;
+        if self.client.as_ref().unwrap_or(&self.facts.client).is_compaction {
+            cache.base_request_type = "compaction".into();
+            if cache.request_type != "retry" {
+                cache.request_type = "compaction".into();
+            }
+        }
+        if self.attempt > 0 {
+            cache.request_type = "retry".into();
+        }
+        cache
+    }
+
     /// The record's [`Timings`]: each mark as an offset from the request's arrival.
     fn timings(&self, exchange: &Exchange) -> Timings {
         let clock = &self.facts.clock;
@@ -2392,6 +2518,165 @@ mod tests {
     /// rejection is Go's `reporter.PublishFailure(err)` after usage was observed (no
     /// tokens, response model kept, and the later failure the server sees changes
     /// nothing); `discard` is Go returning before it created a reporter (no record).
+    #[test]
+    fn canonical_usage_is_the_last_snapshot_and_keeps_absent_counts_absent() {
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAI,
+            Format::OpenAI,
+            "m",
+            b"{}",
+            true,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("openai-compatibility"), "m");
+        let response = ResponseFacts {
+            model: Some("m-served".into()),
+            service_tier: Some("flex".into()),
+        };
+        let early = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(4),
+            ..CanonicalUsage::default()
+        };
+        tracker.canonical(Some(&early), &response);
+        let last = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            final_snapshot: true,
+            ..CanonicalUsage::default()
+        };
+        tracker.canonical(Some(&last), &response);
+        tracker.succeed();
+        let raw = rt.usage_queue().pop_oldest(10);
+        assert_eq!(raw.len(), 1, "one record per attempt");
+        let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+        // The last snapshot replaces the first; nothing is summed, and its absent counts
+        // (cache, reasoning, total) are not written as zero.
+        assert_eq!(
+            record["tokens"],
+            serde_json::json!({"input_tokens": 10, "output_tokens": 20, "cache_read_tokens_present": false})
+        );
+        assert_eq!(record["token_breakdown"]["total_tokens"], 30);
+        assert_eq!(record["response_model"], "m-served");
+        assert_eq!(record["response_service_tier"], "flex");
+    }
+
+    #[test]
+    fn canonical_usage_survives_failure_and_a_missing_snapshot_is_unreported() {
+        use ck_core::exec::{ExecError, FailureScope};
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAI,
+            Format::OpenAI,
+            "m",
+            b"{}",
+            true,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let error = ExecError::local(502, FailureScope::Transport, "upstream");
+        let usage = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            total_tokens: Some(30),
+            ..CanonicalUsage::default()
+        };
+        let response = ResponseFacts::default();
+        // Not a Claude credential: the legacy failure path would drop the counts.
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("openai-compatibility"), "m");
+        tracker.canonical(Some(&usage), &response);
+        tracker.fail(&error);
+        let mut none = Tracker::start(&rt, &facts, &credential_for("openai-compatibility"), "m");
+        none.canonical(None, &response);
+        none.succeed();
+        let raw = rt.usage_queue().pop_oldest(10);
+        let records: Vec<Value> = raw.iter().map(|r| serde_json::from_slice(r).unwrap()).collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["failed"], true);
+        assert_eq!(
+            records[0]["tokens"],
+            serde_json::json!({
+                "input_tokens": 10, "output_tokens": 20, "total_tokens": 30,
+                "cache_read_tokens_present": false,
+            })
+        );
+        assert_eq!(
+            records[1]["tokens"],
+            serde_json::json!({"cache_read_tokens_present": false}),
+            "no snapshot is unknown usage, not zero"
+        );
+    }
+
+    #[test]
+    fn canonical_usage_wins_over_executor_outcomes_and_legacy_cache_buckets() {
+        use ck_core::exec::{ExecError, FailureScope};
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::Claude,
+            Format::Claude,
+            "m",
+            b"{}",
+            true,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let error = ExecError::local(502, FailureScope::Transport, "upstream");
+        let response = ResponseFacts::default();
+        let usage = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            total_tokens: Some(30),
+            ..CanonicalUsage::default()
+        };
+        // An executor-published failure carries its own zero usage.
+        for provider in ["openai-compatibility", "claude", "gemini", "codex"] {
+            let mut tracker = Tracker::start(&rt, &facts, &credential_for(provider), "m");
+            tracker.sink().publish_failure(502, "upstream");
+            tracker.canonical(Some(&usage), &response);
+            tracker.fail(&error);
+            let raw = rt.usage_queue().pop_oldest(10);
+            let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+            assert_eq!(record["failed"], true);
+            assert_eq!(
+                record["tokens"],
+                serde_json::json!({
+                    "input_tokens": 10, "output_tokens": 20, "total_tokens": 30,
+                    "cache_read_tokens_present": false,
+                }),
+                "{provider}"
+            );
+        }
+        // An executor that requires usage and saw none still gets the canonical record.
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("claude"), "m");
+        tracker.sink().usage_required();
+        tracker.canonical(Some(&usage), &response);
+        tracker.succeed();
+        let raw = rt.usage_queue().pop_oldest(10);
+        let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+        assert_eq!(record["tokens"]["total_tokens"], 30);
+        // The Claude observer saw 5m/1h buckets 7/5; the canonical snapshot reports 4 and no 1h.
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("claude"), "m");
+        tracker.sink().response_line(
+            Format::Claude,
+            br#"data: {"type":"message_start","message":{"model":"m","usage":{"input_tokens":9,"output_tokens":1,"cache_creation_input_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":7,"ephemeral_1h_input_tokens":5}}}}"#,
+        );
+        let cached = CanonicalUsage {
+            cache_write_tokens: Some(4),
+            cache_write_5m_tokens: Some(4),
+            ..usage
+        };
+        tracker.canonical(Some(&cached), &response);
+        tracker.fail(&error);
+        let raw = rt.usage_queue().pop_oldest(10);
+        let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+        assert_eq!(record["tokens"]["cache_creation_tokens"], 4);
+        assert_eq!(record["tokens"]["cache_creation_5m_tokens"], 4);
+        assert_eq!(record["tokens"].get("cache_creation_1h_tokens"), None);
+    }
+
     #[test]
     fn claude_executor_outcomes_reach_the_queue() {
         use ck_core::exec::{ExecError, FailureScope};

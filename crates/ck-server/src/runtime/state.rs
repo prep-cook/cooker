@@ -122,6 +122,8 @@ pub struct Runtime {
     managed_config: std::sync::atomic::AtomicBool,
     /// The model routers' benchmarks and conversation bindings ([`crate::inference::model_router`]).
     pub(crate) model_router: crate::inference::model_router::State,
+    /// The stream store, committed stream handles and stream tasks.
+    streams: crate::inference::streams::Registry,
 }
 
 /// The Codex refresh transactions under a credential file's lock: shutdown stops the
@@ -208,6 +210,7 @@ impl Runtime {
             config_commit: Mutex::default(),
             managed_config: Default::default(),
             model_router: Default::default(),
+            streams: Default::default(),
         };
         rt.publish_policy(policy);
         rt.store.set_cooldown_backend(backend);
@@ -219,6 +222,11 @@ impl Runtime {
             .session_closer
             .set(Box::new(rt.executors.credential_session_closer()));
         rt
+    }
+
+    /// The stream store and the committed streams a resume attaches to.
+    pub fn streams(&self) -> &crate::inference::streams::Registry {
+        &self.streams
     }
 
     /// The usage queue: the request path calls `enqueue` with one serialized Go
@@ -622,6 +630,7 @@ impl Runtime {
     pub fn begin_shutdown(&self) {
         self.codex_refreshes.admission_closed.cancel();
         self.stop_auto_refresh();
+        self.streams.begin_shutdown();
     }
 
     pub async fn shutdown_codex_refreshes(&self) {
@@ -632,6 +641,7 @@ impl Runtime {
 
     pub async fn finish_shutdown(&self) -> anyhow::Result<()> {
         self.begin_shutdown();
+        let streams = self.streams.finish_shutdown().await;
         self.codex_refreshes.shutdown.cancel();
         self.codex_refreshes.tasks.close();
         self.codex_refreshes.tasks.wait().await;
@@ -659,7 +669,7 @@ impl Runtime {
         // A recovered required projection can queue normalization during settlement.
         self.store.persistence_tasks.wait().await;
         match settled {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => streams.map_err(|error| anyhow::anyhow!("stream storage shutdown failed: {error}")),
             // An unresolved publication keeps its recovery workspace; a lost cooldown
             // checkpoint alone has nothing left to recover.
             Ok(Err(error)) => Err(error.context("configuration shutdown incomplete")),
