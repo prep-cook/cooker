@@ -188,7 +188,7 @@ pub async fn egress(streams: &Streams, protocol: &str, stream: &mut Writer, id: 
         }
         "responses" => {
             deliver(
-                responses::egress::Egress::new(stream, op, mode, |_, _| {}).unwrap(),
+                crate::support::responses_egress(stream, op, mode).unwrap(),
                 stream,
                 reader,
             )

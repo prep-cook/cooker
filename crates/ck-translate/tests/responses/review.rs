@@ -451,8 +451,7 @@ fn canonical_usage_counts_win_over_the_native_value() {
             .emit(&mut m.writer, kind, Scope::default(), |e| e.bytes(payload), |_| Ok(()))
             .unwrap();
     }
-    let mut egress =
-        responses::egress::Egress::new(&mut m.writer, Operation::Generate, BodyMode::Buffered, |_, _| {}).unwrap();
+    let mut egress = crate::client_egress(&mut m.writer, Operation::Generate, BodyMode::Buffered).unwrap();
     let mut out = Vec::new();
     while let std::task::Poll::Ready(Some(ck_stream::Read::Record(record))) = reader.try_next() {
         egress

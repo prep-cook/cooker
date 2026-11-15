@@ -48,8 +48,7 @@ pub(super) fn to_client(input: &[u8], client: &str, downstream: BodyMode) -> Vec
         }
         egress.finish().unwrap();
     } else {
-        let mut egress =
-            responses::egress::Egress::new(&mut m.writer, Operation::Generate, downstream, |_, _| {}).unwrap();
+        let mut egress = crate::client_egress(&mut m.writer, Operation::Generate, downstream).unwrap();
         for record in records {
             egress.advance(&mut m.writer, record, &mut sink).unwrap();
         }

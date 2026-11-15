@@ -211,7 +211,7 @@ fn assert_every_egress(streams: &Streams, owner: &mut Writer, mode: BodyMode, te
     let chat = deliver(streams, owner, &mut chat);
     let mut messages = anthropic::egress::Egress::new(owner, id, op, mode, |_| {}).unwrap();
     let messages = deliver(streams, owner, &mut messages);
-    let mut responses = responses::egress::Egress::new(owner, op, mode, |_, _| {}).unwrap();
+    let mut responses = crate::support::responses_egress(owner, op, mode).unwrap();
     let responses = deliver(streams, owner, &mut responses);
     let mut native = gemini::egress::Egress::new(owner, id, op, mode, |_| {}).unwrap();
     let native = deliver(streams, owner, &mut native);

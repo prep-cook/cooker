@@ -80,8 +80,7 @@ async fn echo_with<I: RequestIngress>(
     upstream.advance(&mut response, SSE).unwrap();
     upstream.finish(&mut response).unwrap();
     response.finish(Terminal::Done);
-    let mut egress =
-        responses::egress::Egress::new(&mut stream, Operation::Generate, BodyMode::Buffered, |_, _| {}).unwrap();
+    let mut egress = crate::support::responses_egress(&mut stream, Operation::Generate, BodyMode::Buffered).unwrap();
     egress.echo(&mut stream, validated.view())?;
     Ok(serde_json::from_str(&deliver(egress, &mut stream, streams.reader(id)).await).unwrap())
 }

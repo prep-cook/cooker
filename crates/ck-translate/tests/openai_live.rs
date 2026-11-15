@@ -118,7 +118,17 @@ fn decode(upstream: Upstream, input: &[u8], mode: BodyMode, step: usize, client:
             anthropic::egress::Egress::new(w, identity(), Operation::Generate, m, |_| {})
         }),
         Client::Responses(m) => run(upstream, input, mode, step, |w| {
-            responses::egress::Egress::new(w, Operation::Generate, m, |_, _| {})
+            responses::egress::Egress::new(
+                w,
+                codec::event::LocalId::new("resp_test").unwrap(),
+                codec::identity::Producer {
+                    provider: codec::event::LocalId::new("test").unwrap(),
+                    credential: [0; 32],
+                },
+                Operation::Generate,
+                m,
+                |_, _| {},
+            )
         }),
         Client::Gemini(f) => run(upstream, input, mode, step, |w| {
             gemini::egress::Egress::with_framing(w, Operation::Generate, f, |_| {})

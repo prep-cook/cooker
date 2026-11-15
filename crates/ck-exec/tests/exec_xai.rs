@@ -227,7 +227,7 @@ fn deliver(streams: &Streams, owner: &mut Writer, egress: &mut impl ResponseEgre
 
 /// What a Responses client receives, buffered.
 fn responses_json(streams: &Streams, owner: &mut Writer) -> Value {
-    let mut egress = responses::egress::Egress::new(owner, Operation::Generate, BodyMode::Buffered, |_, _| {}).unwrap();
+    let mut egress = support::responses_egress(owner, Operation::Generate, BodyMode::Buffered).unwrap();
     serde_json::from_str(&deliver(streams, owner, &mut egress)).unwrap()
 }
 

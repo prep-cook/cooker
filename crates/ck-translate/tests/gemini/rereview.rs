@@ -222,7 +222,18 @@ fn response_file_data_fails_where_it_cannot_be_written() {
             anthropic::egress::Egress::new(w, response, Operation::Generate, mode, |_| {}).unwrap()
         })));
         assert!(unsupported(gemini_to(&body, |w| {
-            responses::egress::Egress::new(w, Operation::Generate, mode, |_, _| {}).unwrap()
+            responses::egress::Egress::new(
+                w,
+                codec::event::LocalId::new("resp_test").unwrap(),
+                codec::identity::Producer {
+                    provider: codec::event::LocalId::new("test").unwrap(),
+                    credential: [0; 32],
+                },
+                Operation::Generate,
+                mode,
+                |_, _| {},
+            )
+            .unwrap()
         })));
     }
 }
