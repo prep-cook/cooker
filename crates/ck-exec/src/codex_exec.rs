@@ -49,6 +49,7 @@ impl Capability for CodexCapability {
                 operation: Operation::Generate,
                 ..view
             }),
+            Operation::Media(_) | Operation::AlphaSearch => Err(codec::Error::Unsupported),
         }
     }
 }

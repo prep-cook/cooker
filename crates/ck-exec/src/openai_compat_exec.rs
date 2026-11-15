@@ -52,6 +52,7 @@ impl Capability for RelayCapability {
                 ..view
             }),
             Operation::Compact => ResponsesCapability.validate(view),
+            Operation::Media(_) | Operation::AlphaSearch => Err(codec::Error::Unsupported),
         }
     }
 }

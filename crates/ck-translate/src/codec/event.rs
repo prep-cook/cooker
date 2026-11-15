@@ -250,11 +250,7 @@ impl Emitter {
             Scope::default(),
             |encoder| {
                 encoder.bytes(b",\"operation\":")?;
-                encoder.string(match request.operation {
-                    super::Operation::Generate => "generate",
-                    super::Operation::CountTokens => "count_tokens",
-                    super::Operation::Compact => "compact",
-                })
+                encoder.string(request.operation.name())
             },
             |_| Ok(()),
         )?;

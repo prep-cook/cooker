@@ -384,6 +384,58 @@ fn validated_request_binds_destination_operation_and_source() {
     assert!(matches!(scanner.finish(&foreign.source), Err(Error::Position)));
 }
 
+struct AnyDocument;
+
+impl ck_translate::codec::Capability for AnyDocument {
+    fn destination(&self) -> &'static str {
+        "any-document"
+    }
+
+    fn validate(&self, _: ck_translate::codec::RequestView<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn fence_refuses_operations_a_destination_does_not_admit() {
+    use ck_translate::codec::{ClientCapability, Media, Operation, RequestFence, RequestView};
+    let mut mapped = Mapped::new();
+    let doc = document(&mut mapped, br#"{"model":"m"}"#);
+    let media = ck_translate::codec::media::Registry::new(&mut mapped.writer).unwrap();
+    // (operation, request.start name, admitted by a destination that declares no operations)
+    let cases = [
+        (Operation::Generate, "generate", true),
+        (Operation::CountTokens, "count_tokens", true),
+        (Operation::Compact, "compact", true),
+        (Operation::Media(Media::ImageGenerate), "image_generate", false),
+        (Operation::Media(Media::ImageEdit), "image_edit", false),
+        (Operation::Media(Media::Speech), "speech", false),
+        (Operation::Media(Media::VideoCreate), "video_create", false),
+        (Operation::Media(Media::VideoEdit), "video_edit", false),
+        (Operation::Media(Media::VideoExtend), "video_extend", false),
+        (Operation::Media(Media::VideoRetrieve), "video_retrieve", false),
+        (Operation::Media(Media::VideoContent), "video_content", false),
+        (Operation::AlphaSearch, "alpha_search", false),
+    ];
+    for (operation, name, admitted) in cases {
+        assert_eq!(operation.name(), name);
+        let request = RequestView {
+            document: &doc,
+            media: &media,
+            operation,
+        };
+        let fenced = RequestFence::default().end(request, &AnyDocument);
+        assert_eq!(fenced.is_ok(), admitted, "{name}");
+        if !admitted {
+            assert!(matches!(fenced, Err(Error::Unsupported)), "{name}");
+        }
+        assert!(
+            RequestFence::default().end(request, &ClientCapability).is_ok(),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn poisoned_or_rebound_scanners_cannot_resume() {
     let mut original = Mapped::new();

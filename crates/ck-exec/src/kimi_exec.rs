@@ -59,6 +59,7 @@ impl Capability for KimiCapability {
             // The old path counts upstream through the Claude delegation.
             Operation::CountTokens => return Err(codec::Error::Destination),
             Operation::Compact => return Err(codec::Error::Unsupported),
+            Operation::Media(_) | Operation::AlphaSearch => return Err(codec::Error::Unsupported),
         }
         match client(view.document)? {
             Format::Claude => Err(codec::Error::Destination),

@@ -5,7 +5,8 @@
 //! Each protocol implements four independent roles: [`RequestIngress`],
 //! [`RequestEgress`], [`ResponseIngress`] and [`ResponseEgress`]. Buffered JSON is
 //! a body encoding, not a separate semantic pipeline. [`Operation`] includes
-//! generation, count and compact; a protocol without an operation rejects it.
+//! generation, count, compact, one-shot media and alpha search; a protocol without an
+//! operation rejects it. Live sessions have no operation: see [`live`].
 //! Count results never become generation usage, and compact is never a summary
 //! substitute. Keep the old pair registry untouched until integration cutover.
 //!
@@ -56,6 +57,7 @@ pub mod event;
 pub mod identity;
 pub mod internal;
 pub mod json;
+pub mod live;
 pub mod media;
 pub mod multipart;
 pub mod provenance;
@@ -112,11 +114,54 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
+/// The request's operation (`X.operation`, `docs/INTERNAL-STREAM.md` §4). Live sessions
+/// have none: their messages are forwarded as received (`live`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
     Generate,
     CountTokens,
     Compact,
+    /// One-shot media (§5.19-5.24).
+    Media(Media),
+    /// Codex alpha search (§4 `alpha_search`, `crate::search`).
+    AlphaSearch,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Media {
+    ImageGenerate,
+    ImageEdit,
+    /// Bounded speech (TTS).
+    Speech,
+    VideoCreate,
+    VideoEdit,
+    VideoExtend,
+    VideoRetrieve,
+    /// Download of a finished video's bytes.
+    VideoContent,
+}
+impl Operation {
+    /// The `request.start` operation string.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Generate => "generate",
+            Self::CountTokens => "count_tokens",
+            Self::Compact => "compact",
+            Self::Media(Media::ImageGenerate) => "image_generate",
+            Self::Media(Media::ImageEdit) => "image_edit",
+            Self::Media(Media::Speech) => "speech",
+            Self::Media(Media::VideoCreate) => "video_create",
+            Self::Media(Media::VideoEdit) => "video_edit",
+            Self::Media(Media::VideoExtend) => "video_extend",
+            Self::Media(Media::VideoRetrieve) => "video_retrieve",
+            Self::Media(Media::VideoContent) => "video_content",
+            Self::AlphaSearch => "alpha_search",
+        }
+    }
+
+    /// Generate, CountTokens and Compact: the operations of the text-generation codecs.
+    pub const fn is_text(self) -> bool {
+        matches!(self, Self::Generate | Self::CountTokens | Self::Compact)
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BodyMode {
@@ -138,6 +183,12 @@ pub trait Capability {
     /// Unique key for the destination capability policy; distinct policies must
     /// not share a key, even when they use the same wire protocol.
     fn destination(&self) -> &'static str;
+    /// Whether this destination validates `operation` at all; the fence refuses any other
+    /// with [`Error::Unsupported`] before [`Self::validate`]. The text operations by default,
+    /// so a text capability never admits a media or search request by omission.
+    fn admits(&self, operation: Operation) -> bool {
+        operation.is_text()
+    }
     fn validate(&self, request: RequestView<'_>) -> Result<()>;
 }
 
@@ -174,6 +225,9 @@ pub struct ClientCapability;
 impl Capability for ClientCapability {
     fn destination(&self) -> &'static str {
         CLIENT
+    }
+    fn admits(&self, _: Operation) -> bool {
+        true
     }
     fn validate(&self, _: RequestView<'_>) -> Result<()> {
         Ok(())
@@ -214,6 +268,9 @@ impl RequestFence {
             return Err(Error::Closed);
         }
         self.closed = true;
+        if !destination.admits(request.operation) {
+            return Err(Error::Unsupported);
+        }
         request.media.validate_document(request.document)?;
         request.document.check_live()?;
         destination.validate(request)?;
