@@ -9,10 +9,14 @@ use sha2::{Digest, Sha256};
 
 use crate::common::{self, UserTurnDrops, go_lower, trim_space};
 use crate::{Error, Registered, RequestCtx, codex_claude_response as response, openai_claude};
+#[path = "codex_claude_request.rs"]
+mod request;
+use crate::responses_policy::Policy;
+pub(crate) use request::convert_with_policy;
 
 pub static PAIR: Registered = registered!(
     Claude -> Codex,
-    request: |ctx, body| convert(ctx.model, body, false),
+    request: |ctx, body| convert_with_policy(ctx.model, body, false, Policy::Codex),
     non_stream: response::non_stream,
     go_stream: response::go_stream,
     token_count: Some(openai_claude::claude_input_tokens),
@@ -21,7 +25,7 @@ pub static PAIR: Registered = registered!(
 /// ConvertClaudeRequestToCodexWithCompat: assistant thinking blocks with empty or
 /// unknown-format signatures are kept for compatibility endpoints.
 pub fn request_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    convert(ctx.model, body, true)
+    convert_with_policy(ctx.model, body, true, Policy::Codex)
 }
 
 const NAME_LIMIT: usize = 64;
@@ -367,16 +371,7 @@ impl Messages<'_> {
     fn message(&mut self, message: &Res<'_>) {
         let role = message.get("role").bytes().into_owned();
         if role == b"system" {
-            if let Some(text) = common::claude_message_system_reminder_text(&message.get("content")) {
-                let mut item =
-                    br#"{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}"#.to_vec();
-                gj::set_str(&mut item, "content.0.text", &text);
-                if self.pending_tool_uses.is_empty() {
-                    self.items.push(item);
-                } else {
-                    self.pending_reminders.push(item);
-                }
-            }
+            self.system_message(message);
             return;
         }
         let content = message.get("content");
@@ -386,26 +381,6 @@ impl Messages<'_> {
         }
         self.pending_tool_uses.clear();
         let mut current: Vec<Vec<u8>> = vec![];
-        let flush = |items: &mut Vec<Vec<u8>>, current: &mut Vec<Vec<u8>>| {
-            if !current.is_empty() {
-                let mut item = br#"{"type":"message","role":""}"#.to_vec();
-                gj::set_str(&mut item, "role", &role);
-                gj::set_raw(&mut item, "content", gj::join(current));
-                items.push(item);
-                current.clear();
-            }
-        };
-        let text_part = |text: &[u8]| {
-            let kind = if role == b"assistant" {
-                "output_text"
-            } else {
-                "input_text"
-            };
-            let mut part = br#"{"type":"","text":""}"#.to_vec();
-            gj::set_str(&mut part, "type", kind);
-            gj::set_str(&mut part, "text", text);
-            part
-        };
         // Counts only what this turn itself sends, not reminders flushed beside it. Empty
         // text is forwarded but does not count: it can hide an emptied attachment.
         let mut sendable = 0;
@@ -418,19 +393,10 @@ impl Messages<'_> {
                         self.flush_reminders();
                         let text = part.get("text").bytes();
                         sendable += usize::from(!text.is_empty());
-                        current.push(text_part(&text));
+                        current.push(Self::text_part(&role, &text));
                     }
                     b"thinking" => {
-                        if role != b"assistant" {
-                            continue;
-                        }
-                        let Some(signature) = self.reasoning_signature(part) else {
-                            continue;
-                        };
-                        flush(&mut self.items, &mut current);
-                        let mut item = br#"{"type":"reasoning","summary":[],"content":null}"#.to_vec();
-                        gj::set_str(&mut item, "encrypted_content", &signature);
-                        self.items.push(item);
+                        self.thinking_part(&role, part, &mut current);
                     }
                     b"image" => {
                         self.flush_reminders();
@@ -458,36 +424,87 @@ impl Messages<'_> {
                         }
                     }
                     b"tool_use" => {
-                        flush(&mut self.items, &mut current);
-                        let id = part.get("id").bytes().into_owned();
-                        if !id.is_empty() {
-                            self.pending_tool_uses.push(id.clone());
-                        }
-                        let mut call = br#"{"type":"function_call"}"#.to_vec();
-                        gj::set_str(&mut call, "call_id", shorten_call_id(&id));
-                        gj::set_str(&mut call, "name", mapped_name(self.names, &part.get("name").bytes()));
-                        gj::set_str(&mut call, "arguments", &part.get("input").raw);
-                        self.items.push(call);
+                        self.tool_use(&role, part, &mut current);
                     }
                     b"tool_result" => {
-                        flush(&mut self.items, &mut current);
+                        self.flush_message(&role, &mut current);
                         self.items.push(tool_result(part));
                         sendable += 1;
                     }
                     _ => {}
                 }
             }
-            flush(&mut self.items, &mut current);
+            self.flush_message(&role, &mut current);
             self.flush_reminders();
         } else if content.kind == Kind::String {
             sendable += usize::from(!content.s.is_empty());
-            current.push(text_part(&content.s));
-            flush(&mut self.items, &mut current);
+            current.push(Self::text_part(&role, &content.s));
+            self.flush_message(&role, &mut current);
             self.flush_reminders();
         }
         if user {
             self.drops.end_turn(sendable);
         }
+    }
+
+    fn system_message(&mut self, message: &Res<'_>) {
+        if let Some(text) = common::claude_message_system_reminder_text(&message.get("content")) {
+            let mut item = br#"{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}"#.to_vec();
+            gj::set_str(&mut item, "content.0.text", &text);
+            if self.pending_tool_uses.is_empty() {
+                self.items.push(item);
+            } else {
+                self.pending_reminders.push(item);
+            }
+        }
+    }
+
+    fn flush_message(&mut self, role: &[u8], current: &mut Vec<Vec<u8>>) {
+        if !current.is_empty() {
+            let mut item = br#"{"type":"message","role":""}"#.to_vec();
+            gj::set_str(&mut item, "role", role);
+            gj::set_raw(&mut item, "content", gj::join(current));
+            self.items.push(item);
+            current.clear();
+        }
+    }
+
+    fn text_part(role: &[u8], text: &[u8]) -> Vec<u8> {
+        let kind = if role == b"assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        let mut part = br#"{"type":"","text":""}"#.to_vec();
+        gj::set_str(&mut part, "type", kind);
+        gj::set_str(&mut part, "text", text);
+        part
+    }
+
+    fn thinking_part(&mut self, role: &[u8], part: &Res<'_>, current: &mut Vec<Vec<u8>>) {
+        if role != b"assistant" {
+            return;
+        }
+        let Some(signature) = self.reasoning_signature(part) else {
+            return;
+        };
+        self.flush_message(role, current);
+        let mut item = br#"{"type":"reasoning","summary":[],"content":null}"#.to_vec();
+        gj::set_str(&mut item, "encrypted_content", &signature);
+        self.items.push(item);
+    }
+
+    fn tool_use(&mut self, role: &[u8], part: &Res<'_>, current: &mut Vec<Vec<u8>>) {
+        self.flush_message(role, current);
+        let id = part.get("id").bytes().into_owned();
+        if !id.is_empty() {
+            self.pending_tool_uses.push(id.clone());
+        }
+        let mut call = br#"{"type":"function_call"}"#.to_vec();
+        gj::set_str(&mut call, "call_id", shorten_call_id(&id));
+        gj::set_str(&mut call, "name", mapped_name(self.names, &part.get("name").bytes()));
+        gj::set_str(&mut call, "arguments", &part.get("input").raw);
+        self.items.push(call);
     }
 
     /// appendReasoningContent's signature choice: GPT-compatible signatures, then (compat)
@@ -553,194 +570,4 @@ fn tool_result(part: &Res<'_>) -> Vec<u8> {
 fn eq_fold(value: &[u8], token: &str) -> bool {
     use ck_wire::gostr::GoStr;
     String::from_utf8_lossy(value).go_eq_fold(token)
-}
-
-/// convertClaudeRequestToCodex. A user turn left empty because its only attachment
-/// cannot be sent is refused.
-fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
-    let mut out = br#"{"model":"","instructions":"","input":[]}"#.to_vec();
-    let root = gj::parse(raw);
-    let names = original_to_short(raw);
-    gj::set_str(&mut out, "model", model);
-    let mut state = Messages {
-        model,
-        preserve,
-        names: &names,
-        items: vec![],
-        pending_tool_uses: vec![],
-        pending_reminders: vec![],
-        drops: UserTurnDrops::default(),
-    };
-
-    let system = root.get("system");
-    if system.exists() {
-        let mut parts: Vec<Vec<u8>> = vec![];
-        let mut add = |text: &[u8]| {
-            if !text.is_empty() && !common::is_claude_code_attribution_text(text) {
-                let mut part = br#"{"type":"input_text","text":""}"#.to_vec();
-                gj::set_str(&mut part, "text", text);
-                parts.push(part);
-            }
-        };
-        if system.kind == Kind::String {
-            add(&system.s);
-        } else if system.is_array() {
-            for block in system.array() {
-                if block.get("type").bytes().as_ref() == b"text" {
-                    add(&block.get("text").bytes());
-                }
-            }
-        }
-        if !parts.is_empty() {
-            let mut message = br#"{"type":"message","role":"developer"}"#.to_vec();
-            gj::set_raw(&mut message, "content", gj::join(&parts));
-            state.items.push(message);
-        }
-    }
-
-    let messages = root.get("messages");
-    if messages.is_array() {
-        for message in messages.array() {
-            state.message(&message);
-        }
-        state.flush_reminders();
-    }
-
-    let tools = root.get("tools");
-    let mut has_web_search = false;
-    let mut tool_items: Vec<Vec<u8>> = vec![];
-    if tools.is_array() {
-        let web_search: HashSet<Vec<u8>> = tools
-            .array()
-            .iter()
-            .filter(|t| is_web_search_tool(&t.get("type").bytes()))
-            .map(|t| t.get("name").bytes().into_owned())
-            .filter(|n| !n.is_empty())
-            .collect();
-        gj::set_raw(
-            &mut out,
-            "tool_choice",
-            tool_choice(&root.get("tool_choice"), &names, &web_search),
-        );
-        for tool in tools.array() {
-            if is_web_search_tool(&tool.get("type").bytes()) {
-                has_web_search = true;
-                tool_items.push(web_search_tool(&tool));
-                continue;
-            }
-            let mut item = tool.raw.to_vec();
-            let kind = tool.get("type");
-            if kind.kind != Kind::String || kind.s.as_ref() != b"function" {
-                gj::set_str(&mut item, "type", "function");
-            }
-            let name = tool.get("name");
-            if name.exists() {
-                let original = name.bytes().into_owned();
-                let short = mapped_name(&names, &original);
-                if name.kind != Kind::String || short != original {
-                    gj::set_str(&mut item, "name", &short);
-                }
-            }
-            gj::set_raw(
-                &mut item,
-                "parameters",
-                normalize_tool_parameters(&tool.get("input_schema").raw),
-            );
-            for path in ["input_schema", "parameters.$schema", "cache_control", "defer_loading"] {
-                if gj::get(&item, path).exists() {
-                    gj::delete(&mut item, path);
-                }
-            }
-            if gj::get(&item, "strict").kind != Kind::False {
-                gj::set_bool(&mut item, "strict", false);
-            }
-            tool_items.push(item);
-        }
-    }
-
-    let disable_parallel = root.get("tool_choice.disable_parallel_tool_use");
-    gj::set_bool(
-        &mut out,
-        "parallel_tool_calls",
-        !(disable_parallel.exists() && disable_parallel.bool()),
-    );
-
-    let mut effort: Vec<u8> = b"medium".to_vec();
-    let thinking = root.get("thinking");
-    if thinking.is_object() {
-        match thinking.get("type").bytes().as_ref() {
-            b"enabled" => {
-                let budget = thinking.get("budget_tokens");
-                if budget.exists()
-                    && let Some(level) = ck_wire::thinking::convert_budget_to_level(budget.int())
-                    && !level.is_empty()
-                {
-                    effort = level.as_bytes().to_vec();
-                }
-            }
-            b"adaptive" | b"auto" => {
-                // Claude 4.6 adaptive thinking may carry its effort in output_config.
-                let explicit = root.get("output_config.effort");
-                let explicit = if explicit.kind == Kind::String {
-                    go_lower(trim_space(&explicit.s))
-                } else {
-                    vec![]
-                };
-                effort = if explicit.is_empty() {
-                    b"xhigh".to_vec()
-                } else {
-                    explicit
-                };
-            }
-            b"disabled" => {
-                if let Some(level) = ck_wire::thinking::convert_budget_to_level(0)
-                    && !level.is_empty()
-                {
-                    effort = level.as_bytes().to_vec();
-                }
-            }
-            _ => {}
-        }
-    }
-    gj::set_str(&mut out, "reasoning.effort", &effort);
-    let mut tier = service_tier(&root.get("service_tier"));
-    let speed = root.get("speed");
-    if speed.kind == Kind::String && speed.s.as_ref() == b"fast" {
-        tier = "priority";
-    }
-    if !tier.is_empty() {
-        gj::set_str(&mut out, "service_tier", tier);
-    }
-    gj::set_bool(&mut out, "stream", true);
-    gj::set_bool(&mut out, "store", false);
-    if has_web_search {
-        gj::set_strs(
-            &mut out,
-            "include",
-            &["reasoning.encrypted_content", "web_search_call.action.sources"],
-        );
-    } else {
-        gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
-    }
-
-    let format = root.get("output_config.format");
-    if format.is_object() && format.get("type").bytes().as_ref() == b"json_schema" && format.get("schema").is_object() {
-        let mut name = format.get("name").bytes().into_owned();
-        if name.is_empty() {
-            name = b"cli_proxy_structured_output".to_vec();
-        }
-        let schema = format.get("schema");
-        let strict = format.get("strict").kind != Kind::False && !misses_required(&schema);
-        let mut translated = br#"{"type":"json_schema","name":"","strict":true,"schema":{}}"#.to_vec();
-        gj::set_str(&mut translated, "name", &name);
-        gj::set_bool(&mut translated, "strict", strict);
-        gj::set_raw(&mut translated, "schema", &schema.raw);
-        gj::set_raw(&mut out, "text.format", translated);
-    }
-    if tools.is_array() {
-        gj::set_raw(&mut out, "tools", gj::join(&tool_items));
-    }
-    gj::set_items(&mut out, "input", &state.items);
-    state.drops.result()?;
-    Ok(out)
 }

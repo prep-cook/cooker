@@ -21,6 +21,10 @@ struct Calls<'a> {
 }
 
 pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
+    validate_for(view, "responses")
+}
+
+pub(super) fn validate_for(view: RequestView<'_>, destination: &str) -> Result<()> {
     if view.operation == Operation::CountTokens {
         return Err(Error::Unsupported);
     }
@@ -34,8 +38,12 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     {
         return Err(Error::Unsupported);
     }
+    if let Some(n) = doc.member(root, "n")?
+        && (destination != "meta" || doc.unsigned(n)? != 1)
+    {
+        return Err(Error::Unsupported);
+    }
     for unsupported in [
-        "n",
         "seed",
         "stop",
         "logit_bias",

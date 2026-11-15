@@ -8,6 +8,8 @@ use crate::codec::{
 use ck_stream::{ScratchLease, Writer};
 
 mod input;
+mod meta;
+pub use meta::validate as validate_meta;
 mod native;
 mod normalize;
 mod reasoning;
@@ -213,11 +215,17 @@ impl codec::RequestEgress for Egress {
     fn encode(&self, request: &ValidatedRequest<'_>, owner: &mut Writer) -> Result<ScratchLease> {
         let view = request.for_destination(self.destination)?;
         view.document.check_owner(owner)?;
-        validate(view)?;
+        if self.destination == "meta" {
+            meta::validate(view)?;
+        } else {
+            validate(view)?;
+        }
         if view.operation == Operation::Compact && self.upstream_stream {
             return Err(Error::Unsupported);
         }
-        encode::scratch(owner, |e| write_request(view, self.upstream_stream, e))
+        encode::scratch(owner, |e| {
+            write_request(view, self.upstream_stream, self.destination, e)
+        })
     }
 }
 

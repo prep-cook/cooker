@@ -9,6 +9,8 @@ mod support;
 mod common;
 #[path = "exec_meta/failures.rs"]
 mod failures;
+#[path = "exec_meta/policy.rs"]
+mod policy;
 
 use bytes::Bytes;
 use ck_core::exec::{ExecRequest, Operation as ExecOperation};
@@ -61,7 +63,7 @@ async fn every_client_protocol_goes_out_as_meta_and_comes_back() {
         assert_eq!(sent["stream"], true, "{protocol}: {sent}");
         assert_eq!(sent["store"], false, "{protocol}: {sent}");
         assert!(sent["instructions"].is_string(), "{protocol}: {sent}");
-        for absent in ["max_output_tokens", "temperature", "stream_options", "client_metadata"] {
+        for absent in ["stream_options", "client_metadata"] {
             assert!(sent.get(absent).is_none(), "{protocol} {absent}: {sent}");
         }
         for (mode, done) in [(BodyMode::Streaming, streamed), (BodyMode::Buffered, buffered)] {
@@ -161,7 +163,7 @@ async fn a_responses_client_matches_the_old_path() {
         assert!(sent["tools"][1].get("search_content_types").is_none(), "{sent}");
         assert_eq!(sent["tools"][2]["type"], "custom", "{sent}");
         assert_eq!(sent["text"]["verbosity"], "high", "payload rules apply: {sent}");
-        assert!(sent.get("safety_identifier").is_none(), "{sent}");
+        assert_eq!(sent["safety_identifier"], "s1", "{sent}");
         let timeout = &sent["tools"][3]["parameters"]["properties"]["timeout_ms"]["type"];
         assert_eq!(timeout, "integer", "Codex clients' integer parameters: {sent}");
         let reasoning = &sent["input"][4];
@@ -176,8 +178,6 @@ async fn a_responses_client_matches_the_old_path() {
 /// client's string `input`, however long, as one `input_text` part and its own messages as
 /// sent, a one-message untyped array included; every other client's string content as one
 /// text part (`output_text` for the assistant).
-// The old path's Chat and Anthropic translators also default `reasoning.effort` to `medium`;
-// only the input is compared for them.
 #[tokio::test]
 async fn string_input_and_content_match_the_old_path() {
     let long = format!(r#"{{"model":"client-model","input":"{}"}}"#, "a".repeat(30_000));
@@ -373,7 +373,6 @@ fn apply_patch_keeps_the_old_route() {
 #[test]
 fn apply_patch_is_found_only_where_it_is_declared_chosen_or_called() {
     let patch = r#"{"type":"custom","name":"apply_patch"}"#;
-    let custom = r#"{"type":"custom","name":"apply_patch","description":"Patch","format":{"type":"grammar","syntax":"lark","definition":"start: x"}}"#;
     let lookup = r#"{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"object","default":PATCH}}}}"#
         .replace("PATCH", patch);
     let not_patch = [
@@ -405,6 +404,12 @@ fn apply_patch_is_found_only_where_it_is_declared_chosen_or_called() {
             "{body}"
         );
     }
+}
+
+#[test]
+fn apply_patch_carriers_require_the_bridge() {
+    let patch = r#"{"type":"custom","name":"apply_patch"}"#;
+    let custom = r#"{"type":"custom","name":"apply_patch","description":"Patch","format":{"type":"grammar","syntax":"lark","definition":"start: x"}}"#;
     let real = [
         ("responses", format!(r#"{{"model":"m","input":"hi","tools":[{custom}]}}"#)),
         (

@@ -46,7 +46,12 @@ fn originals(doc: &Document, target: usize, e: &mut Encoder<'_, '_>, skip: &[&st
     }
     Ok(())
 }
-pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+pub(super) fn write_request(
+    view: RequestView<'_>,
+    streaming: bool,
+    destination: &str,
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
     let doc = view.document;
     let root = doc.root();
     e.bytes(b"{\"input\":[")?;
@@ -79,12 +84,19 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
         }
     }
     for field in doc.children(root)? {
+        // Responses has one output; Meta's fence permits only n:1, not an n wire field.
+        if destination == "meta" && doc.name_is(doc.node(field)?.name.ok_or(Error::Schema)?, "n")? {
+            continue;
+        }
         write_field(doc, field, e)?;
     }
     if let Some(x) = doc.member(root, "x_ck")? {
         write_extensions(doc, x, e)?;
     }
     originals(doc, root, e, &[])?;
+    if destination == "meta" {
+        super::meta::write_extensions(doc, e)?;
+    }
     e.bytes(b"}")
 }
 /// Writes the reasoning options, the continuation and the Responses provider parameters.

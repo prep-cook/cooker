@@ -26,8 +26,14 @@ pub(crate) fn require(mut raw: Vec<u8>) -> Vec<u8> {
         &mut raw,
         &["truncation", "prompt_cache_options", "prompt_cache_retention"],
     );
+    delete_fields(&mut raw, &["user"]);
+    normalize(raw)
+}
+
+/// Shared input/tool normalization without changing generation controls.
+pub(crate) fn normalize(mut raw: Vec<u8>) -> Vec<u8> {
     raw = strip_cache_breakpoints(raw);
-    delete_fields(&mut raw, &["context_management", "user"]);
+    delete_fields(&mut raw, &["context_management"]);
     raw = system_role_to_developer(raw);
     normalize_builtin_tools(raw)
 }
