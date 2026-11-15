@@ -3,7 +3,7 @@
 
 use super::*;
 
-const PARTNER: &str = "deepseek-ai/deepseek-v3.1-maas";
+pub(super) const PARTNER: &str = "deepseek-ai/deepseek-v3.1-maas";
 const TOKEN: &str = r#"{"access_token":"ya29.vertex-test","token_type":"Bearer","expires_in":3600}"#;
 
 fn chunk(delta: &str, finish: &str) -> String {
@@ -13,7 +13,7 @@ fn chunk(delta: &str, finish: &str) -> String {
 }
 
 /// A complete Chat stream: "hel", "lo", a stop and usage, then `[DONE]`.
-fn chat_sse() -> String {
+pub(super) fn chat_sse() -> String {
     [
         chunk(r#"{"role":"assistant","content":"hel"}"#, "null"),
         chunk(r#"{"content":"lo"}"#, "null"),

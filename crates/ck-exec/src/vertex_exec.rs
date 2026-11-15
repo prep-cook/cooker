@@ -12,6 +12,7 @@
 
 use bytes::Bytes;
 use ck_core::exec::ExecError;
+use ck_core::format::Format;
 use ck_stream::Writer;
 use ck_translate::codec::chat::response::Ingress as ChatIngress;
 use ck_translate::codec::document::{Document, Value};
@@ -27,6 +28,7 @@ use crate::google_wire::{self as wire, Method};
 use crate::openai_compat_exec::{self as relay, CHAT_PATH, RelayCapability, Route};
 use crate::proxy::{self, GoHeaders};
 use crate::types::{Attempt, Counted, Execute, Request, Streams, Upstream};
+use crate::upstream::{record_answer, record_failure, record_send};
 use crate::vertex::{self, Auth, VertexExecutor};
 use crate::vertex_openapi;
 
@@ -194,8 +196,7 @@ impl VertexExecutor {
         };
         let ingress = GeminiIngress::new(streams.response, attempt.identity, operation, mode, MAX_LINE as u64)
             .map_err(encoding)?;
-        let url = wire::model_url(&target.models, &call.base_model, method);
-        let upstream = self.send(attempt, request, &target.auth, &url, body).await?;
+        let upstream = self.send(attempt, request, &target, &call, method, body).await?;
         Ok(Upstream {
             status: upstream.status,
             headers: upstream.headers,
@@ -204,18 +205,20 @@ impl VertexExecutor {
         })
     }
 
-    /// Posts `body` to `url` with the credential (an API key, or a fresh access token) and
-    /// the custom headers; a non-2xx answer is the attempt's failure with the upstream's
-    /// status and body as received.
+    /// Posts `body` to the model's `method` with the credential (an API key, or a fresh access
+    /// token) and the custom headers, recording the call's request-side facts (contract G4); a
+    /// non-2xx answer is the attempt's failure with the upstream's status and body as received.
     async fn send(
         &self,
         attempt: &Attempt<'_>,
         request: &Request<'_>,
-        auth: &Auth,
-        url: &str,
+        target: &Target,
+        call: &Call<'_>,
+        method: Method,
         body: Vec<u8>,
     ) -> Result<proxy::Upstream, ExecError> {
         let credential = attempt.credential;
+        let url = &wire::model_url(&target.models, &call.base_model, method);
         // Refused before the token exchange and before anything is sent, so no credential
         // reaches a host the url crate reads differently from Go.
         vertex::check_url(url)?;
@@ -225,7 +228,7 @@ impl VertexExecutor {
         let client = self.client(credential, attempt.cfg);
         let mut headers = GoHeaders::new();
         headers.set("Content-Type", "application/json");
-        match auth {
+        match &target.auth {
             Auth::ApiKey { key, .. } => wire::api_key(&mut headers, key),
             Auth::ServiceAccount { account, .. } => {
                 let token = self.mint(&client, account).await?;
@@ -242,7 +245,24 @@ impl VertexExecutor {
         {
             headers.set(&name, value);
         }
-        let upstream = proxy::send(&client, url, headers, Bytes::from(body), None).await?;
+        // A count is not generation usage (contract §3).
+        let (usage, generation) = (client_side.usage, method != Method::CountTokens);
+        if generation {
+            if usage.enabled() {
+                usage.request(Format::Gemini, &body);
+            }
+            usage.upstream_model(&call.base_model);
+        }
+        let body = Bytes::from(body);
+        let sent = (headers.pairs(), &body);
+        record_send(usage, generation, credential, vertex::PROVIDER, url, sent);
+        let upstream = proxy::send(&client, url, headers, body, None)
+            .await
+            .inspect_err(|error| record_failure(usage, error))?;
+        let upstream = proxy::Upstream {
+            body: record_answer(usage, generation, upstream.status, &upstream.headers, upstream.body),
+            ..upstream
+        };
         if (200..300).contains(&upstream.status) {
             return Ok(upstream);
         }

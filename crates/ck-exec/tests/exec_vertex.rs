@@ -529,3 +529,5 @@ async fn tool_call_history_reaches_vertex_without_ids() {
 mod count;
 #[path = "exec_vertex/openapi.rs"]
 mod openapi;
+#[path = "exec_vertex/usage.rs"]
+mod usage;

@@ -24,12 +24,16 @@ use crate::openai_compat::{self as compat, OpenAICompatExecutor};
 use crate::openai_compat_http as wire;
 use crate::openai_compat_payload as payload;
 use crate::types::{Attempt, Counted, Execute, Request, Streams, Upstream};
+use crate::upstream::{record_answer, record_failure, record_send};
 
 /// The capability key of OpenAI-compatible relays.
 pub const DESTINATION: &str = "openai-compat";
 
 /// The Chat generation path under a relay's base URL.
 pub(crate) const CHAT_PATH: &str = "/chat/completions";
+
+/// The native compact path under a relay's base URL.
+const COMPACT_PATH: &str = "/responses/compact";
 
 /// Chat generation, its token count, and the Responses native compact.
 pub struct RelayCapability;
@@ -142,7 +146,8 @@ impl Execute for OpenAICompatExecutor {
             upstream_stream: false,
         };
         let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
-        let body = Relay::new(attempt, request)?.compact(upload, route.compat.as_ref())?;
+        let relay = Relay::new(attempt, request)?;
+        let body = relay.compact(upload, route.compat.as_ref())?;
         let ingress = ResponsesIngress::new(
             streams.response,
             attempt.identity,
@@ -151,7 +156,7 @@ impl Execute for OpenAICompatExecutor {
             compat::MAX_LINE as u64,
         )
         .map_err(encoding)?;
-        let upstream = send(&route, attempt, request, "/responses/compact", body, false).await?;
+        let upstream = send(&route, attempt, request, COMPACT_PATH, &relay.base_model, body, false).await?;
         Ok(Upstream {
             status: upstream.status,
             headers: upstream.headers,
@@ -201,7 +206,8 @@ pub(crate) async fn chat(
         upstream_stream: stream,
     };
     let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
-    let body = Relay::new(attempt, request)?.chat(upload, stream, route.compat.as_ref())?;
+    let relay = Relay::new(attempt, request)?;
+    let body = relay.chat(upload, stream, route.compat.as_ref())?;
     let mode = if stream {
         BodyMode::Streaming
     } else {
@@ -216,7 +222,7 @@ pub(crate) async fn chat(
         compat::MAX_LINE as u64,
     )
     .map_err(encoding)?;
-    let upstream = send(&route, attempt, request, CHAT_PATH, body, stream).await?;
+    let upstream = send(&route, attempt, request, CHAT_PATH, &relay.base_model, body, stream).await?;
     Ok(Upstream {
         status: upstream.status,
         headers: upstream.headers,
@@ -251,12 +257,14 @@ pub(crate) fn count(attempt: &Attempt<'_>, request: &Request<'_>, streams: Strea
 }
 
 /// Posts `body` to `path` under the route's base URL with its key and the credential's custom
-/// headers; a non-2xx answer is the attempt's failure with the upstream's status.
+/// headers, recording the request-side facts of `model`'s call (contract G4); a non-2xx answer
+/// is the attempt's failure with the upstream's status and body as received.
 async fn send(
     route: &Route,
     attempt: &Attempt<'_>,
     request: &Request<'_>,
     path: &str,
+    model: &str,
     body: Vec<u8>,
     stream: bool,
 ) -> Result<wire::Upstream, ExecError> {
@@ -280,7 +288,33 @@ async fn send(
     if let Some(error) = crate::xai_url::transport_refusal(&url) {
         return Err(error);
     }
-    let upstream = wire::send(&route.client, &url, headers, Bytes::from(body)).await?;
+    let usage = request.client.usage;
+    if usage.enabled() {
+        let target = if path == CHAT_PATH {
+            Format::OpenAI
+        } else {
+            Format::OpenAIResponse
+        };
+        usage.request(target, &body);
+    }
+    usage.upstream_model(model);
+    let body = Bytes::from(body);
+    let provider = &attempt.credential.provider;
+    record_send(
+        usage,
+        true,
+        attempt.credential,
+        provider,
+        &url,
+        (headers.pairs(), &body),
+    );
+    let upstream = wire::send(&route.client, &url, headers, body)
+        .await
+        .inspect_err(|error| record_failure(usage, error))?;
+    let upstream = wire::Upstream {
+        body: record_answer(usage, true, upstream.status, &upstream.headers, upstream.body),
+        ..upstream
+    };
     if (200..300).contains(&upstream.status) {
         return Ok(upstream);
     }
