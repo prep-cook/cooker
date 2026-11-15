@@ -8,8 +8,6 @@
 //! of that session gets the items its input lacks inserted before the matching turn.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use ck_core::format::Format;
 use ck_wire::gostr::GoStr;
@@ -20,13 +18,6 @@ use sha2::{Digest, Sha256};
 use crate::meta_codex::go_trim_space;
 use crate::replay::{claude_code_session, header_session, payload_session};
 use crate::xai_shape::Inbound;
-
-/// `XAIReasoningReplayCacheTTL`.
-const TTL: Duration = Duration::from_secs(3600);
-/// `XAIReasoningReplayCacheMaxEntries`.
-const MAX_ENTRIES: usize = 10240;
-/// `XAIReasoningReplayCacheEvictBatchSize`.
-const EVICT_BATCH: usize = 128;
 
 /// `xaiReasoningReplayScope`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -41,72 +32,12 @@ impl ReplayScope {
     }
 }
 
-struct Entry {
-    items: Vec<Vec<u8>>,
-    timestamp: Instant,
-}
+pub(crate) use crate::xai_replay_store::Store;
 
-/// The in-process replay cache (Go's package-level map).
-// ponytail: Go also purges expired entries from a background ticker; here an expired
-// entry is dropped when read and capacity eviction bounds memory.
-#[derive(Default)]
-pub(crate) struct Store {
-    entries: Mutex<HashMap<String, Entry>>,
-}
-
-/// `xaiReasoningReplayCacheKey`.
-fn cache_key(scope: &ReplayScope) -> Option<String> {
-    let (model, session) = (scope.model_name.trim(), scope.session_key.trim());
-    (!model.is_empty() && !session.is_empty()).then(|| format!("xai-reasoning-replay\0{model}\0{session}"))
-}
-
-impl Store {
-    /// `GetXAIReasoningReplayItemsRequired`: a hit refreshes the entry's TTL.
-    fn get(&self, scope: &ReplayScope) -> Option<Vec<Vec<u8>>> {
-        let key = cache_key(scope)?;
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let entry = entries.get_mut(&key)?;
-        if now.duration_since(entry.timestamp) > TTL {
-            entries.remove(&key);
-            return None;
-        }
-        entry.timestamp = now;
-        Some(entry.items.clone())
-    }
-
-    /// `StoreXAIReasoningReplayItems`: false when the items hold no replay anchor.
-    fn store(&self, scope: &ReplayScope, items: &[Vec<u8>]) -> bool {
-        let Some(key) = cache_key(scope) else {
-            return false;
-        };
-        let Some(normalized) = normalize_items(items) else {
-            return false;
-        };
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.insert(
-            key,
-            Entry {
-                items: normalized,
-                timestamp: Instant::now(),
-            },
-        );
-        if entries.len() > MAX_ENTRIES {
-            let mut oldest: Vec<(Instant, String)> = entries.iter().map(|(k, e)| (e.timestamp, k.clone())).collect();
-            oldest.sort();
-            for (_, k) in oldest.into_iter().take(EVICT_BATCH) {
-                entries.remove(&k);
-            }
-        }
-        true
-    }
-
-    /// `DeleteXAIReasoningReplayItemRequired`.
-    fn delete(&self, scope: &ReplayScope) {
-        if let Some(key) = cache_key(scope) {
-            self.entries.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
-        }
-    }
+/// `StoreXAIReasoningReplayItems`: false when the items hold no replay anchor or exceed an
+/// entry.
+fn store(store: &Store, scope: &ReplayScope, items: &[Vec<u8>]) -> bool {
+    normalize_items(items).is_some_and(|normalized| store.put(scope, normalized))
 }
 
 /// `strings.TrimSpace(r.String())`.
@@ -123,9 +54,14 @@ pub(crate) fn scope(inbound: &Inbound<'_>, body: &[u8]) -> ReplayScope {
     if inbound.downstream_websocket && !text(&gj::get(inbound.payload, "previous_response_id")).is_empty() {
         return ReplayScope::default();
     }
+    // The execution contract's route names its credential and keys sessions exactly.
+    let session_key = match inbound.credential {
+        Some(_) => crate::xai_replay_key::key(inbound, body),
+        None => inbound.isolate(&session_key(inbound, body)),
+    };
     ReplayScope {
         model_name: parse_suffix(inbound.model).model_name,
-        session_key: inbound.isolate(&session_key(inbound, body)),
+        session_key,
     }
 }
 
@@ -173,15 +109,24 @@ pub(crate) fn cache_completed(store: &Store, scope: &ReplayScope, completed: &[u
     let items: Vec<Vec<u8>> = output
         .array()
         .iter()
-        .filter(|item| {
-            matches!(
-                text(&item.get("type")).as_str(),
-                "reasoning" | "message" | "function_call" | "custom_tool_call"
-            )
-        })
+        .filter(|item| kept(item))
         .map(|item| item.raw().to_vec())
         .collect();
-    if !store.store(scope, &items) {
+    cache_items(store, scope, &items);
+}
+
+/// Whether replay keeps an output item: reasoning, assistant messages and tool calls.
+pub(crate) fn kept(item: &Res<'_>) -> bool {
+    matches!(
+        text(&item.get("type")).as_str(),
+        "reasoning" | "message" | "function_call" | "custom_tool_call"
+    )
+}
+
+/// Caches the kept output `items` of a completed turn; a turn without replayable state
+/// clears the session.
+pub(crate) fn cache_items(store: &Store, scope: &ReplayScope, items: &[Vec<u8>]) {
+    if scope.valid() && !self::store(store, scope, items) {
         store.delete(scope);
     }
 }

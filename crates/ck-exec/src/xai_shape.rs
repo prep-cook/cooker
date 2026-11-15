@@ -101,24 +101,18 @@ impl<'a> Inbound<'a> {
         uuid::Uuid::new_v4().to_string()
     }
 
-    /// The replay cache key of session `key`. The old path namespaces client-controlled keys
-    /// by the caller's key (`xaiReasoningReplayIsolateSessionKey`); the executor namespaces
-    /// every key by caller and credential. Without a client key only the gateway's execution
-    /// sessions replay.
+    /// `xaiReasoningReplayIsolateSessionKey`: the old path's replay key of session `key`,
+    /// a client-controlled key namespaced by the caller's key; the execution contract's
+    /// route keys sessions with `xai_replay_key`.
     pub(crate) fn isolate(&self, key: &str) -> String {
         let (key, principal) = (key.trim(), self.principal.trim());
-        // An execution session is the gateway's own, never a client-controlled key.
-        let execution = key.starts_with("execution:");
-        if key.is_empty() || (execution && self.credential.is_none()) {
+        if key.is_empty() || key.starts_with("execution:") {
             return key.to_owned();
         }
-        if principal.is_empty() && !execution {
+        if principal.is_empty() {
             return String::new();
         }
-        match self.credential {
-            Some(credential) => format!("caller:{}:credential:{}:{key}", digest(principal), digest(credential)),
-            None => format!("caller:{}:{key}", digest(principal)),
-        }
+        format!("caller:{}:{key}", digest(principal))
     }
 }
 

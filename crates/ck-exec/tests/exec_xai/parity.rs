@@ -106,24 +106,104 @@ fn egress_defaults(got: &mut Value, want: &Value) {
     }
 }
 
+/// The scenario's attempt against `upstream`.
+fn scenario_exchange(s: &Value, upstream: &StreamUpstream) -> Exchange {
+    let cfg = s["config"]
+        .as_str()
+        .map_or_else(Config::default, |c| Config::parse(c).unwrap());
+    let mut exchange = exchange(upstream);
+    exchange.credential = scenario_credential(s, &cfg, &format!("{}/v1", upstream.url()));
+    exchange.cfg = cfg;
+    exchange.model = s["model"].as_str().unwrap().into();
+    exchange.caller.principal = s["caller_key"].as_str().unwrap_or_default().into();
+    exchange.route = s["request_path"].as_str().unwrap_or("/v1/responses").into();
+    for (k, v) in s["headers"].as_object().into_iter().flatten() {
+        exchange.headers.insert(
+            http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            v.as_str().unwrap().parse().unwrap(),
+        );
+    }
+    exchange
+}
+
+/// One scenario's run: the buffered Responses output or the attempt's failure, or the
+/// fence's refusal message.
+async fn run_scenario(
+    executors: &Executors,
+    s: &Value,
+    upstream: &StreamUpstream,
+) -> Result<Result<Value, ExecError>, String> {
+    let exchange = scenario_exchange(s, upstream);
+    let resolved = s["resolved_model"]
+        .as_object()
+        .map(|info| ck_core::exec::ResolvedModel {
+            info: ck_core::registry::ModelInfo::from_raw(info.clone()).unwrap(),
+            source: ck_core::exec::ResolvedSource::ApiKey,
+        });
+    let sessions = Sessions {
+        execution: s["execution_session"].as_str(),
+        derived: s["derived_session"].as_str(),
+        resolved: resolved.as_ref(),
+    };
+    let streams = Streams::new();
+    let input = (s["payload"].as_str().unwrap(), 64, sessions);
+    let run = run_on(
+        &streams,
+        executors,
+        &exchange,
+        Client::Responses,
+        Operation::Generate,
+        input,
+    )
+    .await;
+    match run.started {
+        Ok(started) => {
+            let (outcome, _, mut owner) = produce(&streams, started).await;
+            Ok(outcome.map(|()| responses_json(&streams, &mut owner)))
+        }
+        Err(error) if error.status == 400 && error.body.starts_with(b"fence") => {
+            Err(String::from_utf8_lossy(&error.body).into_owned())
+        }
+        Err(error) => Ok(Err(error)),
+    }
+}
+
+/// How the scenario's outcome differs from Go's recorded output or error, if it does.
+fn response_difference(name: &str, s: &Value, outcome: &Result<Value, ExecError>) -> Option<String> {
+    match (outcome, s.get("output"), s.get("error")) {
+        (Ok(out), Some(want), _) if s["op"] == "execute" => {
+            let want: Value = serde_json::from_str(want.as_str().unwrap()).unwrap();
+            let mut out = out.clone();
+            egress_defaults(&mut out, &want);
+            (out != want).then(|| format!("{name}:\n  got  {out}\n  want {want}"))
+        }
+        (Err(error), _, Some(want)) if want["status"] != error.status => {
+            Some(format!("{name}: status {} want {}", error.status, want["status"]))
+        }
+        (Err(error), _, None) => Some(format!("{name}: failed {}", error.status)),
+        (Ok(_), _, Some(want)) => Some(format!("{name}: ok, want {want}")),
+        _ => None,
+    }
+}
+
+/// Whether the new route runs the scenario: a Responses client's generation over HTTP.
+fn compared(s: &Value) -> bool {
+    let name = s["name"].as_str().unwrap();
+    let generation = matches!(s["op"].as_str(), Some("execute" | "stream"));
+    !LEFT_OUT.iter().any(|(left, _)| *left == name)
+        && s["source"] == "openai-response"
+        && generation
+        && s.get("alt").is_none()
+        && s.get("websocket").is_none()
+        && s["request"].is_string()
+}
+
 #[tokio::test]
 async fn responses_uploads_match_the_go_executor() {
     let executors = executors();
-    let mut compared = 0;
-    let mut failures = Vec::new();
-    let mut responses = Vec::new();
-    for s in scenarios() {
+    let (mut count, mut failures, mut responses) = (0, Vec::new(), Vec::new());
+    for s in scenarios().into_iter().filter(compared) {
         let name = s["name"].as_str().unwrap();
-        if LEFT_OUT.iter().any(|(left, _)| *left == name) {
-            continue;
-        }
-        let generation = matches!(s["op"].as_str(), Some("execute" | "stream"));
-        if s["source"] != "openai-response" || !generation || s.get("alt").is_some() || s.get("websocket").is_some() {
-            continue;
-        }
-        let Some(raw) = s["request"].as_str() else {
-            continue;
-        };
         let up = &s["upstream"];
         let reply = Reply::status(
             up["status"].as_u64().unwrap() as u16,
@@ -131,84 +211,26 @@ async fn responses_uploads_match_the_go_executor() {
             up["body"].as_str().unwrap_or_default().to_owned(),
         );
         let upstream = StreamUpstream::start([reply]).await;
-        let cfg = s["config"]
-            .as_str()
-            .map_or_else(Config::default, |c| Config::parse(c).unwrap());
-        let mut exchange = exchange(&upstream);
-        exchange.credential = scenario_credential(&s, &cfg, &format!("{}/v1", upstream.url()));
-        exchange.cfg = cfg;
-        exchange.model = s["model"].as_str().unwrap().into();
-        exchange.caller.principal = s["caller_key"].as_str().unwrap_or_default().into();
-        exchange.route = s["request_path"].as_str().unwrap_or("/v1/responses").into();
-        for (k, v) in s["headers"].as_object().into_iter().flatten() {
-            exchange.headers.insert(
-                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                v.as_str().unwrap().parse().unwrap(),
-            );
-        }
-        let payload = s["payload"].as_str().unwrap();
-        let resolved = s["resolved_model"]
-            .as_object()
-            .map(|info| ck_core::exec::ResolvedModel {
-                info: ck_core::registry::ModelInfo::from_raw(info.clone()).unwrap(),
-                source: ck_core::exec::ResolvedSource::ApiKey,
-            });
-        let sessions = Sessions {
-            execution: s["execution_session"].as_str(),
-            derived: s["derived_session"].as_str(),
-            resolved: resolved.as_ref(),
-        };
-        let streams = Streams::new();
-        let run = run_on(
-            &streams,
-            &executors,
-            &exchange,
-            Client::Responses,
-            Operation::Generate,
-            (payload, 64, sessions),
-        )
-        .await;
-        let outcome = match run.started {
-            Ok(started) => {
-                let (outcome, _, mut owner) = produce(&streams, started).await;
-                match outcome {
-                    Ok(()) => Ok(responses_json(&streams, &mut owner)),
-                    Err(error) => Err(error),
-                }
-            }
-            Err(error) if error.status == 400 && error.body.starts_with(b"fence") => {
-                failures.push(format!("{name}: {}", String::from_utf8_lossy(&error.body)));
+        let outcome = match run_scenario(&executors, &s, &upstream).await {
+            Ok(outcome) => outcome,
+            Err(refusal) => {
+                failures.push(format!("{name}: {refusal}"));
                 continue;
             }
-            Err(error) => Err(error),
         };
-        match (&outcome, s.get("output"), s.get("error")) {
-            (Ok(out), Some(want), _) if s["op"] == "execute" => {
-                let want: Value = serde_json::from_str(want.as_str().unwrap()).unwrap();
-                let mut out = out.clone();
-                egress_defaults(&mut out, &want);
-                if out != want {
-                    responses.push(format!("{name}:\n  got  {out}\n  want {want}"));
-                }
-            }
-            (Err(error), _, Some(want)) if want["status"] != error.status => {
-                responses.push(format!("{name}: status {} want {}", error.status, want["status"]));
-            }
-            (Err(error), _, None) => responses.push(format!("{name}: failed {}", error.status)),
-            (Ok(_), _, Some(want)) => responses.push(format!("{name}: ok, want {want}")),
-            _ => {}
-        }
+        responses.extend(response_difference(name, &s, &outcome));
         let Some(captured) = upstream.captured().into_iter().next() else {
             failures.push(format!("{name}: nothing sent"));
             continue;
         };
-        compared += 1;
+        count += 1;
+        let raw = s["request"].as_str().unwrap();
         let (sent, want) = (messages(json_body(&captured)), messages(recorded_body(raw)));
         if sent != want {
             failures.push(format!("{name}:\n  sent {sent}\n  want {want}"));
         }
     }
-    assert!(compared >= 30, "only {compared} scenarios compared");
+    assert!(count >= 30, "only {count} scenarios compared");
     assert!(
         responses.is_empty(),
         "{} responses differ:\n{}",
@@ -217,7 +239,7 @@ async fn responses_uploads_match_the_go_executor() {
     );
     assert!(
         failures.is_empty(),
-        "{} of {compared} differ:\n{}",
+        "{} of {count} differ:\n{}",
         failures.len(),
         failures.join("\n")
     );

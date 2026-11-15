@@ -118,6 +118,7 @@ impl Execute for XaiExecutor {
         let upload = encode(&request.validated, true, streams.request)?;
         let call = Call::new(attempt, request)?;
         let mut prepared = call.shape(&upload, &self.replay, true, Format::Codex)?;
+        call.report(&prepared.body);
         let body = call.rules(Format::Codex, &upload, std::mem::take(&mut prepared.body));
         let headers = call.headers(&prepared, true, true);
         let url = xai::endpoint(&xai::chat_base_url(attempt.credential), "/responses");
@@ -179,6 +180,7 @@ impl Execute for XaiExecutor {
         let call = Call::new(attempt, request)?;
         let mut prepared = call.shape(&upload, &self.replay, false, Format::OpenAIResponse)?;
         let body = shape::compact_body(std::mem::take(&mut prepared.body), &previous);
+        call.report(&body);
         let body = call.rules(Format::OpenAIResponse, &upload, body);
         let headers = call.headers(&prepared, false, false);
         let url = xai::endpoint(&xai::compact_base_url(attempt.credential), "/responses/compact");
@@ -207,7 +209,8 @@ impl Execute for XaiExecutor {
 impl XaiExecutor {
     /// Posts `body` to `url` through the credential's client; a non-2xx answer is the
     /// attempt's failure with `xaiStatusErr`'s status and retry hint and the upstream's body
-    /// and headers as received.
+    /// and headers as received. The request, the answer's metadata and every body chunk go
+    /// to the capture, and the round trip and first byte to the usage tracker.
     async fn send(
         &self,
         call: &Call<'_>,
@@ -223,11 +226,27 @@ impl XaiExecutor {
             return Err(error);
         }
         let client = self.clients.for_credential(call.attempt.credential, &call.cfg);
-        let upstream = wire::send(&client, &url, headers, Bytes::from(body)).await?;
+        let usage = call.request.client.usage;
+        let (credential, pairs) = (call.attempt.credential, headers.pairs());
+        let capture = wire::Capture::on(
+            usage.capture().clone(),
+            credential,
+            xai::PROVIDER,
+            &url,
+            "POST",
+            pairs,
+            &body,
+        );
+        usage.round_trip_started();
+        let upstream = wire::send(&client, &url, headers, Bytes::from(body)).await;
+        capture.sent(&upstream);
+        let mut upstream = xai::track_first_byte(upstream?, usage);
         if (200..300).contains(&upstream.status) {
+            upstream.body = capture.stream(upstream.body);
             return Ok(upstream);
         }
         let (status, headers, body) = wire::read_error_body(upstream).await;
+        capture.chunk(&body);
         let mut error = response::status_error(status, &body);
         error.body = body;
         error.headers = Box::new(headers);
@@ -284,6 +303,14 @@ impl<'r> Call<'r> {
             downstream_websocket: false,
         };
         shape::shape(&inbound, &self.cfg, store, stream, to, required_members(upload), upload)
+    }
+
+    /// The request-side usage facts (contract G4): the shaped body before the payload rules,
+    /// for the reasoning effort, as the old path reports it, and the model xAI should serve.
+    fn report(&self, body: &[u8]) {
+        let usage = self.request.client.usage;
+        usage.request_for(xai::PROVIDER, body);
+        usage.upstream_model(&parse_suffix(self.attempt.model).model_name);
     }
 
     /// The configured payload rules, the last change to the body (Go `finalizePayload`).

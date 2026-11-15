@@ -6,10 +6,13 @@
 //!   trace the request rewrote are restored or dropped.
 //! - The apply_patch bridge turns function calls back into the client's custom tool; its
 //!   failure ends the response with Go's 502.
-//! - A completion whose `output` is empty gets the items `response.output_item.done`
-//!   announced. They wait in scratch leases of the response stream, never on the heap.
+//! - A completion whose `output` is empty or absent gets the items
+//!   `response.output_item.done` announced. They wait in scratch leases of the response
+//!   stream, never on the heap.
 //! - A completed response is cached for reasoning replay once its SSE event has ended and
-//!   the ingress accepted it, so a cut or refused completion caches nothing.
+//!   the ingress accepted it, so a cut or refused completion caches nothing, nor one after
+//!   an upstream failure, whose input the ingress ignores. The kept items wait in scratch
+//!   leases and reach the replay cache one item at a time.
 //! - The body ending before the completion boundary fails with Go's 408.
 //!
 //! One SSE event goes out per upstream event, in order; the ingress decodes the result. A
@@ -105,8 +108,13 @@ pub struct Events {
     folded: HashSet<String>,
     alias: String,
     replay: Option<(Arc<replay::Store>, ReplayScope)>,
-    /// The completed event, `data: ` included, waiting for the blank line that ends it.
-    completed: Option<ScratchLease>,
+    /// The name of the SSE event in progress.
+    name: Option<Vec<u8>>,
+    /// An upstream failure event went to the ingress, which ignores what follows it.
+    failed: bool,
+    /// The completion's output items replay keeps, waiting for the blank line that ends it;
+    /// `None` when the completion has no output array.
+    completed: Option<Vec<ScratchLease>>,
 }
 
 impl Events {
@@ -124,6 +132,8 @@ impl Events {
             folded: HashSet::new(),
             alias: prepared.web_search_alias,
             replay: scope.valid().then_some((store, scope)),
+            name: None,
+            failed: false,
             completed: None,
         }
     }
@@ -293,27 +303,26 @@ impl Events {
     /// output, and a completion is passed on with them.
     fn data(&mut self, owner: &mut Writer, line: &[u8], event: &[u8]) -> codec::Result<()> {
         let kind = gj::get(event, "type").bytes().into_owned();
+        self.failed |= failure(self.name.as_deref(), event);
         match kind.as_slice() {
             b"response.output_item.done" => {
                 self.items.collect(owner, event)?;
                 self.put(owner, line)
             }
             b"response.completed" | b"response.incomplete" => {
-                let completed = kind == b"response.completed" && self.replay.is_some();
-                let splice = self.items.splice(event);
-                if splice.is_none() && !completed {
+                let replay = kind == b"response.completed" && self.replay.is_some() && !self.failed;
+                let Some(splice) = self.items.splice(event) else {
+                    if replay {
+                        self.completed = kept(owner, event)?;
+                    }
                     return self.put(owner, line);
-                }
+                };
                 let lease = encode::scratch(owner, |e| {
                     e.bytes(b"data: ")?;
-                    match splice {
-                        Some((at, end)) => {
-                            e.bytes(&event[..at])?;
-                            self.items.write(e)?;
-                            e.bytes(&event[end..])
-                        }
-                        None => e.bytes(event),
-                    }
+                    e.bytes(&event[..splice.at])?;
+                    e.bytes(splice.lead)?;
+                    self.items.write(e)?;
+                    e.bytes(&event[splice.end..])
                 })?;
                 let mut at = 0;
                 while at < lease.len() {
@@ -322,8 +331,8 @@ impl Events {
                     at += chunk.len();
                 }
                 self.inner.advance(owner, b"\n")?;
-                if completed {
-                    self.completed = Some(lease);
+                if replay {
+                    self.completed = Some(self.items.take());
                 }
                 Ok(())
             }
@@ -335,19 +344,70 @@ impl Events {
     /// that is the completion, the ingress has accepted it and replay caches it.
     fn put(&mut self, owner: &mut Writer, content: &[u8]) -> codec::Result<()> {
         if !content.is_empty() {
+            if let Some(name) = content.strip_prefix(b"event:") {
+                self.name = Some(trim_space(name).to_vec());
+            }
             self.inner.advance(owner, content)?;
             return self.inner.advance(owner, b"\n");
         }
+        self.name = None;
         self.inner.advance(owner, b"\n")?;
-        if let (Some(lease), Some((store, scope))) = (self.completed.take(), &self.replay) {
-            let mut event = Vec::with_capacity(lease.len());
-            while event.len() < lease.len() {
-                event.extend_from_slice(lease.chunk(event.len()).map_err(codec::Error::Storage)?);
+        if let (Some(leases), Some((store, scope))) = (self.completed.take(), &self.replay) {
+            let mut items = Vec::with_capacity(leases.len());
+            for lease in &leases {
+                let mut item = Vec::with_capacity(lease.len());
+                while item.len() < lease.len() {
+                    item.extend_from_slice(lease.chunk(item.len()).map_err(codec::Error::Storage)?);
+                }
+                if replay::kept(&gj::parse(&item)) {
+                    items.push(item);
+                }
             }
-            replay::cache_completed(store, scope, &event[b"data: ".len()..]);
+            replay::cache_items(store, scope, &items);
         }
         Ok(())
     }
+}
+
+/// Whether an upstream event is a failure the Responses ingress ends the response with and
+/// ignores the input after: `error` or `response.failed` by its `type`, else by its SSE
+/// name, else a non-null `error` member.
+fn failure(name: Option<&[u8]>, event: &[u8]) -> bool {
+    const FAILURES: [&[u8]; 2] = [b"error", b"response.failed"];
+    if !gj::parse(event).is_object() {
+        return false;
+    }
+    let kind = gj::get(event, "type");
+    if kind.exists() {
+        return kind.kind == Kind::String && FAILURES.contains(&&*kind.bytes());
+    }
+    if let Some(name) = name {
+        return FAILURES.contains(&name);
+    }
+    let error = gj::get(event, "error");
+    error.exists() && error.kind != Kind::Null
+}
+
+/// The output items of a completion replay keeps, each in its own scratch lease; `None`
+/// when the completion has no output array.
+fn kept(owner: &mut Writer, event: &[u8]) -> codec::Result<Option<Vec<ScratchLease>>> {
+    let output = gj::get(event, "response.output");
+    if !output.is_array() {
+        return Ok(None);
+    }
+    let mut leases = Vec::new();
+    for item in output.array().iter().filter(|item| replay::kept(item)) {
+        leases.push(encode::scratch(owner, |e| e.bytes(item.raw()))?);
+    }
+    Ok(Some(leases))
+}
+
+/// Where a terminal event's `output` takes the collected items: `event[at..end]` becomes
+/// `lead` and the items' array.
+struct Splice {
+    at: usize,
+    end: usize,
+    lead: &'static [u8],
 }
 
 /// The items `response.output_item.done` announced (`xaiCollectOutputItemDone`), by output
@@ -374,18 +434,40 @@ impl Items {
         Ok(())
     }
 
-    /// `xaiPatchCompletedOutput`: the byte range of a terminal event's `output` that the
-    /// collected items replace, when that output is empty and items were announced.
-    fn splice(&self, event: &[u8]) -> Option<(usize, usize)> {
+    /// `xaiPatchCompletedOutput`: where a terminal event's `output` takes the collected
+    /// items, when that output is empty, not an array or absent and items were announced.
+    fn splice(&self, event: &[u8]) -> Option<Splice> {
         if self.by_index.is_empty() && self.unindexed.is_empty() {
             return None;
         }
         let output = gj::get(event, "response.output");
-        if !output.exists() || (output.is_array() && !output.array().is_empty()) {
+        if output.is_array() && !output.array().is_empty() {
             return None;
         }
-        let (at, end) = (output.index, output.index + output.raw().len());
-        (event.get(at..end) == Some(output.raw())).then_some((at, end))
+        if output.exists() {
+            let (at, end) = (output.index, output.index + output.raw().len());
+            return (event.get(at..end) == Some(output.raw())).then_some(Splice { at, end, lead: b"" });
+        }
+        // An absent `output` goes in before the response object's closing brace.
+        let response = gj::get(event, "response");
+        let (start, len) = (response.index, response.raw().len());
+        if !response.is_object() || event.get(start..start + len) != Some(response.raw()) {
+            return None;
+        }
+        let inner = trim_space(&response.raw()[1..len - 1]);
+        let lead: &[u8] = if inner.is_empty() {
+            b"\"output\":"
+        } else {
+            b",\"output\":"
+        };
+        let at = start + len - 1;
+        Some(Splice { at, end: at, lead })
+    }
+
+    /// The collected items, in output order, for replay once the completion is passed on.
+    fn take(&mut self) -> Vec<ScratchLease> {
+        let indexed = std::mem::take(&mut self.by_index).into_values();
+        indexed.chain(std::mem::take(&mut self.unindexed)).collect()
     }
 
     /// The collected items as one JSON array.

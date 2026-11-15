@@ -285,3 +285,5 @@ mod failures;
 mod flow;
 #[path = "exec_xai/parity.rs"]
 mod parity;
+#[path = "exec_xai/replay.rs"]
+mod replay;

@@ -1,5 +1,5 @@
 //! Generation from every client protocol, xAI's line rules, any split of the body, the
-//! local count, the native compact, reasoning replay and the selector.
+//! local count, the native compact and the selector.
 
 use super::*;
 
@@ -89,17 +89,22 @@ async fn any_split_gives_the_same_records() {
     }
 }
 
-/// A completion with an empty `output` (as Grok sends it) gets the announced items, from the
-/// response stream's scratch, so a buffered client sees its message.
+/// A completion with an empty `output` (as Grok sends it), or none, gets the announced items,
+/// from the response stream's scratch, so a buffered client sees its message.
 #[tokio::test]
 async fn an_empty_completion_gets_the_announced_items() {
-    let streams = Streams::new();
-    let upstream = StreamUpstream::start([Reply::sse(sse_with(json!([])))]).await;
-    let run = run(&streams, &upstream, Client::Responses, RESPONSES, 64).await;
-    let (outcome, _, mut owner) = produce(&streams, run.started.unwrap()).await;
-    outcome.unwrap();
-    let out = responses_json(&streams, &mut owner);
-    assert_eq!(out["output"], json!([message("hello")]), "{out}");
+    let mut absent = response("completed", json!([]));
+    absent.as_object_mut().unwrap().remove("output");
+    let without = message_events() + &event(json!({"type":"response.completed","response":absent}));
+    for body in [sse_with(json!([])), without] {
+        let streams = Streams::new();
+        let upstream = StreamUpstream::start([Reply::sse(body)]).await;
+        let run = run(&streams, &upstream, Client::Responses, RESPONSES, 64).await;
+        let (outcome, _, mut owner) = produce(&streams, run.started.unwrap()).await;
+        outcome.unwrap();
+        let out = responses_json(&streams, &mut owner);
+        assert_eq!(out["output"], json!([message("hello")]), "{out}");
+    }
 }
 
 /// Grok's reasoning text reaches a Responses client as a reasoning summary.
@@ -189,39 +194,66 @@ async fn compact_goes_to_the_native_compact() {
     assert!(records(&published).iter().any(|r| r.contains("secret")));
 }
 
-/// Grok's encrypted reasoning, as the Go recording has it (other blobs are sanitized away).
-const ENC: &str = "TKwE++a7qP4CXIXITJIj2DYyQCSyR3JuUSrOe758M0CwwzrC2cbGVuOaEQaBqIrN6dvHWTX7FJ0iqroON2AsUyUnrtPc/TZpMRjPoWUeMN4m8PpoZ7WEOcq9ouGU9GXp1dV2okgnwdVvFfliii45xpY2Vr+czC4aqEgQFOmfOkP/1/2QzRooWeLd0i2AVLOOckBWoRQ1jCCa1racBhwpsfYf7Ax5lb393La7xuA7EJm6/n9nslYW3GJXW4GKnsKysoL7Ml0tLwoN1m+lBumus/5uivtkjccC5s5Jrf6Q41NADO7Q4yeiDfkUs7Ro4NVGD/ehf4+8qBtI28X3Gx54Fw";
+/// Every usage and capture call, by name.
+#[derive(Default)]
+struct Observed(std::sync::Mutex<Vec<String>>);
 
-/// One completed Responses turn with encrypted reasoning and a message.
-fn reasoning_turn() -> String {
-    let reasoning = json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":ENC,"status":"completed"});
-    [
-        event(json!({"type":"response.created","response":response("in_progress", json!([]))})),
-        event(json!({"type":"response.output_item.done","output_index":0,"item":reasoning})),
-        event(json!({"type":"response.output_item.done","output_index":1,"item":message("hello")})),
-        event(
-            json!({"type":"response.completed","response":response("completed", json!([reasoning, message("hello")]))}),
-        ),
-    ]
-    .concat()
+impl Observed {
+    fn push(&self, call: String) {
+        self.0.lock().unwrap().push(call);
+    }
 }
 
-const TURN: &str =
-    r#"{"model":"grok-4.3","stream":true,"prompt_cache_key":"k1","input":[{"role":"user","content":"hi"}]}"#;
-const NEXT: &str = r#"{"model":"grok-4.3","stream":true,"prompt_cache_key":"k1","input":[{"role":"user","content":"hi"},{"role":"user","content":"more"}]}"#;
+impl ck_core::exec::UsageObserver for Observed {
+    fn response_body(&self, _format: ck_core::format::Format, _body: &[u8]) {
+        self.push("response_body".into());
+    }
+    fn response_line(&self, _format: ck_core::format::Format, _line: &[u8]) {
+        self.push("response_line".into());
+    }
+    fn request(&self, _format: ck_core::format::Format, _payload: &[u8]) {
+        self.push("request".into());
+    }
+    fn request_for(&self, identifier: &str, payload: &[u8]) {
+        self.push(format!("request {identifier} {}", String::from_utf8_lossy(payload)));
+    }
+    fn upstream_model(&self, model: &str) {
+        self.push(format!("upstream_model {model}"));
+    }
+    fn round_trip_started(&self) {
+        self.push("round_trip_started".into());
+    }
+    fn first_byte(&self) {
+        self.push("first_byte".into());
+    }
+}
 
-/// One turn of `body` on `executors` from caller `principal` over credential `id`: what went
-/// upstream and the producer's outcome.
-async fn turn(executors: &Executors, (principal, id): (&str, &str), body: &str, reply: Reply) -> (Value, bool) {
+impl ck_core::exec::CaptureObserver for Observed {
+    fn record(&self, event: ck_core::exec::CaptureEvent<'_>) {
+        let name = match event {
+            ck_core::exec::CaptureEvent::Request(request) => format!("capture request {}", request.url),
+            ck_core::exec::CaptureEvent::ResponseMetadata(status, _) => format!("capture metadata {status}"),
+            ck_core::exec::CaptureEvent::ResponseChunk(_) => "capture chunk".into(),
+            _ => "capture other".into(),
+        };
+        self.push(name);
+    }
+}
+
+/// The executor reports the request-side facts (contract G4) and captures the exchange; the
+/// response's usage comes from the canonical stream, never `response_*`.
+#[tokio::test]
+async fn request_side_facts_reach_the_usage_sink() {
     let streams = Streams::new();
-    let upstream = StreamUpstream::start([reply]).await;
+    let upstream = StreamUpstream::start([Reply::sse(sse())]).await;
     let mut exchange = exchange(&upstream);
-    exchange.caller.principal = principal.into();
-    exchange.credential.id = id.into();
-    let input = (body, 64, Sessions::default());
+    let observed = std::sync::Arc::new(Observed::default());
+    let capture = ck_core::exec::CaptureSink::new(observed.clone());
+    exchange.usage = ck_core::exec::UsageSink::new(observed.clone()).with_capture(capture);
+    let input = (RESPONSES, 64, Sessions::default());
     let run = run_on(
         &streams,
-        executors,
+        &executors(),
         &exchange,
         Client::Responses,
         Operation::Generate,
@@ -229,35 +261,22 @@ async fn turn(executors: &Executors, (principal, id): (&str, &str), body: &str, 
     )
     .await;
     let (outcome, _, _) = produce(&streams, run.started.unwrap()).await;
-    (json_body(&upstream.captured()[0]), outcome.is_ok())
-}
-
-/// A completed turn's encrypted reasoning returns in the next turn of the same session,
-/// caller and credential only (another caller's or credential's turn, which completes without
-/// reasoning and so clears its own entry, leaves it in place); a completion cut before its event ended caches nothing.
-#[tokio::test]
-async fn replay_is_namespaced_and_published_after_completion() {
-    let executors = executors();
-    let a = ("sk-a", "xai-1");
-    let (_, ok) = turn(&executors, a, TURN, Reply::sse(reasoning_turn())).await;
-    assert!(ok);
-    for other in [("sk-b", "xai-1"), ("sk-a", "xai-2")] {
-        let (sent, _) = turn(&executors, other, NEXT, Reply::sse(sse())).await;
-        assert!(!sent["input"].to_string().contains(ENC), "{other:?}: {sent}");
+    outcome.unwrap();
+    let calls = observed.0.lock().unwrap().clone();
+    let wire = String::from_utf8(upstream.captured()[0].body.clone()).unwrap();
+    let url = format!("{}/v1/responses", upstream.url());
+    for call in [
+        format!("request xai {wire}"),
+        format!("upstream_model {MODEL}"),
+        "round_trip_started".into(),
+        format!("capture request {url}"),
+        "capture metadata 200".into(),
+        "first_byte".into(),
+        "capture chunk".into(),
+    ] {
+        assert!(calls.contains(&call), "{call} missing from {calls:?}");
     }
-    let (sent, _) = turn(&executors, a, NEXT, Reply::sse(sse())).await;
-    assert!(sent["input"].to_string().contains(ENC), "{sent}");
-    let body = reasoning_turn();
-    let (_, ok) = turn(
-        &executors,
-        a,
-        &TURN.replace("k1", "k2"),
-        Reply::sse(body.trim_end().to_owned()),
-    )
-    .await;
-    assert!(!ok, "a completion without its blank line does not complete");
-    let (sent, _) = turn(&executors, a, &NEXT.replace("k1", "k2"), Reply::sse(sse())).await;
-    assert!(!sent["input"].to_string().contains(ENC), "{sent}");
+    assert!(!calls.iter().any(|c| c.starts_with("response_")), "{calls:?}");
 }
 
 /// The selector sends xAI credentials through this executor.
