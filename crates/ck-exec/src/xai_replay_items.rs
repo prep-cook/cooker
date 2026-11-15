@@ -7,8 +7,9 @@
 //! items on the old route, which reads a call's id, name and status as Go's `Result.String()`
 //! does; see [`Text`].
 
-use ck_translate::codec::document::{Document, Value};
+use ck_translate::codec::document::{Document, Name, Text as Sent, Value};
 use ck_translate::codec::encode::{self, Encoder};
+use ck_translate::codec::source::Span;
 use ck_translate::codec::{self, Error};
 use ck_wire::gostr::GoStr;
 use ck_wire::json as gj;
@@ -34,6 +35,8 @@ enum Text {
     Trimmed(usize, usize, usize),
     /// A value whose JSON text is its text: an integer, a boolean, an object or an array.
     Json(usize),
+    /// An object or array, as the JSON text the upstream sent.
+    Raw(Sent),
     /// A non-integer number, formatted.
     Formatted(String),
 }
@@ -173,13 +176,76 @@ fn text(doc: &Document, node: Option<usize>, held: &mut Reservation<'_>) -> code
         },
         Value::Null => Text::Empty,
         Value::Number(_) => return number(doc, node, held),
+        Value::Object | Value::Array => Text::Raw(sent(doc, node)?),
         _ => Text::Json(node),
     }))
 }
 
+/// The JSON text of member `node`, an object or array, as the upstream sent it. The parse
+/// keeps no span for a container, so its source is read from the member's name up to the
+/// bracket that closes the value.
+fn sent(doc: &Document, node: usize) -> codec::Result<Sent> {
+    let Some(Name::Mapped(name, _)) = doc.node(node)?.name else {
+        return Err(Error::Schema);
+    };
+    let source = doc.source(name)?;
+    let (mut at, mut start, mut end) = (name.span.end, None, None);
+    let (mut depth, mut quoted, mut escaped) = (0u32, false, false);
+    let rest = Span {
+        start: name.span.end,
+        end: source.len(),
+    };
+    let scan = source.visit(rest, |chunk| {
+        for &byte in chunk {
+            at += 1;
+            if start.is_none() {
+                match byte {
+                    b'{' | b'[' => (start, depth) = (Some(at - 1), 1),
+                    b':' | b' ' | b'\t' | b'\n' | b'\r' => {}
+                    _ => return Err(Error::Schema),
+                }
+            } else if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+            } else {
+                match byte {
+                    b'"' => quoted = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    end = Some(at);
+                    // Stops the visit; the value has ended.
+                    return Err(Error::Closed);
+                }
+            }
+        }
+        Ok(())
+    });
+    match (scan, start, end) {
+        (Err(Error::Closed), Some(start), Some(end)) => Ok(Sent {
+            source: name.source,
+            span: Span { start, end },
+        }),
+        (Err(error), _, _) if !matches!(error, Error::Closed) => Err(error),
+        _ => Err(Error::Schema),
+    }
+}
+
+/// Go's `'f'` format of an `f64` holds at most this many bytes at once: its result is at most
+/// 343 bytes, built from a digit string and a run of zeros.
+const FORMATTING: usize = 2048;
+
 /// A number as `Result.String()` reads it: an integer as written, any other number in Go's
-/// float format. Reading it takes a copy of its JSON text, charged as its length; the
-/// formatted result is a few dozen bytes at most.
+/// float format. Reading it takes a copy of its JSON text and room to format it, charged
+/// before either is allocated; a formatted text stays charged until the reservation ends,
+/// after the text is freed.
 fn number(doc: &Document, node: usize, held: &mut Reservation<'_>) -> codec::Result<Option<Text>> {
     let json = |e: &mut Encoder<'_, '_>| doc.write(node, e);
     let mut len = 0;
@@ -196,7 +262,17 @@ fn number(doc: &Document, node: usize, held: &mut Reservation<'_>) -> codec::Res
             Text::Formatted(String::from_utf8_lossy(&text).into_owned())
         })
     };
-    held.scratch(len, read).transpose()
+    let charge = len + FORMATTING;
+    if !held.charge(charge) {
+        return Ok(None);
+    }
+    let text = read();
+    let kept = match &text {
+        Ok(Text::Formatted(text)) => text.capacity().min(charge),
+        _ => 0,
+    };
+    held.release(charge - kept);
+    text.map(Some)
 }
 
 /// Whether `value` is Grok encrypted content. Its decoded copy, and what checking it decodes
@@ -349,6 +425,7 @@ fn write_text(doc: &Document, text: &Text, e: &mut Encoder<'_, '_>) -> codec::Re
     let (node, skip, keep) = match text {
         Text::Empty => return e.bytes(b"\"\""),
         Text::Json(node) => return e.quoted_json(|e| doc.write(*node, e)),
+        Text::Raw(sent) => return e.quoted_json(|e| e.span(doc.source(*sent)?, sent.span)),
         Text::Formatted(text) => return e.string(text),
         Text::Trimmed(node, skip, keep) => (*node, *skip, *keep),
     };

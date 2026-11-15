@@ -163,9 +163,14 @@ impl Reservation<'_> {
             return None;
         }
         let result = check();
+        self.release(bytes);
+        Some(result)
+    }
+
+    /// Returns `bytes` of the charge once what they paid for is freed.
+    pub(crate) fn release(&mut self, bytes: usize) {
         self.bytes -= bytes;
         self.store.lock().reserved -= bytes;
-        Some(result)
     }
 
     /// Charges `bytes` more before they are allocated, evicting the oldest entries to make

@@ -65,7 +65,20 @@ fn items_normalize_as_raw_items_do() {
         r#"{"type":"custom_tool_call","call_id":"c","name":"patch"}"#.to_owned(),
         r#"{"type":5,"call_id":"c"}"#.to_owned(),
     ];
-    for item in items.into_iter().chain(scalar_items()) {
+    let structured = [r#"[1, 2]"#, r#"{ "a": [1, { "b": "\u00e9\"]" }] }"#, "[ ]"];
+    let mut raw = Vec::new();
+    for value in structured {
+        raw.push(format!(
+            r#"{{"type":"function_call","call_id":{value},"name":"t","arguments":"{{}}"}}"#
+        ));
+        raw.push(format!(
+            r#"{{"type":"function_call","call_id":"c","name":{value},"arguments":"{{}}"}}"#
+        ));
+        raw.push(format!(
+            r#"{{"type":"custom_tool_call","call_id":"c","name":"t","input":"x","status":{value}}}"#
+        ));
+    }
+    for item in items.into_iter().chain(scalar_items()).chain(raw) {
         let raw = crate::xai_replay::normalize_item(item.as_bytes());
         let want = raw.map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
         assert_eq!(normalized(&mut owner, &item), want, "{item}");
@@ -139,8 +152,8 @@ fn checking_reasoning_is_charged_while_it_runs() {
     let _ = std::fs::remove_dir_all(directory);
 }
 
-/// Reading a number takes a charge of its length: a long one that formats short fits an
-/// entry only while its text does.
+/// Reading a number takes a charge of its length and room to format it: a long one that
+/// formats short fits an entry only while its text does.
 #[test]
 fn reading_a_number_is_charged() {
     let (pool, directory) = pool();
@@ -149,7 +162,22 @@ fn reading_a_number_is_charged() {
     let turn = format!(r#"{{"output":[{{"type":"function_call","call_id":{id},"name":"t","arguments":"{{}}"}}]}}"#);
     let call = serde_json::json!({"type":"function_call","call_id":"1","name":"t","arguments":"{}"});
     assert!(items(&mut owner, &turn, (1_000, 1_000)).is_none());
-    assert_eq!(items(&mut owner, &turn, (6_000, 6_000)), Some(vec![call]));
+    assert_eq!(items(&mut owner, &turn, (8_000, 8_000)), Some(vec![call]));
+    drop(owner);
+    drop(pool);
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// A number's formatted text stays charged while it is kept: ten calls whose id formats to
+/// 301 digits fit an entry only with room for those texts beside their items.
+#[test]
+fn formatted_numbers_stay_charged() {
+    let (pool, directory) = pool();
+    let mut owner = pool.create().unwrap();
+    let call = r#"{"type":"function_call","call_id":1e300,"name":"t","arguments":"{}"}"#;
+    let turn = format!(r#"{{"output":[{}]}}"#, [call; 10].join(","));
+    assert!(items(&mut owner, &turn, (6_000, 6_000)).is_none());
+    assert_eq!(items(&mut owner, &turn, (8_000, 8_000)).map(|i| i.len()), Some(10));
     drop(owner);
     drop(pool);
     let _ = std::fs::remove_dir_all(directory);

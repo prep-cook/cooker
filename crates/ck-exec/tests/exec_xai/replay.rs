@@ -231,3 +231,43 @@ async fn a_numeric_call_id_is_replayed() {
         "{sent}"
     );
 }
+
+/// The call the next turn of a session gets back when the upstream completed with the raw
+/// JSON `call` and that turn sends the result for `id`.
+async fn replayed_call(call: &str, id: &str) -> Option<Value> {
+    let executors = executors();
+    let a = ("sk-a", "xai-1");
+    let completed = event(json!({"type":"response.completed","response":response("completed", json!(["CALL"]))}));
+    let (_, ok) = turn(&executors, a, TURN, Reply::sse(completed.replace("\"CALL\"", call))).await;
+    assert!(ok);
+    let next = json!({"model":MODEL,"stream":true,"previous_response_id":"resp_1","prompt_cache_key":"k1","input":[
+        {"role":"user","content":"hi"},
+        {"type":"function_call_output","call_id":id,"output":"done"},
+    ]});
+    let (sent, ok) = turn(&executors, a, &next.to_string(), Reply::sse(sse())).await;
+    assert!(ok);
+    sent["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .cloned()
+}
+
+/// An object or array where a call's id or name belongs is replayed as the JSON text the
+/// upstream sent, white space included.
+#[tokio::test]
+async fn a_structured_call_id_or_name_keeps_its_text() {
+    let name = replayed_call(
+        r#"{"type":"function_call","call_id":"c","name":[1, 2],"arguments":"{}"}"#,
+        "c",
+    )
+    .await;
+    assert_eq!(name.map(|c| c["name"].clone()), Some(json!("[1, 2]")));
+    let id = r#"{ "a": [1, { "b": "é" }] }"#;
+    let call = format!(r#"{{"type":"function_call","call_id":{id},"name":"t","arguments":"{{}}"}}"#);
+    assert_eq!(
+        replayed_call(&call, id).await.map(|c| c["call_id"].clone()),
+        Some(json!(id))
+    );
+}
