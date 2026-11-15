@@ -502,7 +502,7 @@ The caller supplies body-byte, part-byte and part-count limits. Header lines hav
 | Wire fields | Internal location | Notes |
 | --- | --- | --- |
 | model, input/text, voice/voice_id, language, speed, instructions | Q model/text; `X.provider_parameters.audio` | Preserve instructions and original voice independently of provider voice mapping. |
-| response_format/output_format codec/sample_rate, stream options | Q delivery; X media attributes/provider parameters | Audio input files use the same multipart/media mapping when an operation supports them. |
+| response_format/output_format codec/sample_rate/bit_rate, stream options | Q delivery; X media attributes/provider parameters (the audio codec keeps the raw wire values under `provider_parameters.audio`) | Audio input files use the same multipart/media mapping when an operation supports them. |
 
 ### 5.22 Audio/speech — response, both directions
 
@@ -511,6 +511,10 @@ The caller supplies body-byte, part-byte and part-count limits. Header lines hav
 | Raw audio body/content type, JSON audio/base64, codec/rate/channels | Media lifecycle + data events | Egress writes raw audio incrementally; non-JSON bytes do not undergo UTF-8 validation. |
 | Transcript, timestamps, segment/word timing, audio IDs/expiry | Transcript/media attributes/X original | Keep units and audio-text association. |
 | Usage/error/EOF | Usage/terminal | HTTP success plus complete body supplies media end; truncated body is error. |
+
+`ck-translate::audio` implements the bounded `/v1/audio/speech` document boundary, not live audio or SSE speech. Its request decoder retains `model`, `text` and `X.provider_parameters.audio` in mapped storage. OpenAI egress restores unknown fields; xAI egress maps the voice without changing its canonical value and refuses supplied `instructions` before encoding rather than dropping them (L16). A request names its format with `response_format` (OpenAI) or `output_format` (xAI: `codec`, `sample_rate`, `bit_rate`), never both: carrying both is refused at decode and encode, so neither field is silently dropped. OpenAI egress refuses `output_format` because the destination cannot express it; xAI egress sends `output_format` whole, or builds it from `response_format` when that is not `mp3`, and refuses codecs outside `mp3`, `wav` and `pcm`. Unknown `output_format` members are refused rather than forwarded. Format names match exactly, with no trimming or case folding, and a zero `sample_rate` or `bit_rate` is refused, not replaced by a default; the Go handler's lenient forms are not preserved. Request body-limit failures expose status 413. Like the search document codec, it leaves request fencing and transport integration to the boundary owner.
+
+Audio-file response ingress publishes one media lifetime with the supplied content type, unaligned data records and an explicit terminal. The owner schedules its flush deadline, flushes when client egress waits, and calls `finish` only after successful HTTP framing; a read failure calls `fail`. Declared lengths must match. Raw egress validates correlation, chunk indexes, offsets and the final byte count before reporting completion; it returns failures to the HTTP owner rather than inserting JSON into audio bytes.
 
 ### 5.23 Video — request, both directions
 

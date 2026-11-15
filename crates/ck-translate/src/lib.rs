@@ -66,6 +66,7 @@ mod antigravity_interactions;
 mod antigravity_responses;
 mod apply_patch;
 pub mod apply_patch_responses;
+pub mod audio;
 mod boundary;
 mod claude_chat_request;
 mod claude_chat_response;
