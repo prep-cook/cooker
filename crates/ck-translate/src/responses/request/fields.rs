@@ -26,6 +26,11 @@ pub(super) fn write_field(doc: &Document, field: usize, e: &mut Encoder<'_, '_>)
 /// `parallel_tool_calls`) as one object, in their Responses shapes; members the request lacks
 /// are absent.
 pub(in crate::responses) fn write_echo(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
+    // Native declarations are copied as they are, which is the Responses shape only for a
+    // Responses request; another protocol's, such as Anthropic web search, has none.
+    if !natives(doc)?.is_empty() && !is(doc, doc.required(doc.root(), "x_ck")?, "original_protocol", "responses")? {
+        return Err(Error::Unsupported);
+    }
     e.bytes(b"{")?;
     let mut first = true;
     for field in doc.children(doc.root())? {
@@ -68,28 +73,79 @@ fn write_member(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result
         e.bytes(b"}")?;
     } else if doc.name_is(name, "tools")? {
         write_tools(doc, field, e)?;
-    } else if doc.name_is(name, "tool_choice")?
-        && matches!(doc.node(field)?.value, Value::Object)
-        && is(doc, field, "type", "function")?
-    {
-        // Responses spells the function name flat; every other member, `type` first, stays.
-        let mut first = true;
-        for f in doc.children(field)? {
-            let n = doc.node(f)?.name.ok_or(Error::Schema)?;
-            if !doc.name_is(n, "function")? {
-                e.bytes(if first { b"{" } else { b"," })?;
-                first = false;
-                doc.write_name(n, e)?;
-                e.bytes(b":")?;
-                doc.write(f, e)?;
-            }
-        }
-        member(doc, doc.required(field, "function")?, "name", e)?;
-        e.bytes(b"}")?;
+    } else if doc.name_is(name, "tool_choice")? && matches!(doc.node(field)?.value, Value::Object) {
+        write_choice(doc, field, e)?;
     } else {
         doc.write(field, e)?;
     }
     Ok(())
+}
+/// Writes a tool choice object in its Responses shape: a named tool is flat, and a nested
+/// allowed-tools choice holds `mode` and `tools` beside its type. A Responses request's other
+/// choices, such as a hosted tool's, are already in that shape; another protocol's have none.
+fn write_choice(doc: &Document, choice: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    if let Some(carrier) = carrier(doc, choice)?
+        && doc.member(choice, carrier)?.is_some()
+    {
+        return write_named(doc, choice, e);
+    }
+    let allowed = if is(doc, choice, "type", "allowed_tools")? {
+        doc.member(choice, "allowed_tools")?
+    } else {
+        None
+    };
+    let Some(allowed) = allowed else {
+        if is(doc, doc.required(doc.root(), "x_ck")?, "original_protocol", "responses")? {
+            return doc.write(choice, e);
+        }
+        return Err(Error::Unsupported);
+    };
+    e.bytes(b"{\"type\":\"allowed_tools\"")?;
+    for f in doc.children(allowed)? {
+        let name = doc.node(f)?.name.ok_or(Error::Schema)?;
+        e.bytes(b",")?;
+        doc.write_name(name, e)?;
+        e.bytes(b":")?;
+        if !doc.name_is(name, "tools")? {
+            doc.write(f, e)?;
+            continue;
+        }
+        e.bytes(b"[")?;
+        for (i, tool) in doc.children(f)?.enumerate() {
+            e.bytes(if i == 0 { b"" } else { b"," })?;
+            write_named(doc, tool, e)?;
+        }
+        e.bytes(b"]")?;
+    }
+    e.bytes(b"}")
+}
+/// Writes a choice naming one function or custom tool: Responses spells the name flat, and
+/// every other member, `type` first, stays. Any other choice has no Responses form here.
+fn write_named(doc: &Document, choice: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let carrier = carrier(doc, choice)?.ok_or(Error::Unsupported)?;
+    let mut first = true;
+    for f in doc.children(choice)? {
+        let n = doc.node(f)?.name.ok_or(Error::Schema)?;
+        if !doc.name_is(n, carrier)? {
+            e.bytes(if first { b"{" } else { b"," })?;
+            first = false;
+            doc.write_name(n, e)?;
+            e.bytes(b":")?;
+            doc.write(f, e)?;
+        }
+    }
+    member(doc, doc.required(choice, carrier)?, "name", e)?;
+    e.bytes(b"}")
+}
+/// The member a canonical function or custom tool, or a choice of one, nests its name in;
+/// `None` for any other type.
+fn carrier(doc: &Document, tool: usize) -> Result<Option<&'static str>> {
+    for carrier in ["function", "custom"] {
+        if is(doc, tool, "type", carrier)? {
+            return Ok(Some(carrier));
+        }
+    }
+    Ok(None)
 }
 /// The `text` options other than `format` that ingress kept as Responses provider parameters.
 fn provider_text(doc: &Document) -> Result<Option<usize>> {
@@ -137,16 +193,7 @@ fn write_format(doc: &Document, format: usize, e: &mut Encoder<'_, '_>) -> Resul
 /// Writes the function tools and the native tool declarations kept in `x_ck.tools`; a
 /// declaration whose pointer names its position returns there, others follow the functions.
 fn write_tools(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
-    let native = match doc.member(doc.root(), "x_ck")? {
-        Some(x) => doc.member(x, "tools")?,
-        None => None,
-    };
-    let mut natives = native
-        .map(|n| doc.children(n))
-        .transpose()?
-        .into_iter()
-        .flatten()
-        .peekable();
+    let mut natives = natives(doc)?.into_iter().peekable();
     let mut functions = doc.children(field)?.peekable();
     let gemini = json_schema::from_gemini(doc)?;
     e.bytes(b"[")?;
@@ -161,27 +208,89 @@ fn write_tools(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<
         if at && let Some(entry) = natives.next() {
             doc.write(doc.required(entry, "declaration")?, e)?;
         } else if let Some(tool) = functions.next() {
-            e.bytes(b"{\"type\":\"function\"")?;
-            let function = doc.required(tool, "function")?;
-            if gemini {
-                // A Gemini declaration's schemas become JSON Schema `parameters` and `output_schema`.
-                e.bytes(b",")?;
-                json_schema::write_function(doc, function, ("parameters", Some("output_schema")), e)?;
-            } else {
-                for f in doc.children(function)? {
-                    e.bytes(b",")?;
-                    doc.write_name(doc.node(f)?.name.ok_or(Error::Schema)?, e)?;
-                    e.bytes(b":")?;
-                    doc.write(f, e)?;
-                }
+            match carrier(doc, tool)? {
+                Some("custom") => write_custom(doc, tool, e)?,
+                Some(_) => write_function(doc, tool, gemini, e)?,
+                // Another protocol's tool, such as an Anthropic server tool, has no Responses form.
+                None => return Err(Error::Unsupported),
             }
-            originals(doc, tool, e, &["type", "function"])?;
-            e.bytes(b"}")?;
         } else {
             break;
         }
     }
     e.bytes(b"]")
+}
+/// Writes a function tool flat.
+fn write_function(doc: &Document, tool: usize, gemini: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"{\"type\":\"function\"")?;
+    let function = doc.required(tool, "function")?;
+    if gemini {
+        // A Gemini declaration's schemas become JSON Schema `parameters` and `output_schema`.
+        e.bytes(b",")?;
+        json_schema::write_function(doc, function, ("parameters", Some("output_schema")), e)?;
+    } else {
+        for f in doc.children(function)? {
+            e.bytes(b",")?;
+            doc.write_name(doc.node(f)?.name.ok_or(Error::Schema)?, e)?;
+            e.bytes(b":")?;
+            doc.write(f, e)?;
+        }
+    }
+    originals(doc, tool, e, &["type", "function"])?;
+    e.bytes(b"}")
+}
+/// Writes a custom tool flat; a grammar format holds its syntax and definition beside its type.
+fn write_custom(doc: &Document, tool: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"{\"type\":\"custom\"")?;
+    for f in doc.children(doc.required(tool, "custom")?)? {
+        let name = doc.node(f)?.name.ok_or(Error::Schema)?;
+        e.bytes(b",")?;
+        doc.write_name(name, e)?;
+        e.bytes(b":")?;
+        let grammar = if doc.name_is(name, "format")? && matches!(doc.node(f)?.value, Value::Object) {
+            doc.member(f, "grammar")?
+        } else {
+            None
+        };
+        match grammar {
+            Some(grammar) => write_flat(doc, f, grammar, e)?,
+            None => doc.write(f, e)?,
+        }
+    }
+    originals(doc, tool, e, &["type", "custom"])?;
+    e.bytes(b"}")
+}
+/// Writes object `node` with the members of its member `nested` in place of `nested`.
+fn write_flat(doc: &Document, node: usize, nested: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"{")?;
+    let fields = doc.children(node)?.filter(|&f| f != nested);
+    for (i, f) in fields.chain(doc.children(nested)?).enumerate() {
+        e.bytes(if i == 0 { b"" } else { b"," })?;
+        doc.write_name(doc.node(f)?.name.ok_or(Error::Schema)?, e)?;
+        e.bytes(b":")?;
+        doc.write(f, e)?;
+    }
+    e.bytes(b"}")
+}
+/// The native declarations kept in `x_ck.tools`. An entry bound to a canonical tool, such as a
+/// Chat custom tool's, is that tool's projection and is written with it, not as a declaration.
+fn natives(doc: &Document) -> Result<Vec<usize>> {
+    let Some(x) = doc.member(doc.root(), "x_ck")? else {
+        return Ok(Vec::new());
+    };
+    let mut natives = Vec::new();
+    for entry in doc
+        .member(x, "tools")?
+        .map(|n| doc.children(n))
+        .transpose()?
+        .into_iter()
+        .flatten()
+    {
+        if doc.origin(entry)?.is_none() {
+            natives.push(entry);
+        }
+    }
+    Ok(natives)
 }
 /// The position a `/tools/N` declaration pointer names; `None` for any other pointer.
 fn position_of(doc: &Document, entry: usize) -> Result<Option<u64>> {
