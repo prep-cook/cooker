@@ -20,6 +20,8 @@
 //! Go sends it and recovers on 401.
 
 pub mod aistudio;
+#[cfg(test)]
+mod alloc_count;
 pub mod antigravity;
 pub mod antigravity_auth;
 mod antigravity_compaction;

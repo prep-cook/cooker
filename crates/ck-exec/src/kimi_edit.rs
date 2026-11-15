@@ -122,4 +122,59 @@ mod tests {
             assert_eq!(String::from_utf8(body).unwrap(), want);
         }
     }
+
+    /// Tool outputs move ahead of the items between them and their calls, group by group, and
+    /// the separators and white space of the moved items stay valid.
+    #[test]
+    fn outputs_move_ahead_of_the_items_between() {
+        let body = br#"{"input": [
+            {"type":"function_call","call_id":"a"}, {"type":"function_call","call_id":"b"},
+            {"type":"message","role":"user","content":"m1"},
+            {"type":"function_call_output","call_id":"b"}, {"type":"message","content":"m2"},
+            {"type":"function_call_output","call_id":"a"}, {"type":"function_call","call_id":"c"},
+            {"type":"message","content":"m3"}, {"type":"function_call_output","call_id":"c"}
+        ], "model": "k3"}"#;
+        let out = crate::kimi::normalize_responses_input(body.to_vec());
+        let got: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let order: Vec<String> = got["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                format!(
+                    "{}{}",
+                    i["call_id"].as_str().unwrap_or(""),
+                    i["content"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        assert_eq!(order, ["a", "b", "b", "a", "m1", "m2", "c", "c", "m3"]);
+        assert_eq!(got["model"], "k3");
+        // A second output for an answered call is not an answer: it stays between.
+        let body = br#"{"input":[{"type":"function_call","call_id":"a"},{"type":"function_call","call_id":"b"},{"type":"function_call_output","call_id":"a"},{"type":"message","content":"m"},{"type":"function_call_output","call_id":"a","output":"again"},{"type":"function_call_output","call_id":"b"}]}"#;
+        let out: serde_json::Value =
+            serde_json::from_slice(&crate::kimi::normalize_responses_input(body.to_vec())).unwrap();
+        assert_eq!(out["input"][3]["call_id"], "b");
+        assert_eq!(out["input"][5]["output"], "again");
+    }
+
+    /// The reorder moves the items inside the upload: a megabyte between a call and its output
+    /// is not copied.
+    #[test]
+    fn the_reorder_copies_no_item() {
+        let text = "x".repeat(1_000_000);
+        let body = format!(
+            r#"{{"input":[{{"type":"function_call","call_id":"a","name":"f","arguments":"{{}}"}},{{"type":"message","role":"developer","content":"{text}"}},{{"type":"function_call_output","call_id":"a","output":"A"}}]}}"#
+        )
+        .into_bytes();
+        let (address, len) = (body.as_ptr(), body.len());
+        let before = crate::alloc_count::allocated();
+        let out = crate::kimi::normalize_responses_input(body);
+        let spent = crate::alloc_count::allocated() - before;
+        assert_eq!((out.as_ptr(), out.len()), (address, len));
+        assert!(spent < 64 * 1024, "{spent} bytes allocated for a {len}-byte upload");
+        let got: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(got["input"][1]["type"], "function_call_output");
+        assert_eq!(got["input"][2]["content"].as_str().map(str::len), Some(text.len()));
+    }
 }

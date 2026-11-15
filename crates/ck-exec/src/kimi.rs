@@ -1183,7 +1183,7 @@ fn is_tool_output(item: &Res<'_>) -> bool {
 
 /// `NormalizeKimiResponsesInput`: tool outputs must follow their parallel calls directly;
 /// items in between move after the outputs.
-pub(crate) fn normalize_responses_input(body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn normalize_responses_input(mut body: Vec<u8>) -> Vec<u8> {
     if body.is_empty() || !gj::valid(&body) {
         return body;
     }
@@ -1191,20 +1191,27 @@ pub(crate) fn normalize_responses_input(body: Vec<u8>) -> Vec<u8> {
     if !input.is_array() {
         return body;
     }
-    let items = input.array();
-    if items.is_empty() {
-        return body;
+    let moves = output_moves(&input.array());
+    drop(input);
+    for (front, unit) in moves {
+        body[front..unit.end].rotate_left(unit.start - front);
     }
-    let mut reordered = false;
-    let mut result: Vec<&[u8]> = Vec::with_capacity(items.len());
+    body
+}
+
+/// Where [`normalize_responses_input`] moves each tool output, in the order to apply them: the
+/// output with the separator before it (`unit`), to `front`, the start of the items that came
+/// between it and its calls. A moved item always follows a call, so it has a separator, and a
+/// move leaves the offsets before `front` and after the output as they were.
+fn output_moves(items: &[Res<'_>]) -> Vec<(usize, std::ops::Range<usize>)> {
+    let item_end = |k: usize| items[k].index + items[k].raw.len();
+    let mut moves = Vec::new();
     let mut i = 0;
     while i < items.len() {
         if !is_tool_call(&items[i]) {
-            result.push(items[i].raw());
             i += 1;
             continue;
         }
-        let start = i;
         let mut end = i;
         let mut ids: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
         let mut count = 0;
@@ -1216,56 +1223,62 @@ pub(crate) fn normalize_responses_input(body: Vec<u8>) -> Vec<u8> {
             }
             end += 1;
         }
-        result.extend(items[start..end].iter().map(|v| v.raw()));
-        if count == 0 {
+        let last = (count > 0).then(|| matched_outputs(items, end, &ids, count)).flatten();
+        let Some(last) = last else {
             i = end;
             continue;
-        }
-        let mut needed = ids.clone();
-        let mut remaining = count;
-        let mut last = None;
-        for (j, item) in items.iter().enumerate().skip(end) {
-            if remaining == 0 || is_tool_call(item) {
-                break;
-            }
-            if is_tool_output(item) {
-                let id = responses_call_id(item);
-                if let Some(n) = needed.get_mut(&id).filter(|n| **n > 0) {
-                    *n -= 1;
-                    remaining -= 1;
-                    last = Some(j);
-                }
-            }
-        }
-        match last.filter(|_| remaining == 0) {
-            Some(last) => {
-                let mut outputs = Vec::new();
-                let mut between = Vec::new();
-                let mut consumed = ids;
-                for item in &items[end..=last] {
-                    if is_tool_output(item) {
-                        let id = responses_call_id(item);
-                        if let Some(n) = consumed.get_mut(&id).filter(|n| **n > 0) {
-                            *n -= 1;
-                            outputs.push(item.raw());
-                            continue;
-                        }
+        };
+        let mut consumed = ids;
+        let mut front: Option<usize> = None;
+        for (k, item) in items.iter().enumerate().take(last + 1).skip(end) {
+            let matched = is_tool_output(item)
+                && match consumed.get_mut(&responses_call_id(item)) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        true
                     }
-                    between.push(item.raw());
+                    _ => false,
+                };
+            let unit = item_end(k - 1)..item_end(k);
+            match (matched, front) {
+                (false, None) => front = Some(unit.start),
+                (true, Some(at)) => {
+                    front = Some(at + unit.len());
+                    moves.push((at, unit));
                 }
-                reordered |= !between.is_empty();
-                result.extend(outputs);
-                result.extend(between);
-                i = last + 1;
+                _ => {}
             }
-            None => i = end,
+        }
+        i = last + 1;
+    }
+    moves
+}
+
+/// The index of the last of the outputs answering every call in `ids` (`count` in all) after
+/// the calls ending at `end`, before the next call; `None` if some call has no output there.
+fn matched_outputs(
+    items: &[Res<'_>],
+    end: usize,
+    ids: &std::collections::HashMap<Vec<u8>, usize>,
+    count: usize,
+) -> Option<usize> {
+    let mut needed = ids.clone();
+    let mut remaining = count;
+    let mut last = None;
+    for (j, item) in items.iter().enumerate().skip(end) {
+        if remaining == 0 || is_tool_call(item) {
+            break;
+        }
+        if is_tool_output(item) {
+            let id = responses_call_id(item);
+            if let Some(n) = needed.get_mut(&id).filter(|n| **n > 0) {
+                *n -= 1;
+                remaining -= 1;
+                last = Some(j);
+            }
         }
     }
-    if !reordered {
-        return body;
-    }
-    let joined = gj::join(&result);
-    gj::try_set_raw(&body, "input", joined).unwrap_or(body)
+    last.filter(|_| remaining == 0)
 }
 
 /// `restoreClaudeResponseModel`: put the client's model back on a Claude response body or
