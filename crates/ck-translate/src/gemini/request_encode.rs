@@ -5,6 +5,10 @@ use crate::codec::{
     document::{Document, Value},
     encode::Encoder,
 };
+use calls::{function_call, function_response, function_results};
+
+#[path = "request_calls.rs"]
+mod calls;
 
 pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
@@ -21,8 +25,9 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
     e.bytes(b"{\"contents\":[")?;
     let messages = doc.required(root, "messages")?;
     let mut first = true;
-    // Consecutive Chat tool messages answer the preceding assistant's calls in one user turn.
-    let (mut calls, mut results) = (None, false);
+    // Consecutive Chat tool messages answer the preceding model turn's calls in one user turn;
+    // `run` is that turn's first message and `open` whether the next message joins the turn.
+    let (mut run, mut results, mut open) = (None, false, false);
     for message in doc.children(messages)? {
         if super::request_schema::system(doc, message)? {
             continue;
@@ -31,21 +36,18 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
         if results && !tool {
             e.bytes(b"]}")?;
         }
-        if !(results && tool) {
+        if !(results && tool || open) {
             comma(&mut first, e)?;
         }
-        if tool {
-            e.bytes(if results {
-                b","
-            } else {
-                b"{\"role\":\"user\",\"parts\":["
-            })?;
-            e.bytes(b"{")?;
-            function_result(doc, message, calls.ok_or(Error::Schema)?, e)?;
-            e.bytes(b"}")?;
-        } else {
-            write_message(view, message, false, calls, e)?;
-            calls = doc.member(message, "tool_calls")?;
+        if tool && !results {
+            e.bytes(b"{\"role\":\"user\",\"parts\":[")?;
+            function_results(doc, message, run, e)?;
+        } else if !tool {
+            let joined = open;
+            open = write_message(view, message, false, run, joined, e)?;
+            if !joined {
+                run = Some(message);
+            }
         }
         results = tool;
     }
@@ -53,7 +55,7 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
     for message in doc.children(messages)? {
         if super::request_schema::system(doc, message)? {
             e.bytes(b",\"systemInstruction\":")?;
-            write_message(view, message, true, None, e)?;
+            write_message(view, message, true, None, false, e)?;
         }
     }
     let native = super::request_schema::native(doc)?;
@@ -356,17 +358,91 @@ fn comma(first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<()> {
     *first = false;
     Ok(())
 }
-/// Writes a content turn; `previous` holds the tool calls its tool results answer.
+/// Writes a content turn, or with `joined` adds the parts to the open one; `previous` is the
+/// model turn its tool results answer. Returns whether the next message joins this turn.
 fn write_message(
     view: RequestView<'_>,
     message: usize,
     system: bool,
     previous: Option<usize>,
+    joined: bool,
     e: &mut Encoder<'_, '_>,
-) -> Result<()> {
+) -> Result<bool> {
     let doc = view.document;
+    if !joined {
+        head(doc, message, system, e)?;
+    }
+    let mut first = !joined;
+    // A null content beside tool calls carries no text.
+    let content = match doc.member(message, "content")? {
+        Some(n) if matches!(doc.node(n)?.value, Value::Null) => None,
+        content => content,
+    };
+    let calls = doc.member(message, "tool_calls")?;
+    let order = super::origin(doc, message, "parts")?;
+    if let Some(order) = order {
+        for entry in doc.children(doc.required(order, "parts")?)? {
+            let (part, _) = doc.origin(entry)?.ok_or(Error::Schema)?;
+            if doc.node(part)?.parent != content && doc.node(part)?.parent != calls {
+                continue;
+            }
+            comma(&mut first, e)?;
+            write_part(view, part, Some(entry), e)?;
+        }
+    }
+    // Claude thinking history is stripped, as at a Chat upstream (owner ruling 2026-11-15).
+    let claude = super::is(doc, doc.required(doc.root(), "x_ck")?, "original_protocol", "anthropic")?;
+    if let Some(content) = content {
+        if matches!(doc.node(content)?.value, Value::Array) {
+            // A block of results is written at its first part, ordered by call.
+            let mut block = false;
+            for part in doc.children(content)? {
+                let result = super::request_schema::is_result(doc, part)?;
+                let written = result && block;
+                block = result;
+                if written
+                    || super::origin(doc, part, "part")?.is_some()
+                    || (claude
+                        && (super::is(doc, part, "type", "reasoning")? || super::is(doc, part, "type", "redacted")?))
+                {
+                    continue;
+                }
+                comma(&mut first, e)?;
+                if result {
+                    function_results(doc, part, previous, e)?;
+                } else {
+                    write_part(view, part, None, e)?;
+                }
+            }
+        } else {
+            comma(&mut first, e)?;
+            e.bytes(b"{\"text\":")?;
+            doc.write(content, e)?;
+            e.bytes(b"}")?;
+        }
+    }
+    if let Some(calls) = calls {
+        for call in doc.children(calls)? {
+            if super::origin(doc, call, "part")?.is_some() {
+                continue;
+            }
+            comma(&mut first, e)?;
+            write_part(view, call, None, e)?;
+        }
+    }
+    if super::request_schema::next_in_turn(doc, message)?.is_some() {
+        return Ok(true);
+    }
+    // Only a Gemini client's turns carry Gemini originals, and those are never joined.
+    e.bytes(b"]")?;
+    originals(doc, message, None, e)?;
+    e.bytes(b"}")?;
+    Ok(false)
+}
+/// Writes `{"role":...,"parts":[` of a content turn; the source spelling wins, and a recorded
+/// null role was absent.
+fn head(doc: &Document, message: usize, system: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"{")?;
-    // The source spelling wins: a recorded null role was absent.
     if let Some(entry) = super::origin(doc, message, "role")? {
         let role = doc.required(entry, "value")?;
         if !matches!(doc.node(role)?.value, Value::Null) {
@@ -383,66 +459,9 @@ fn write_message(
         })?;
         e.bytes(b",")?;
     }
-    e.bytes(b"\"parts\":[")?;
-    let mut first = true;
-    // A null content beside tool calls carries no text.
-    let content = match doc.member(message, "content")? {
-        Some(n) if matches!(doc.node(n)?.value, Value::Null) => None,
-        content => content,
-    };
-    let calls = doc.member(message, "tool_calls")?;
-    let order = super::origin(doc, message, "parts")?;
-    if let Some(order) = order {
-        for entry in doc.children(doc.required(order, "parts")?)? {
-            let (part, _) = doc.origin(entry)?.ok_or(Error::Schema)?;
-            if doc.node(part)?.parent != content && doc.node(part)?.parent != calls {
-                continue;
-            }
-            comma(&mut first, e)?;
-            write_part(view, part, Some(entry), previous, e)?;
-        }
-    }
-    // Claude thinking history is stripped, as at a Chat upstream (owner ruling 2026-11-15).
-    let claude = super::is(doc, doc.required(doc.root(), "x_ck")?, "original_protocol", "anthropic")?;
-    if let Some(content) = content {
-        if matches!(doc.node(content)?.value, Value::Array) {
-            for part in doc.children(content)? {
-                if super::origin(doc, part, "part")?.is_some()
-                    || (claude
-                        && (super::is(doc, part, "type", "reasoning")? || super::is(doc, part, "type", "redacted")?))
-                {
-                    continue;
-                }
-                comma(&mut first, e)?;
-                write_part(view, part, None, previous, e)?;
-            }
-        } else {
-            comma(&mut first, e)?;
-            e.bytes(b"{\"text\":")?;
-            doc.write(content, e)?;
-            e.bytes(b"}")?;
-        }
-    }
-    if let Some(calls) = calls {
-        for call in doc.children(calls)? {
-            if super::origin(doc, call, "part")?.is_some() {
-                continue;
-            }
-            comma(&mut first, e)?;
-            write_part(view, call, None, previous, e)?;
-        }
-    }
-    e.bytes(b"]")?;
-    originals(doc, message, None, e)?;
-    e.bytes(b"}")
+    e.bytes(b"\"parts\":[")
 }
-fn write_part(
-    view: RequestView<'_>,
-    part: usize,
-    order: Option<usize>,
-    calls: Option<usize>,
-    e: &mut Encoder<'_, '_>,
-) -> Result<()> {
+fn write_part(view: RequestView<'_>, part: usize, order: Option<usize>, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
     let kind = doc.required(part, "type")?;
     let flag = |name| -> Result<bool> { Ok(order.map(|n| doc.member(n, name)).transpose()?.flatten().is_some()) };
@@ -451,7 +470,7 @@ fn write_part(
     if doc.string_is(kind, "function")? {
         function_call(doc, part, flag("synthetic_id")?, e)?;
     } else if doc.string_is(kind, "tool_result")? {
-        function_response(doc, part, calls, flag("synthetic_id")?, e)?;
+        function_response(doc, part, flag("synthetic_id")?, e)?;
     } else if doc.string_is(kind, "text")? || doc.string_is(kind, "reasoning")? {
         first = flag("signature_only")?;
         if !first {
@@ -502,73 +521,6 @@ fn write_part(
         }
     }
     e.bytes(b"}")
-}
-/// Writes `"functionCall":{...}`; a synthesized call id has no native field.
-fn function_call(doc: &Document, part: usize, synthetic_id: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
-    e.bytes(b"\"functionCall\":{\"name\":")?;
-    let function = doc.required(part, "function")?;
-    doc.write(doc.required(function, "name")?, e)?;
-    if !synthetic_id {
-        super::member(doc, part, "id", e)?;
-    }
-    if let Some(args) = doc.member(function, "arguments")? {
-        e.bytes(b",\"args\":")?;
-        doc.write(args, e)?;
-    }
-    super::members(doc, function, &["name", "arguments"], e)?;
-    e.bytes(b"}")
-}
-/// Writes `"functionResponse":{...}`; a linked id the source omitted stays omitted. A tool result
-/// from another protocol has no `result` and answers one of `calls` like a Chat tool message.
-fn function_response(
-    doc: &Document,
-    part: usize,
-    calls: Option<usize>,
-    synthetic_id: bool,
-    e: &mut Encoder<'_, '_>,
-) -> Result<()> {
-    let Some(result) = doc.member(part, "result")? else {
-        return function_result(doc, part, calls.ok_or(Error::Schema)?, e);
-    };
-    e.bytes(b"\"functionResponse\":{\"name\":")?;
-    doc.write(doc.required(result, "name")?, e)?;
-    if !synthetic_id {
-        e.bytes(b",\"id\":")?;
-        doc.write(doc.required(part, "tool_call_id")?, e)?;
-    }
-    super::members(doc, result, &["name"], e)?;
-    e.bytes(b"}")
-}
-/// Writes a Chat tool message or a canonical tool result as `"functionResponse":{...}`: the name
-/// of the call it answers, its id and its text as `response.result`.
-fn function_result(doc: &Document, message: usize, calls: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
-    let id = doc.required(message, "tool_call_id")?;
-    let mut name = None;
-    for call in doc.children(calls)? {
-        if doc.equal_strings(doc.required(call, "id")?, id)? {
-            name = Some(doc.required(doc.required(call, "function")?, "name")?);
-        }
-    }
-    e.bytes(b"\"functionResponse\":{\"name\":")?;
-    doc.write(name.ok_or(Error::Schema)?, e)?;
-    e.bytes(b",\"id\":")?;
-    doc.write(id, e)?;
-    e.bytes(b",\"response\":{\"result\":")?;
-    match doc.member(message, "content")? {
-        Some(content) if matches!(doc.node(content)?.value, Value::Array) => {
-            e.bytes(b"\"")?;
-            for part in doc.children(content)? {
-                let mut chars = doc.chars(doc.required(part, "text")?)?;
-                while let Some(c) = chars.next_scalar()? {
-                    e.escaped(c.encode_utf8(&mut [0; 4]))?;
-                }
-            }
-            e.bytes(b"\"")?;
-        }
-        Some(content) => doc.write(content, e)?,
-        None => e.bytes(b"\"\"")?,
-    }
-    e.bytes(b"}}")
 }
 /// Writes `"inlineData":{...}` from a registered payload or `"fileData":{...}` from a URI.
 fn media(view: RequestView<'_>, part: usize, e: &mut Encoder<'_, '_>) -> Result<()> {

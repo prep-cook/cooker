@@ -7,12 +7,15 @@ use std::time::Duration;
 
 use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
 use bytes::{Bytes, BytesMut};
-use ck_core::exec::{ExecError, ExecResponse, ExecStream, FailureScope, ResponseBody};
+use ck_core::credential::Credential;
+use ck_core::exec::{CaptureEvent, ExecError, ExecResponse, ExecStream, FailureScope, ResponseBody, UsageSink};
 use ck_translate::sse::Framer;
 use futures_util::{Stream, StreamExt};
 use http::HeaderMap;
 use tokio::io::{AsyncBufRead, AsyncReadExt, BufReader};
 use tokio_util::io::{ReaderStream, StreamReader};
+
+use crate::types::Body;
 
 /// Largest upstream error body read; the rest is never pulled off the socket.
 pub(crate) const MAX_ERROR_BODY: usize = 64 * 1024;
@@ -349,6 +352,50 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     crate::quota::retry_after(headers.get(http::header::RETRY_AFTER)?.to_str().ok()?, now)?
         .duration_since(now)
         .ok()
+}
+
+/// The record of one upstream call before it is sent: the request capture, whose observer
+/// masks the credentials, and for a generation the round-trip start (contract §3, G4).
+pub(crate) fn record_send(
+    usage: &UsageSink,
+    generation: bool,
+    credential: &Credential,
+    provider: &str,
+    url: &str,
+    (headers, body): (&[(String, String)], &Bytes),
+) {
+    crate::gemini::capture_request(usage.capture(), credential, provider, url, headers, body);
+    if generation {
+        usage.round_trip_started();
+    }
+}
+
+/// A send that failed before any answer, as the capture records it.
+pub(crate) fn record_failure(usage: &UsageSink, error: &ExecError) {
+    if usage.capture().enabled() {
+        let text = std::str::from_utf8(&error.body).unwrap_or_default();
+        usage.capture().record(CaptureEvent::ResponseError(text));
+    }
+}
+
+/// The answer's metadata capture, then its body with every chunk captured and, for a
+/// generation, the first non-empty one marked as the first byte.
+pub(crate) fn record_answer(usage: &UsageSink, generation: bool, status: u16, headers: &HeaderMap, body: Body) -> Body {
+    crate::gemini::capture_metadata(usage.capture(), status, headers);
+    let usage = usage.clone();
+    let mut marked = !generation;
+    body.inspect(move |chunk| {
+        if let Ok(chunk) = chunk
+            && !chunk.is_empty()
+        {
+            if !marked {
+                marked = true;
+                usage.first_byte();
+            }
+            usage.capture().record(CaptureEvent::ResponseChunk(chunk));
+        }
+    })
+    .boxed()
 }
 
 #[cfg(test)]

@@ -419,6 +419,11 @@ async fn go_reference_scenarios() {
                 want_error["status"] = 500.into();
             }
             want_error["plain"] = plain.into();
+            // The upstream's error body is kept as received; Go's `statusErr` reads an empty
+            // one as `status N`.
+            if name == "error_500_empty_body" {
+                want_error["message"] = "".into();
+            }
         }
         assert_eq!(error.unwrap_or(Value::Null), want_error, "{name}: error");
     }
