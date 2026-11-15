@@ -112,6 +112,7 @@ mod responses_interactions;
 mod responses_interactions_response;
 mod responses_policy;
 mod responses_tools;
+pub mod search;
 pub mod sse;
 pub mod stream;
 mod thinking;

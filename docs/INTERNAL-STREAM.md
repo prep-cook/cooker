@@ -547,6 +547,8 @@ WebRTC media forwarding applies only when the existing `media-relay` build featu
 Alpha-search requests/results use the §4 `alpha_search` schema and X original; AI Studio inference uses the Gemini codec with relay correlation. These are not exemptions.
 Current alpha search bypasses translation (`crates/ck-server/src/inference/codex_alpha.rs:4-6`); the browser relay registers an executor-side session (`crates/ck-server/src/realtime/aistudio_relay.rs:4-11`).
 
+`ck_translate::search::Decoder` validates bounded Alpha Search JSON incrementally in mapped storage. Its `finish` returns an operation document with `kind: "alpha_search"`, the §4 `value`, and native extra fields in `x_ck.original`. `search::encode` restores those fields at their bound source objects; after reconstructing canonical JSON, call `codec::provenance::restore_bindings` before encoding or editing it. The codec does not select credentials, strip prompt-cache options or publish lifecycle/fence events. Executor and route integration remain E6b and E7; the existing HTTP path is unchanged.
+
 ### 5.27 Today's loss ledger
 
 These are source-verified transformations at the cited baseline, not claims that every route/provider loses the field. `New` means not mentioned in the supplied PIPELINE-SURVEY.md.

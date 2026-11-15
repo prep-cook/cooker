@@ -1,0 +1,48 @@
+[
+  {
+    "phase": "request",
+    "wire": {
+      "id": "s-1",
+      "model": "gpt-5.5",
+      "query": "rust <ws> 雪",
+      "limit": 2,
+      "prompt_cache_key": "cache-id",
+      "prompt_cache_retention": "24h",
+      "kind": "native-kind",
+      "value": null,
+      "phase": "native-phase",
+      "x_ck": {
+        "v": 99,
+        "original": [{"protocol": "codex", "pointer": "/query", "value": "spoofed"}]
+      },
+      "a/~\"雪": [null, false, 1.25, {"nested": "kept"}]
+    },
+    "value": {"phase": "request", "query": "rust <ws> 雪", "limit": 2}
+  },
+  {
+    "phase": "result",
+    "wire": {
+      "id": "s-1",
+      "results": [
+        {"title": "Rust", "uri": "https://example.invalid/rust", "text": "Search result", "rank": 1, "a/~": {"flags": [true, null]}},
+        {"title": "Empty text", "text": "", "rank": 2},
+        {"future": ["opaque", {"x_ck_media": "literal"}]}
+      ],
+      "next": null,
+      "x_ck": {"seq": 900, "direction": "request"}
+    },
+    "value": {
+      "phase": "result",
+      "results": [
+        {"title": "Rust", "uri": "https://example.invalid/rust", "text": "Search result"},
+        {"title": "Empty text", "text": ""},
+        {}
+      ]
+    }
+  },
+  {
+    "phase": "result",
+    "wire": {"results": []},
+    "value": {"phase": "result", "results": []}
+  }
+]
