@@ -947,9 +947,9 @@ fn parse_interactions_stream(line: &[u8]) -> Option<Detail> {
 pub fn parse_body(format: Format, body: &[u8]) -> Detail {
     match format {
         Format::Claude => parse_claude(body),
+        Format::OpenAI => parse_openai(body),
         // A buffered Responses body is the completed response object: usage and
         // service_tier are top-level, as `ParseOpenAIUsage` reads them.
-        Format::OpenAI => parse_openai(body),
         Format::OpenAIResponse | Format::Codex => parse_responses(body),
         Format::Gemini => parse_gemini(body),
         Format::Antigravity => {
