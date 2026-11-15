@@ -1,0 +1,158 @@
+//! Usage accounting reads only canonical `x_ck.usage` (`docs/EXECUTION-CONTRACT.md` §8): the
+//! last snapshot replaces earlier ones, a missing count stays missing, and a resume
+//! accounts nothing.
+
+mod stream_fixture;
+
+use ck_server::http::egress::Framing;
+use ck_server::observability::usage_snapshot::{self, CanonicalUsage, ResponseFacts};
+use stream_fixture::*;
+
+fn usage_chunk(usage: &str, tier: &str) -> bytes::Bytes {
+    bytes::Bytes::from(format!(
+        "data: {{\"id\":\"r\",\"model\":\"m\",\"created\":1,\"service_tier\":{tier},\"choices\":[],\"usage\":{usage}}}\n\n"
+    ))
+}
+
+/// Spawns the runtime-owned usage reader on `live`'s response stream.
+fn usage_reader(fixture: &Fixture, live: &Live) -> tokio::task::JoinHandle<(Option<CanonicalUsage>, ResponseFacts)> {
+    let streams = fixture.rt.streams();
+    let reader = streams
+        .with_store(|store| store.reader(live.response.id(), 0))
+        .unwrap()
+        .unwrap();
+    streams.spawn(usage_snapshot::read(live.response.allocator(), reader))
+}
+
+#[tokio::test]
+async fn the_last_snapshot_is_the_usage_once_however_often_the_stream_is_read() {
+    let fixture = Fixture::new(|_| {});
+    fixture.rt.usage_queue().configure(
+        true,
+        &ck_core::config::Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+    );
+    let app = fixture.app();
+    let mut live = commit(&fixture, owner(KEY), Framing::Sse, STREAMED);
+    let accounting = usage_reader(&fixture, &live);
+    live.send(chunk(r#"{"role":"assistant","content":"hel"}"#, "null"));
+    // A progress snapshot, then the final one: accounting takes the last, never the sum.
+    live.send(usage_chunk(
+        r#"{"prompt_tokens":10,"completion_tokens":5}"#,
+        r#""flex""#,
+    ));
+    live.send(chunk(r#"{"content":"lo"}"#, "null"));
+    live.send(chunk("{}", r#""stop""#));
+    live.send(usage_chunk(
+        r#"{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4}}"#,
+        "null",
+    ));
+    live.send(done());
+    live.end();
+
+    let (usage, facts) = accounting.await.unwrap();
+    let usage = usage.expect("the stream reported usage");
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+            usage.cache_read_tokens
+        ),
+        (Some(10), Some(20), Some(30), Some(4))
+    );
+    // Counts the upstream never reported stay absent rather than zero.
+    assert_eq!(
+        (
+            usage.reasoning_tokens,
+            usage.cache_write_tokens,
+            usage.cache_write_5m_tokens
+        ),
+        (None, None, None)
+    );
+    assert!(usage.final_snapshot);
+    // The explicit `null` tier of the last chunk clears the earlier `flex`.
+    assert_eq!(
+        facts,
+        ResponseFacts {
+            model: Some("m".into()),
+            service_tier: None
+        }
+    );
+
+    // Client delivery and resumes, live or repeated, account nothing.
+    for _ in 0..3 {
+        let (text, clean) = body(resume(&app, &live, "v1.e.0").await).await;
+        assert!(clean && text.contains("\"total_tokens\":30"), "{text}");
+    }
+    assert!(fixture.rt.usage_queue().pop_oldest(10).is_empty());
+    // A second reader of the same stream sees the same snapshot, not an increment.
+    let (again, _) = usage_reader(&fixture, &live).await.unwrap();
+    assert_eq!(again, Some(usage));
+}
+
+#[tokio::test]
+async fn a_stream_without_usage_reports_none_not_zero() {
+    let fixture = Fixture::new(|_| {});
+    let mut live = commit(&fixture, owner(KEY), Framing::Sse, BUFFERED);
+    let accounting = usage_reader(&fixture, &live);
+    answer(&mut live);
+    let (usage, facts) = accounting.await.unwrap();
+    assert_eq!(usage, None);
+    assert_eq!(facts.model.as_deref(), Some("m"));
+}
+
+/// The usage record's prompt-prefix hash of a Chat request, from its request view.
+fn prefix(fixture: &Fixture, body: &str) -> String {
+    use ck_translate::codec::chat::request;
+    use ck_translate::codec::event::{Direction, Identity, LocalId};
+    use ck_translate::codec::{Operation, RequestIngress};
+    fixture
+        .rt
+        .streams()
+        .with_store(|store| {
+            let mut stream = store.create().unwrap();
+            let identity = Identity {
+                request_id: LocalId::new("request").unwrap(),
+                stream_id: LocalId::new("stream").unwrap(),
+                attempt: 0,
+                direction: Direction::Request,
+            };
+            let mut ingress =
+                request::Ingress::new(&mut stream, store, identity, Operation::Generate, 1 << 20).unwrap();
+            ingress.advance(&mut stream, body.as_bytes()).unwrap();
+            let validated = ingress.finish(&mut stream, &request::ChatCapability).unwrap();
+            usage_snapshot::prompt_prefix(validated.view(), &mut stream).unwrap()
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_prompt_prefix_names_tools_and_leading_system_messages() {
+    let fixture = Fixture::new(|_| {});
+    let tools = r#""tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]"#;
+    let with = |system: &str, user: &str| {
+        format!(
+            r#"{{"model":"m",{tools},"messages":[{{"role":"system","content":"{system}"}},{{"role":"user","content":"{user}"}}]}}"#
+        )
+    };
+    let base = prefix(&fixture, &with("be brief", "hi"));
+    assert_eq!(base.len(), 16);
+    assert_eq!(
+        prefix(&fixture, &with("be brief", "another turn")),
+        base,
+        "the conversation is not part of it"
+    );
+    assert_ne!(prefix(&fixture, &with("be long", "hi")), base);
+    assert_ne!(
+        prefix(
+            &fixture,
+            r#"{"model":"m","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#
+        ),
+        base,
+        "the tools are part of it"
+    );
+    assert_eq!(
+        prefix(&fixture, r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#),
+        ""
+    );
+}

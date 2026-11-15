@@ -15,6 +15,8 @@ use ck_core::format::Format;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Kind, Res};
 
+use super::usage_snapshot::{CanonicalUsage, ResponseFacts};
+
 /// Go `usage.TokenAccountingQuality`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Quality {
@@ -49,6 +51,67 @@ pub struct Detail {
     pub total: i64,
     pub breakdown: Option<Breakdown>,
     pub response_service_tier: String,
+    pub unreported: Unreported,
+}
+
+/// Counts an attempt's canonical usage did not report (`docs/EXECUTION-CONTRACT.md` §8):
+/// the queued record omits them instead of writing zero. The legacy per-protocol parsers
+/// report every count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Unreported {
+    pub input: bool,
+    pub output: bool,
+    pub reasoning: bool,
+    pub cache_read: bool,
+    pub cache_creation: bool,
+    pub total: bool,
+}
+
+impl Detail {
+    /// The record of an attempt's canonical usage. Canonical counts are inclusive, cache
+    /// reads and writes inside input and reasoning inside output, so the breakdown is Go's
+    /// subset one whatever the provider.
+    pub fn canonical(usage: &CanonicalUsage, facts: &ResponseFacts) -> Self {
+        let count = |n: Option<u64>| n.map_or(0, |n| i64::try_from(n).unwrap_or(i64::MAX));
+        let (input, output, total) = (
+            count(usage.input_tokens),
+            count(usage.output_tokens),
+            count(usage.total_tokens),
+        );
+        let (cache_read, cache_write, reasoning) = (
+            count(usage.cache_read_tokens),
+            count(usage.cache_write_tokens),
+            count(usage.reasoning_tokens),
+        );
+        // ponytail: an unreported cache or reasoning count enters the breakdown as none, as
+        // Go's accounting did; the stored counts keep it absent.
+        let breakdown = if usage.input_tokens.is_some() && usage.output_tokens.is_some() {
+            subset(input, cache_read, cache_write, output, reasoning, total)
+        } else {
+            unclassified(total)
+        };
+        Self {
+            input,
+            output,
+            reasoning,
+            cached: cache_read,
+            cache_read,
+            cache_creation: cache_write,
+            cache_creation_5m: usage.cache_write_5m_tokens.map(|n| count(Some(n))),
+            cache_creation_1h: usage.cache_write_1h_tokens.map(|n| count(Some(n))),
+            total,
+            breakdown: Some(breakdown),
+            response_service_tier: facts.service_tier.clone().unwrap_or_default(),
+            unreported: Unreported {
+                input: usage.input_tokens.is_none(),
+                output: usage.output_tokens.is_none(),
+                reasoning: usage.reasoning_tokens.is_none(),
+                cache_read: usage.cache_read_tokens.is_none(),
+                cache_creation: usage.cache_write_tokens.is_none(),
+                total: usage.total_tokens.is_none(),
+            },
+        }
+    }
 }
 
 /// Go `nonNegativeSum`.
@@ -782,6 +845,10 @@ fn parse_interactions_stream(line: &[u8]) -> Option<Detail> {
 }
 
 /// The buffered-response parser for a format (Go's executor for that format).
+// Q1 (temporary): the per-protocol parsers and `StreamUsage` serve executors that still
+// report through `UsageSink::response_*` and dispatch's `Tracker::body`/`event`. Each
+// provider unit (P1–P9) removes its executor's calls and D2 removes dispatch's; the last
+// of them deletes these parsers.
 pub fn parse_body(format: Format, body: &[u8]) -> Detail {
     match format {
         Format::Claude => parse_claude(body),
@@ -1476,21 +1543,32 @@ pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
     w.str("resolved_client_ip", &client.resolved_client_ip);
     w.str("x_forwarded_for", &client.x_forwarded_for);
     w.str("user_agent", &client.user_agent);
+    let unreported = detail.unreported;
     w.object("tokens", |t| {
-        t.int("input_tokens", detail.input);
-        t.int("output_tokens", detail.output);
-        t.int("reasoning_tokens", detail.reasoning);
-        t.int("cached_tokens", detail.cached);
-        t.int("cache_read_tokens", detail.cache_read);
-        t.bool("cache_read_tokens_present", true);
-        t.int("cache_creation_tokens", detail.cache_creation);
+        for (name, value, absent) in [
+            ("input_tokens", detail.input, unreported.input),
+            ("output_tokens", detail.output, unreported.output),
+            ("reasoning_tokens", detail.reasoning, unreported.reasoning),
+            ("cached_tokens", detail.cached, unreported.cache_read),
+            ("cache_read_tokens", detail.cache_read, unreported.cache_read),
+        ] {
+            if !absent {
+                t.int(name, value);
+            }
+        }
+        t.bool("cache_read_tokens_present", !unreported.cache_read);
+        if !unreported.cache_creation {
+            t.int("cache_creation_tokens", detail.cache_creation);
+        }
         if let Some(n) = detail.cache_creation_5m {
             t.int("cache_creation_5m_tokens", n);
         }
         if let Some(n) = detail.cache_creation_1h {
             t.int("cache_creation_1h_tokens", n);
         }
-        t.int("total_tokens", detail.total);
+        if !unreported.total {
+            t.int("total_tokens", detail.total);
+        }
     });
     w.bool("failed", record.failed);
     if let Some(observed) = record.usage_observed {
@@ -1646,6 +1724,8 @@ impl Facts {
 // ponytail: Chat Completions, Antigravity and Interactions bodies get none (their system
 // prompt is a message or sits in an envelope); add a lookup when a client of theirs
 // needs one.
+// Q1 (temporary): D2 switches dispatch to `usage_snapshot::prompt_prefix` over the request
+// view and deletes this.
 pub(crate) fn prompt_prefix(format: Format, body: &[u8]) -> String {
     use sha2::Digest;
     let system: &[&[u8]] = match format {
@@ -2089,6 +2169,7 @@ impl Tracker {
 
     /// The buffered client-format body (or the joined events of a stream the client
     /// did not ask to stream).
+    // Q1 (temporary): D2 removes `body` and `event` with dispatch's byte-level accounting.
     pub fn body(&mut self, body: &[u8]) {
         if body.trim_ascii_start().first() == Some(&b'{') {
             self.body = Some(parse_body(self.facts.format, body));
@@ -2114,6 +2195,21 @@ impl Tracker {
         }
         self.stream.line(self.facts.format, line);
         self.model.observe(line, &self.observer.provider);
+    }
+
+    /// The attempt's canonical usage and response facts (`usage_snapshot::read`); they
+    /// replace what the legacy parsers saw. A missing snapshot leaves the usage unknown.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Q1 (temporary): D2's dispatch is the first caller")
+    )]
+    pub fn canonical(&mut self, usage: Option<&CanonicalUsage>, facts: &ResponseFacts) {
+        if let Some(usage) = usage {
+            self.body = Some(Detail::canonical(usage, facts));
+        }
+        if let Some(model) = &facts.model {
+            self.model.set(model);
+        }
     }
 
     pub fn succeed(mut self) {
@@ -2392,6 +2488,52 @@ mod tests {
     /// rejection is Go's `reporter.PublishFailure(err)` after usage was observed (no
     /// tokens, response model kept, and the later failure the server sees changes
     /// nothing); `discard` is Go returning before it created a reporter (no record).
+    #[test]
+    fn canonical_usage_is_the_last_snapshot_and_keeps_absent_counts_absent() {
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAI,
+            Format::OpenAI,
+            "m",
+            b"{}",
+            true,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("openai-compatibility"), "m");
+        let response = ResponseFacts {
+            model: Some("m-served".into()),
+            service_tier: Some("flex".into()),
+        };
+        let early = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(4),
+            ..CanonicalUsage::default()
+        };
+        tracker.canonical(Some(&early), &response);
+        let last = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            final_snapshot: true,
+            ..CanonicalUsage::default()
+        };
+        tracker.canonical(Some(&last), &response);
+        tracker.succeed();
+        let raw = rt.usage_queue().pop_oldest(10);
+        assert_eq!(raw.len(), 1, "one record per attempt");
+        let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+        // The last snapshot replaces the first; nothing is summed, and its absent counts
+        // (cache, reasoning, total) are not written as zero.
+        assert_eq!(
+            record["tokens"],
+            serde_json::json!({"input_tokens": 10, "output_tokens": 20, "cache_read_tokens_present": false})
+        );
+        assert_eq!(record["token_breakdown"]["total_tokens"], 30);
+        assert_eq!(record["response_model"], "m-served");
+        assert_eq!(record["response_service_tier"], "flex");
+    }
+
     #[test]
     fn claude_executor_outcomes_reach_the_queue() {
         use ck_core::exec::{ExecError, FailureScope};
