@@ -216,7 +216,7 @@ pub(super) fn publish_record(
     output: &mut Writer,
     kind: u32,
     correlation: u32,
-    aligned: bool,
+    custom_data: bool,
     encode: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
 ) -> Result<Record> {
     let mut count = Encoder {
@@ -228,10 +228,10 @@ pub(super) fn publish_record(
     };
     encode(&mut count)?;
     let length = count.length;
-    if aligned && length > ck_stream::FRAME_BYTES {
+    if custom_data && length > 50_000 {
         return Err(Error::EventTooLarge);
     }
-    let mut reservation = output.begin_record(length, aligned, kind, correlation)?;
+    let mut reservation = output.begin_record(length, false, kind, correlation)?;
     {
         let mut encoder = Encoder {
             reservation: Some(&mut reservation),

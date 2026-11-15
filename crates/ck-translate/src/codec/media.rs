@@ -465,6 +465,10 @@ impl Publisher {
         })
     }
 
+    pub(crate) fn capacity(&self, emitter: &Emitter) -> Result<usize> {
+        emitter.data_capacity(self.scope, self.index, self.offset)
+    }
+
     pub(crate) fn append(&mut self, bytes: &[u8], emitter: &mut Emitter, owner: &mut Writer) -> Result<()> {
         use base64::Engine;
         if self.ended {
@@ -473,7 +477,7 @@ impl Publisher {
         if bytes.is_empty() {
             return Ok(());
         }
-        if bytes.len() > emitter.data_capacity(self.scope, self.index, self.offset)? {
+        if bytes.len() > self.capacity(emitter)? {
             return Err(Error::EventTooLarge);
         }
         let mut encoded = [0; 49_152];
@@ -508,7 +512,7 @@ impl Publisher {
     ) -> Result<()> {
         let mut chunk = [0; 36_864];
         let mut len = 0;
-        let mut ceiling = emitter.data_capacity(self.scope, self.index, self.offset)?;
+        let mut ceiling = self.capacity(emitter)?;
         decode(&mut |bytes| {
             for &byte in bytes {
                 chunk[len] = byte;
@@ -516,7 +520,7 @@ impl Publisher {
                 if len == ceiling {
                     self.append(&chunk[..len], emitter, owner)?;
                     len = 0;
-                    ceiling = emitter.data_capacity(self.scope, self.index, self.offset)?;
+                    ceiling = self.capacity(emitter)?;
                 }
             }
             Ok(())

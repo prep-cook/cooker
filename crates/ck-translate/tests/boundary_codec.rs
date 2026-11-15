@@ -646,7 +646,7 @@ fn canonical_request_end_requires_its_own_validated_document() {
 }
 
 #[test]
-fn canonical_media_data_fits_one_frame_and_failed_output_is_not_published() {
+fn canonical_media_data_obeys_chunk_ceiling_and_failed_output_is_not_published() {
     use ck_translate::codec::event::{Direction, Emitter, Kind, LocalId, Scope};
     let mut mapped = Mapped::new();
     let output = &mut mapped.writer;
@@ -674,7 +674,7 @@ fn canonical_media_data_fits_one_frame_and_failed_output_is_not_published() {
         )
         .unwrap();
     let before = output.committed();
-    let too_large = "A".repeat(ck_stream::FRAME_BYTES);
+    let too_large = "A".repeat(50_000);
     assert!(matches!(
         emitter.emit(
             output,
@@ -702,8 +702,8 @@ fn canonical_media_data_fits_one_frame_and_failed_output_is_not_published() {
             |_| Ok(()),
         )
         .unwrap();
-    assert_eq!(record.start.offset, 0);
-    assert!(record.len() <= ck_stream::FRAME_BYTES as u64);
+    assert_eq!(record.start, before);
+    assert!(record.len() <= 50_000);
     let bytes = mapped.output(&mapped.writer);
     let text = std::str::from_utf8(&bytes).unwrap();
     let value: serde_json::Value = serde_json::from_str(

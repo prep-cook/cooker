@@ -337,9 +337,7 @@ impl Emitter {
                 &|_| Ok(()),
             )
         })?;
-        let available = ck_stream::FRAME_BYTES
-            .checked_sub(framing)
-            .ok_or(Error::EventTooLarge)?;
+        let available = 50_000usize.checked_sub(framing).ok_or(Error::EventTooLarge)?;
         let decoded = (available / 4 * 3).min(36_864);
         if decoded == 0 {
             return Err(Error::EventTooLarge);
