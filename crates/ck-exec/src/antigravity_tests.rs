@@ -285,6 +285,33 @@ async fn a_split_payload_reports_its_served_model() {
     );
 }
 
+/// Settled 65 (docs/OPEN-QUESTIONS.md): in these scenarios a Claude client receives the Claude
+/// model's signature as the upstream sent it (`RULED_SIGNATURE.1`), where Go hands it the
+/// single-layer decoding (`.0`). They expect Go's client bytes with that value restored; every
+/// other byte still comes from Go.
+const RULED: &[&str] = &[
+    "claude_model_execute",
+    "claude_client_claude_model_empty_signature",
+    "claude_stream_claude_model",
+    "credits_claude_execute",
+];
+const RULED_SIGNATURE: (&str, &str) = (
+    "EqsCkwIBGAIiQHfake-claude-signature-for-antigravity-tests",
+    "RXFzQ2t3SUJHQUlpUUhmYWtlLWNsYXVkZS1zaWduYXR1cmUtZm9yLWFudGlncmF2aXR5LXRlc3Rz",
+);
+
+/// Go's client bytes for scenario `name`, with Settled 65 applied.
+fn ruled(name: &str, go: &str) -> String {
+    if !RULED.contains(&name) || go == "<none>" || go.is_empty() {
+        return go.to_owned();
+    }
+    assert!(
+        go.contains(RULED_SIGNATURE.0),
+        "{name}: no longer differs from Go; remove it from RULED"
+    );
+    go.replace(RULED_SIGNATURE.0, RULED_SIGNATURE.1)
+}
+
 /// Replays `scenarios` in order on one executor; returns how many ran.
 async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
     // Keep the shared cooldown fixed while unrelated fixture requests run.
@@ -374,14 +401,14 @@ async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
             name,
             "output",
             &normalize(output.as_deref().unwrap_or("<none>")),
-            &normalize(s["output"].as_str().unwrap_or("<none>")),
+            &normalize(&ruled(name, s["output"].as_str().unwrap_or("<none>"))),
         );
         let want_stream = client_bytes(client, alt, s["chunks"].as_array().map_or(&[][..], Vec::as_slice));
         assert_same(
             name,
             "stream",
             &normalize(&String::from_utf8_lossy(&streamed)),
-            &normalize(&String::from_utf8_lossy(&want_stream)),
+            &normalize(&ruled(name, &String::from_utf8_lossy(&want_stream))),
         );
         let summary =
             compaction::summary_text(s["upstream"]["body"].as_str().unwrap_or_default().as_bytes()).unwrap_or_default();

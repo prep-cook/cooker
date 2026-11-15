@@ -26,6 +26,7 @@ pub mod antigravity;
 pub mod antigravity_auth;
 mod antigravity_compaction;
 pub mod antigravity_credits;
+mod antigravity_exec;
 mod antigravity_models;
 mod antigravity_replay;
 mod antigravity_request;
@@ -201,6 +202,7 @@ impl Executors {
             meta::PROVIDER => Some(pipeline::destination(&self.devices.meta, attempt)),
             p if vertex::handles(p) => vertex_exec::destination(&self.google.vertex, attempt),
             p if kimi::PROVIDERS.contains(&p) => Some(pipeline::destination(&self.devices.kimi, attempt)),
+            antigravity::PROVIDER => Some(pipeline::destination(&self.google.antigravity, attempt)),
             _ => None,
         }
     }
@@ -223,6 +225,7 @@ impl Executors {
             meta::PROVIDER => pipeline::fence(&self.devices.meta, attempt, ingress, request),
             p if vertex::handles(p) => pipeline::fence(&self.google.vertex, attempt, ingress, request),
             p if kimi::PROVIDERS.contains(&p) => pipeline::fence(&self.devices.kimi, attempt, ingress, request),
+            antigravity::PROVIDER => pipeline::fence(&self.google.antigravity, attempt, ingress, request),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -242,6 +245,7 @@ impl Executors {
             meta::PROVIDER => pipeline::refence(&self.devices.meta, attempt, view),
             p if vertex::handles(p) => pipeline::refence(&self.google.vertex, attempt, view),
             p if kimi::PROVIDERS.contains(&p) => pipeline::refence(&self.devices.kimi, attempt, view),
+            antigravity::PROVIDER => pipeline::refence(&self.google.antigravity, attempt, view),
             _ => Err(ck_translate::codec::Error::Destination),
         }
     }
@@ -269,6 +273,9 @@ impl Executors {
             p if vertex::handles(p) => pipeline::start(&self.google.vertex, attempt, request, upload, response).await,
             p if kimi::PROVIDERS.contains(&p) => {
                 pipeline::start(&self.devices.kimi, attempt, request, upload, response).await
+            }
+            antigravity::PROVIDER => {
+                pipeline::start(&self.google.antigravity, attempt, request, upload, response).await
             }
             provider => {
                 response.finish(ck_stream::Terminal::Gone);
