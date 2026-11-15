@@ -8,10 +8,7 @@
 //! of that session gets the items its input lacks inserted before the matching turn.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
-use ck_core::exec::ExecRequest;
 use ck_core::format::Format;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Kind, Res};
@@ -20,13 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::meta_codex::go_trim_space;
 use crate::replay::{claude_code_session, header_session, payload_session};
-
-/// `XAIReasoningReplayCacheTTL`.
-const TTL: Duration = Duration::from_secs(3600);
-/// `XAIReasoningReplayCacheMaxEntries`.
-const MAX_ENTRIES: usize = 10240;
-/// `XAIReasoningReplayCacheEvictBatchSize`.
-const EVICT_BATCH: usize = 128;
+use crate::xai_shape::Inbound;
 
 /// `xaiReasoningReplayScope`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -36,77 +27,17 @@ pub(crate) struct ReplayScope {
 }
 
 impl ReplayScope {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         !self.model_name.trim().is_empty() && !self.session_key.trim().is_empty()
     }
 }
 
-struct Entry {
-    items: Vec<Vec<u8>>,
-    timestamp: Instant,
-}
+pub(crate) use crate::xai_replay_store::{Reservation, Store};
 
-/// The in-process replay cache (Go's package-level map).
-// ponytail: Go also purges expired entries from a background ticker; here an expired
-// entry is dropped when read and capacity eviction bounds memory.
-#[derive(Default)]
-pub(crate) struct Store {
-    entries: Mutex<HashMap<String, Entry>>,
-}
-
-/// `xaiReasoningReplayCacheKey`.
-fn cache_key(scope: &ReplayScope) -> Option<String> {
-    let (model, session) = (scope.model_name.trim(), scope.session_key.trim());
-    (!model.is_empty() && !session.is_empty()).then(|| format!("xai-reasoning-replay\0{model}\0{session}"))
-}
-
-impl Store {
-    /// `GetXAIReasoningReplayItemsRequired`: a hit refreshes the entry's TTL.
-    fn get(&self, scope: &ReplayScope) -> Option<Vec<Vec<u8>>> {
-        let key = cache_key(scope)?;
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let entry = entries.get_mut(&key)?;
-        if now.duration_since(entry.timestamp) > TTL {
-            entries.remove(&key);
-            return None;
-        }
-        entry.timestamp = now;
-        Some(entry.items.clone())
-    }
-
-    /// `StoreXAIReasoningReplayItems`: false when the items hold no replay anchor.
-    fn store(&self, scope: &ReplayScope, items: &[Vec<u8>]) -> bool {
-        let Some(key) = cache_key(scope) else {
-            return false;
-        };
-        let Some(normalized) = normalize_items(items) else {
-            return false;
-        };
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.insert(
-            key,
-            Entry {
-                items: normalized,
-                timestamp: Instant::now(),
-            },
-        );
-        if entries.len() > MAX_ENTRIES {
-            let mut oldest: Vec<(Instant, String)> = entries.iter().map(|(k, e)| (e.timestamp, k.clone())).collect();
-            oldest.sort();
-            for (_, k) in oldest.into_iter().take(EVICT_BATCH) {
-                entries.remove(&k);
-            }
-        }
-        true
-    }
-
-    /// `DeleteXAIReasoningReplayItemRequired`.
-    fn delete(&self, scope: &ReplayScope) {
-        if let Some(key) = cache_key(scope) {
-            self.entries.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
-        }
-    }
+/// `StoreXAIReasoningReplayItems`: false when the items hold no replay anchor or exceed an
+/// entry.
+fn store(store: &Store, scope: &ReplayScope, items: &[Vec<u8>], held: Reservation<'_>) -> bool {
+    normalize_items(items).is_some_and(|normalized| store.put(scope, normalized, held))
 }
 
 /// `strings.TrimSpace(r.String())`.
@@ -116,54 +47,38 @@ fn text(r: &Res<'_>) -> String {
 
 /// `xaiReasoningReplayScopeFromRequest`: Claude and OpenAI Responses clients only, and
 /// not for a downstream WebSocket turn that continues upstream state.
-pub(crate) fn scope(req: &ExecRequest, body: &[u8], downstream_websocket: bool) -> ReplayScope {
-    if !matches!(req.source_format, Format::Claude | Format::OpenAIResponse) {
+pub(crate) fn scope(inbound: &Inbound<'_>, body: &[u8]) -> ReplayScope {
+    if !matches!(inbound.source, Format::Claude | Format::OpenAIResponse) {
         return ReplayScope::default();
     }
-    if downstream_websocket && !text(&gj::get(&req.body, "previous_response_id")).is_empty() {
+    if inbound.downstream_websocket && !text(&gj::get(inbound.payload, "previous_response_id")).is_empty() {
         return ReplayScope::default();
     }
+    // The execution contract's route names its credential and keys sessions exactly.
+    let session_key = match inbound.credential {
+        Some(_) => crate::xai_replay_key::key(inbound, body),
+        None => inbound.isolate(&session_key(inbound, body)),
+    };
     ReplayScope {
-        model_name: parse_suffix(&req.model).model_name,
-        session_key: isolate(req, &session_key(req, body)),
+        model_name: parse_suffix(inbound.model).model_name,
+        session_key,
     }
 }
 
 /// `codexReasoningReplaySessionKey` for the sources replay serves.
-fn session_key(req: &ExecRequest, body: &[u8]) -> String {
-    if req.source_format == Format::Claude
-        && let Some(key) = claude_code_session(&req.body, &req.headers)
+fn session_key(inbound: &Inbound<'_>, body: &[u8]) -> String {
+    if inbound.source == Format::Claude
+        && let Some(key) = claude_code_session(inbound.payload, inbound.headers)
     {
         return key;
     }
-    if let Some(execution) = req
-        .execution_session
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(execution) = inbound.execution_session.map(str::trim).filter(|s| !s.is_empty()) {
         return format!("execution:{execution}");
     }
     payload_session(body)
-        .or_else(|| payload_session(&req.body))
-        .or_else(|| header_session(&req.headers))
+        .or_else(|| payload_session(inbound.payload))
+        .or_else(|| header_session(inbound.headers))
         .unwrap_or_default()
-}
-
-/// `xaiReasoningReplayIsolateSessionKey`: client-controlled keys are namespaced by the
-/// caller's API key, and disabled without one.
-fn isolate(req: &ExecRequest, key: &str) -> String {
-    let key = key.trim();
-    if key.is_empty() || key.starts_with("execution:") {
-        return key.to_owned();
-    }
-    let api_key = req.caller.principal.trim();
-    if api_key.is_empty() {
-        return String::new();
-    }
-    let digest = Sha256::digest(api_key.as_bytes());
-    let prefix: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    format!("caller:{prefix}:{key}")
 }
 
 /// `applyXAIReasoningReplayCacheRequired` after the scope is known.
@@ -194,15 +109,24 @@ pub(crate) fn cache_completed(store: &Store, scope: &ReplayScope, completed: &[u
     let items: Vec<Vec<u8>> = output
         .array()
         .iter()
-        .filter(|item| {
-            matches!(
-                text(&item.get("type")).as_str(),
-                "reasoning" | "message" | "function_call" | "custom_tool_call"
-            )
-        })
+        .filter(|item| kept(item))
         .map(|item| item.raw().to_vec())
         .collect();
-    if !store.store(scope, &items) {
+    cache_items(store, scope, &items, store.reserve());
+}
+
+/// Whether replay keeps an output item: reasoning, assistant messages and tool calls.
+pub(crate) fn kept(item: &Res<'_>) -> bool {
+    matches!(
+        text(&item.get("type")).as_str(),
+        "reasoning" | "message" | "function_call" | "custom_tool_call"
+    )
+}
+
+/// Caches the kept output `items` of a completed turn, built under `held`; a turn without
+/// replayable state clears the session.
+pub(crate) fn cache_items(store: &Store, scope: &ReplayScope, items: &[Vec<u8>], held: Reservation<'_>) {
+    if scope.valid() && !self::store(store, scope, items, held) {
         store.delete(scope);
     }
 }
@@ -234,7 +158,7 @@ fn normalize_items(items: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
     anchor.then_some(normalized)
 }
 
-fn normalize_item(item: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn normalize_item(item: &[u8]) -> Option<Vec<u8>> {
     let r = gj::parse(item);
     match text(&r.get("type")).as_str() {
         "reasoning" => {
