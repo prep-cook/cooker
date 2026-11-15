@@ -36,14 +36,12 @@ pub fn validate_config(
         return Ok(config);
     };
     let capability = detect_capability(info);
-    let has_levels = matches!(capability, Capability::LevelOnly | Capability::Hybrid);
     let family_mismatch = info.is_some_and(|i| {
         let kind = i.kind.trim().go_lower();
         !kind.is_empty()
             && ((!from.is_empty() && !is_same_provider_family(&from, &kind))
                 || (!to.is_empty() && !is_same_provider_family(&to, &kind)))
     });
-    let allow_clamp_unsupported = has_levels && (!is_same_provider_family(&from, &to) || family_mismatch);
     let strict_budget = !from_suffix && !from.is_empty() && is_same_provider_family(&from, &to) && !family_mismatch;
     let mut budget_from_level = false;
 
@@ -82,20 +80,13 @@ pub fn validate_config(
     }
 
     if !support.levels.is_empty() && config.mode == Mode::Level && !is_level_supported(&config.level, &support.levels) {
-        if allow_clamp_unsupported {
-            config.level = clamp_level(&config.level, info);
-        }
-        if !is_level_supported(&config.level, &support.levels) {
-            let valid: Vec<String> = support.levels.iter().map(|l| l.trim().go_lower()).collect();
+        if level_index(&config.level).is_none() {
             return Err(Error::new(
-                ErrorCode::LevelNotSupported,
-                format!(
-                    "level {} not supported, valid levels: {}",
-                    crate::gostr::quote(config.level.go_lower()),
-                    valid.join(", ")
-                ),
+                ErrorCode::UnknownLevel,
+                format!("unknown level: {}", config.level),
             ));
         }
+        config.level = clamp_level(&config.level, info);
     }
 
     if strict_budget && config.mode == Mode::Budget && !budget_from_level {

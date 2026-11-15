@@ -344,6 +344,8 @@ service-name ports such as `:http` are not accepted.
 |---|---|
 | `catalog`, `codex-catalog`, `devin-catalog` | Where the model catalog (`models.json`), the Codex client catalog and the Devin catalog come from: an absolute local path or an `http`/`https` URL. Empty keeps the default. Any other value, such as a relative path, `~/models.json` or a `file://` URL, refuses the config, as in CLIProxyAPI v8.0.35. cooker checks and keeps these settings but does not use them yet; see [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md). |
 
+When a model lists supported reasoning levels, an unsupported standard level snaps to the nearest supported level in this order: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Ties choose the lower level. Requests below or above the supported range use its lowest or highest level. This applies within a provider family and across families; `none`, `auto`, budgets and models without a level list keep their existing handling. Unknown level strings are not snapped.
+
 ## worker-threads
 
 `worker-threads: 4` at the top level sets how many threads serve requests. Without it, cooker uses the smaller of the CPU count and two, which is plenty for one person: a coding-agent request with a 300 KB prompt costs about 20 to 30 ms of CPU (a small chat request about 1 ms), and most of a request's time is spent waiting on the provider. Each extra thread can keep its own pool of freed memory, so more threads mean a larger resident size. The `TOKIO_WORKER_THREADS` environment variable overrides it.
