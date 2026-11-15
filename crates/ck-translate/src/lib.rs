@@ -117,6 +117,7 @@ pub mod search;
 pub mod sse;
 pub mod stream;
 mod thinking;
+pub mod video;
 
 #[doc(hidden)]
 pub use codex_responses::go_stream_with_bridge as codex_responses_go_stream_with_bridge;
