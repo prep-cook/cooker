@@ -80,7 +80,7 @@ pub(super) fn capture(doc: &mut Document, owner: &mut Writer, node: usize) -> Re
     if doc.name_is(name, "cache_control")?
         && matches!(
             context(doc, parent)?,
-            Context::Message | Context::Part | Context::Tool | Context::Function | Context::Custom
+            Context::Root | Context::Message | Context::Part | Context::Tool | Context::Function | Context::Custom
         )
     {
         return super::request_controls::capture_cache(doc, owner, node).map(Some);

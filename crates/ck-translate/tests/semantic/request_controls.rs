@@ -141,7 +141,34 @@ pub(super) fn canonical(input: &serde_json::Value, policy: &impl Capability) -> 
 }
 
 fn output(mapped: &mut Mapped, doc: &Document, policy: &impl Capability) -> serde_json::Value {
-    use super::RequestEgress;
+    let egress = super::Egress {
+        destination: policy.destination(),
+        upstream_stream: false,
+    };
+    encoded(mapped, doc, policy, &egress)
+}
+
+/// The Anthropic upstream body for a canonical document.
+fn anthropic(mapped: &mut Mapped, doc: &Document) -> serde_json::Value {
+    use ck_translate::anthropic::request::{AnthropicCapability, Egress};
+    let policy = AnthropicCapability {
+        default_max_tokens: Some(16),
+        ..Default::default()
+    };
+    let egress = Egress {
+        destination: "anthropic",
+        upstream_stream: false,
+        default_max_tokens: Some(16),
+    };
+    encoded(mapped, doc, &policy, &egress)
+}
+
+fn encoded(
+    mapped: &mut Mapped,
+    doc: &Document,
+    policy: &impl Capability,
+    egress: &impl super::RequestEgress,
+) -> serde_json::Value {
     let media = Registry::new(&mut mapped.writer).unwrap();
     let ready = RequestFence::default()
         .end(
@@ -153,12 +180,7 @@ fn output(mapped: &mut Mapped, doc: &Document, policy: &impl Capability) -> serd
             policy,
         )
         .unwrap();
-    let lease = super::Egress {
-        destination: policy.destination(),
-        upstream_stream: false,
-    }
-    .encode(&ready, &mut mapped.writer)
-    .unwrap();
+    let lease = egress.encode(&ready, &mut mapped.writer).unwrap();
     let raw = super::bytes(&lease);
     let mut source = codec::source::Source::new(&mut mapped.writer).unwrap();
     source.push_bytes(&mut mapped.writer, &raw).unwrap();
@@ -166,29 +188,49 @@ fn output(mapped: &mut Mapped, doc: &Document, policy: &impl Capability) -> serd
     serde_json::from_slice(&raw).unwrap()
 }
 
+/// The Anthropic isolated map entries of `doc` (owner ruling Q3, 2026-11-16).
+fn cache_entries(doc: &Document) -> Vec<usize> {
+    let list = codec::provenance::isolated(doc, "anthropic", "cache_control")
+        .unwrap()
+        .expect("Anthropic isolated cache list");
+    doc.children(list).unwrap().collect()
+}
+
 #[test]
-fn exact_cache_breakpoints_round_trip_and_normalized_mutations_win() {
-    let input = json!({"model":"m","messages":[{"role":"user","cache_control":{"type":"ephemeral","ttl":"1h"},"content":[{"type":"text","text":"a","cache_control":{"type":"ephemeral","ttl":"5m"}},{"type":"text","text":"b","cache_control":null}]}],"tools":[{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"f","cache_control":{"type":"ephemeral","ttl":"1h"}}}]});
+fn cache_breakpoints_reach_only_anthropic_and_normalized_mutations_win() {
+    let input = json!({"model":"m","messages":[{"role":"user","cache_control":{"type":"ephemeral","ttl":"1h"},"content":[{"type":"text","text":"a","cache_control":{"type":"ephemeral","ttl":"5m"}},{"type":"text","text":"b","cache_control":null}]}],"tools":[{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"f","parameters":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}}]});
     let (mut mapped, mut doc, _) = canonical(&input, &ChatCapability);
     let encoded = output(&mut mapped, &doc, &ChatCapability);
-    assert_eq!(encoded["messages"], input["messages"]);
-    assert_eq!(encoded["tools"], input["tools"]);
-    let x = doc.required(doc.root(), "x_ck").unwrap();
-    let cache = doc.required(x, "cache_control").unwrap();
-    let entries: Vec<_> = doc.children(cache).unwrap().collect();
+    assert_eq!(
+        encoded["messages"],
+        json!([{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}])
+    );
+    assert_eq!(
+        encoded["tools"],
+        json!([{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}])
+    );
+    let upstream = anthropic(&mut mapped, &doc);
+    assert_eq!(upstream["messages"][0]["cache_control"]["ttl"], "1h");
+    assert_eq!(upstream["messages"][0]["content"][0]["cache_control"]["ttl"], "5m");
+    assert_eq!(
+        upstream["messages"][0]["content"][1]["cache_control"],
+        serde_json::Value::Null
+    );
+    assert_eq!(upstream["tools"][0]["cache_control"], json!({"type":"ephemeral"}));
+    let entries = cache_entries(&doc);
     assert_eq!(entries.len(), 5);
     for entry in entries {
         let pointer = doc.required(entry, "pointer").unwrap();
         if doc.string_is(pointer, "/messages/0/cache_control").unwrap() {
-            let value = doc.required(entry, "value").unwrap();
-            doc.set(value, "ttl", Value::Text("5m")).unwrap();
-        } else if doc.string_is(pointer, "/messages/0/content/0/cache_control").unwrap() {
             doc.remove(entry, "value").unwrap();
+        } else if doc.string_is(pointer, "/messages/0/content/0/cache_control").unwrap() {
+            let value = doc.required(entry, "value").unwrap();
+            doc.set(value, "ttl", Value::Text("1h")).unwrap();
         }
     }
-    let encoded = output(&mut mapped, &doc, &ChatCapability);
-    assert_eq!(encoded["messages"][0]["cache_control"]["ttl"], "5m");
-    assert!(encoded["messages"][0]["content"][0].get("cache_control").is_none());
+    let upstream = anthropic(&mut mapped, &doc);
+    assert!(upstream["messages"][0].get("cache_control").is_none(), "{upstream}");
+    assert_eq!(upstream["messages"][0]["content"][0]["cache_control"]["ttl"], "1h");
 }
 
 #[test]
@@ -295,8 +337,7 @@ fn late_cache_policy_rejection_never_publishes_success() {
         }
         fn validate(&self, request: RequestView<'_>) -> codec::Result<()> {
             let doc = request.document;
-            let x = doc.required(doc.root(), "x_ck")?;
-            let cache = doc.required(x, "cache_control")?;
+            let cache = codec::provenance::isolated(doc, "anthropic", "cache_control")?.ok_or(codec::Error::Schema)?;
             for entry in doc.children(cache)? {
                 let value = doc.required(entry, "value")?;
                 if doc.string_is(doc.required(value, "ttl")?, "1h")? {
@@ -331,16 +372,14 @@ fn late_cache_policy_rejection_never_publishes_success() {
 fn legacy_cache_pointer_and_custom_text_history_keep_native_spelling() {
     let legacy = json!({"model":"m","messages":[{"role":"user","content":"hi"}],"functions":[{"name":"f","cache_control":{"type":"ephemeral","ttl":"1h"}}]});
     let (mut mapped, doc, _) = canonical(&legacy, &ChatCapability);
-    let x = doc.required(doc.root(), "x_ck").unwrap();
-    let cache = doc.required(x, "cache_control").unwrap();
-    let entry = doc.children(cache).unwrap().next().unwrap();
+    let entry = cache_entries(&doc)[0];
     assert!(
         doc.string_is(doc.required(entry, "pointer").unwrap(), "/functions/0/cache_control")
             .unwrap()
     );
     assert_eq!(
         output(&mut mapped, &doc, &ChatCapability)["functions"],
-        legacy["functions"]
+        json!([{"name":"f"}])
     );
     let input = json!({"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"custom","custom":{"name":"free","namespace":"ns","input":"not JSON {", "extra":null}}]}]});
     let (mut mapped, doc, _) = canonical(&input, &ChatCapability);
@@ -376,24 +415,12 @@ fn reviewed_custom_signatures_require_policy_and_keep_their_carrier() {
 }
 
 #[test]
-fn reviewed_opaque_cache_controls_preserve_mutations_and_deletions() {
+fn opaque_part_cache_control_leaves_the_chat_body() {
     let input = json!({"model":"m","messages":[{"role":"user","content":[{"type":"vendor_part","cache_control":{"type":"ephemeral","ttl":"1h"},"payload":1}]}]});
-    let (mut mapped, mut doc, _) = canonical(&input, &ChatCapability);
+    let (mut mapped, doc, _) = canonical(&input, &ChatCapability);
+    assert_eq!(cache_entries(&doc).len(), 1);
     assert_eq!(
-        output(&mut mapped, &doc, &ChatCapability)["messages"],
-        input["messages"]
+        output(&mut mapped, &doc, &ChatCapability)["messages"][0]["content"][0],
+        json!({"type":"vendor_part","payload":1})
     );
-    let x = doc.required(doc.root(), "x_ck").unwrap();
-    let cache = doc.required(x, "cache_control").unwrap();
-    let entry = doc.children(cache).unwrap().next().unwrap();
-    let value = doc.required(entry, "value").unwrap();
-    doc.set(value, "ttl", Value::Text("5m")).unwrap();
-    assert_eq!(
-        output(&mut mapped, &doc, &ChatCapability)["messages"][0]["content"][0]["cache_control"]["ttl"],
-        "5m"
-    );
-    doc.remove(entry, "value").unwrap();
-    let encoded = output(&mut mapped, &doc, &ChatCapability);
-    assert!(encoded["messages"][0]["content"][0].get("cache_control").is_none());
-    assert_eq!(encoded["messages"][0]["content"][0]["payload"], 1);
 }

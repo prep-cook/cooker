@@ -543,3 +543,109 @@ fn chat_logprobs_are_judged_by_responses() {
     assert_eq!(out["top_logprobs"], 2);
     assert_eq!(out.get("logprobs"), None, "{out}");
 }
+
+fn has_key(value: &Value, key: &str) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(k, v)| k == key || has_key(v, key)),
+        Value::Array(items) => items.iter().any(|v| has_key(v, key)),
+        _ => false,
+    }
+}
+
+/// (source, destination, input, member, restored location and value).
+type IsolationRow<'a> = (P, P, &'a Value, &'a str, Option<(&'a str, Value)>);
+
+/// Owner ruling Q3 (2026-11-16): a provider's own members live in its isolated map. Only that
+/// provider's request egress restores them; every other destination accepts the request and
+/// never sees them. Rows: (source, destination, input, member, restored location and value, or
+/// `None` when the member must appear nowhere in the upstream body).
+#[test]
+fn provider_members_reach_only_their_provider() {
+    let breakpoint = json!({"type":"ephemeral","ttl":"1h"});
+    let an = json!({"model":"claude-x","max_tokens":100,
+        "system":[{"type":"text","text":"s","cache_control":breakpoint}],
+        "messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":breakpoint}]}]});
+    let ch = json!({"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":breakpoint}]}]});
+    let ch_vendor =
+        json!({"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi","vendor_hint":1}]}]});
+    let gm_vendor = json!({"contents":[{"role":"user","parts":[{"text":"hi","partMetadata":{"k":"v"}}]}]});
+    let rs_vendor = json!({"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi","vendor_hint":1}]}]});
+    let ch_root = json!({"model":"m","messages":[{"role":"user","content":"hi"}],"cache_control":breakpoint});
+    let part = "/messages/0/content/0/cache_control";
+    let rows: [IsolationRow; 19] = [
+        (
+            P::Anthropic,
+            P::Anthropic,
+            &an,
+            "cache_control",
+            Some((part, breakpoint.clone())),
+        ),
+        (
+            P::Anthropic,
+            P::Anthropic,
+            &an,
+            "cache_control",
+            Some(("/system/0/cache_control", breakpoint.clone())),
+        ),
+        (P::Anthropic, P::Chat, &an, "cache_control", None),
+        (P::Anthropic, P::Responses, &an, "cache_control", None),
+        (P::Anthropic, P::Gemini, &an, "cache_control", None),
+        (
+            P::Chat,
+            P::Anthropic,
+            &ch,
+            "cache_control",
+            Some((part, breakpoint.clone())),
+        ),
+        (P::Chat, P::Chat, &ch, "cache_control", None),
+        (P::Chat, P::Responses, &ch, "cache_control", None),
+        (P::Chat, P::Gemini, &ch, "cache_control", None),
+        (
+            P::Chat,
+            P::Anthropic,
+            &ch_root,
+            "cache_control",
+            Some(("/cache_control", breakpoint.clone())),
+        ),
+        (P::Chat, P::Chat, &ch_root, "cache_control", None),
+        (
+            P::Chat,
+            P::Chat,
+            &ch_vendor,
+            "vendor_hint",
+            Some(("/messages/0/content/0/vendor_hint", json!(1))),
+        ),
+        (P::Chat, P::Anthropic, &ch_vendor, "vendor_hint", None),
+        (
+            P::Gemini,
+            P::Gemini,
+            &gm_vendor,
+            "partMetadata",
+            Some(("/contents/0/parts/0/partMetadata", json!({"k":"v"}))),
+        ),
+        (P::Gemini, P::Anthropic, &gm_vendor, "partMetadata", None),
+        (P::Gemini, P::Chat, &gm_vendor, "partMetadata", None),
+        (
+            P::Responses,
+            P::Responses,
+            &rs_vendor,
+            "vendor_hint",
+            Some(("/input/0/content/0/vendor_hint", json!(1))),
+        ),
+        (P::Responses, P::Anthropic, &rs_vendor, "vendor_hint", None),
+        (P::Responses, P::Gemini, &rs_vendor, "vendor_hint", None),
+    ];
+    let mut failures = Vec::new();
+    for (from, to, input, member, expected) in rows {
+        let row = format!("{from:?}->{to:?} {member}");
+        match (translate(from, to, input), expected) {
+            (Ok(out), Some((pointer, value))) if out.pointer(pointer) != Some(&value) => {
+                failures.push(format!("{row}: {pointer} missing in {out}"));
+            }
+            (Ok(out), None) if has_key(&out, member) => failures.push(format!("{row}: leaked into {out}")),
+            (Ok(_), _) => {}
+            (Err(error), _) => failures.push(format!("{row}: refused with {error:?}")),
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

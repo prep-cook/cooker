@@ -155,14 +155,8 @@ fn bindings(doc: &mut Document, owner: &mut Writer) -> Result<()> {
     let lease = encode::scratch(owner, |e| {
         e.bytes(b"[")?;
         let mut first = true;
-        for list in codec::provenance::BOUND_LISTS {
-            for entry in doc
-                .member(x, list)?
-                .map(|l| doc.children(l))
-                .transpose()?
-                .into_iter()
-                .flatten()
-            {
+        for list in codec::provenance::bound_lists(doc, x)?.into_iter().flatten() {
+            for entry in doc.children(list)? {
                 if let Some((parent, _)) = doc.origin(entry)? {
                     if !first {
                         e.bytes(b",")?;
@@ -175,10 +169,7 @@ fn bindings(doc: &mut Document, owner: &mut Writer) -> Result<()> {
         e.bytes(b"]")
     })?;
     let pointers = doc.import_json(owner, lease)?;
-    for list in codec::provenance::BOUND_LISTS {
-        let Some(list) = doc.member(x, list)? else {
-            continue;
-        };
+    for list in codec::provenance::bound_lists(doc, x)?.into_iter().flatten() {
         let mut next = doc.node(list)?.first;
         while let Some(entry) = next {
             next = doc.node(entry)?.next;
