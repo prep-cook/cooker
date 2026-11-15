@@ -19,11 +19,11 @@ use ck_core::credential::Credential;
 use ck_exec::Executors;
 use ck_exec::claude::ClaudeExecutor;
 use ck_server::store::cooldown_store::Backend;
+use ck_server::testing::SchedulerClock;
 use serde_json::json;
 
 const FILE: &str = "claude-q.json";
-/// The bound under test: the smallest allowed (Go's 10 s floor), so the test does not
-/// wait an hour.
+/// The smallest allowed bound (Go's 10 s floor), advanced by the fixture clock.
 const BOUND: Duration = Duration::from_secs(10);
 const SIX_DAYS: Duration = Duration::from_secs(6 * 24 * 3600);
 
@@ -97,13 +97,19 @@ async fn serve(app: axum::Router) -> String {
 }
 
 /// A proxy over the private `auth_dir` with one API-key credential at `upstream_url`.
-async fn proxy(auth_dir: &Path, upstream_url: &str, save: bool) -> (String, Arc<ck_server::Runtime>) {
+async fn proxy(
+    auth_dir: &Path,
+    upstream_url: &str,
+    save: bool,
+    clock: Arc<SchedulerClock>,
+) -> (String, Arc<ck_server::Runtime>) {
     proxy_with(
         auth_dir,
         upstream_url,
         save,
         &format!("{}s", BOUND.as_secs()),
         Vec::new(),
+        clock,
     )
     .await
 }
@@ -115,6 +121,7 @@ async fn proxy_with(
     save: bool,
     bound: &str,
     cooldowns: Vec<ck_server::store::cooldown_store::Record>,
+    clock: Arc<SchedulerClock>,
 ) -> (String, Arc<ck_server::Runtime>) {
     let yaml = format!(
         "access:\n\
@@ -129,13 +136,13 @@ async fn proxy_with(
     let meta = json!({"type": "claude", "api_key": "sk-fake-claude", "base_url": upstream_url});
     let path = db.auth_dir().join(FILE);
     db.save(&path, meta.to_string().as_bytes()).unwrap();
-    Backend::save(&*db, cooldowns, SystemTime::now()).unwrap();
+    Backend::save(&*db, cooldowns, clock.wall()).unwrap();
     let mut credential = Credential::from_file(&db.auth_dir(), &path, meta.as_object().unwrap().clone()).unwrap();
     credential.attributes.insert("api_key".into(), "sk-fake-claude".into());
     credential.attributes.insert("base_url".into(), upstream_url.into());
     let mut config = Config::parse(&yaml).unwrap();
     config.auth_dir = db.auth_dir();
-    let rt = Arc::new(ck_server::testing::runtime_with_db(
+    let rt = Arc::new(ck_server::testing::runtime_with_db_clock(
         config,
         vec![credential],
         Executors {
@@ -146,6 +153,7 @@ async fn proxy_with(
             google: Default::default(),
         },
         db,
+        Some(clock),
     ));
     let app = ck_server::app(rt.clone(), axum::Router::new());
     (serve(app).await, rt)
@@ -174,11 +182,14 @@ fn auth_dir(name: &str) -> PathBuf {
 
 async fn early_reset_is_noticed_after_the_bound(save: bool) {
     let dir = auth_dir(if save { "saved" } else { "memory" });
+    let clock = Arc::new(SchedulerClock::default());
     let up = Arc::new(Up::default());
     let upstream_url = serve(axum::Router::new().fallback(upstream).with_state(up.clone())).await;
-    let (url, rt) = proxy(&dir, &upstream_url, save).await;
+    let (url, rt) = proxy(&dir, &upstream_url, save, clock.clone()).await;
 
+    let started = SystemTime::now();
     assert_eq!(message(&url).await, 429);
+    let elapsed = started.elapsed().unwrap();
     let cooling = rt.store().cooldowns(FILE);
     let window = cooling
         .iter()
@@ -187,13 +198,19 @@ async fn early_reset_is_noticed_after_the_bound(save: bool) {
         .expect("the 429 cools the credential");
     // The six-day header was read: the window is the bound (not Go's 1 s backoff for a
     // 429 without a reset), and the stated reset is kept.
-    assert!(window > BOUND / 2 && window <= BOUND, "{window:?}");
+    assert_eq!(window, BOUND);
     let stated = cooling
         .iter()
         .filter_map(|c| c.recover_in)
         .max()
         .expect("stated reset kept");
-    assert!(stated > SIX_DAYS - Duration::from_secs(60), "{stated:?}");
+    // The absolute reset is rounded to seconds and parsed during the request;
+    // executor jitter adds at most 30 s. Host scheduling is not a quota tolerance.
+    assert!(
+        stated >= SIX_DAYS.saturating_sub(elapsed + Duration::from_secs(1)),
+        "{stated:?}"
+    );
+    assert!(stated <= SIX_DAYS + Duration::from_secs(30), "{stated:?}");
     assert_eq!(message(&url).await, 429, "still cooling inside the bound");
     assert_eq!(
         up.calls.load(Ordering::SeqCst),
@@ -201,25 +218,22 @@ async fn early_reset_is_noticed_after_the_bound(save: bool) {
         "a cooling credential is not sent upstream"
     );
 
-    let url = if save {
-        rt.shutdown_codex_refreshes().await;
+    let (url, rt) = if save {
+        rt.finish_shutdown().await.unwrap();
         let backend = rt.store().credential_backend();
         let saved = Backend::load(backend.as_ref()).unwrap();
         assert!(!saved.is_empty(), "save-cooldown-status writes SQLite");
         let next = saved[0].next_retry_after.unwrap();
-        let left = next.duration_since(SystemTime::now()).unwrap_or_default();
-        assert!(left <= BOUND, "SQLite holds the bound, not the six days: {left:?}");
+        let left = next.duration_since(clock.wall()).unwrap();
+        assert_eq!(left, BOUND, "SQLite holds the bound, not the six days");
         let recover = saved[0].quota.next_recover_at.unwrap();
-        assert!(
-            recover > SystemTime::now() + SIX_DAYS - Duration::from_secs(60),
-            "Go's recovery time"
-        );
+        assert_eq!(recover, clock.wall() + stated, "the stated reset survives persistence");
         assert_eq!(saved[0].quota.trust_windows, Some(1));
         // A restart restores the bounded cooldown, neither escalated nor six days.
         let config = (*rt.config()).clone();
         let credentials = rt.store().snapshot().iter().map(|c| (**c).clone()).collect();
         drop(rt);
-        let restarted = Arc::new(ck_server::testing::runtime_with_db(
+        let restarted = Arc::new(ck_server::testing::runtime_with_db_clock(
             config,
             credentials,
             Executors {
@@ -230,22 +244,23 @@ async fn early_reset_is_noticed_after_the_bound(save: bool) {
                 google: Default::default(),
             },
             backend,
+            Some(clock.clone()),
         ));
         let url = serve(ck_server::app(restarted.clone(), axum::Router::new())).await;
         let restored = restarted.store().cooldowns(FILE);
         let left = restored.iter().map(|c| c.remaining).max().expect("restored");
-        assert!(left > Duration::ZERO && left <= BOUND, "restored from SQLite: {left:?}");
-        url
+        assert_eq!(left, BOUND, "restored from SQLite");
+        (url, restarted)
     } else {
         assert!(
             Backend::load(rt.store().credential_backend().as_ref())
                 .unwrap()
                 .is_empty()
         );
-        url
+        (url, rt)
     };
 
-    tokio::time::sleep(BOUND + Duration::from_millis(200)).await;
+    clock.advance(BOUND);
     // Four requests arrive together: the first pick is the probe, the others see the
     // credential cooling until it answers. The probe's reply is held until the other
     // three have their answers, so the check does not depend on timing.
@@ -268,6 +283,7 @@ async fn early_reset_is_noticed_after_the_bound(save: bool) {
         "exactly one probe reached the upstream: {statuses:?}"
     );
     assert_eq!(message(&url).await, 200, "the account is back after the probe");
+    rt.finish_shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -287,13 +303,14 @@ async fn early_reset_is_noticed_after_the_bound_with_save_cooldown_status() {
 async fn a_saved_trust_count_restores_its_window() {
     use ck_server::store::cooldown_store::{Quota, Record};
     let dir = auth_dir("count");
-    let at = SystemTime::now() + SIX_DAYS;
+    let clock = Arc::new(SchedulerClock::default());
+    let at = clock.wall() + SIX_DAYS;
     let record = Record {
         provider: "claude".into(),
         auth_id: FILE.into(),
         status: "cooling".into(),
         // The third bounded window: probe in 4 h, stated reset in six days.
-        next_retry_after: Some(SystemTime::now() + Duration::from_secs(4 * 3600)),
+        next_retry_after: Some(clock.wall() + Duration::from_secs(4 * 3600)),
         reason: "credential_quota".into(),
         quota: Quota {
             exceeded: true,
@@ -304,22 +321,19 @@ async fn a_saved_trust_count_restores_its_window() {
         },
         ..Default::default()
     };
-    let (_url, rt) = proxy_with(&dir, "http://127.0.0.1:9", true, "", vec![record]).await;
+    let (_url, rt) = proxy_with(&dir, "http://127.0.0.1:9", true, "", vec![record], clock).await;
     let restored = rt.store().cooldowns(FILE);
     let left = restored.iter().map(|c| c.remaining).max().expect("restored");
     let four_hours = Duration::from_secs(4 * 3600);
-    assert!(
-        left <= four_hours && left > four_hours - Duration::from_secs(60),
-        "{left:?}"
-    );
+    assert_eq!(left, four_hours);
     let stated = restored
         .iter()
         .filter_map(|c| c.recover_in)
         .max()
         .expect("stated reset kept");
-    assert!(stated > SIX_DAYS - Duration::from_secs(60), "{stated:?}");
+    assert_eq!(stated, SIX_DAYS);
     // The restored state is rewritten into SQLite with its trust count intact.
-    rt.shutdown_codex_refreshes().await;
+    rt.finish_shutdown().await.unwrap();
     let rewritten = Backend::load(rt.store().credential_backend().as_ref()).unwrap();
     assert_eq!(rewritten.len(), 1);
     assert_eq!(rewritten[0].quota.trust_windows, Some(3));
@@ -333,11 +347,12 @@ async fn a_saved_trust_count_restores_its_window() {
 async fn an_open_probe_stream_frees_the_account() {
     use futures_util::StreamExt;
     let dir = auth_dir("stream");
+    let clock = Arc::new(SchedulerClock::default());
     let up = Arc::new(Up::default());
     let upstream_url = serve(axum::Router::new().fallback(upstream).with_state(up.clone())).await;
-    let (url, _rt) = proxy(&dir, &upstream_url, false).await;
+    let (url, rt) = proxy(&dir, &upstream_url, false, clock.clone()).await;
     assert_eq!(message(&url).await, 429);
-    tokio::time::sleep(BOUND + Duration::from_millis(200)).await;
+    clock.advance(BOUND);
     let body = json!({"model": "claude-opus-4-6", "max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]});
     let probe = wreq::Client::new()
         .post(format!("{url}/v1/messages"))
@@ -361,5 +376,6 @@ async fn an_open_probe_stream_frees_the_account() {
     while let Some(chunk) = chunks.next().await {
         chunk.unwrap();
     }
+    rt.finish_shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -287,7 +287,11 @@ async fn a_split_payload_reports_its_served_model() {
 
 /// Replays `scenarios` in order on one executor; returns how many ran.
 async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
-    let executor = AntigravityExecutor::default();
+    // Keep the shared cooldown fixed while unrelated fixture requests run.
+    let executor = AntigravityExecutor {
+        cooldown_now: Some(Instant::now()),
+        ..Default::default()
+    };
     let mut ran = 0;
     for s in scenarios {
         let name = s["name"].as_str().unwrap();
@@ -360,8 +364,8 @@ async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
         if let Some(want) = want_error.and_then(|e| e.get("retry_after_ms")).and_then(Value::as_u64) {
             let got = error.as_ref().and_then(|e| e.2).map(|d| d.as_millis() as u64);
             if error.as_ref().is_some_and(|e| e.1.contains("short cooldown")) {
-                // The cooldown left when the second request arrived: within a second.
-                assert!(got.is_some_and(|g| g <= 30_000 && g + 1_000 >= want), "{name}: {got:?}");
+                // The fixture opens a 30 s cooldown; no manual time has elapsed.
+                assert_eq!(got, Some(30_000), "{name}: cooldown remaining");
             } else {
                 assert_eq!(got, Some(want), "{name}: retry after");
             }

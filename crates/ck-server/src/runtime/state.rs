@@ -175,11 +175,30 @@ impl Runtime {
 
     /// Installs a cooldown backend before restoring state, including test backends.
     pub fn with_cooldown_backend(
+        config: Config,
+        credentials: Vec<Credential>,
+        executors: Executors,
+        db: Arc<crate::store::credential_store::CredentialDb>,
+        backend: Arc<dyn crate::store::cooldown_store::Backend>,
+    ) -> Self {
+        Self::build(
+            config,
+            credentials,
+            executors,
+            db,
+            backend,
+            #[cfg(any(test, feature = "testing"))]
+            None,
+        )
+    }
+
+    pub(crate) fn build(
         mut config: Config,
         credentials: Vec<Credential>,
         executors: Executors,
         db: Arc<crate::store::credential_store::CredentialDb>,
         backend: Arc<dyn crate::store::cooldown_store::Backend>,
+        #[cfg(any(test, feature = "testing"))] clock: Option<Arc<crate::testing::SchedulerClock>>,
     ) -> Self {
         config.auth_dir = db.auth_dir();
         let mut policy = crate::management::api::policy(&config);
@@ -212,6 +231,10 @@ impl Runtime {
             model_router: Default::default(),
             streams: Default::default(),
         };
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(clock) = clock {
+            assert!(rt.store.clock.set(clock).is_ok());
+        }
         rt.publish_policy(policy);
         rt.store.set_cooldown_backend(backend);
         rt.store.configure_cooldown_store(cooldown_dir);
@@ -1716,6 +1739,8 @@ pub struct CredentialStore {
     inner: RwLock<Inner>,
     policy: RwLock<Arc<Policy>>,
     scheduler: Mutex<Scheduler>,
+    #[cfg(any(test, feature = "testing"))]
+    clock: std::sync::OnceLock<Arc<crate::testing::SchedulerClock>>,
     attempts: AtomicU64,
     stats: [AtomicU64; 3],
     prepare_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -1898,6 +1923,8 @@ impl CredentialStore {
             inner: RwLock::new(inner),
             policy: RwLock::new(Arc::new(Policy::default())),
             scheduler: Mutex::default(),
+            #[cfg(any(test, feature = "testing"))]
+            clock: Default::default(),
             attempts: AtomicU64::new(0),
             stats: Default::default(),
             prepare_locks: Mutex::default(),
@@ -1919,6 +1946,22 @@ impl CredentialStore {
             session_closer: std::sync::OnceLock::new(),
             registrations: Mutex::new(registrations),
         })
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(clock) = self.clock.get() {
+            return clock.now();
+        }
+        Instant::now()
+    }
+
+    fn wall(&self) -> std::time::SystemTime {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(clock) = self.clock.get() {
+            return clock.wall();
+        }
+        std::time::SystemTime::now()
     }
 
     pub fn credential_backend(&self) -> Arc<crate::store::credential_store::CredentialDb> {
@@ -2144,7 +2187,7 @@ impl CredentialStore {
             let policy = self.policy.read().unwrap_or_else(PoisonError::into_inner).clone();
             let inner = self.read();
             let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-            let (now, wall) = (Instant::now(), std::time::SystemTime::now());
+            let (now, wall) = (self.now(), self.wall());
             for record in &records {
                 let Some(c) = inner.creds.iter().find(|c| c.id == record.auth_id.trim()) else {
                     continue;
@@ -2172,12 +2215,12 @@ impl CredentialStore {
             return;
         }
         let writer = self.cooldown_write.lock().unwrap_or_else(PoisonError::into_inner);
-        let wall = std::time::SystemTime::now();
+        let wall = self.wall();
         let mut records = {
             let policy = self.policy.read().unwrap_or_else(PoisonError::into_inner).clone();
             let inner = self.read();
             let scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-            let now = Instant::now();
+            let now = self.now();
             inner
                 .creds
                 .iter()
@@ -2357,7 +2400,7 @@ impl CredentialStore {
             return false;
         }
         let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
+        let now = self.now();
         let mut cleared = false;
         for id in replaced {
             cleared |= scheduler.clear_unauthorized(id, now);
@@ -2418,7 +2461,7 @@ impl CredentialStore {
     ) -> Result<Lease, AcquireError> {
         let allowed = |c: &Credential| (!self.grant_blocks(c)).then(|| admit(c)).flatten();
         let admit: &Admit<'_> = &allowed;
-        let now = Instant::now();
+        let now = self.now();
         let credential = {
             let inner = self.read();
             let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2449,7 +2492,7 @@ impl CredentialStore {
     pub fn suspension(&self, credential: &Credential, model: &str) -> crate::scheduling::registry::Suspension {
         use crate::scheduling::registry::Suspension;
         let scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
+        let now = self.now();
         let live = |m: &str| {
             scheduler
                 .cooldowns
@@ -2478,7 +2521,7 @@ impl CredentialStore {
     pub fn blocked(&self, credential: &Credential, model: &str) -> bool {
         let scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
         self.grant_blocks(credential)
-            || scheduler.cooling(credential, model, Instant::now())
+            || scheduler.cooling(credential, model, self.now())
             || scheduler.tokens_rejected(credential)
     }
 
@@ -2557,7 +2600,7 @@ impl CredentialStore {
         attempted: &[String],
         admit: &Admit<'_>,
     ) -> Option<Duration> {
-        self.retry_wait_at(selection, policy, status, attempted, admit, Instant::now())
+        self.retry_wait_at(selection, policy, status, attempted, admit, self.now())
     }
 
     fn retry_wait_at(
@@ -2609,7 +2652,7 @@ impl CredentialStore {
         self.scheduler
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .accept_probe_picked(&lease.credential, &lease.execution_model, lease.picked, Instant::now());
+            .accept_probe_picked(&lease.credential, &lease.execution_model, lease.picked, self.now());
     }
 
     fn record(&self, lease: &Lease, outcome: &Outcome) {
@@ -2634,7 +2677,7 @@ impl CredentialStore {
             .iter()
             .any(|c| c.id == lease.credential.id && c.revision == lease.credential.revision)
         {
-            let (now, wall) = (Instant::now(), std::time::SystemTime::now());
+            let (now, wall) = (self.now(), self.wall());
             let persist = self
                 .cooldown_dir
                 .read()
@@ -3606,7 +3649,7 @@ impl CredentialStore {
         self.scheduler
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .cooldowns_of(id, Instant::now())
+            .cooldowns_of(id, self.now())
     }
 
     /// Clears the cooldowns of one credential (Go `Manager.ResetQuota`); returns the
