@@ -45,7 +45,7 @@ Every provider module implements `Execute` once. The selector in `crates/ck-exec
 
 `Client::usage` carries request-side facts only (§8, G4).
 
-**G5, the client's own bytes for the Claude cloak.** `Client::original` borrows the client's request body as the server received it; the server fills it on every attempt from the body it already holds, without a copy. Only the Claude executor reads it, and only for an Anthropic Messages request that the OAuth cloak or the Claude Code identity shapes: a credential the cloak may serve (an OAuth token, a fingerprint profile or a cloak setting), or a request the Claude Code detection confirms from its headers and body. That request is prepared from these bytes exactly as the old route prepares them, and the result goes upstream, because the detection reads the client's member order and `cch` signs the body the cloak built from them. This is the single exception to the no-raw-passthrough rule in `crates/AGENTS.md` (owner ruling 2026-11-16, Q14 option (a)). The fence (§4) still validates the request first, so the capability refuses what it refuses for any other client. Every other request, including a foreign client's request on a cloak credential, is encoded from the fenced view.
+**G5, the client's own bytes for the Claude cloak.** `Client::original` borrows the client's request body as the server received it; the server fills it on every attempt from the body it already holds, without a copy. Only the Claude executor reads it, and only for an Anthropic Messages request that the OAuth cloak or the Claude Code identity shapes: a credential the cloak may serve (an OAuth token, a fingerprint profile or a cloak setting), or a request the Claude Code detection confirms from its headers and body. That request is prepared from these bytes exactly as the old route prepares them, and the result goes upstream, because the detection reads the client's member order and `cch` signs the body the cloak built from them. This is one of two exceptions to the no-raw-passthrough rule in `crates/AGENTS.md` (owner ruling 2026-11-16, Q14 option (a)); live-session messages are the other (Settled 55). The fence (§4) still validates the request first, so the capability refuses what it refuses for any other client. Every other request, including a foreign client's request on a cloak credential, is encoded from the fenced view.
 
 A generation the cloak may shape whose upstream answers in one JSON body stays on the old arm: restoring its tool aliases and recording its session continuity read the complete body, which §3 forbids collecting. Only the fenced document shows the client's `stream` member, so for it `destination` answers the capability key while `refence` and `start` refuse with `Destination`. A streamed generation and every count run on the contract path.
 
@@ -81,7 +81,7 @@ impl Executors {
 
 ## 5. Producer
 
-`pipeline::Started` is what an attempt yields once the upstream answered: status, headers, the response stream's allocator (`Started::stream`) and the `Producer` task. The producer owns the response stream's producer writer, the upstream body and the response ingress. It drives `upstream bytes -> ResponseIngress -> Writer` on its own task, schedules `flush` at `flush_deadline`, finishes the writer with `Terminal::Done` after the ingress completes, and stops when `Writer::cancelled` resolves. A slow or absent client never slows it.
+`pipeline::Started` is what an attempt yields once the upstream answered: status, headers, the response stream's allocator (`Started::stream`) and the `Producer` task. The producer owns the response stream's producer writer, the upstream body and the response ingress. It drives `upstream bytes -> ResponseIngress -> Writer` on its own task, schedules `flush` at `flush_deadline`, finishes the writer with `Terminal::Done` after the ingress completes, and stops when `Writer::cancelled` resolves. For document streams, a slow or absent client never slows it; live sessions use transport flow control instead (Settled 55).
 
 The producer's output, `Result<(), ExecError>`, is the attempt's routing outcome. `Err` carries the scope the scheduler and cooldown use.
 
@@ -126,7 +126,8 @@ Commitment is the first deliverable byte the client's `ResponseEgress` emits. Be
 | Producer panic or dropped writer | `stream.producer_lost`, 502, scope `upstream` | attempt failure | delivered as `error` |
 | Explicit client cancel | `Terminal::Cancelled` | nothing is delivered | delivered as the protocol's cancellation where it has one |
 | Shutdown | `Terminal::Shutdown` | the listener's shutdown response; no failover | delivered as the shutdown terminal |
-| Client disconnect | nothing | the reader lease is released; the producer continues | same |
+| Client disconnect on a document stream | nothing | the reader lease is released; the producer continues | same |
+| Client disconnect on a live session or Responses WebSocket turn | Terminal::ClientDisconnected (cancelled, reason client_disconnect) | nothing is delivered | not reachable: the client is gone |
 
 Only an attempt failure before commitment may fail over. The client sees the official API's error shape for its protocol in every row.
 
@@ -140,10 +141,10 @@ D0 declares every module that D1–D3 and the provider units create, so later un
 
 ## 12. Phase E boundary
 
-Phase E extends this contract; it does not change it. It reuses `Attempt`, `Client`, `Body`, the producer and its allocator, `Exchange`, `StreamHandle` and §2–§9 unchanged.
+Phase E extends this contract; it does not change it. It reuses `Attempt`, `Client`, `Body`, the producer and its allocator, `Exchange`, `StreamHandle` and §2–§9 unchanged, except that live-session messages are forwarded as received under transport flow control and only their metadata projection goes through the producer (Settled 55).
 
 - One-shot media operations (images, speech, video create, retrieve and content) keep the `Execute` shape. E adds their `codec::Operation` variants together with the codecs that accept them; `Operation` lives in `codec/mod.rs` and is matched exhaustively in `codec/event.rs`, so the variants land after the codec request-ingress work (R1) merges.
-- Duplex sessions (Realtime, Live, Responses WebSocket) need request-direction admission after the first turn and a retained upstream session. E defines that as its own trait in its own file next to `types.rs`; a session's turns each run as attempts under this contract, and reattachment uses the `StreamHandle` of §6.
+- Duplex sessions (Realtime, Live, Responses WebSocket) need request-direction admission after the first turn and a retained upstream session. E defines that as its own trait in its own file next to `types.rs`; a session's turns each run as attempts under this contract. A client disconnect closes a live session and cancels an in-flight Responses WebSocket turn; neither reattaches (Settled 55, 56).
 
 ## 13. Open for an owner
 
