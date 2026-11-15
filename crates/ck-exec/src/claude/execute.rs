@@ -5,7 +5,7 @@
 //! `claude.rs` prepares it as it prepares a Claude client's body: the cloak, identity, cache
 //! policy, betas and headers are those of the old path. The response reaches
 //! `anthropic::response::Ingress` chunk by chunk. Messages has no native compact, so the
-//! capability refuses one.
+//! capability refuses one (owner question 7).
 //!
 //! Requests the OAuth cloak or the Claude Code identity would shape stay on the old route
 //! ([`ClaudeExecutor::old_route_only`]): the cloak must not change until owner question 13
@@ -30,6 +30,10 @@ use crate::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
 
 /// The capability key of the Anthropic Messages API.
 pub const DESTINATION: &str = "anthropic";
+
+/// The refusal of a compaction, which Messages has no native form of (owner question 7). It
+/// names no upstream: members see it.
+pub(super) const NO_COMPACT: &str = "This model does not support compaction; choose a model that does.";
 
 impl Execute for ClaudeExecutor {
     type Capability = AnthropicCapability;
@@ -65,11 +69,7 @@ impl Execute for ClaudeExecutor {
         _streams: Streams<'_>,
     ) -> Result<Upstream<Ingress>, ExecError> {
         // The capability refuses compact at the fence, so no request reaches this.
-        Err(ExecError::local(
-            400,
-            FailureScope::Model,
-            "Messages has no native compact",
-        ))
+        Err(ExecError::local(400, FailureScope::Model, NO_COMPACT))
     }
 }
 
