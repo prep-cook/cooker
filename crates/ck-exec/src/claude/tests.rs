@@ -1798,8 +1798,8 @@ async fn unrestorable_tool_alias_publishes_no_tokens() {
 /// Go's reporter calls on each Claude path (claude_executor_execute.go and
 /// claude_executor_stream.go): native Execute publishes, translated Execute and
 /// ExecuteStream require usage (no EnsurePublished), the TTFT marks bracket the round
-/// trip, a renamed upstream model is reported, and `responses/compact` reports only its
-/// summary turn, a native non-stream Execute (v8.0.35 2bc236d2).
+/// trip, a renamed upstream model is reported, and a refused `responses/compact` reports
+/// nothing (owner question 7).
 #[tokio::test]
 async fn usage_reports_follow_go_reporter_calls() {
     use axum::response::IntoResponse;
@@ -1910,8 +1910,7 @@ async fn usage_reports_follow_go_reporter_calls() {
     let usage = run(Format::Claude, false, None, renamed).await;
     assert_eq!(usage.kinds()[0], "upstream_model");
     assert_eq!(usage.0.lock().unwrap()[0].2, "claude-sonnet-4-6-upstream");
-    // responses/compact: executeClaudeCompaction returns before its own reporter and
-    // the summary turn publishes like a native Execute.
+    // responses/compact is refused before the reporter exists.
     let usage = run(
         Format::OpenAIResponse,
         false,
@@ -1919,10 +1918,7 @@ async fn usage_reports_follow_go_reporter_calls() {
         Delegation::default(),
     )
     .await;
-    assert_eq!(
-        usage.kinds(),
-        ["request", "round_trip_started", "first_byte", "body", "publish"]
-    );
+    assert_eq!(usage.kinds(), ["discard"]);
 }
 
 /// Owned copies of the capture events an executor records.
@@ -2517,311 +2513,132 @@ fn claude_rate_limit_cooldown_and_scope_match_go() {
     }
 }
 
-/// The cases of v8.0.35's claude_executor_compaction_test.go (2bc236d2): a compaction
-/// trigger or `responses/compact` becomes one non-stream Claude summary turn sealed into
-/// a single compaction item; replayed CPA capsules expand, foreign ones are dropped and
-/// broken ones fail with 400 before any upstream call.
-#[tokio::test]
-async fn responses_compaction_matches_go() {
+/// One Responses request on a Claude key against a local upstream: the result, the bodies the
+/// upstream saw and the usage calls.
+async fn compaction_run(
+    payload: String,
+    original: Option<&str>,
+    stream: bool,
+    alt: Option<&str>,
+) -> (Result<(), ExecError>, Vec<String>, Vec<&'static str>) {
     use axum::response::IntoResponse;
-    const PROMPT: &str = "Please provide a concise and comprehensive summary";
-    const SUMMARY: &str = "Sealed summary of the build.";
     let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let reply = Arc::new(std::sync::Mutex::new(String::new()));
     let router = {
-        let (seen, reply) = (seen.clone(), reply.clone());
+        let seen = seen.clone();
+        // A Responses client's upstream always streams.
         axum::Router::new().fallback(move |body: String| {
-            let (seen, reply) = (seen.clone(), reply.clone());
-            async move {
-                let stream = rawjson::get(&body, "stream").bool();
-                seen.lock().unwrap().push(body);
-                if stream {
-                    let events = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-haiku-4-5-20251001\",\"content\":[],\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n\
-                                  event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n\
-                                  event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
-                    return ([(http::header::CONTENT_TYPE, "text/event-stream")], events).into_response();
-                }
-                let usage = reply.lock().unwrap().clone();
-                // "empty": a 200 without any text block.
-                let content = if usage == "empty" { String::new() } else { format!(r#"{{"type":"text","text":"{SUMMARY}"}}"#) };
-                let usage = if usage.is_empty() || usage == "empty" { r#"{"input_tokens":11,"output_tokens":7}"#.to_owned() } else { usage };
-                let body = format!(
-                    r#"{{"id":"msg_compact","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{content}],"stop_reason":"end_turn","usage":{usage}}}"#
-                );
-                ([(http::header::CONTENT_TYPE, "application/json")], body).into_response()
-            }
+            seen.lock().unwrap().push(body);
+            let events = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-haiku-4-5-20251001\",\"content\":[],\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n\
+                          event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n\
+                          event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            async move { ([(http::header::CONTENT_TYPE, "text/event-stream")], events).into_response() }
         })
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
-    let mut credential = Credential::from_file(
-        Path::new("/fake"),
-        Path::new("/fake/claude.json"),
-        serde_json::json!({"type":"claude"}).as_object().unwrap().clone(),
-    )
-    .unwrap();
+    let metadata = serde_json::json!({"type":"claude"}).as_object().unwrap().clone();
+    let mut credential = Credential::from_file(Path::new("/fake"), Path::new("/fake/claude.json"), metadata).unwrap();
     credential.attributes.insert("api_key".into(), "key-compaction".into());
     credential.attributes.insert("base_url".into(), base);
-    let run = |payload: String, original: Option<&str>, stream: bool, alt: Option<&str>, cfg: Config| {
-        let body = Bytes::from(payload);
-        let usage = Arc::new(Usage::default());
-        let req = ExecRequest {
-            operation: Operation::Generate,
-            source_format: Format::OpenAIResponse,
-            response_format: Format::OpenAIResponse,
-            requested_model: "claude-haiku-4-5-20251001".into(),
-            model: "claude-haiku-4-5-20251001".into(),
-            original_body: original.map_or_else(|| body.clone(), |o| Bytes::from(o.to_owned())),
-            body,
-            stream,
-            alt: alt.map(str::to_owned),
-            session: None,
-            execution_session: None,
-            derived_session: None,
-            resolved_model: None,
-            usage: ck_core::exec::UsageSink::new(usage.clone()),
-            request_path: String::new(),
-            headers: Default::default(),
-            caller: Caller {
-                principal: "fake-client".into(),
-                source: "x-api-key",
-                provider: String::new(),
-            },
-        };
-        seen.lock().unwrap().clear();
-        let (executor, credential, seen) = (&executor, &credential, seen.clone());
-        async move {
-            let result = executor.execute(credential, req, &cfg).await;
-            let body = match result {
-                Ok(ExecResponse {
-                    body: ResponseBody::Buffered(b),
-                    ..
-                }) => Ok(String::from_utf8(b.to_vec()).unwrap()),
-                Ok(ExecResponse {
-                    body: ResponseBody::Stream(events),
-                    ..
-                }) => {
-                    let chunks: Vec<_> = events.collect().await;
-                    Ok(chunks
-                        .into_iter()
-                        .map(|c| String::from_utf8(c.unwrap().to_vec()).unwrap())
-                        .collect())
-                }
-                Err(e) => Err(e),
-            };
-            let upstream = seen.lock().unwrap().clone();
-            (body, upstream, usage.kinds())
+    let body = Bytes::from(payload);
+    let usage = Arc::new(Usage::default());
+    let req = ExecRequest {
+        operation: Operation::Generate,
+        source_format: Format::OpenAIResponse,
+        response_format: Format::OpenAIResponse,
+        requested_model: "claude-haiku-4-5-20251001".into(),
+        model: "claude-haiku-4-5-20251001".into(),
+        original_body: original.map_or_else(|| body.clone(), |o| Bytes::from(o.to_owned())),
+        body,
+        stream,
+        alt: alt.map(str::to_owned),
+        session: None,
+        execution_session: None,
+        derived_session: None,
+        resolved_model: None,
+        usage: ck_core::exec::UsageSink::new(usage.clone()),
+        request_path: String::new(),
+        headers: Default::default(),
+        caller: Caller {
+            principal: "fake-client".into(),
+            source: "x-api-key",
+            provider: String::new(),
+        },
+    };
+    let result = match executor.execute(&credential, req, &Config::parse("").unwrap()).await {
+        Ok(ExecResponse {
+            body: ResponseBody::Stream(events),
+            ..
+        }) => {
+            let _: Vec<_> = events.collect().await;
+            Ok(())
         }
+        result => result.map(drop),
     };
-    let none = || Config::parse("").unwrap();
-    let input = |items: &str, extra: &str| {
-        format!(r#"{{"model":"claude-haiku-4-5-20251001","stream":false{extra},"input":[{items}]}}"#)
-    };
-    let user = r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"Check the build next."}]}"#;
-    let assistant = r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK, I will check the build."}]}"#;
-    let tools = r#","tools":[{"type":"function","name":"check_build","description":"Check the build","parameters":{"type":"object","properties":{}}}]"#;
-    let calls = r#"{"type":"function_call","call_id":"call_1","name":"check_build","arguments":"{\"target\":\"api\"}"},{"type":"function_call_output","call_id":"call_1","output":"build ok"}"#;
-    let trigger = r#"{"type":"compaction_trigger"}"#;
-    let capsule = |summary: &str| {
-        let sealed = crate::antigravity_compaction::seal(summary, "claude-haiku-4-5-20251001").unwrap();
-        format!(r#"{{"type":"compaction","encrypted_content":"{sealed}"}}"#)
-    };
-    // The single compaction item, its capsule and the usage of the answer.
-    let compaction = |payload: &str, usage: (i64, i64, i64, i64)| {
-        let item = rawjson::get(payload, "output");
-        let items = item.array();
-        assert_eq!(items.len(), 1, "{payload}");
-        assert_eq!(items[0].get("type").str(), "compaction");
-        let sealed = items[0].get("encrypted_content").str().to_owned();
-        assert_eq!(crate::antigravity_compaction::unseal(&sealed).unwrap(), SUMMARY);
-        let got = rawjson::get(payload, "usage");
-        assert_eq!(
-            (
-                got.get("input_tokens").i64(),
-                got.get("output_tokens").i64(),
-                got.get("total_tokens").i64(),
-                got.get("input_tokens_details.cached_tokens").i64()
-            ),
-            usage,
-            "{payload}"
-        );
-    };
-    let summary_request = |upstream: &[String]| -> String {
-        assert_eq!(upstream.len(), 1, "one summary turn");
-        let body = upstream[0].clone();
-        assert!(body.contains(PROMPT), "{body}");
-        assert!(!body.contains("compaction_trigger"), "{body}");
-        assert!(!rawjson::get(&body, "stream").bool(), "{body}");
-        body
-    };
+    let upstream = seen.lock().unwrap().clone();
+    (result, upstream, usage.kinds())
+}
 
-    // CompactionTriggerReturnsSingleCompactionItem, and the responses/compact alt.
-    for alt in [None, Some("responses/compact")] {
-        let items = if alt.is_some() {
-            format!("{user},{assistant}")
-        } else {
-            format!("{user},{assistant},{trigger}")
-        };
-        let (body, upstream, _) = run(input(&items, ""), None, false, alt, none()).await;
-        compaction(&body.unwrap(), (11, 7, 18, 0));
-        summary_request(&upstream);
+fn compaction_input(items: &str) -> String {
+    format!(r#"{{"model":"claude-haiku-4-5-20251001","stream":false,"input":[{items}]}}"#)
+}
+
+const COMPACTION_USER: &str =
+    r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"Check the build next."}]}"#;
+
+/// Messages has no native compaction, so a compaction trigger or `responses/compact` is
+/// refused with 400 before any upstream call or usage report, streamed or not; the gateway
+/// writes no summary in its place (owner question 7).
+#[tokio::test]
+async fn responses_compaction_is_refused() {
+    let with_trigger = compaction_input(&format!(r#"{COMPACTION_USER},{{"type":"compaction_trigger"}}"#));
+    let cases = [
+        (compaction_input(COMPACTION_USER), None, Some("responses/compact")),
+        (with_trigger.clone(), None, None),
+        // Only the original request carries the trigger.
+        (compaction_input(COMPACTION_USER), Some(with_trigger.as_str()), None),
+    ];
+    for (body, original, alt) in cases {
+        for stream in [false, true] {
+            let (result, upstream, usage) = compaction_run(body.clone(), original, stream, alt).await;
+            let error = result.unwrap_err();
+            assert_eq!((error.status, error.scope), (400, FailureScope::Request), "{alt:?}");
+            assert_eq!(String::from_utf8_lossy(&error.body), super::execute::NO_COMPACT);
+            assert!(upstream.is_empty(), "{upstream:?}");
+            assert_eq!(usage, ["discard"]);
+        }
     }
-    // CompactionTriggerStreamReturnsSingleCompactionItem: the summary turn stays
-    // non-stream; the client gets the five Responses events.
-    let (body, upstream, _) = run(
-        input(&format!("{user},{assistant},{trigger}"), ""),
-        None,
-        true,
-        None,
-        none(),
-    )
-    .await;
-    let body = body.unwrap();
-    assert_eq!(body.matches("event: ").count(), 5, "{body}");
-    let completed = body
-        .split("\n\n")
-        .find(|f| f.starts_with("event: response.completed"))
-        .unwrap();
-    compaction(
-        rawjson::get(completed.split_once("data: ").unwrap().1, "response").json(),
-        (11, 7, 18, 0),
-    );
-    summary_request(&upstream);
-    // ReplayedCompactionCapsuleIsExpanded: an ordinary turn, with the summary as context.
+}
+
+/// Replayed CPA capsules expand into an ordinary turn; broken ones fail with 400 before any
+/// upstream call (v8.0.35's claude_executor_compaction_test.go, 2bc236d2).
+#[tokio::test]
+async fn responses_compaction_capsules_expand() {
+    const SUMMARY: &str = "Sealed summary of the build.";
+    let sealed = crate::antigravity_compaction::seal(SUMMARY, "claude-haiku-4-5-20251001").unwrap();
+    let capsule = format!(r#"{{"type":"compaction","encrypted_content":"{sealed}"}}"#);
     let continue_ = r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}"#;
-    let (body, upstream, _) = run(
-        input(&format!("{},{continue_}", capsule(SUMMARY)), ""),
-        None,
-        false,
-        None,
-        none(),
-    )
-    .await;
-    assert!(body.is_ok());
+    let body = compaction_input(&format!("{capsule},{continue_}"));
+    let (result, upstream, _) = compaction_run(body, None, false, None).await;
+    assert!(result.is_ok());
     assert!(
         upstream[0].contains(SUMMARY) && !upstream[0].contains(r#""type":"compaction""#),
         "{}",
         upstream[0]
     );
-    assert!(!upstream[0].contains(PROMPT));
-    // CompactionTriggerKeepsToolsForToolHistory.
-    let (body, upstream, _) = run(
-        input(&format!("{user},{calls},{trigger}"), tools),
-        None,
-        false,
-        None,
-        none(),
-    )
-    .await;
-    compaction(&body.unwrap(), (11, 7, 18, 0));
-    let sent = summary_request(&upstream);
-    assert!(
-        sent.contains("check_build")
-            && sent.contains(r#""type":"tool_use""#)
-            && sent.contains(r#""type":"tool_result""#),
-        "{sent}"
-    );
-    assert_eq!(rawjson::get(&sent, "tool_choice.type").str(), "none", "{sent}");
-    // CompactionTriggerFlattensToolHistoryWithoutTools.
-    let (_, upstream, _) = run(
-        input(&format!("{user},{calls},{trigger}"), ""),
-        None,
-        false,
-        None,
-        none(),
-    )
-    .await;
-    let sent = summary_request(&upstream);
-    assert!(
-        !sent.contains(r#""type":"tool_use""#) && !sent.contains(r#""type":"tool_result""#),
-        "{sent}"
-    );
-    assert!(
-        sent.contains(r#"Tool call check_build (call_1): {\"target\":\"api\"}"#),
-        "{sent}"
-    );
-    assert!(sent.contains("Tool result call_1: build ok"), "{sent}");
-    assert!(!rawjson::get(&sent, "tool_choice").exists(), "{sent}");
-    // CompactionSummaryPayloadRuleIsLast: payload rules see the finalized body.
-    let ruled = Config::parse(
-        "requests:\n  payload:\n    override:\n      - models: [{name: claude-haiku-4-5-20251001}]\n        params: {max_tokens: 1234, tool_choice: {type: auto}}\n",
-    )
-    .unwrap();
-    let (_, upstream, _) = run(
-        input(&format!("{user},{calls},{trigger}"), tools),
-        None,
-        false,
-        None,
-        ruled,
-    )
-    .await;
-    let sent = summary_request(&upstream);
-    assert_eq!(rawjson::get(&sent, "max_tokens").i64(), 1234, "{sent}");
-    assert_eq!(rawjson::get(&sent, "tool_choice.type").str(), "auto", "{sent}");
-    // CompactionTriggerIncludesPreviousCapsule.
-    let earlier = capsule("Earlier sealed summary.");
-    let (body, upstream, _) = run(
-        input(&format!("{earlier},{continue_},{assistant},{trigger}"), ""),
-        None,
-        false,
-        None,
-        none(),
-    )
-    .await;
-    compaction(&body.unwrap(), (11, 7, 18, 0));
-    assert!(summary_request(&upstream).contains("Earlier sealed summary."));
-    // ForeignCompactionCapsuleIsDropped.
-    let foreign = r#"{"type":"compaction","encrypted_content":"gAAAAA-openai-native"}"#;
-    let (body, upstream, _) = run(
-        input(&format!("{foreign},{continue_},{trigger}"), ""),
-        None,
-        false,
-        None,
-        none(),
-    )
-    .await;
-    compaction(&body.unwrap(), (11, 7, 18, 0));
-    assert!(!summary_request(&upstream).contains("gAAAAA-openai-native"));
-    // CompactionUsageMatchesResponsesAccounting: cache writes and reads count as input.
-    *reply.lock().unwrap() =
-        r#"{"input_tokens":11,"output_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":100}"#.into();
-    let (body, _, _) = run(input(&format!("{user},{trigger}"), ""), None, false, None, none()).await;
-    compaction(&body.unwrap(), (114, 7, 121, 100));
-    reply.lock().unwrap().clear();
-    // InvalidCompactionCapsuleReturns400, before any upstream call.
+    // Go rejects a broken capsule before its usage reporter exists, also when only the
+    // original request carries it.
     let broken = r#"{"type":"compaction","encrypted_content":"cpa-ag-compact-v1:not-valid-base64"}"#;
-    // Go rejects it before its usage reporter exists, so no record is published, also
-    // when only the original request carries the capsule.
-    let plain = input(continue_, "");
-    let broken = input(&format!("{broken},{continue_}"), "");
+    let plain = compaction_input(continue_);
+    let broken = compaction_input(&format!("{broken},{continue_}"));
     for (body, original) in [(broken.clone(), None), (plain, Some(broken.as_str()))] {
-        let (body, upstream, usage) = run(body, original, false, None, none()).await;
-        let error = body.unwrap_err();
+        let (result, upstream, usage) = compaction_run(body, original, false, None).await;
+        let error = result.unwrap_err();
         assert_eq!(error.status, 400);
         assert!(String::from_utf8_lossy(&error.body).starts_with("invalid compaction capsule: "));
         assert!(upstream.is_empty());
         assert_eq!(usage, ["discard"]);
     }
-    // A summary answer without text fails like Go's fmt.Errorf: no status and no
-    // transport fault, so it cools the model on the trigger path and is neutral on the
-    // compact alt, without a retry round (ck-server classify tests); the summary turn
-    // itself published its usage.
-    *reply.lock().unwrap() = "empty".into();
-    for (items, alt) in [
-        (format!("{user},{trigger}"), None),
-        (user.to_owned(), Some("responses/compact")),
-    ] {
-        let (body, upstream, usage) = run(input(&items, ""), None, false, alt, none()).await;
-        let error = body.unwrap_err();
-        assert_eq!((error.status, error.scope), (0, FailureScope::Model), "{alt:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&error.body),
-            "extract summary: no summary text found in upstream response"
-        );
-        summary_request(&upstream);
-        assert!(usage.contains(&"publish"), "{usage:?}");
-    }
-    reply.lock().unwrap().clear();
 }

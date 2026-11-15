@@ -231,6 +231,11 @@ impl Exchange {
     }
 
     pub fn request<'a>(&'a self, validated: ValidatedRequest<'a>) -> Request<'a> {
+        self.request_with(validated, &[])
+    }
+
+    /// [`Self::request`] whose client sent `original` (contract G5).
+    pub fn request_with<'a>(&'a self, validated: ValidatedRequest<'a>, original: &'a [u8]) -> Request<'a> {
         Request {
             validated,
             client: Client {
@@ -241,6 +246,7 @@ impl Exchange {
                 execution_session: None,
                 derived_session: None,
                 usage: &self.usage,
+                original,
             },
         }
     }
