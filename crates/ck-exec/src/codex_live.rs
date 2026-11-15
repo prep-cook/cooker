@@ -1130,7 +1130,10 @@ impl CodexExecutor {
             .max_frame_size(MAX_WS_MESSAGE)
             .max_message_size(MAX_WS_MESSAGE);
         let attempt = async {
-            let mut res = builder.send().await.map_err(|e| fail(&dial_text(&e)))?;
+            let mut res = builder
+                .send()
+                .await
+                .map_err(|e| fail(&crate::upstream::transport_text(&e)))?;
             let status = res.status().as_u16();
             let headers = res.headers().clone();
             if status != 101 {
@@ -1172,16 +1175,6 @@ impl CodexExecutor {
             .await
             .unwrap_or_else(|_| Err(fail("websocket: handshake timed out")))
     }
-}
-
-fn dial_text(error: &wreq::Error) -> String {
-    let mut text = error.to_string();
-    let mut source = std::error::Error::source(error);
-    while let Some(inner) = source {
-        text = format!("{text}: {inner}");
-        source = inner.source();
-    }
-    text
 }
 
 /// Go `mime/multipart.Reader` and `textproto.readMIMEHeader` over a body already in

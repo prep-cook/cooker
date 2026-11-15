@@ -3158,7 +3158,7 @@
       },
       "error": {
         "status": 0,
-        "message": "Post \"https:relay.example/v1/endpoints/openapi/chat/completions\": http: no Host in request URL"
+        "message": "Post \"<redacted url>\": http: no Host in request URL"
       },
       "usage": {
         "input_tokens": 0,
@@ -3171,7 +3171,7 @@
         "response_model": "",
         "reasoning_effort": "",
         "failed": true,
-        "fail_body": "Post \"https:relay.example/v1/endpoints/openapi/chat/completions\": http: no Host in request URL",
+        "fail_body": "Post \"<redacted url>\": http: no Host in request URL",
         "executor_type": "OpenAICompatExecutor",
         "model": "meta/llama-4",
         "quality": "complete"
@@ -3283,7 +3283,7 @@
       },
       "error": {
         "status": 0,
-        "message": "Post \"https:relay.example/v1/publishers/google/models/gemini-2.5-flash:generateContent\": http: no Host in request URL"
+        "message": "Post \"<redacted url>\": http: no Host in request URL"
       },
       "usage": {
         "input_tokens": 0,
@@ -3296,7 +3296,7 @@
         "response_model": "",
         "reasoning_effort": "",
         "failed": true,
-        "fail_body": "Post \"https:relay.example/v1/publishers/google/models/gemini-2.5-flash:generateContent\": http: no Host in request URL",
+        "fail_body": "Post \"<redacted url>\": http: no Host in request URL",
         "executor_type": "GeminiVertexExecutor",
         "model": "gemini-2.5-flash",
         "quality": "complete"
@@ -3353,7 +3353,7 @@
       },
       "error": {
         "status": 0,
-        "message": "Post \"https:relay.example/v1beta1/interactions\": http: no Host in request URL"
+        "message": "Post \"<redacted url>\": http: no Host in request URL"
       },
       "usage": {
         "input_tokens": 0,
@@ -3366,7 +3366,7 @@
         "response_model": "",
         "reasoning_effort": "",
         "failed": true,
-        "fail_body": "Post \"https:relay.example/v1beta1/interactions\": http: no Host in request URL",
+        "fail_body": "Post \"<redacted url>\": http: no Host in request URL",
         "executor_type": "GeminiVertexExecutor",
         "model": "gemini-3-pro-preview",
         "quality": "complete"
@@ -3392,7 +3392,7 @@
       },
       "error": {
         "status": 0,
-        "message": "Post \"relay.example/v1/endpoints/openapi/chat/completions\": unsupported protocol scheme \"\""
+        "message": "Post \"<redacted url>\": unsupported protocol scheme \"\""
       },
       "usage": {
         "input_tokens": 0,
@@ -3405,7 +3405,7 @@
         "response_model": "",
         "reasoning_effort": "",
         "failed": true,
-        "fail_body": "Post \"relay.example/v1/endpoints/openapi/chat/completions\": unsupported protocol scheme \"\"",
+        "fail_body": "Post \"<redacted url>\": unsupported protocol scheme \"\"",
         "executor_type": "OpenAICompatExecutor",
         "model": "meta/llama-4",
         "quality": "complete"
@@ -3457,7 +3457,7 @@
       },
       "error": {
         "status": 0,
-        "message": "Post \"relay.example/v1/publishers/google/models/gemini-2.5-flash:generateContent\": unsupported protocol scheme \"\""
+        "message": "Post \"<redacted url>\": unsupported protocol scheme \"\""
       },
       "usage": {
         "input_tokens": 0,
@@ -3470,7 +3470,7 @@
         "response_model": "",
         "reasoning_effort": "",
         "failed": true,
-        "fail_body": "Post \"relay.example/v1/publishers/google/models/gemini-2.5-flash:generateContent\": unsupported protocol scheme \"\"",
+        "fail_body": "Post \"<redacted url>\": unsupported protocol scheme \"\"",
         "executor_type": "GeminiVertexExecutor",
         "model": "gemini-2.5-flash",
         "quality": "complete"

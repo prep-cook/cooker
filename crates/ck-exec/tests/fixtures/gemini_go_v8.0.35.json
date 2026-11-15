@@ -1243,7 +1243,7 @@
       "session": "derived:ctx:v1:39e4011826e21361d0429d85036f493dd10bf10db89b9f0c5d315b6486284c41",
       "error": {
         "status": 0,
-        "message": "Post \"https:relay.example/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse\": http: no Host in request URL"
+        "message": "Post \"<redacted url>\": http: no Host in request URL"
       },
       "usage": {
         "input_tokens": 0,
@@ -1256,7 +1256,7 @@
         "response_model": "",
         "reasoning_effort": "",
         "failed": true,
-        "fail_body": "Post \"https:relay.example/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse\": http: no Host in request URL"
+        "fail_body": "Post \"<redacted url>\": http: no Host in request URL"
       }
     },
     {
@@ -1274,7 +1274,7 @@
       "session": "derived:ctx:v1:39e4011826e21361d0429d85036f493dd10bf10db89b9f0c5d315b6486284c41",
       "error": {
         "status": 0,
-        "message": "Post \"relay.example/v1beta/models/gemini-2.5-flash:countTokens\": unsupported protocol scheme \"\""
+        "message": "Post \"<redacted url>\": unsupported protocol scheme \"\""
       }
     },
     {

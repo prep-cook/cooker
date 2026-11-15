@@ -170,7 +170,7 @@ async fn access_logs_carry_no_cursor_or_identity() {
     .with_subscriber(subscriber)
     .await;
     let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-    assert!(log.contains("/v1/streams?after=<redacted>"), "{log}");
+    assert!(log.contains("/v1/streams?after=***"), "{log}");
     for secret in ["123456789", "987654321", "v1.e.2", &live.header(), &unknown] {
         assert!(!log.contains(secret), "{secret:?} reached the access log:\n{log}");
     }

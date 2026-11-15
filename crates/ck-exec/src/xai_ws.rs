@@ -1378,10 +1378,12 @@ async fn dial_once(
     let key = codex_ws::offer_compression(&mut headers);
     let builder = client.websocket(&target.url).headers(headers).accept_key(key.clone());
     let attempt = async {
-        let mut res = builder
-            .send()
-            .await
-            .map_err(|e| Dial::Failed(plain(format!("xai websockets executor: dial failed: {e}"))))?;
+        let mut res = builder.send().await.map_err(|e| {
+            Dial::Failed(plain(format!(
+                "xai websockets executor: dial failed: {}",
+                crate::upstream::transport_text(&e)
+            )))
+        })?;
         let status = res.status().as_u16();
         let handshake = res.headers().clone();
         if status != 101 {

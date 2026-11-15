@@ -121,3 +121,5 @@ RSFIX_ONLY='^(count_payload_rules_not_applied|stream_usage_trace_id|claude_malfo
 Go applies one rule's `params` in random map order (`docs/DIFFERENCES-FROM-GO.md`); this
 scenario's default rule adds two keys, so of five runs the one kept added them in the
 order the config lists them, as Rust does. One of the five ran them the other way.
+
+URL redaction (owner ruling Q18): error messages that name a URL hold cooker's redacted form, not Go's text. After re-recording, rewrite each URL in a `Post "…"`, `parse "…"` or `must use https: "…"` message as `ck_wire::redact::url` renders it.

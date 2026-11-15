@@ -1,6 +1,8 @@
 //! Go request_logging.go / response_writer.go and request_logger_writer.go.
-//! Request bodies in these files are intentionally unredacted, as in Go. Headers
-//! and URL queries are masked before writing; management routes are never captured.
+//! Request bodies in these files are intentionally unredacted, as in Go, except for
+//! URLs: every file here, spools included, is written through `ck_wire::redact`, so no
+//! URL credential reaches the disk (owner ruling Q18). Headers and URL queries are
+//! masked before writing; management routes are never captured.
 
 use ck_core::gostr::GoStr;
 use std::fs::{File, OpenOptions};
@@ -18,10 +20,16 @@ use axum::middleware::Next;
 use axum::response::Response;
 use bytes::Bytes;
 use chrono::{DateTime, Local, SecondsFormat};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+#[path = "request_logging_spool.rs"]
+mod spool;
+#[cfg(test)]
+use spool::SECTION_MEMORY;
+use spool::{Section, Spool, Temp};
 
 use crate::management::api::Management;
-use crate::observability::api::{RequestId, hide_key, mask_query};
+use crate::observability::api::{RequestId, hide_key};
 use crate::{Runtime, http::body_limit};
 
 const SMALL_BODY: u64 = 1 << 20;
@@ -159,9 +167,19 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
         request_body = decode(bytes.to_vec(), request.headers(), true, limit).await.0;
     }
     let deferred = if !eager && !multipart && length != Some(0) && !request.body().is_end_stream() {
-        Spool::new(&state.dir, "request-body").ok().map(|spool| {
+        let encoded = request.headers().get("content-encoding").is_some_and(|v| {
+            let v = trim(v.as_bytes());
+            !v.is_empty() && !v.eq_ignore_ascii_case(b"identity")
+        });
+        let spool = if encoded {
+            Ok(None)
+        } else {
+            Spool::new(&state.dir, "request-body").map(Some)
+        };
+        spool.ok().map(|spool| {
             Arc::new(Mutex::new(Deferred {
                 spool,
+                memory: Vec::new(),
                 length,
                 read: 0,
                 captured: 0,
@@ -180,7 +198,8 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             deferred: deferred.clone(),
         });
     }
-    let query = mask_query(request.uri().query().unwrap_or_default());
+    // The record keeps this URL, so its query is masked as it enters.
+    let query = ck_wire::redact::query(request.uri().query().unwrap_or_default());
     let url = if query.is_empty() {
         path
     } else {
@@ -290,16 +309,13 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
                     })));
     let chunks = if record.streaming && !head {
         match Spool::new(&record.state.dir, "response-body") {
-            Ok(spool) => match spool.file.try_clone() {
-                Ok(file) => {
-                    record.response_spool = Some(spool);
-                    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(100);
-                    record.state.work.spawn(spool_response(file, rx, sink.clone()));
-                    guard.0 = None;
-                    Some(tx)
-                }
-                Err(_) => None,
-            },
+            Ok(Spool { file, temp }) => {
+                record.response_spool = Some(temp);
+                let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(100);
+                record.state.work.spawn(spool_response(file, rx, sink.clone()));
+                guard.0 = None;
+                Some(tx)
+            }
             Err(_) => None,
         }
     } else {
@@ -455,6 +471,8 @@ struct UpstreamCapture {
     body: bool,
     event: bool,
     error: bool,
+    /// The body so far, scanned for where its URLs end.
+    chunks: ck_wire::redact::Stream,
 }
 
 fn commercial_mode(config: &ck_core::config::Config) -> bool {
@@ -554,7 +572,7 @@ impl RequestLog {
                     if info.url.is_empty() {
                         String::from("<unknown>")
                     } else {
-                        logged_url(info.url)
+                        info.url.to_owned()
                     }
                 )
                 .unwrap();
@@ -632,18 +650,21 @@ impl RequestLog {
                     record.api_response.append(dir, b"Headers:\n<none>\n\n");
                     record.upstream.headers = true;
                 }
+                let mut scratch = Vec::new();
                 if !record.upstream.body {
                     record.api_response.append(dir, b"Body:\n");
-                } else {
-                    record.api_response.append(
-                        dir,
-                        if record.upstream.event && chunk.starts_with(b"data:") {
-                            b"\n"
-                        } else {
-                            b"\n\n"
-                        },
-                    );
+                } else if !record.upstream.chunks.inside_reference() {
+                    let separator: &[u8] = if record.upstream.event && chunk.starts_with(b"data:") {
+                        b"\n"
+                    } else {
+                        b"\n\n"
+                    };
+                    record.upstream.chunks.push(separator, &mut scratch);
+                    record.api_response.append(dir, separator);
                 }
+                // A URL split across two chunks is joined rather than separated, so the
+                // log's redactor sees it whole and no part of its query prints as text.
+                record.upstream.chunks.push(chunk, &mut scratch);
                 record.api_response.append(dir, chunk);
                 record.upstream.body = true;
                 record.upstream.event = chunk.starts_with(b"event:");
@@ -651,7 +672,7 @@ impl RequestLog {
             WebsocketRequest(info) => {
                 let mut part = websocket_event("api.websocket.request");
                 if !info.url.is_empty() {
-                    writeln!(part, "Upstream URL: {}", logged_url(info.url)).unwrap();
+                    writeln!(part, "Upstream URL: {}", info.url).unwrap();
                 }
                 upstream_auth(&mut part, &info);
                 part.extend_from_slice(b"Headers:\n");
@@ -790,7 +811,7 @@ impl WebsocketLog {
                     record.timeline = Some(Spool::new(&record.state.dir, "websocket-timeline")?);
                 }
                 let spool = record.timeline.as_mut().unwrap();
-                if spool.file.metadata()?.len() > 0 {
+                if !spool.file.is_empty() {
                     spool.file.write_all(b"\n")?;
                 }
                 spool.file.write_all(part)?;
@@ -833,15 +854,19 @@ fn schedule(sink: RequestLog, websocket: bool) {
 
 /// Drain even after a sticky disk error. Only EOF/drop ends capture; never
 /// finalize a live HTTP stream merely because its log file could not be written.
-async fn spool_response(file: File, mut rx: tokio::sync::mpsc::Receiver<Bytes>, sink: RequestLog) {
-    let mut file = tokio::fs::File::from_std(file);
+/// Writes are synchronous, like a section's spill: the redactor sits in front of the file.
+async fn spool_response(
+    mut file: ck_wire::redact::Writer<File>,
+    mut rx: tokio::sync::mpsc::Receiver<Bytes>,
+    sink: RequestLog,
+) {
     let mut failed = false;
     while let Some(bytes) = rx.recv().await {
-        if !failed && file.write_all(&bytes).await.is_err() {
+        if !failed && file.write_all(&bytes).is_err() {
             failed = true;
         }
     }
-    failed |= file.flush().await.is_err();
+    failed = failed || file.end().is_err();
     drop(file);
     if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
         record.streaming_failed = failed;
@@ -933,7 +958,15 @@ impl HttpBody for RequestBody {
                 .min(DEFERRED_BODY.saturating_sub(deferred.captured) as usize);
             deferred.truncated |= length < bytes.len();
             if !deferred.failed {
-                match deferred.spool.file.write(&bytes[..length]) {
+                let deferred = &mut *deferred;
+                let written = match deferred.spool.as_mut() {
+                    Some(spool) => spool.file.write(&bytes[..length]),
+                    None => {
+                        deferred.memory.extend_from_slice(&bytes[..length]);
+                        Ok(length)
+                    }
+                };
+                match written {
                     Ok(n) => {
                         deferred.captured += n as u64;
                         deferred.failed = n < length;
@@ -956,7 +989,10 @@ impl HttpBody for RequestBody {
 }
 
 struct Deferred {
-    spool: Spool,
+    /// `None` for a content-encoded body, kept in `memory`: it is decoded before it is
+    /// logged, and the spool's redactor would corrupt the encoding.
+    spool: Option<Spool>,
+    memory: Vec<u8>,
     length: Option<u64>,
     read: u64,
     captured: u64,
@@ -965,7 +1001,7 @@ struct Deferred {
     failed: bool,
 }
 impl Deferred {
-    fn bytes(&self) -> io::Result<(Vec<u8>, String)> {
+    fn bytes(&mut self) -> io::Result<(Vec<u8>, String)> {
         if self.failed {
             return Err(io::Error::other("request body capture failed"));
         }
@@ -985,146 +1021,14 @@ impl Deferred {
                 ),
             });
         }
-        Ok((std::fs::read(&self.spool.path)?, markers.join("\n")))
-    }
-}
-
-struct Spool {
-    file: File,
-    path: PathBuf,
-}
-impl Spool {
-    fn new(dir: &Path, prefix: &str) -> io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!("{prefix}-{}.tmp", uuid::Uuid::new_v4()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        // Go's os.OpenFile modes; Windows ignores them.
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let file = options.open(&path)?;
-        Ok(Self { file, path })
-    }
-}
-impl Drop for Spool {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// In-memory bytes an upstream section keeps before it moves to its spool file.
-const SECTION_MEMORY: usize = 64 << 10;
-/// Long enough for every section header that `section` looks for.
-const SECTION_HEAD: usize = 32;
-
-/// An append-only upstream section of the log (API REQUEST, API RESPONSE or
-/// API WEBSOCKET TIMELINE). Go appends these to file-backed sources
-/// (request_logging.go attachRequestLogSources), so a long stream or WebSocket
-/// session does not grow in memory. Here a section stays in memory until it
-/// passes SECTION_MEMORY bytes, then the buffered bytes and everything after
-/// them go to a spool file in the log directory. If the spool cannot be
-/// written, the section keeps the rest in memory, as Go's writeAttemptResponse
-/// falls back to a strings.Builder.
-struct Section {
-    prefix: &'static str,
-    memory: Vec<u8>,
-    spool: Option<Spool>,
-    /// Bytes at the start of the spool file that belong to the section; a
-    /// failed write can leave more after them, which are never read.
-    spilled: u64,
-    spill_failed: bool,
-    /// The first SECTION_HEAD bytes of the section.
-    head: Vec<u8>,
-    /// Newlines at the end of the section.
-    trailing: usize,
-    /// Every byte so far is whitespace (the section trims to nothing).
-    blank: bool,
-}
-
-impl Section {
-    fn new(prefix: &'static str) -> Self {
-        Self {
-            prefix,
-            memory: Vec::new(),
-            spool: None,
-            spilled: 0,
-            spill_failed: false,
-            head: Vec::new(),
-            trailing: 0,
-            blank: true,
-        }
-    }
-
-    /// A section that holds `bytes` in memory, for a buffer that is already
-    /// in memory as a whole.
-    fn from_vec(prefix: &'static str, bytes: Vec<u8>) -> Self {
-        let mut section = Self::new(prefix);
-        section.track(&bytes);
-        section.memory = bytes;
-        section
-    }
-
-    fn is_empty(&self) -> bool {
-        self.spilled == 0 && self.memory.is_empty()
-    }
-
-    fn track(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let room = SECTION_HEAD.saturating_sub(self.head.len());
-        self.head.extend_from_slice(&bytes[..room.min(bytes.len())]);
-        let newlines = bytes.iter().rev().take_while(|&&b| b == b'\n').count();
-        self.trailing = if newlines == bytes.len() {
-            self.trailing + newlines
-        } else {
-            newlines
+        let body = match &mut self.spool {
+            Some(spool) => {
+                spool.file.end()?;
+                std::fs::read(&spool.temp.path)?
+            }
+            None => self.memory.clone(),
         };
-        self.blank &= trim(bytes).is_empty();
-    }
-
-    fn append(&mut self, dir: &Path, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        self.track(bytes);
-        if !self.spill_failed && self.memory.len() + bytes.len() > SECTION_MEMORY {
-            if self.spill(dir, bytes).is_ok() {
-                return;
-            }
-            self.spill_failed = true;
-        }
-        self.memory.extend_from_slice(bytes);
-    }
-
-    /// Moves the buffered bytes and then `bytes` to the spool file. On error,
-    /// whatever did not reach the file is still in memory or in `bytes`.
-    fn spill(&mut self, dir: &Path, bytes: &[u8]) -> io::Result<()> {
-        if self.spool.is_none() {
-            self.spool = Some(Spool::new(dir, self.prefix)?);
-        }
-        let file = &mut self.spool.as_mut().unwrap().file;
-        file.write_all(&self.memory)?;
-        self.spilled += self.memory.len() as u64;
-        // Appends only reach memory while it stays within SECTION_MEMORY, so
-        // the kept allocation is bounded too.
-        self.memory.clear();
-        file.write_all(bytes)?;
-        self.spilled += bytes.len() as u64;
-        Ok(())
-    }
-
-    fn write_to(&self, out: &mut dyn Write) -> io::Result<()> {
-        if let Some(spool) = self.spool.as_ref().filter(|_| self.spilled > 0) {
-            let copied = io::copy(&mut File::open(&spool.path)?.take(self.spilled), out)?;
-            if copied != self.spilled {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("{} spool is shorter than written", self.prefix),
-                ));
-            }
-        }
-        out.write_all(&self.memory)
+        Ok((body, markers.join("\n")))
     }
 }
 
@@ -1143,7 +1047,7 @@ struct Record {
     status: u16,
     response_headers: HeaderMap,
     response: Vec<u8>,
-    response_spool: Option<Spool>,
+    response_spool: Option<Temp>,
     streaming: bool,
     streaming_failed: bool,
     detached: bool,
@@ -1225,12 +1129,21 @@ impl Record {
             .await;
     }
 
-    fn write(self, forced: bool, max: i64, decompress_error: Option<String>) -> io::Result<()> {
+    fn write(mut self, forced: bool, max: i64, decompress_error: Option<String>) -> io::Result<()> {
+        for section in [&mut self.api_timeline, &mut self.api_request, &mut self.api_response] {
+            section.end()?;
+        }
+        if let Some(spool) = &mut self.timeline {
+            spool.file.end()?;
+        }
         std::fs::create_dir_all(&self.state.dir)?;
         let filename = filename(&self.url, &self.id, Local::now(), forced);
-        let mut file = unique_file(&self.state.dir, &filename)?;
+        // Every URL in the log, wherever it came from (URLs, errors, headers, bodies),
+        // drops its credentials here (owner ruling Q18); the bytes sent to the client and
+        // upstream are not touched.
+        let mut file = ck_wire::redact::Writer::new(unique_file(&self.state.dir, &filename)?);
         self.format(&mut file, decompress_error)?;
-        drop(file);
+        drop(file.finish()?);
         if forced {
             retain_errors(&self.state.dir, max)?;
         }
@@ -1238,10 +1151,7 @@ impl Record {
     }
 
     fn format(&self, out: &mut dyn Write, decompress_error: Option<String>) -> io::Result<()> {
-        let websocket = self
-            .timeline
-            .as_ref()
-            .is_some_and(|s| s.file.metadata().is_ok_and(|m| m.len() > 0));
+        let websocket = self.timeline.as_ref().is_some_and(|s| !s.file.is_empty());
         let downstream = if websocket
             || self
                 .headers
@@ -1280,7 +1190,7 @@ impl Record {
         }
         if let Some(spool) = &self.timeline {
             out.write_all(b"=== WEBSOCKET TIMELINE ===\n")?;
-            let mut input = File::open(&spool.path)?;
+            let mut input = File::open(&spool.temp.path)?;
             let mut buffer = [0; 8192];
             let mut trailing = 0;
             loop {
@@ -1384,44 +1294,6 @@ const REDACTED: &str = "<redacted>";
 /// cursor (`docs/INTERNAL-STREAM.md` §6.7). Names arrive lowercase.
 fn redacted(name: &str) -> bool {
     name.contains("cookie") || name == crate::inference::streams::STREAM_ID_HEADER || name == "last-event-id"
-}
-
-/// Deliberate difference: Go prints upstream URLs unchanged, and a configured
-/// base-url can carry credentials. The logged copy replaces any userinfo and
-/// masks sensitive query values the way the downstream URL is masked; the
-/// request itself still goes to the URL as configured.
-fn logged_url(url: &str) -> String {
-    let mut out = String::new();
-    let mut rest = url;
-    if let Some(i) = url.find("://")
-        && i > 0
-        && url[..i]
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
-    {
-        out.push_str(&url[..i + 3]);
-        rest = &url[i + 3..];
-        // Look for '@' up to the first '/', even past a '?' or '#': a
-        // password with those characters unescaped still counts as userinfo,
-        // and dropping too much is safer than printing a secret.
-        let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
-        if let Some(at) = authority.rfind('@') {
-            out.push_str(REDACTED);
-            out.push('@');
-            rest = &rest[at + 1..];
-        }
-    }
-    let (rest, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
-    match rest.split_once('?') {
-        Some((base, query)) => {
-            out.push_str(base);
-            out.push('?');
-            out.push_str(&mask_query(query));
-        }
-        None => out.push_str(rest),
-    }
-    out.push_str(fragment);
-    out
 }
 
 fn masked_header(name: &str, value: &[u8]) -> Vec<u8> {
@@ -1665,6 +1537,10 @@ async fn held_delivery(dir: &Path) {
 }
 
 #[cfg(test)]
+#[path = "request_logging_url_tests.rs"]
+mod url_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::{Request as HttpRequest, StatusCode};
@@ -1687,7 +1563,7 @@ mod tests {
         serde_json::from_str(&text).unwrap()
     }
 
-    fn management(dir: &Path, enabled: bool, commercial: bool) -> Arc<Management> {
+    pub(super) fn management(dir: &Path, enabled: bool, commercial: bool) -> Arc<Management> {
         let config = ck_core::config::Config::parse(&format!(
             "observability: {{logs: {{request-log: {enabled}}}}}\nserver: {{commercial-mode: {commercial}}}\n"
         ))
@@ -1716,7 +1592,7 @@ mod tests {
         )
     }
 
-    fn scratch() -> PathBuf {
+    pub(super) fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cooker-request-log-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1748,7 +1624,7 @@ mod tests {
         out
     }
 
-    fn logs(dir: &Path) -> Vec<PathBuf> {
+    pub(super) fn logs(dir: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(dir)
             .unwrap()
             .flatten()
@@ -2350,7 +2226,8 @@ mod tests {
         for size in [32 << 20, (32 << 20) + 1] {
             let dir = scratch();
             let capture = Arc::new(Mutex::new(Deferred {
-                spool: Spool::new(&dir, "request-body").unwrap(),
+                spool: Some(Spool::new(&dir, "request-body").unwrap()),
+                memory: Vec::new(),
                 length: None,
                 read: 0,
                 captured: 0,
@@ -2379,9 +2256,10 @@ mod tests {
         }
         let dir = scratch();
         let mut spool = Spool::new(&dir, "request-body").unwrap();
-        spool.file = unwritable(&dir);
+        spool.file = ck_wire::redact::Writer::new(unwritable(&dir));
         let capture = Arc::new(Mutex::new(Deferred {
-            spool,
+            spool: Some(spool),
+            memory: Vec::new(),
             length: None,
             read: 0,
             captured: 0,
@@ -2443,7 +2321,7 @@ mod tests {
         .unwrap();
         assert_eq!(forwarded.len(), 102, "stalled logger must not delay/drop client output");
         assert_eq!(rx.len(), 100, "logger alone drops chunks above its queue limit");
-        let file = unwritable(&dir);
+        let file = ck_wire::redact::Writer::new(unwritable(&dir));
         let worker = tokio::spawn(spool_response(file, rx, sink.clone()));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!worker.is_finished(), "disk failure must wait for HTTP completion");
@@ -2588,28 +2466,48 @@ mod tests {
     /// Serves one request (sending a Cookie) whose handler feeds `events` to the
     /// capture sink and answers `status` with a Set-Cookie, then returns the
     /// persisted log file.
-    async fn persisted(
+    pub(super) async fn persisted(
         enabled: bool,
         status: StatusCode,
         events: impl Fn(&RequestLog) + Clone + Send + Sync + 'static,
     ) -> Vec<u8> {
+        persisted_request(enabled, status, "/fixture", &[], events).await.0
+    }
+
+    /// [`persisted`] for a request to `uri`, with `headers` on both the request and the
+    /// response; also returns the headers the client received.
+    pub(super) async fn persisted_request(
+        enabled: bool,
+        status: StatusCode,
+        uri: &str,
+        headers: &'static [(&'static str, &'static str)],
+        events: impl Fn(&RequestLog) + Clone + Send + Sync + 'static,
+    ) -> (Vec<u8>, HeaderMap) {
         let dir = scratch();
         let state = management(&dir, enabled, false);
         let app = axum::Router::new().fallback(move |axum::Extension(log): axum::Extension<RequestLog>| {
             let events = events.clone();
             async move {
                 events(&log);
-                (status, [("set-cookie", "down=c00kie-down-set")], "done")
+                let mut response = (status, [("set-cookie", "down=c00kie-down-set")], "done").into_response();
+                for (name, value) in headers {
+                    response
+                        .headers_mut()
+                        .insert(*name, axum::http::HeaderValue::from_static(value));
+                }
+                response
             }
         });
         let mut app = router(&state, app);
-        let request = HttpRequest::builder()
+        let mut request = HttpRequest::builder()
             .method("POST")
-            .uri("/fixture")
-            .header("cookie", "client=c00kie-client")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.call(request).await.unwrap();
+            .uri(uri)
+            .header("cookie", "client=c00kie-client");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = app.call(request.body(Body::empty()).unwrap()).await.unwrap();
+        let received = response.headers().clone();
         axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let mut content = Vec::new();
         for _ in 0..500 {
@@ -2640,10 +2538,10 @@ mod tests {
         }
         assert!(leftovers.is_empty(), "spool files left behind: {leftovers:?}");
         std::fs::remove_dir_all(dir).unwrap();
-        content
+        (content, received)
     }
 
-    fn upstream_request<'a>(
+    pub(super) fn upstream_request<'a>(
         url: &'a str,
         headers: &'a [(String, String)],
         body: &'a [u8],
@@ -2692,55 +2590,6 @@ mod tests {
             );
             assert!(content.contains("\nContent-Type: application/json\n"));
         }
-    }
-
-    #[tokio::test]
-    async fn upstream_url_credentials_are_redacted_in_logs() {
-        use ck_core::exec::CaptureEvent::*;
-        let content = persisted(true, StatusCode::OK, |log| {
-            let sink = log.capture_sink();
-            sink.record(Request(upstream_request(
-                "https://alice:pw-h1dden@proxy.example/v1/models?alt=sse&key=AIza-h1dden-query-123&access_token=tok-x-h1dden-x-456#frag",
-                &[],
-                b"",
-            )));
-            sink.record(WebsocketRequest(upstream_request(
-                "wss://bob:pw2-h1dden@ws.example/realtime?client_secret=cs-xx-h1dden-xx-789&model=gpt",
-                &[],
-                b"",
-            )));
-        })
-        .await;
-        let content = String::from_utf8(content).unwrap();
-        assert!(!content.contains("h1dden"), "{content}");
-        assert!(!content.contains("alice") && !content.contains("bob:"), "{content}");
-        let line = |prefix: &str| {
-            content
-                .lines()
-                .find(|l| l.starts_with(prefix))
-                .unwrap_or_else(|| panic!("no {prefix} in {content}"))
-                .to_owned()
-        };
-        let http = line("Upstream URL: https://<redacted>@proxy.example/v1/models?alt=sse&key=");
-        assert!(http.contains("&access_token=") && http.ends_with("#frag"), "{http}");
-        let ws = line("Upstream URL: wss://<redacted>@ws.example/realtime?client_secret=");
-        assert!(ws.ends_with("&model=gpt"), "{ws}");
-
-        for url in [
-            "https://host.example/v1/users/a@b.example?alt=sse",
-            "http://127.0.0.1:8080/v1#a@b",
-            "https://host.example/v1?model=gpt",
-        ] {
-            assert_eq!(logged_url(url), url);
-        }
-        assert_eq!(
-            logged_url("https://u:p@host.example"),
-            "https://<redacted>@host.example"
-        );
-        assert_eq!(
-            logged_url("https://user@host.example/x"),
-            "https://<redacted>@host.example/x"
-        );
     }
 
     #[tokio::test]

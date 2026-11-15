@@ -38,15 +38,62 @@ pub struct GoUrl {
     pub raw_path: String,
 }
 
-/// `url.Parse`. The error is Go's `*url.Error` text.
+/// `url.Parse`. The error is Go's `*url.Error` text with the URL redacted
+/// ([`ck_wire::redact::url`]) and no rejected port or fragment escape echoed: it reaches
+/// returned errors and captures, and the URL can carry credentials. When the URL is too
+/// malformed to print, every quoted part of the cause (an escape, a character, an
+/// IP literal) prints as `"***"` too.
 pub fn parse(raw: &str) -> Result<GoUrl, String> {
+    let error = |u: &str, cause: String| {
+        let shown = ck_wire::redact::url(u);
+        let cause = if shown == ck_wire::redact::UNPRINTABLE {
+            masked_quotes(&cause)
+        } else {
+            cause
+        };
+        format!("parse {}: {cause}", quote(shown))
+    };
     let (u, frag) = raw.split_once('#').unwrap_or((raw, ""));
-    let mut url = parse_inner(u).map_err(|e| format!("parse {}: {e}", quote_bytes(u.as_bytes())))?;
+    let mut url = parse_inner(u).map_err(|cause| {
+        // An authority without '@' whose "port" is the start of a password.
+        let cause = if cause.starts_with("invalid port ") {
+            "invalid port after host".to_owned()
+        } else {
+            cause
+        };
+        error(u, cause)
+    })?;
     if !frag.is_empty() {
-        unescape(frag.as_bytes(), Mode::Other).map_err(|e| format!("parse {}: {e}", quote_bytes(raw.as_bytes())))?;
+        // Go quotes the invalid escape, which is part of the masked fragment.
+        unescape(frag.as_bytes(), Mode::Other)
+            .map_err(|_| error(raw, format!("invalid URL escape {}", quote(ck_wire::redact::MASK))))?;
     }
     url.fragment = frag.to_owned();
     Ok(url)
+}
+
+/// `cause` with each Go-quoted string's contents replaced by the mask.
+fn masked_quotes(cause: &str) -> String {
+    let mut out = String::with_capacity(cause.len());
+    let mut chars = cause.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c != '"' {
+            continue;
+        }
+        out.push_str(ck_wire::redact::MASK);
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => break,
+                _ => {}
+            }
+        }
+        out.push('"');
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -175,15 +222,8 @@ fn parse_authority(scheme: &str, authority: &str) -> Result<(Vec<u8>, Option<Str
     if !valid {
         return Err("net/url: invalid userinfo".into());
     }
-    match userinfo.split_once(':') {
-        Some((user, password)) => {
-            unescape(user.as_bytes(), Mode::Other)?;
-            unescape(password.as_bytes(), Mode::Other)?;
-        }
-        None => {
-            unescape(userinfo.as_bytes(), Mode::Other)?;
-        }
-    }
+    // Go quotes the invalid escape; here no byte of the userinfo is echoed.
+    unescape(userinfo.as_bytes(), Mode::Other).map_err(|_| "net/url: invalid userinfo".to_owned())?;
     Ok((host, Some(userinfo.to_owned())))
 }
 
@@ -506,7 +546,10 @@ pub(crate) fn transport_refusal(raw: &str) -> Option<ck_core::exec::ExecError> {
     } else {
         return None;
     };
-    Some(statusless(format!("Post {}: {reason}", quote_bytes(raw.as_bytes()))))
+    Some(statusless(format!(
+        "Post {}: {reason}",
+        quote(ck_wire::redact::url(raw))
+    )))
 }
 
 /// Whether the HTTP client, which parses URLs with WHATWG rules (`url`), would contact
@@ -540,88 +583,5 @@ pub fn same_authority(raw: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `url.Parse` then `URL.String()`, recorded from Go 1.26.4 (tests/reference/go_url).
-    #[test]
-    fn string_follows_go() {
-        let cases: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/go_url_string.json")).unwrap();
-        for case in cases.as_array().unwrap() {
-            let input = case["in"].as_str().unwrap();
-            let want = &case["string"];
-            match parse(input) {
-                Ok(u) => assert_eq!(Some(string(&u).as_str()), want["out"].as_str(), "{input}"),
-                Err(e) => assert_eq!(Some(e.as_str()), want["err"].as_str(), "{input}"),
-            }
-        }
-    }
-
-    #[test]
-    fn transport_must_agree_with_go_on_the_authority() {
-        for ok in [
-            "https://auth.x.ai/oauth2/token",
-            "https://AUTH.X.AI:443/t",
-            "https://auth.x.ai:8443/t?q=1#f",
-            "https://u:p@auth.x.ai/t",
-            "https://例.x.ai/t",
-            "http://127.0.0.1:9/t",
-            "https://[::1]:8443/t",
-        ] {
-            assert!(same_authority(ok), "{ok}");
-        }
-        for bad in [
-            r"https://attacker.example\[::1%25.x.ai]/oauth2/token",
-            r"https://auth.x.ai\@evil.example/t",
-            "https://auth.x.ai:99999/t",
-            "https://%61uth.x.ai/t",
-            "https:auth.x.ai/t",
-        ] {
-            assert!(!same_authority(bad), "{bad}");
-        }
-    }
-
-    /// Go 1.26.4 `http.DefaultClient.Do` of a POST to each URL.
-    #[test]
-    fn transport_refusals_match_go() {
-        for (raw, want) in [
-            (
-                "ftp://relay.example/x",
-                Some(r#"Post "ftp://relay.example/x": unsupported protocol scheme "ftp""#),
-            ),
-            (
-                "//relay.example/x",
-                Some(r#"Post "//relay.example/x": unsupported protocol scheme """#),
-            ),
-            (
-                "https:relay.example/x",
-                Some(r#"Post "https:relay.example/x": http: no Host in request URL"#),
-            ),
-            ("HTTPS://relay.example/x", None),
-            ("http://127.0.0.1:9/x", None),
-        ] {
-            let got = transport_refusal(raw).map(|e| String::from_utf8_lossy(&e.body).into_owned());
-            assert_eq!(got.as_deref(), want, "{raw}");
-        }
-    }
-
-    /// Go 1.26.4 `url.Parse`: an IP literal must start the host.
-    #[test]
-    fn a_bracket_inside_the_host_is_go_s_invalid_ip_literal() {
-        for (raw, want) in [
-            ("http://x[::1]", r#"parse "http://x[::1]": invalid IP-literal"#),
-            (
-                "http://x[::1]:80/p",
-                r#"parse "http://x[::1]:80/p": invalid IP-literal"#,
-            ),
-            (
-                "http://[::1]x/",
-                r#"parse "http://[::1]x/": invalid port "x" after host"#,
-            ),
-        ] {
-            assert_eq!(parse(raw).err().as_deref(), Some(want), "{raw}");
-        }
-        assert_eq!(parse("http://[::1]:80/p").map(|u| u.hostname).as_deref(), Ok("::1"));
-    }
-}
+#[path = "xai_url_tests.rs"]
+mod tests;

@@ -803,6 +803,55 @@ async fn rejected_handshake_is_an_upstream_attempt() {
     server.abort();
 }
 
+/// A failed dial names the socket URL without the base URL's query key, in the returned
+/// error and in the capture's websocket error.
+#[tokio::test]
+async fn a_failed_dial_never_names_the_query_key() {
+    const SECRET: &str = "sk-review-secret";
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = closed.local_addr().unwrap().to_string();
+    drop(closed);
+    let attrs = serde_json::json!({
+        "base_url": format!("http://UPSTREAM/?api_key={SECRET}"),
+        "websockets": "true",
+        "access_token": "xai-token",
+    });
+    let credential = credential("xai-auth-dial", &attrs, &addr);
+    let (_recorder, capture, usage) = sinks();
+    let turn = serde_json::json!({"payload": r#"{"model":"grok-4.3","input":"hello"}"#});
+    let session = ExecSession {
+        id: "sess-dial".into(),
+        continuation: false,
+    };
+    let Err(error) = XaiExecutor::with_client(wreq::Client::new())
+        .execute_in_session(
+            &credential,
+            request(&turn, "sess-dial", usage),
+            &Config::default(),
+            &session,
+        )
+        .await
+    else {
+        panic!("a dial to a closed port succeeded");
+    };
+    let body = String::from_utf8_lossy(&error.body).into_owned();
+    assert!(
+        body.contains(&format!(
+            "dial failed: error sending request for uri (http://{addr}/?api_key=***"
+        )),
+        "{body}"
+    );
+    // The request event carries the URL as sent; the log writer masks it.
+    let errors: Vec<_> = capture
+        .take()
+        .into_iter()
+        .filter(|e| matches!(e, Captured::WsError(..) | Captured::Error(_)))
+        .collect();
+    assert!(matches!(errors.as_slice(), [Captured::WsError(..)]), "{errors:?}");
+    let all = format!("{body} {errors:?}");
+    assert!(!all.contains(SECRET), "{all}");
+}
+
 /// TestMapXAIWebsocketWriteErrorStopsRetryForMessageTooBig: a write failure after the
 /// upstream closed with 1009 is the request-scoped 413 and never retries; any other write
 /// failure retries on a fresh socket.

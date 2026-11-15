@@ -28,9 +28,17 @@ pub(super) fn go_preflight(url: &str, parsed: &GoUrl, headers: &Header) -> Resul
     Ok(())
 }
 
-/// The `*url.Error` text for a request Go's client refused: `Get "url": cause`.
+/// The `*url.Error` text for a request Go's client refused: `Get "url": cause`. The
+/// URL is redacted ([`ck_wire::redact::url`]) where Go masks only a password: a probe
+/// URL carries the credential's token after `$TOKEN$` substitution. A URL in the cause
+/// (wreq's `for uri (...)`) is redacted too.
 pub(super) fn go_url_error_text(method: &str, url: &str, cause: &str) -> String {
-    format!("{} {}: {cause}", url_error_op(method), quote(strip_password(url)))
+    format!(
+        "{} {}: {}",
+        url_error_op(method),
+        quote(ck_wire::redact::url(url)),
+        ck_wire::redact::urls_in(cause)
+    )
 }
 
 /// The error Go's response body reader reports for `err`.
@@ -39,10 +47,10 @@ pub(super) fn go_read_error_text(err: &std::io::Error) -> String {
 }
 
 /// The `*url.Error` text Go's `http.Client.Do` returns for a failed send
-/// (`Get "url": cause`), password masked.
+/// (`Get "url": cause`), URL redacted as in [`go_url_error_text`].
 pub(super) fn go_url_error(method: &str, err: SendError) -> String {
     let (url, cause) = send_error_parts(err);
-    format!("{} {}: {cause}", url_error_op(method), quote(strip_password(&url)))
+    go_url_error_text(method, &url, &cause)
 }
 
 /// Go `urlErrorOp`: the method with only its first letter upper case.
@@ -55,25 +63,6 @@ fn url_error_op(method: &str) -> String {
         return format!("{}{}", &method[..1], &lower[1..]);
     }
     method.to_owned()
-}
-
-/// Go `stripPassword`: a password in the URL's authority (after `scheme://`, or a
-/// leading `//`) prints as `***`.
-fn strip_password(raw: &str) -> String {
-    let start = match raw.find("://") {
-        Some(i) => i + 3,
-        None if raw.starts_with("//") => 2,
-        None => return raw.to_owned(),
-    };
-    let rest = &raw[start..];
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let Some((userinfo, host)) = rest[..end].rsplit_once('@') else {
-        return raw.to_owned();
-    };
-    match userinfo.split_once(':') {
-        Some((user, _)) => format!("{}{user}:***@{host}{}", &raw[..start], &rest[end..]),
-        None => raw.to_owned(),
-    }
 }
 
 /// Go `validateHeaders` on the request: the first invalid name (or value, named by
@@ -170,14 +159,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_errors_name_the_method_and_mask_the_password() {
+    fn url_errors_name_the_method_and_redact_the_url() {
         assert_eq!(
-            go_url_error_text("POST", "http://user:secret@127.0.0.1:1/q?t=1", "boom"),
-            r#"Post "http://user:***@127.0.0.1:1/q?t=1": boom"#
+            go_url_error_text("POST", "http://user:secret@127.0.0.1:1/q?t=sk-review-secret", "boom"),
+            r#"Post "http://127.0.0.1:1/q?t=***": boom"#
         );
         assert_eq!(
             go_url_error_text("", "http://user@h/x", "boom"),
-            r#"Get "http://user@h/x": boom"#
+            r#"Get "http://h/x": boom"#
         );
+        // A wreq error with no source prints its URI in the cause.
+        let got = go_url_error_text(
+            "GET",
+            "http://127.0.0.1:1/q?t=sk-review-secret",
+            "error sending request for uri (http://127.0.0.1:1/q?t=sk-review-secret)",
+        );
+        assert!(!got.contains("sk-review-secret"), "{got}");
     }
 }

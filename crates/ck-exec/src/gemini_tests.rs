@@ -133,9 +133,10 @@ pub(crate) fn check_refused_capture(name: &str, s: &Value, events: &mut std::col
     else {
         return;
     };
+    // The error names the URL redacted; the request capture holds it as sent.
     let url = message.split('"').nth(1).unwrap();
     assert!(
-        matches!(events.pop_front(), Some(Captured::Request { url: u, .. }) if u == url),
+        matches!(events.pop_front(), Some(Captured::Request { url: u, .. }) if ck_wire::redact::url(&u) == url),
         "{name}: refused request capture"
     );
     assert_eq!(

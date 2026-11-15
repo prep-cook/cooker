@@ -170,12 +170,12 @@
     [
       "https://auth.x.ai\\@evil.com/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai\\\\@evil.com/t\": net/url: invalid userinfo"
+      "xai discovery token_endpoint is invalid: parse \"https://evil.com/t\": net/url: invalid userinfo"
     ],
     [
       "https://auth.x.ai\t/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai\\t/t\": net/url: invalid control character in URL"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": net/url: invalid control character in URL"
     ],
     [
       "https://auth.x.ai/t\n",
@@ -235,12 +235,12 @@
     [
       "https://auth.x.ai%2f.evil.com/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai%2f.evil.com/t\": invalid URL escape \"%2f\""
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid URL escape \"***\""
     ],
     [
       "https://auth.x.ai:80:90/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai:80:90/t\": invalid port \":80:90\" after host"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid port after host"
     ],
     [
       "https://[fe80::1%25en0]/t",
@@ -250,7 +250,7 @@
     [
       "https://[1.2.3.4]/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://[1.2.3.4]/t\": invalid IP-literal"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid IP-literal"
     ],
     [
       "https://[::ffff:1.2.3.4]/t",
@@ -260,12 +260,12 @@
     [
       "*",
       false,
-      "xai discovery token_endpoint must use https: \"*\""
+      "xai discovery token_endpoint must use https: \"<redacted url>\""
     ],
     [
       ":foo",
       false,
-      "xai discovery token_endpoint is invalid: parse \":foo\": missing protocol scheme"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": missing protocol scheme"
     ],
     [
       "https://auth.x.ai/%zz",
@@ -275,7 +275,7 @@
     [
       "https://auth.x.ai/#%zz",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai/#%zz\": invalid URL escape \"%zz\""
+      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai/#***\": invalid URL escape \"***\""
     ],
     [
       "https://auth.x.ai/#ok%41",
@@ -290,12 +290,12 @@
     [
       "https://user%zz@auth.x.ai/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://user%zz@auth.x.ai/t\": invalid URL escape \"%zz\""
+      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai/t\": net/url: invalid userinfo"
     ],
     [
       "https://[::1/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://[::1/t\": missing ']' in host"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": missing ']' in host"
     ],
     [
       "https://foo%e4%be%8b.x.ai/t",
@@ -320,12 +320,12 @@
     [
       "https://auth.x.ai%",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai%\": invalid URL escape \"%\""
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid URL escape \"***\""
     ],
     [
       "https://auth.x.ai%4",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai%4\": invalid URL escape \"%4\""
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid URL escape \"***\""
     ],
     [
       "https://u:p@w@auth.x.ai/t",
@@ -335,7 +335,7 @@
     [
       "https://auth.x.ai /t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://auth.x.ai /t\": invalid character \" \" in host name"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid character \"***\" in host name"
     ],
     [
       "https://x.ai:443",
@@ -365,27 +365,27 @@
     [
       "https://[::1]x/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://[::1]x/t\": invalid port \"x\" after host"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid port after host"
     ],
     [
       "postgres://a:1,b:2/t",
       false,
-      "xai discovery token_endpoint must use https: \"postgres://a:1,b:2/t\""
+      "xai discovery token_endpoint must use https: \"<redacted url>\""
     ],
     [
       "postgresql://a:1:2/t",
       false,
-      "xai discovery token_endpoint must use https: \"postgresql://a:1:2/t\""
+      "xai discovery token_endpoint must use https: \"<redacted url>\""
     ],
     [
       "https://a:1,b:2/t",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://a:1,b:2/t\": invalid port \":1,b:2\" after host"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid port after host"
     ],
     [
       "https://attacker.example\\[::1%25.x.ai]/oauth2/token",
       false,
-      "xai discovery token_endpoint is invalid: parse \"https://attacker.example\\\\[::1%25.x.ai]/oauth2/token\": invalid IP-literal"
+      "xai discovery token_endpoint is invalid: parse \"<redacted url>\": invalid IP-literal"
     ]
   ],
   "file_names": [

@@ -793,3 +793,49 @@ async fn a_refused_baseline_alone_does_not_refuse_the_request() {
     s["payload"] = s["original"].clone();
     assert_eq!(run(s).await, (false, None));
 }
+
+/// A base URL the relay refuses before sending (Go's parser, then its transport) names
+/// neither its password nor its query key in the returned error or the captured error.
+#[tokio::test]
+async fn refused_base_urls_never_print_url_credentials() {
+    use crate::openai_compat_usage::Captured;
+    const SECRET: &str = "sk-review-secret";
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let s = fixture["scenarios"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "claude_not_compat_drops_thinking")
+        .unwrap();
+    for (base, want) in [
+        (
+            format!("http://user:{SECRET}@127.0.0.1:bad/?api_key={SECRET}"),
+            r#"parse "<redacted url>": invalid port after host"#,
+        ),
+        (
+            format!("ftp://user:{SECRET}@127.0.0.1/?api_key={SECRET}"),
+            r#"Post "ftp://127.0.0.1/?api_key=***": unsupported protocol scheme "ftp""#,
+        ),
+    ] {
+        let cfg = Config::parse(&s["config"].as_str().unwrap().replace("http://UPSTREAM/v1", &base)).unwrap();
+        let cred = credential(s, &cfg, "");
+        let (_recorder, capture, sink) = crate::openai_compat_usage::sinks();
+        let (req, _) = request(s, sink);
+        let error = OpenAICompatExecutor::default()
+            .execute(&cred, req, &cfg)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&error.body), want, "{base}");
+        // The request event carries the URL as sent; the log writer masks it.
+        let errors: Vec<_> = capture
+            .take()
+            .into_iter()
+            .filter(|e| matches!(e, Captured::Error(_)))
+            .collect();
+        assert!(!format!("{errors:?}").contains(SECRET), "{errors:?}");
+        if base.starts_with("ftp:") {
+            assert_eq!(errors, [Captured::Error(want.to_owned())]);
+        }
+    }
+}

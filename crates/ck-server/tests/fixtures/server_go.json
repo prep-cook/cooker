@@ -5274,11 +5274,11 @@
     },
     {
       "in": "request to https://user:pass@api.example.com/v1?key=abc123\u0026x=1 failed",
-      "out": "request to https://[REDACTED_AUTH]@api.example.com/v1?key=[REDACTED]"
+      "out": "request to https://api.example.com/v1?key=[REDACTED]"
     },
     {
       "in": "Post \"https://api.example.com/v1/messages?beta=true\": dial tcp 10.0.0.1:443: i/o timeout",
-      "out": "Post \"https://api.example.com/v1/messages?beta=true\": dial tcp 10.0.0.1:443: i/o timeout"
+      "out": "Post \"https://api.example.com/v1/messages?beta=***\": dial tcp 10.0.0.1:443: i/o timeout"
     },
     {
       "in": "Authorization: Bearer sk-ant-api03-abcdefghijkl",

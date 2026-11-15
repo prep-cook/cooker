@@ -26,6 +26,42 @@ pub(crate) fn transport_error(e: wreq::Error) -> ExecError {
     ExecError::local(502, FailureScope::Transport, "upstream request failed")
 }
 
+/// `error` and its sources as text for errors and logs. wreq's own text names the
+/// request URI, which can carry credentials, so each wreq error in the chain prints its
+/// kind and the URI as [`ck_wire::redact::url`] renders it, and any other URL in a source
+/// is rendered the same way.
+pub fn transport_text(error: &wreq::Error) -> String {
+    let mut parts = Vec::new();
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = next {
+        parts.push(match e.downcast_ref::<wreq::Error>() {
+            Some(e) => wreq_kind(e),
+            None => ck_wire::redact::urls_in(&e.to_string()).into_owned(),
+        });
+        next = e.source();
+    }
+    parts.join(": ")
+}
+
+/// wreq's text for `e` without its URI and source: `<kind> for uri (<uri>): <source>`.
+fn wreq_kind(e: &wreq::Error) -> String {
+    let full = e.to_string();
+    let mut kind = full.as_str();
+    if let Some(source) = std::error::Error::source(e) {
+        kind = kind.strip_suffix(&format!(": {source}")).unwrap_or_default();
+    }
+    if let Some(uri) = e.uri() {
+        kind = kind.strip_suffix(&format!(" for uri ({uri})")).unwrap_or_default();
+    }
+    if kind.is_empty() {
+        return "transport error".to_owned();
+    }
+    match e.uri() {
+        Some(uri) => format!("{kind} for uri ({})", ck_wire::redact::url(&uri.to_string())),
+        None => kind.to_owned(),
+    }
+}
+
 /// A response whose body went through Go's Claude `decodeResponseBody`. `body` is
 /// the decoded stream, or the decoder-construction error text Go reports.
 pub(crate) struct Decoded {
