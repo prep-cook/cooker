@@ -13,7 +13,6 @@ use ck_core::format::Format;
 use ck_translate::{RequestCtx, ResponseCtx, StreamTranslator};
 use futures_util::StreamExt;
 
-use ck_wire::gostr::GoStr;
 use ck_wire::json as gj;
 use ck_wire::thinking::{self, ModelCaps, RequestThinking, parse_suffix};
 
@@ -641,44 +640,12 @@ fn prompt_cache_key(
         return body;
     }
     let sessions = (req.execution_session.as_deref(), req.derived_session.as_deref());
-    if let Some(key) = session_cache_key(provider, &model, req.source_format.as_str(), sessions) {
+    if let Some(key) =
+        crate::openai_compat_exec::session_cache_key(provider, &model, req.source_format.as_str(), sessions)
+    {
         payload::set_str_if_different(&mut body, "prompt_cache_key", &key);
     }
     body
-}
-
-/// The prompt cache key of a provider session: a stable UUID over the provider, the model, the
-/// client protocol and [`provider_session_uuid`]; `None` without a session.
-pub(crate) fn session_cache_key(
-    provider: &str,
-    model: &str,
-    source: &str,
-    sessions: (Option<&str>, Option<&str>),
-) -> Option<String> {
-    let session = provider_session_uuid(provider, sessions)?;
-    let identity = format!(
-        "cli-proxy-api:openai-compat:prompt-cache\0{}\0{}\0{}\0{session}",
-        provider.trim().go_lower(),
-        model.go_lower(),
-        source.trim().go_lower()
-    );
-    Some(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.as_bytes()).to_string())
-}
-
-/// `helps.ProviderSessionUUID`: the execution session, else the derived session identity,
-/// as a provider-scoped stable UUID.
-fn provider_session_uuid(provider: &str, (execution, derived): (Option<&str>, Option<&str>)) -> Option<String> {
-    let nonempty = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
-    let (kind, value) = match nonempty(execution) {
-        Some(execution) => ("execution-session", execution),
-        None => ("derived-session", nonempty(derived)?),
-    };
-    let provider = provider.trim().go_lower();
-    if provider.is_empty() {
-        return None;
-    }
-    let identity = format!("cli-proxy-api\0{provider}\0{kind}\0{value}");
-    Some(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.as_bytes()).to_string())
 }
 
 /// `CountTokens`: a local tiktoken estimate of the translated chat request.

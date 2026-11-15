@@ -9,6 +9,7 @@
 use bytes::Bytes;
 use ck_core::exec::{ExecError, FailureScope};
 use ck_core::format::Format;
+use ck_core::gostr::GoStr;
 use ck_stream::{ScratchLease, Writer};
 use ck_translate::codec::chat::request::{ChatCapability, Egress as ChatEgress};
 use ck_translate::codec::chat::response::Ingress as ChatIngress;
@@ -339,7 +340,7 @@ impl<'r> Relay<'r> {
                 .flatten()
                 .or_else(|| {
                     let sessions = (client.execution_session, client.derived_session);
-                    compat::session_cache_key(&self.attempt.credential.provider, &model, self.source, sessions)
+                    session_cache_key(&self.attempt.credential.provider, &model, self.source, sessions)
                 })
         } else {
             Some(explicit)
@@ -368,6 +369,40 @@ impl<'r> Relay<'r> {
             body,
         )
     }
+}
+
+/// The prompt cache key of a provider session: a stable UUID over the provider, the model, the
+/// client protocol and [`provider_session_uuid`]; `None` without a session.
+pub(crate) fn session_cache_key(
+    provider: &str,
+    model: &str,
+    source: &str,
+    sessions: (Option<&str>, Option<&str>),
+) -> Option<String> {
+    let session = provider_session_uuid(provider, sessions)?;
+    let identity = format!(
+        "cli-proxy-api:openai-compat:prompt-cache\0{}\0{}\0{}\0{session}",
+        provider.trim().go_lower(),
+        model.go_lower(),
+        source.trim().go_lower()
+    );
+    Some(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.as_bytes()).to_string())
+}
+
+/// `helps.ProviderSessionUUID`: the execution session, else the derived session identity,
+/// as a provider-scoped stable UUID.
+fn provider_session_uuid(provider: &str, (execution, derived): (Option<&str>, Option<&str>)) -> Option<String> {
+    let nonempty = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let (kind, value) = match nonempty(execution) {
+        Some(execution) => ("execution-session", execution),
+        None => ("derived-session", nonempty(derived)?),
+    };
+    let provider = provider.trim().go_lower();
+    if provider.is_empty() {
+        return None;
+    }
+    let identity = format!("cli-proxy-api\0{provider}\0{kind}\0{value}");
+    Some(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.as_bytes()).to_string())
 }
 
 /// The client's protocol, as `Format` names it.

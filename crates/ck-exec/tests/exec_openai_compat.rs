@@ -522,4 +522,7 @@ fn the_executor_uses_no_old_translation() {
     ] {
         assert!(!source.contains(old), "{old}");
     }
+    // The legacy module is over the size cap: it may shrink, never grow (size ratchet).
+    let legacy = include_str!("../src/openai_compat.rs").lines().count();
+    assert!(legacy <= 1013, "openai_compat.rs has {legacy} lines");
 }
