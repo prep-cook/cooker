@@ -43,6 +43,7 @@ fn run(m: &mut Mapped, mut ingress: impl RequestIngress, input: &Value, to: P) -
         P::Anthropic => {
             let capability = AnthropicCapability {
                 default_max_tokens: Some(4096),
+                ..Default::default()
             };
             let ready = ingress.finish(&mut m.writer, &capability)?;
             anthropic::request::Egress {

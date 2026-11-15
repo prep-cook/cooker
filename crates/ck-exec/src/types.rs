@@ -11,7 +11,7 @@ use std::future::Future;
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::Credential;
-use ck_core::exec::{Caller, ExecError, ResolvedModel};
+use ck_core::exec::{Caller, ExecError, ResolvedModel, UsageSink};
 use ck_stream::{Store, Writer};
 use ck_translate::codec::event::Identity;
 use ck_translate::codec::{Capability, ResponseIngress, ValidatedRequest};
@@ -25,6 +25,9 @@ pub struct Attempt<'a> {
     pub cfg: &'a Config,
     /// Upstream model after alias resolution, thinking suffix included.
     pub model: &'a str,
+    /// The client's request headers, for routing decisions only (contract G6); the server
+    /// fills it on every attempt. Request execution reads `Client::headers`.
+    pub headers: &'a HeaderMap,
     /// Capabilities the dispatch loop bound to this attempt; `None` means the registry entry.
     pub resolved_model: Option<&'a ResolvedModel>,
     /// The process stream store; response ingress constructors read their own stream from it.
@@ -47,6 +50,10 @@ pub struct Client<'a> {
     pub execution_session: Option<&'a str>,
     /// Derived session (`ctx:v1:<sha256>`), set only when no explicit session exists.
     pub derived_session: Option<&'a str>,
+    /// Request-side usage facts and upstream capture (contract §3, G4). An executor calls only
+    /// `request`, `upstream_model`, `claude_cache`, `round_trip_started`, `first_byte` and the
+    /// capture calls; response usage comes from the canonical stream, never `response_*`.
+    pub usage: &'a UsageSink,
 }
 
 /// The request handle an attempt executes. `validated` is this attempt's fence: the client

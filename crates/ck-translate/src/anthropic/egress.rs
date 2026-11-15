@@ -129,7 +129,7 @@ impl Egress {
             finish.write(finish.root(), e)?;
             if let Some(usage) = &self.usage {
                 e.bytes(b",\"usage\":")?;
-                write_usage(usage, false, e)?;
+                write_delta_usage(usage, e)?;
             }
             if let Some(doc) = &origin {
                 original_members(doc, doc.required(doc.root(), "x_ck")?, e)?;
@@ -374,6 +374,16 @@ fn write_base(doc: &Document, later: Option<&Document>, e: &mut Encoder<'_, '_>)
         original_members_with_separator(doc, x, "", true, later, e)?;
     }
     Ok(())
+}
+/// Writes `message_delta.usage` without the `Message.usage`-only members a snapshot merged in.
+fn write_delta_usage(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
+    const MESSAGE_ONLY: [&str; 4] = ["cache_creation", "service_tier", "inference_geo", "speed"];
+    if let Some(native) = doc.member(doc.root(), "native")?
+        && is(doc, native, "protocol", "anthropic")?
+    {
+        return object(doc, doc.required(native, "value")?, &MESSAGE_ONLY, e);
+    }
+    write_usage(doc, false, e)
 }
 /// Writes `usage` in Anthropic names; `complete` writes an unknown input or output count as 0.
 fn write_usage(doc: &Document, complete: bool, e: &mut Encoder<'_, '_>) -> Result<()> {

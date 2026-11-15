@@ -374,6 +374,7 @@ fn with_model<'a>(attempt: &Attempt<'a>, model: &'a str) -> Attempt<'a> {
         credential: attempt.credential,
         cfg: attempt.cfg,
         model,
+        headers: attempt.headers,
         resolved_model: attempt.resolved_model,
         store: attempt.store,
         identity: attempt.identity,

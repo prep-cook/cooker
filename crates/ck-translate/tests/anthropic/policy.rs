@@ -154,7 +154,12 @@ fn chat_max_tokens_reaches_anthropic_from_the_request_or_the_capability_default(
         }
         body
     };
-    let default = |default_max_tokens| Some(AnthropicCapability { default_max_tokens });
+    let default = |default_max_tokens| {
+        Some(AnthropicCapability {
+            default_max_tokens,
+            ..Default::default()
+        })
+    };
     assert_eq!(
         from_chat(&input(None), default(Some(4096))).unwrap()["max_tokens"],
         4096

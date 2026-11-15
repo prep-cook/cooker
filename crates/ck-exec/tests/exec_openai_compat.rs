@@ -543,7 +543,8 @@ async fn the_selector_runs_relays_through_the_executor() {
         .unwrap();
     finish(&streams, started, id).await.0.unwrap();
     assert_eq!(upstream.requests(), 1);
-    exchange.credential.provider = "claude".into();
+    // An unconverted provider has no destination; Claude has one since P1.
+    exchange.credential.provider = "codex".into();
     assert_eq!(executors.destination(&exchange.attempt(&streams.store)), None);
 }
 

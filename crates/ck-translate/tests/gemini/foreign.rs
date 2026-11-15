@@ -25,6 +25,7 @@ fn encode(mapped: &mut Mapped, mut ingress: impl RequestIngress, input: &Value, 
         To::Anthropic => {
             let capability = AnthropicCapability {
                 default_max_tokens: Some(4096),
+                ..Default::default()
             };
             let ready = ingress.finish(&mut mapped.writer, &capability)?;
             anthropic::request::Egress {
