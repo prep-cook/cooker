@@ -24,7 +24,7 @@ use futures_util::StreamExt;
 
 use super::{
     ClaudeExecutor, Ctx, Delegation, Input, Prepared, RawResponse, base_model, cloak, fast_request_error, header_value,
-    rebuild_mid_system, replay, sanitize_for_upstream, stream, telemetry,
+    rebuild_mid_system, replay, stream, telemetry,
 };
 use crate::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
 
@@ -110,12 +110,16 @@ pub(super) fn capability(model: &str, resolved: Option<&ResolvedModel>) -> Anthr
 }
 
 impl ClaudeExecutor {
-    /// Whether `attempt` stays on the old route: see [`Ctx::old_route_only`]. The selector
-    /// answers no destination for it, so the server keeps the old `claude` arm (Q1).
+    /// Whether `attempt` stays on the old route: see [`Ctx::old_route_only`], and every
+    /// credential thinking replay serves. Replay stores a response only once it is known
+    /// complete, which `Execute` cannot see: the producer validates the body after the
+    /// executor returned. The selector answers no destination for it, so the server keeps
+    /// the old `claude` arm (Q1).
     pub fn old_route_only(&self, attempt: &Attempt<'_>) -> bool {
         let cfg = scoped(attempt);
         let facts = (attempt.model, attempt.resolved_model, None);
-        Ctx::new(self, attempt.credential, facts, &cfg, Delegation::default()).old_route_only()
+        let ctx = Ctx::new(self, attempt.credential, facts, &cfg, Delegation::default());
+        ctx.old_route_only() || replay::eligible(&gate(&ctx))
     }
 
     async fn messages(
@@ -133,16 +137,7 @@ impl ClaudeExecutor {
         let ctx = context(self, attempt, request, &cfg);
         let usage = request.client.usage;
         let input = facts.input(request, attempt, &upload, stream);
-        let (scope, restored) = match replay::prepare(&self.replay, &gate(&ctx), &input) {
-            Some((scope, restored)) => (Some(scope), restored),
-            None => (None, None),
-        };
-        let body: &[u8] = restored.as_deref().unwrap_or(&upload);
-        let input = Input {
-            original_body: body,
-            body,
-            ..input
-        };
+        let body: &[u8] = &upload;
         // As the old path: a foreign client's upstream always streams.
         let upstream_stream = stream || facts.client_format != Format::Claude;
         let mut prepared = ctx.prepare_messages(&input, body, body, upstream_stream).await?;
@@ -157,28 +152,15 @@ impl ClaudeExecutor {
         report(usage, &ctx, &input, &prepared);
         let capture = usage.capture();
         let sent = self
-            .send(
-                &ctx,
-                &mut prepared,
-                "/v1/messages",
-                Some(usage),
-                capture,
-                scope.as_ref(),
-            )
+            .send(&ctx, &mut prepared, "/v1/messages", Some(usage), capture, None)
             .await;
         if prepared.recovered {
             // The final attempt, not the rejected first body, owns final-wire usage.
             report(usage, &ctx, &input, &prepared);
         }
-        let raw = sent.inspect_err(|error| {
-            if let Some(scope) = scope.as_ref().filter(|s| s.applied)
-                && replay::upstream_rejects(error)
-            {
-                scope.clear();
-            }
-        })?;
+        let raw = sent?;
         let (status, headers) = (raw.status, raw.headers.clone());
-        let body = relay(&ctx, &mut prepared, raw, scope, usage);
+        let body = relay(&ctx, &mut prepared, raw, usage);
         Ok(Upstream {
             status,
             headers,
@@ -238,13 +220,16 @@ impl ClaudeExecutor {
     }
 }
 
-/// The old path's local count rules on the encoded generation projection.
+/// The local count of what the contract path would send: the generation projection, the
+/// operator's thinking suffix, mid-system rebuild and count rules.
 fn local_count(ctx: &Ctx<'_>, input: &Input<'_>) -> Result<u64, ExecError> {
-    let mut body = ctx.apply_thinking(input, super::utf8(input.body).into_owned())?;
+    let mut body = super::utf8(input.body).into_owned();
+    if ctx.legacy_thinking(input) {
+        body = ctx.apply_thinking(input, body)?;
+    }
     if ctx.rebuild_mid_system() {
         body = rebuild_mid_system(&body);
     }
-    let body = sanitize_for_upstream(body, &ctx.base_model, ctx.is_compat);
     let body = cloak::strip_prompt_cache_options(ctx.count_rules(input, body, input.body));
     let counted = crate::tokens::count(body.as_bytes())?;
     let count = crate::rawjson::get(&super::utf8(&counted), "input_tokens").i64();
@@ -254,61 +239,21 @@ fn local_count(ctx: &Ctx<'_>, input: &Input<'_>) -> Result<u64, ExecError> {
 /// The prepared request's response body: whole native events after alias restore when the
 /// upstream streams, which also completes continuity and the thread; the bytes as read
 /// otherwise. Request logs record every chunk.
-fn relay(
-    ctx: &Ctx<'_>,
-    prepared: &mut Prepared,
-    raw: RawResponse,
-    scope: Option<replay::Scope>,
-    usage: &UsageSink,
-) -> Body {
+fn relay(ctx: &Ctx<'_>, prepared: &mut Prepared, raw: RawResponse, usage: &UsageSink) -> Body {
     let fast = ctx.first_party && prepared.fast;
     let capture = usage.capture().clone();
     let body = body_of(raw.body);
     if !prepared.stream {
-        let body = recorded(body, capture);
-        let body = match scope {
-            Some(scope) => stored(body, scope),
-            None => body,
-        };
-        return body
+        return recorded(body, capture)
             .map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)))
             .boxed();
     }
     let completion = ctx.completion(prepared);
     let request_id = header_value(&raw.headers, "request-id");
     let done: stream::OnComplete = Box::new(move |message_id| completion.complete(&message_id, &request_id));
-    let relayed = stream::relay(body, prepared.reverse.clone(), done, None, capture)
+    stream::relay(body, prepared.reverse.clone(), done, None, capture)
         .map(move |chunk| chunk.map_err(|e| fast_request_error(fast, e)))
-        .boxed();
-    match scope {
-        Some(scope) => scope.wrap(relayed),
-        None => relayed,
-    }
-}
-
-/// A buffered answer under a replay scope, passed on as read; the scope stores the whole
-/// message once the body ended cleanly, as the old path stores what it collected.
-fn stored(body: Body, scope: replay::Scope) -> Body {
-    let copy = std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new())));
-    let seen = copy.clone();
-    let end = futures_util::stream::once(async move {
-        if let Some(message) = copy.lock().ok().and_then(|mut c| c.take()) {
-            scope.store_response(&message);
-        }
-        None
-    });
-    body.inspect(move |chunk| {
-        if let Ok(mut held) = seen.lock() {
-            match chunk {
-                Ok(bytes) => held.iter_mut().for_each(|c| c.extend_from_slice(bytes)),
-                Err(_) => *held = None,
-            }
-        }
-    })
-    .map(Some)
-    .chain(end)
-    .filter_map(futures_util::future::ready)
-    .boxed()
+        .boxed()
 }
 
 /// Records each chunk of a body the executor passes on as read.

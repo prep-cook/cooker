@@ -215,7 +215,8 @@ async fn a_model_suffix_sets_thinking_as_on_the_old_route() {
     Fixture::new(&upstream, &model)
         .old_route(&serde_json::to_vec(&body).unwrap(), false)
         .await;
-    assert_eq!(new, sent(&upstream).0);
+    // The old route also adds cache markers; the suffix's thinking is the same.
+    assert_eq!(new["thinking"], sent(&upstream).0["thinking"]);
     assert_eq!(new["thinking"]["budget_tokens"], 8192, "{new}");
     assert_eq!(new["model"], SONNET);
 }
@@ -224,4 +225,64 @@ async fn a_model_suffix_sets_thinking_as_on_the_old_route() {
 async fn a_foreign_clients_upstream_streams_as_on_the_old_route() {
     let chat = json!({"model": "m", "max_completion_tokens": 300, "messages": [{"role": "user", "content": "hi"}]});
     assert_eq!(foreign("chat", chat).await["stream"], true);
+}
+
+#[tokio::test]
+async fn a_key_request_gets_no_cache_markers_it_did_not_send() {
+    let body = json!({"model": SONNET, "max_tokens": 1024, "system": "Be brief.",
+        "messages": [{"role": "user", "content": "hi"}]});
+    let sent = contract(SONNET, &body).await;
+    assert!(!sent.to_string().contains("cache_control"), "{sent}");
+    assert_eq!(sent["system"], "Be brief.");
+    assert_eq!(sent["messages"][0]["content"], "hi");
+}
+
+/// Thinking replay may store only a response known complete, which the contract path cannot
+/// see, so a credential replay serves stays on the old route.
+#[tokio::test]
+async fn thinking_replay_credentials_stay_on_the_old_route() {
+    use ck_core::exec::{ResolvedModel, ResolvedSource};
+    let fixture = Fixture::new(&StreamUpstream::start([]).await, SONNET);
+    let mut key = fixture.exchange.credential.clone();
+    key.attributes.insert("auth_kind".into(), "apikey".into());
+    let info = json!({"id": SONNET, "is_compat": true}).as_object().unwrap().clone();
+    let compat = ResolvedModel {
+        info: ck_core::registry::ModelInfo::from_raw(info).unwrap(),
+        source: ResolvedSource::ApiKey,
+    };
+    let attempt = |resolved_model| ck_exec::types::Attempt {
+        credential: &key,
+        cfg: &fixture.exchange.cfg,
+        model: SONNET,
+        resolved_model,
+        store: &fixture.streams.store,
+        identity: identity(Direction::Response),
+    };
+    assert_eq!(fixture.executors.destination(&attempt(Some(&compat))), None);
+    assert_eq!(fixture.executors.destination(&attempt(None)), Some("anthropic"));
+}
+
+/// No cache limit, TTL order, signature sanitizing or proxy-owned prefix recovery: the
+/// official API judges the client's markers and history.
+#[tokio::test]
+async fn a_key_request_keeps_its_markers_and_history() {
+    let marked = |text: &str, ttl: &str| json!({"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": ttl}});
+    let system = json!([
+        marked("a", "5m"),
+        marked("b", "1h"),
+        marked("c", "1h"),
+        marked("d", "1h"),
+        marked("e", "1h")
+    ]);
+    let messages = json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "signature": "c2lnbmVk"}, {"type": "text", "text": "ok"}]},
+        {"role": "user", "content": "more"},
+    ]);
+    let body = json!({"model": OPUS_4_7, "max_tokens": 4096, "thinking": {"type": "adaptive"},
+        "system": system, "messages": messages});
+    let sent = contract(OPUS_4_7, &body).await;
+    assert_eq!(sent["system"], body["system"]);
+    assert_eq!(sent["messages"], body["messages"]);
+    assert_eq!(sent["thinking"], json!({"type": "adaptive"}));
 }

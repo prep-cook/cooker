@@ -1471,11 +1471,19 @@ impl<'a> Ctx<'a> {
         })
     }
 
+    /// Whether the old body normalizers run: only on the old path. The contract path sends
+    /// the client's body as the fence accepted it, and the official API judges the rest:
+    /// no forced-tool or sampling rewrite, no cache markers or TTL edits, no signature
+    /// sanitizing and no proxy-owned prefix recovery (P8 removes the old path).
+    pub(super) fn legacy_body(&self) -> bool {
+        !self.contract
+    }
+
     /// Whether the old thinking normalizer runs: always on the old path; on the contract path
     /// only for the operator's model-name thinking suffix, such as `(8192)`. Otherwise the
     /// client's thinking and effort go upstream as written, and the fence refused what the
     /// API would (P8 removes the old path).
-    fn legacy_thinking(&self, req: &Input<'_>) -> bool {
+    pub(super) fn legacy_thinking(&self, req: &Input<'_>) -> bool {
         !self.contract || ck_wire::thinking::parse_suffix(req.model).has_suffix
     }
 
@@ -1684,29 +1692,33 @@ impl<'a> Ctx<'a> {
         }
         body = self.ensure_max_tokens(body);
         // The contract's fence refuses a forced tool with manual thinking instead.
-        if !self.contract {
+        if self.legacy_body() {
             body = disable_thinking_if_tool_choice_forced(body);
         }
         body = cloak::reconcile_context_management(body, eligible, caller_owned_cm, injected_cm);
         // The contract path keeps the client's values; the API answers an invalid pair itself.
-        if !self.contract {
+        if self.legacy_body() {
             body = normalize_sampling(body, confirmed);
         }
-        // `shouldEnsureCacheControl`.
-        let cpa_owns_cache = !explicit && !confirmed && (cloaked || cloak::count_cache_controls(&body) == 0);
+        // `shouldEnsureCacheControl`. The contract path sends the client's markers as written.
+        let legacy = self.legacy_body();
+        let cpa_owns_cache = legacy && !explicit && !confirmed && (cloaked || cloak::count_cache_controls(&body) == 0);
         if cpa_owns_cache {
             body = cloak::ensure_cache_control(body);
         }
-        body = cloak::enforce_cache_limit(body, 4);
+        if legacy {
+            body = cloak::enforce_cache_limit(body, 4);
+        }
+        // `prompt_cache_options` is the gateway's own member, never Anthropic's.
         body = cloak::strip_prompt_cache_options(body);
         let subagent = signals::subagent(req.headers, &body);
         let subagent_1h = subagent && signals::subagent_requests_1h(req.headers, &body);
         if cpa_owns_cache && self.cli_profile && (!subagent || subagent_1h) && !probe {
             body = cloak::upgrade_ttl(body, "1h");
-        } else if (probe || (subagent && !subagent_1h)) && !explicit {
+        } else if legacy && (probe || (subagent && !subagent_1h)) && !explicit {
             body = cloak::strip_ttl(body);
         }
-        if !explicit {
+        if legacy && !explicit {
             body = cloak::normalize_ttl(body);
         }
         // Execute only: ExecuteStream forwards the body's own `stream` field.
@@ -1736,9 +1748,11 @@ impl<'a> Ctx<'a> {
                 reverse = Arc::new(aliases);
             }
         }
-        body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
-        let thinking_recovery;
-        (body, thinking_recovery) = enable_prefix_drop(body, &self.base_model);
+        let mut thinking_recovery = false;
+        if legacy {
+            body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
+            (body, thinking_recovery) = enable_prefix_drop(body, &self.base_model);
+        }
         if self.cli_profile {
             body = self.apply_identity(&body, &session_id)?;
         }
@@ -1886,9 +1900,11 @@ impl<'a> Ctx<'a> {
                 body = m.obfuscate(&body);
             }
         }
-        body = cloak::enforce_cache_limit(body, 4);
-        if !explicit {
-            body = cloak::normalize_ttl(body);
+        if self.legacy_body() {
+            body = cloak::enforce_cache_limit(body, 4);
+            if !explicit {
+                body = cloak::normalize_ttl(body);
+            }
         }
         let (mut extra_betas, stripped) = extract_betas(body);
         body = stripped;
@@ -1903,7 +1919,9 @@ impl<'a> Ctx<'a> {
                 .unwrap_or(alias::DEFAULT_SECRET);
             body = alias::remap(&body, secret).0;
         }
-        body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
+        if self.legacy_body() {
+            body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
+        }
         body = cloak::strip_prompt_cache_options(body);
         if self.first_party || self.cli_profile {
             for field in ["metadata", "context_management", "diagnostics"] {

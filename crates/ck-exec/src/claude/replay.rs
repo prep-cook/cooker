@@ -358,18 +358,21 @@ pub(crate) struct Gate<'a> {
 /// clients of an is-compat Claude API-key model. Restores every cached turn into the
 /// request's Messages body and returns the body when a turn was restored. `None` when
 /// replay does not apply or no session identity exists.
+/// Whether thinking replay serves this credential and model, whatever the request.
+pub(super) fn eligible(gate: &Gate<'_>) -> bool {
+    gate.credential.provider.trim().eq_ignore_ascii_case("claude")
+        && auth_kind_is_api_key(gate.credential)
+        && gate.is_compat
+        && !gate.api_key.trim().is_empty()
+        && !gate.oauth_token
+}
+
 pub(super) fn prepare(
     cache: &Arc<ReplayCache>,
     gate: &Gate<'_>,
     req: &super::Input<'_>,
 ) -> Option<(Scope, Option<Bytes>)> {
-    let enabled = req.client_format == ck_core::format::Format::Claude
-        && gate.credential.provider.trim().eq_ignore_ascii_case("claude")
-        && auth_kind_is_api_key(gate.credential)
-        && gate.is_compat
-        && !gate.api_key.trim().is_empty()
-        && !gate.oauth_token;
-    if !enabled {
+    if req.client_format != ck_core::format::Format::Claude || !eligible(gate) {
         return None;
     }
     let family = model_family(gate.credential, gate.api_key, gate.base_url, gate.base_model);
