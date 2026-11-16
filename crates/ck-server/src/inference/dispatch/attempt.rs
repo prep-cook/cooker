@@ -113,6 +113,11 @@ impl<'x, X: Arms> Arm<'x, X> {
             started: 0,
         }
     }
+
+    /// The client's operation.
+    pub(super) fn operation(&self) -> codec::Operation {
+        self.view.operation
+    }
 }
 
 /// What one candidate came to.

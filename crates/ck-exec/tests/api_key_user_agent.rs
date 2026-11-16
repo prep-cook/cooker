@@ -146,28 +146,3 @@ async fn xai_identity_uses_auth_kind_not_endpoint_mode() {
         assert_eq!(upstream.captured()[0].header("user-agent"), Some(expected));
     }
 }
-
-#[tokio::test]
-async fn codex_alpha_search_identifies_cooker() {
-    let upstream = StreamUpstream::start([Reply::json("{}")]).await;
-    let mut credential = support::credential("codex", &upstream.url(), "test-key");
-    credential
-        .attributes
-        .insert("header:User-Agent".into(), "configured/1".into());
-    let mut headers = http::HeaderMap::new();
-    headers.insert(http::header::USER_AGENT, "caller/1".parse().unwrap());
-    ck_exec::codex::CodexExecutor::default()
-        .alpha_search(
-            &credential,
-            br#"{"model":"gpt-5"}"#,
-            &headers,
-            "gpt-5",
-            &Default::default(),
-            &Default::default(),
-        )
-        .await
-        .unwrap();
-    let captured = upstream.captured();
-    assert_eq!(captured[0].path, "/alpha/search");
-    assert_eq!(captured[0].header("user-agent"), Some("cooker"));
-}

@@ -4,7 +4,7 @@ mod semantic;
 use base64::Engine;
 use ck_translate::{
     codec::{
-        Error,
+        Error, ResponseIngress,
         document::Document,
         encode,
         event::{Direction, Identity, LocalId},
@@ -179,11 +179,13 @@ fn video_rejects_invalid_or_incomplete_documents() {
     let mut mapped = Mapped::new();
     for (phase, job_id) in [
         (Phase::Request(Create), Some("v")),
-        (Phase::Request(Edit), None),
+        (Phase::Request(Retrieve), None),
         (Phase::Request(Retrieve), Some("")),
     ] {
         assert!(Decoder::new(&mut mapped.writer, Dialect::Xai, phase, job_id, 8).is_err());
     }
+    // xAI names an edit's source video by URL, so an edit needs no job id.
+    assert!(Decoder::new(&mut mapped.writer, Dialect::Xai, Phase::Request(Edit), None, 8).is_ok());
 }
 
 #[test]
@@ -293,6 +295,33 @@ fn video_job_egress_keeps_status_and_identity_and_refuses_what_a_dialect_lacks()
             json!({"request_id": "video_1"}),
             Xai,
             Some(json!({"request_id": "video_1"})),
+        ),
+        // An xAI job for an OpenAI client names what an OpenAI video object shares with it.
+        (
+            Xai,
+            Phase::Job,
+            json!({"status": "done", "model": "grok-imagine-video", "video": {"url": "https://v.x/1.mp4", "duration": 8}}),
+            OpenAi,
+            Some(json!({
+                "id": "video_1",
+                "object": "video",
+                "status": "completed",
+                "model": "grok-imagine-video",
+                "video_url": "https://v.x/1.mp4",
+                "seconds": "8"
+            })),
+        ),
+        (
+            Xai,
+            Phase::Job,
+            json!({"status": "failed", "error": "moderated"}),
+            OpenAi,
+            Some(json!({
+                "id": "video_1",
+                "object": "video",
+                "status": "failed",
+                "error": {"code": "video_generation_failed", "message": "moderated"}
+            })),
         ),
     ];
     for (source, phase, wire, destination, expected) in cases {
@@ -510,7 +539,7 @@ fn records(text: &[u8]) -> Vec<(String, Value, usize)> {
         .collect()
 }
 
-fn download(content: &[u8], mime: Option<&str>, declared: Option<u64>, chunk: usize) -> (Vec<u8>, Result<u64, Error>) {
+fn download(content: &[u8], mime: Option<&str>, declared: Option<u64>, chunk: usize) -> (Vec<u8>, Result<(), Error>) {
     let mut mapped = Mapped::new();
     let mut download = Download::new(&mut mapped.writer, response_identity(), "req-1", mime, declared).unwrap();
     for bytes in content.chunks(chunk) {
@@ -528,7 +557,7 @@ fn video_content_is_published_byte_for_byte_with_its_mime_at_any_feed_size() {
         let mut baseline = None;
         for chunk in [1, 4097, content.len()] {
             let (output, result) = download(&content, mime, Some(content.len() as u64), chunk);
-            assert_eq!(result.unwrap(), content.len() as u64);
+            result.unwrap();
             let events = records(&output);
             let names: Vec<&str> = events.iter().map(|(name, ..)| name.as_str()).collect();
             assert_eq!(names.first(), Some(&"x_ck.response.start"));
@@ -568,13 +597,21 @@ fn video_content_is_published_byte_for_byte_with_its_mime_at_any_feed_size() {
 }
 
 #[test]
-fn video_content_without_a_declared_length_ends_at_finish() {
-    let (output, result) = download(&pattern(10), Some("video/mp4"), None, 3);
-    assert_eq!(result.unwrap(), 10);
-    assert_eq!(records(&output).last().unwrap().0, "x_ck.done");
-    let (output, result) = download(&[], None, Some(0), 1);
-    assert_eq!(result.unwrap(), 0);
-    assert_eq!(records(&output).last().unwrap().0, "x_ck.done");
+fn video_content_without_a_declared_length_publishes_on_flush_and_ends_at_finish() {
+    // (bytes, declared length)
+    for (content, declared) in [(pattern(10), None), (Vec::new(), Some(0))] {
+        let (output, result) = download(&content, Some("video/mp4"), declared, 3);
+        result.unwrap();
+        let events = records(&output);
+        assert_eq!(events[events.len() - 2].1["bytes"], content.len(), "{declared:?}");
+        assert_eq!(events.last().unwrap().0, "x_ck.done");
+    }
+    // A flush publishes the buffered bytes before their deadline.
+    let mut mapped = Mapped::new();
+    let mut download = Download::new(&mut mapped.writer, response_identity(), "req-1", None, None).unwrap();
+    download.advance(&mut mapped.writer, b"abc").unwrap();
+    download.flush(&mut mapped.writer).unwrap();
+    assert_eq!(records(&mapped.output(&mapped.writer)).last().unwrap().0, "x_ck.data");
 }
 
 #[test]
@@ -614,12 +651,13 @@ fn video_content_truncation_is_an_error_not_a_shorter_success() {
     )
     .unwrap();
     download.advance(&mut mapped.writer, &content[..4]).unwrap();
-    assert!(matches!(download.abort(&mut mapped.writer), Error::Truncated));
+    download.fail(&mut mapped.writer, 502, "upstream").unwrap();
     let names: Vec<String> = records(&mapped.output(&mapped.writer))
         .into_iter()
         .map(|(n, ..)| n)
         .collect();
-    assert_eq!(names.last().unwrap(), "x_ck.error");
+    // The bytes received before the cut are published ahead of the failure.
+    assert_eq!(names[names.len() - 2..], ["x_ck.data", "x_ck.error"], "{names:?}");
 }
 
 #[test]
@@ -641,5 +679,8 @@ fn video_content_refuses_an_unusable_mime_direction_or_foreign_writer() {
         download.advance(&mut other.writer, b"x"),
         Err(Error::Position)
     ));
-    assert!(matches!(download.abort(&mut other.writer), Error::Position));
+    assert!(matches!(
+        download.fail(&mut other.writer, 502, "upstream"),
+        Err(Error::Position)
+    ));
 }

@@ -20,7 +20,7 @@ use crate::types::{Attempt, Request, Streams, Upstream};
 impl CodexExecutor {
     /// Whether `credential` may serve Alpha Search (credential policy `codex_alpha_search_v1`):
     /// an OAuth login, or an API key that opted in and has a base URL to send to.
-    pub(crate) fn alpha_allowed(&self, credential: &Credential, cfg: &Config) -> bool {
+    pub fn alpha_allowed(&self, credential: &Credential, cfg: &Config) -> bool {
         match ck_core::registry::dynamic::auth_kind(credential) {
             Some("oauth") => true,
             Some("apikey") => {

@@ -554,15 +554,6 @@ pub(crate) fn provider_session_uuid(kind: &str, id: &str) -> Option<String> {
     })
 }
 
-/// `ProviderSessionUUID`: the long-lived execution session (the downstream WebSocket
-/// connection) when there is one, else the derived session identity.
-pub(crate) fn session_uuid(req: &ExecRequest, ws_session: Option<&str>) -> Option<String> {
-    crate::codex_shape::sessions_uuid(
-        ws_session.or(req.execution_session.as_deref()),
-        req.derived_session.as_deref(),
-    )
-}
-
 /// `cacheHelper` / `applyCodexPromptCacheHeadersWithContext`: the prompt cache key from
 /// the client body (Claude Code agent, Responses or Chat) or the session identity,
 /// written into the body.

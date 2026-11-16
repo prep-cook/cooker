@@ -64,42 +64,24 @@ pub struct Call {
     pub media: Option<Arc<Media>>,
 }
 
-/// How a media route runs through [`run`]: which executor operation serves it, and the
-/// same credential binding a [`SessionTurn`] has (`WithPinnedAuthID`,
-/// `WithSelectedAuthIDCallback`), which the video routes use to keep a job on the
-/// credential that created it.
+/// How a media route runs through [`run`]: which media operation it is, and the
+/// credential binding (`WithPinnedAuthID`) the image and video polls use to keep a job on
+/// the credential that created it.
 pub struct Media {
     pub kind: MediaKind,
     /// Only this credential may serve the call.
     pub pinned: Option<String>,
-    /// Called with each credential right before it is attempted.
-    pub on_selected: Option<OnSelected>,
-    /// The client gets an event stream (Go's image streams, also when emulated from a
-    /// buffered call): until the result renders, [`serve`] holds the connection with
-    /// `: keep-alive` frames every `requests.streaming.keepalive-seconds`
-    /// (`waitImagesStreamExecution`) instead of the non-stream keep-alive. A failure that
-    /// renders after that commit is replaced by the response's [`SseError`] event.
-    pub sse: bool,
     /// `WithDisallowFreeAuth` (routed images): Codex credentials on the free plan are
     /// never selected (Go `isFreeCodexAuth`), in any round.
     pub disallow_free: bool,
 }
 
-/// The `event: error` frame a route attaches to an error response (as a response
-/// extension), for [`serve`] to write instead when the event stream already committed
-/// (`writeImagesStreamErrorEvent`).
-#[derive(Clone)]
-pub struct SseError(pub Bytes);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaKind {
-    /// [`ck_exec::Executors::images`]; image-only models are allowed
-    /// (`ExecuteImageWithAuthManager`).
+    /// Image-only models are allowed (`ExecuteImageWithAuthManager`).
     Images,
-    /// [`ck_exec::Executors::videos`].
     Videos,
-    /// [`ck_exec::Executors::speech`]; speech-only models are allowed, and no
-    /// non-stream keep-alive runs: its newlines would prefix the audio.
+    /// Speech-only models are allowed.
     Speech,
     /// A deferred xAI Chat create or poll (X11); an empty success body denotes pending
     /// (202), and no non-stream keep-alive runs: its newlines would prefix an empty body.
@@ -115,12 +97,9 @@ impl Call {
             .or_else(|| self.media.as_ref().and_then(|m| m.pinned.clone()))
     }
 
-    /// `WithSelectedAuthIDCallback` of a session turn or media call.
+    /// `WithSelectedAuthIDCallback` of a session turn.
     fn on_selected(&self) -> Option<&OnSelected> {
-        self.turn
-            .as_ref()
-            .and_then(|t| t.on_selected.as_ref())
-            .or_else(|| self.media.as_ref().and_then(|m| m.on_selected.as_ref()))
+        self.turn.as_ref().and_then(|t| t.on_selected.as_ref())
     }
 }
 
@@ -504,20 +483,13 @@ fn canonical_model_raw(model: &str) -> &str {
 /// interval, the response commits as 200 `application/json` and a `\n` goes out every
 /// interval until the call finishes; the rendered body follows. The rendered status and
 /// headers are lost then, as in Go, where they are written after the first keep-alive
-/// flush. Media calls marked [`Media::sse`] hold with event-stream keep-alives instead.
+/// flush.
 pub async fn serve<F, Fut>(rt: &Arc<Runtime>, call: Call, render: F) -> axum::response::Response
 where
     F: FnOnce(Result<Done, Failure>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
 {
-    let sse = call.media.as_ref().is_some_and(|m| m.sse);
-    let speech = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Speech);
-    let interval = if sse {
-        crate::http::respond::keepalive(&rt.config())
-    } else {
-        nonstream_keepalive(&call, &rt.config())
-    }
-    .filter(|_| !waits_for_kimi_proof(rt, &call));
+    let interval = nonstream_keepalive(&call, &rt.config()).filter(|_| !waits_for_kimi_proof(rt, &call));
     let trace = Arc::new(Trace::with_request_id(crate::observability::api::current_request_id()));
     let mut run = Box::pin({
         let (rt, trace) = (rt.clone(), trace.clone());
@@ -525,20 +497,6 @@ where
             let result = run_with_bootstrap_retries(&rt, call, &trace).await;
             let cfg = rt.config();
             let upstream = upstream_headers(&cfg, &result, trace.served_by_kimi(&rt));
-            let result = match result {
-                // Go's speech handler reads the downstream headers the execution hands
-                // back (`downstreamHeadersAfterInterceptors`): the final filtered headers
-                // under passthrough, else none.
-                Ok(Done::Buffered { headers, body }) if speech => {
-                    let headers = if respond::passthrough_headers(&cfg) {
-                        respond::filter_upstream_headers(&headers)
-                    } else {
-                        HeaderMap::new()
-                    };
-                    Ok(Done::Buffered { headers, body })
-                }
-                result => result,
-            };
             (result, upstream)
         }
     });
@@ -554,7 +512,7 @@ where
         () = tokio::time::sleep(interval) => {}
     }
     // Go's handlers stop the keep-alive as soon as Execute returns: no beats while the
-    // result renders (the video download, for one).
+    // result renders.
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     enum Event {
@@ -569,7 +527,7 @@ where
             _ = ticks.tick() => Some((Event::Tick, Some((run, ticks)))),
         }
     });
-    let beat = Bytes::from_static(if sse { b": keep-alive\n\n" } else { b"\n" });
+    let beat = Bytes::from_static(b"\n");
     let once = |bytes: Bytes| futures_util::stream::iter([Ok::<_, axum::Error>(bytes)]);
     let first = once(beat.clone());
     let mut render = Some(render);
@@ -578,24 +536,16 @@ where
         Event::Done(result) => {
             let render = render.take().expect("the run finishes once");
             let rendered = futures_util::stream::once(render(result));
-            let body = rendered.flat_map(move |response| match response.extensions().get::<SseError>() {
-                Some(SseError(event)) if sse => once(event.clone()).left_stream(),
-                _ => response.into_body().into_data_stream().right_stream(),
-            });
-            body.right_stream()
+            rendered
+                .flat_map(|response| response.into_body().into_data_stream())
+                .right_stream()
         }
     }));
-    let body = axum::body::Body::from_stream(body);
-    let mut response = if sse {
-        crate::http::respond::sse(body)
-    } else {
-        let mut response = axum::response::Response::new(body);
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
-        );
-        response
-    };
+    let mut response = axum::response::Response::new(axum::body::Body::from_stream(body));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
     let headers = response.headers_mut();
     // Go cpa_trace.go applies the trace ID when the first keep-alive commits headers.
     if let Some(value) = trace.header() {
@@ -731,14 +681,10 @@ fn waits_for_kimi_proof(rt: &Runtime, call: &Call) -> bool {
 /// `requests.nonstream-keepalive-interval` seconds (Go `NonStreamingKeepAliveInterval`;
 /// 0 or below disables it), for the calls whose Go handler starts the keep-alive: only
 /// non-stream generate handlers do; the count-tokens handlers (code_handlers.go,
-/// gemini_handlers.go), the speech handler and deferred Chat never call
-/// `StartNonStreamingKeepAlive`.
+/// gemini_handlers.go) and deferred Chat never call `StartNonStreamingKeepAlive`.
 fn nonstream_keepalive(call: &Call, cfg: &Config) -> Option<Duration> {
-    let control = call
-        .media
-        .as_ref()
-        .is_some_and(|m| matches!(m.kind, MediaKind::Speech | MediaKind::DeferredChat));
-    if call.stream || call.operation != Operation::Generate || control {
+    let deferred = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::DeferredChat);
+    if call.stream || call.operation != Operation::Generate || deferred {
         return None;
     }
     let seconds = cfg
@@ -1112,8 +1058,12 @@ async fn run_loop<X: Arms>(
         call.execution_session.as_deref(),
         &call.caller.principal,
     );
-    // Go's usage reporter: one record per Generate attempt while the queue accepts.
-    let usage = (call.operation == Operation::Generate && rt.usage_queue().accepts()).then(|| {
+    let alpha = arm
+        .as_ref()
+        .is_some_and(|arm| arm.operation() == ck_translate::codec::Operation::AlphaSearch);
+    // Go's usage reporter: one record per Generate attempt while the queue accepts. Alpha
+    // Search reports none (`Server.codexAlphaSearch`).
+    let usage = (call.operation == Operation::Generate && !alpha && rt.usage_queue().accepts()).then(|| {
         Arc::new(crate::observability::usage_record::Facts::new(
             usage_client(&cfg, &call, trace, &session),
             call.entry,
@@ -1144,6 +1094,15 @@ async fn run_loop<X: Arms>(
                     .get("plan_type")
                     .is_some_and(|plan| plan.trim().eq_ignore_ascii_case("free"));
             if free && !pinned_exclusion.contains(&credential.id) {
+                pinned_exclusion.push(credential.id.clone());
+            }
+        }
+    }
+    // `codex_alpha_search_v1`: a credential the policy refuses is no candidate for Alpha
+    // Search, so it neither answers the request nor spends a retry slot.
+    if alpha {
+        for credential in rt.store().snapshot() {
+            if !rt.executors.codex.alpha_allowed(&credential, &cfg) && !pinned_exclusion.contains(&credential.id) {
                 pinned_exclusion.push(credential.id.clone());
             }
         }
@@ -1650,17 +1609,10 @@ async fn attempt<X: Arms>(
                 let credential = rt.for_executor(&credential);
                 match (session, call.media.as_ref().map(|m| m.kind)) {
                     (Some(session), _) => rt.executors.execute_in_session(&credential, req, cfg, session).await,
-                    // The call names the path (Go's request_path metadata).
-                    (None, Some(MediaKind::Images)) => {
-                        let path = req.request_path.clone();
-                        rt.executors.images(&credential, req, &path, cfg).await
-                    }
-                    (None, Some(MediaKind::Videos)) => {
-                        let path = req.request_path.clone();
-                        rt.executors.videos(&credential, req, &path, cfg).await
-                    }
-                    (None, Some(MediaKind::Speech)) => rt.executors.speech(&credential, req, cfg).await,
                     (None, Some(MediaKind::DeferredChat)) => rt.executors.deferred_chat(&credential, req, cfg).await,
+                    // Other media runs only on the contract arm: a provider it does not take has
+                    // no executor for the call.
+                    (None, Some(_)) => Err(ck_exec::no_executor(&credential.provider)),
                     (None, None) => rt.executors.execute(&credential, req, cfg).await,
                 }
             };

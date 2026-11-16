@@ -6,7 +6,7 @@ use ck_stream::{Lease, Reader, ScratchLease, Writer};
 use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
 use ck_translate::codec::{self, BodyMode, Operation, RequestView, ResponseEgress, internal};
-use ck_translate::{anthropic, audio, gemini, images, responses};
+use ck_translate::{anthropic, audio, gemini, images, responses, search, video};
 
 use crate::http::egress::{Framing, Output, Protocol};
 
@@ -15,8 +15,11 @@ pub enum ProtocolEgress {
     Anthropic(Box<anthropic::egress::Egress>),
     Responses(responses::egress::Egress<fn(&'static str, u64)>),
     Gemini(gemini::egress::Egress),
-    Speech(audio::Egress),
+    /// A media file's bytes: speech audio or a finished video.
+    Raw(audio::Egress),
     Images(Box<images::Egress>),
+    Search(search::ResultEgress),
+    Video(video::JobEgress),
 }
 
 impl ProtocolEgress {
@@ -78,7 +81,9 @@ impl ProtocolEgress {
                 }
                 Self::Responses(egress)
             }
-            Protocol::Speech | Protocol::Images(_) => Self::media(output, stream, identity)?,
+            Protocol::Speech | Protocol::Images(_) | Protocol::Search | Protocol::Video(_) => {
+                Self::media(output, stream, identity)?
+            }
             Protocol::Gemini => {
                 let framing = match output.framing {
                     Framing::Json | Framing::Raw => gemini::response::Framing::Json,
@@ -97,8 +102,9 @@ impl ProtocolEgress {
 }
 
 impl ProtocolEgress {
-    /// A media egress, which needs no request view: the speech audio's bytes, or the Images
-    /// response as one JSON body or its generation or edit events.
+    /// An egress that needs no request view: the speech audio's or a finished video's bytes, the
+    /// Images response as one JSON body or its generation or edit events, the search result JSON,
+    /// or a video job.
     pub fn media(output: Output, stream: &mut Writer, identity: Identity) -> codec::Result<Self> {
         Ok(match output.protocol {
             Protocol::Images(delivery) => {
@@ -109,7 +115,12 @@ impl ProtocolEgress {
                 };
                 Self::Images(Box::new(images::Egress::new(stream, Some(identity), format, delivery)?))
             }
-            _ => Self::Speech(audio::Egress::new(stream, Some(identity))),
+            Protocol::Search => Self::Search(search::ResultEgress::new(stream, Some(identity))),
+            Protocol::Video(_) if output.framing == Framing::Raw => {
+                Self::Raw(audio::Egress::of(stream, Some(identity), "video"))
+            }
+            Protocol::Video(dialect) => Self::Video(video::JobEgress::new(stream, Some(identity), dialect)),
+            _ => Self::Raw(audio::Egress::new(stream, Some(identity))),
         })
     }
 
@@ -121,12 +132,12 @@ impl ProtocolEgress {
         }
     }
 
-    /// Whether the response head is known: a speech egress learns its `Content-Type` from the
+    /// Whether the response head is known: a raw media egress learns its `Content-Type` from the
     /// stream's `media.start`, an images egress its status from a job record or its first result,
     /// both before their first byte.
     pub fn typed(&self) -> bool {
         match self {
-            Self::Speech(egress) => egress.content_type().is_ok_and(|mime| mime.is_some()),
+            Self::Raw(egress) => egress.content_type().is_ok_and(|mime| mime.is_some()),
             Self::Images(egress) => egress.decided(),
             _ => true,
         }
@@ -135,7 +146,7 @@ impl ProtocolEgress {
     /// The body's `Content-Type`: the media type the upstream named for raw media, else the
     /// framing's own.
     pub fn content_type(&self, framing: Framing) -> HeaderValue {
-        if let Self::Speech(egress) = self
+        if let Self::Raw(egress) = self
             && let Ok(Some((doc, node))) = egress.content_type()
             && let Ok(mime) = text(doc, node)
             && let Ok(value) = HeaderValue::from_str(&mime)
@@ -162,8 +173,10 @@ impl ResponseEgress for ProtocolEgress {
             Self::Anthropic(egress) => egress.advance(owner, input, output),
             Self::Responses(egress) => egress.advance(owner, input, output),
             Self::Gemini(egress) => egress.advance(owner, input, output),
-            Self::Speech(egress) => egress.advance(owner, input, output),
+            Self::Raw(egress) => egress.advance(owner, input, output),
             Self::Images(egress) => egress.advance(owner, input, output),
+            Self::Search(egress) => egress.advance(owner, input, output),
+            Self::Video(egress) => egress.advance(owner, input, output),
         }
     }
 
@@ -173,8 +186,10 @@ impl ResponseEgress for ProtocolEgress {
             Self::Anthropic(egress) => egress.finish(),
             Self::Responses(egress) => egress.finish(),
             Self::Gemini(egress) => egress.finish(),
-            Self::Speech(egress) => egress.finish(),
+            Self::Raw(egress) => egress.finish(),
             Self::Images(egress) => egress.finish(),
+            Self::Search(egress) => egress.finish(),
+            Self::Video(egress) => egress.finish(),
         }
     }
 }

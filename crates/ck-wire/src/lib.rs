@@ -26,6 +26,8 @@
 //! - `gostr`: Go's `strings.ToLower`, `strings.EqualFold`, `strings.TrimSpace` and
 //!   `strconv.Quote` on Go's own Unicode tables (owner: Google).
 //! - `redact`: URLs in error and log text, without userinfo, query values or fragment.
+//! - `mime`: Go's `mime.ParseMediaType` and `mime.FormatMediaType`, for multipart bodies and
+//!   content dispositions in executors and server routes.
 //!
 //! The proxy-aware HTTP client (executor/helps/proxy_helpers.go) touches the network and
 //! lives in ck-exec instead.
@@ -40,6 +42,7 @@ pub mod idle;
 pub mod json;
 #[cfg(test)]
 mod json_go_vectors;
+pub mod mime;
 pub mod payload;
 pub mod redact;
 pub mod schema;

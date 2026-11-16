@@ -183,7 +183,10 @@ impl Replay {
             ))
         })??;
         let identity = response_identity(&mut response, &mut first).await?;
-        let egress = if matches!(output.protocol, Protocol::Speech | Protocol::Images(_)) {
+        let egress = if matches!(
+            output.protocol,
+            Protocol::Speech | Protocol::Images(_) | Protocol::Search | Protocol::Video(_)
+        ) {
             ProtocolEgress::media(output, &mut response, identity)?
         } else {
             // The request view is rebuilt from the request stream's records (contract §2).

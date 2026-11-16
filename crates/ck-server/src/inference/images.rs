@@ -23,7 +23,7 @@ use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use ck_core::exec::{Caller, ExecError, FailureScope, Operation};
 use ck_core::format::Format;
-use ck_exec::openai_compat_multipart::{self as multipart, Form, MediaType};
+use ck_exec::multipart::{self, Form};
 use ck_stream::{Store, Writer};
 use ck_translate::codec::document::Document;
 use ck_translate::codec::event::{Direction, Identity, LocalId};
@@ -32,6 +32,7 @@ use ck_translate::codec::{self, ClientCapability, Media as MediaOp, RequestIngre
 use ck_translate::images;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Kind};
+use ck_wire::mime::{MediaType, parse_media_type};
 
 use crate::http::egress::{Framing, Output, Protocol};
 use crate::http::respond;
@@ -126,11 +127,6 @@ fn canonical_xai_model(model: &str) -> &'static str {
 
 pub(crate) fn text(body: &[u8], path: &str) -> String {
     gj::get(body, path).str().into_owned()
-}
-
-/// `WriteErrorResponse` for a handler-side failure.
-pub(crate) fn gateway_error(message: &str) -> Response {
-    respond::json(502, "application/json", errors::openai_body(502, message))
 }
 
 /// Image generation turned off for every route (`disable-image-generation: true`).
@@ -240,8 +236,6 @@ async fn run(
         media: Some(Arc::new(Media {
             kind: MediaKind::Images,
             pinned,
-            on_selected: None,
-            sse: false,
             disallow_free,
         })),
     };
@@ -258,7 +252,7 @@ async fn run(
 
 /// What the images codec refused of a client request, in client wording: malformed input is
 /// 400, an oversized body or part 413, and storage follows contract §9.
-fn refused(error: codec::Error) -> Failure {
+pub(crate) fn refused(error: codec::Error) -> Failure {
     let error = match error {
         codec::Error::Storage(error) => dispatch::stored(&error),
         codec::Error::Limit | codec::Error::EventTooLarge => {
@@ -546,7 +540,7 @@ pub(crate) fn multipart_boundary(content_type: &str) -> Result<String, String> {
     if content_type.is_empty() {
         return Err(NOT_MULTIPART.into());
     }
-    let MediaType::Ok(media, mut params) = multipart::parse_media_type(content_type) else {
+    let MediaType::Ok(media, mut params) = parse_media_type(content_type) else {
         return Err(NOT_MULTIPART.into());
     };
     if media != "multipart/form-data" {

@@ -6,9 +6,11 @@
 //! boundary. Options keep their native names and units (`seconds` is not turned into
 //! `duration`); an option the destination dialect lacks is refused by [`encode`], never
 //! dropped. Unknown fields travel in `x_ck.original` and return only to their own protocol.
-//! [`Ingress`] publishes a job response on a response stream.
+//! [`Ingress`] publishes a job response on a response stream; [`JobEgress`] writes it back to the
+//! client.
 
 pub mod content;
+mod egress;
 mod response;
 mod table;
 mod wire;
@@ -26,6 +28,7 @@ use crate::{
         source::Source,
     },
 };
+pub use egress::JobEgress;
 pub use response::{Ingress, Ledger};
 use table::{Shape, WIRE_STATUS, known, shape};
 use wire::write_fraction;
@@ -128,11 +131,12 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// `job_id` is the cooker job the route resolved: mandatory for every request action but
-    /// create, forbidden for create, and the fallback identity of a status body that has none.
+    /// `job_id` is the cooker job the route resolved: mandatory for a retrieve or content request,
+    /// forbidden for create, optional for an edit or extension, whose body names its source video
+    /// as its dialect does (xAI by URL), and the fallback identity of a status body that has none.
     pub fn new(owner: &mut Writer, dialect: Dialect, phase: Phase, job_id: Option<&str>, limit: u64) -> Result<Self> {
         match (phase, job_id) {
-            (Phase::Request(Action::Create), None) => {}
+            (Phase::Request(Action::Create | Action::Edit | Action::Extend), None) => {}
             (Phase::Request(Action::Create), Some(_)) | (Phase::Request(_), None) => return Err(Error::Schema),
             (_, Some("")) => return Err(Error::Schema),
             (_, Some(id)) if id.len() > MAX_JOB_ID => return Err(Error::Limit),
@@ -165,7 +169,13 @@ impl Decoder {
         result
     }
 
-    pub fn finish(mut self, owner: &mut Writer) -> Result<Decoded> {
+    pub fn finish(self, owner: &mut Writer) -> Result<Decoded> {
+        self.finish_with(owner, None)
+    }
+
+    /// [`Self::finish`] with `echo`, an array of `x_ck.original` entries in other protocols, after
+    /// the body's own native fields.
+    fn finish_with(mut self, owner: &mut Writer, echo: Option<&Document>) -> Result<Decoded> {
         self.source.check_owner(owner)?;
         if self.failed {
             return Err(Error::Closed);
@@ -187,7 +197,7 @@ impl Decoder {
             None
         };
         let (dialect, phase) = (self.dialect, self.phase);
-        let mut operation = boundary::mapped(owner, |e| write_operation(&native, dialect, phase, id, e))?;
+        let mut operation = boundary::mapped(owner, |e| write_operation(&native, dialect, phase, id, echo, e))?;
         provenance::restore_bindings(&mut operation)?;
         Ok(Decoded { operation, usage })
     }
@@ -331,6 +341,7 @@ fn write_operation(
     dialect: Dialect,
     phase: Phase,
     caller_id: Option<&str>,
+    echo: Option<&Document>,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
     let (fields, implied) = match phase {
@@ -374,7 +385,58 @@ fn write_operation(
         doc.write(field, e)?;
         e.bytes(b"}")?;
     }
+    if let Some(echo) = echo {
+        for entry in echo.children(echo.root())? {
+            if !std::mem::replace(&mut first, false) {
+                e.bytes(b",")?;
+            }
+            echo.write(entry, e)?;
+        }
+    }
     e.bytes(b"]}}")
+}
+
+/// `operation` with each member of the JSON object `members` added to `x_ck.original` as a native
+/// field of `dialect`: what a route answers in `dialect` that the request it sends cannot carry.
+/// The xAI executor returns such fields with the job ([`Ingress::echo`]), and only a `dialect`
+/// client sees them.
+pub fn with_originals(owner: &mut Writer, operation: &Document, dialect: Dialect, members: &[u8]) -> Result<Document> {
+    let extra = boundary::mapped(owner, |e| e.bytes(members))?;
+    object(&extra, extra.root())?;
+    let root = operation.root();
+    let x = operation.required(root, "x_ck")?;
+    let original = operation.required(x, "original")?;
+    let mut doc = boundary::mapped(owner, |e| {
+        e.bytes(b"{\"kind\":")?;
+        operation.write(operation.required(root, "kind")?, e)?;
+        e.bytes(b",\"value\":")?;
+        operation.write(operation.required(root, "value")?, e)?;
+        e.bytes(b",\"x_ck\":{\"v\":1,\"original_protocol\":")?;
+        operation.write(operation.required(x, "original_protocol")?, e)?;
+        e.bytes(b",\"original\":[")?;
+        let mut first = true;
+        for entry in operation.children(original)? {
+            if !std::mem::replace(&mut first, false) {
+                e.bytes(b",")?;
+            }
+            operation.write(entry, e)?;
+        }
+        for field in extra.children(extra.root())? {
+            if !std::mem::replace(&mut first, false) {
+                e.bytes(b",")?;
+            }
+            e.bytes(b"{\"protocol\":")?;
+            e.string(dialect.name())?;
+            e.bytes(b",\"pointer\":\"/")?;
+            provenance::write_pointer_segment(&extra, extra.node(field)?.name.ok_or(Error::Schema)?, e)?;
+            e.bytes(b"\",\"binding\":\"/value\",\"value\":")?;
+            extra.write(field, e)?;
+            e.bytes(b"}")?;
+        }
+        e.bytes(b"]}}")
+    })?;
+    provenance::restore_bindings(&mut doc)?;
+    Ok(doc)
 }
 
 fn write_request_value(doc: &Document, action: Action, id: Option<&str>, e: &mut Encoder<'_, '_>) -> Result<()> {

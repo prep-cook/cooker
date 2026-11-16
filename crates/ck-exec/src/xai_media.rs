@@ -1,6 +1,5 @@
-//! xAI images, videos and speech. `XaiExecutor::serve_media` runs them under the execution
-//! contract; `images`, `videos` and `speech` are the old routes' entry points until E7 moves
-//! the routes onto it.
+//! xAI images, videos and speech, which `XaiExecutor::serve_media` runs under the execution
+//! contract.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -9,8 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::Credential;
-use ck_core::exec::{Caller, ExecError, ExecRequest, ExecResponse, FailureScope, ResponseBody};
-use ck_core::format::Format;
+use ck_core::exec::{Caller, ExecError, ExecRequest, FailureScope};
 use ck_wire::gostr::GoStr;
 use ck_wire::json as gj;
 use http::HeaderMap;
@@ -25,11 +23,10 @@ use crate::openai_compat_http::{self as wire, GoHeaders};
 use crate::types::{Attempt, Request, Streams, Upstream};
 use crate::xai::{
     PROVIDER, XaiExecutor, capture_request, chat_base_url, compact_base_url, creds, endpoint, fail_if_canceled,
-    path_escape, plain_headers, request_headers, scoped, track_first_byte,
+    path_escape, request_headers, scoped, track_first_byte,
 };
 use crate::xai_events::XaiIngress;
 use crate::xai_exec;
-use crate::xai_request as request;
 use crate::xai_response::{self as response, text};
 
 const IMAGES_GENERATIONS: &str = "/images/generations";
@@ -37,151 +34,6 @@ const IMAGES_EDITS: &str = "/images/edits";
 const VIDEOS_GENERATIONS: &str = "/videos/generations";
 const VIDEOS_EDITS: &str = "/videos/edits";
 const VIDEOS_EXTENSIONS: &str = "/videos/extensions";
-
-/// The payload rules on an image or video body (Go's media finalizer: the body's
-/// model, else the routed one; protocol `openai`; the client body as the baseline).
-fn media_rules(req: &ExecRequest, cfg: &Config, payload: Vec<u8>) -> Vec<u8> {
-    let mut model = text(&gj::get(&req.body, "model")).trim().to_owned();
-    if model.is_empty() {
-        model = req.model.trim().to_owned();
-    }
-    crate::payload_barrier::Barrier {
-        executor: PROVIDER,
-        model: &model,
-        protocol: "openai",
-        root: "",
-        original: &req.body,
-    }
-    .apply(cfg, req, payload)
-}
-
-impl XaiExecutor {
-    /// `executeImages`: the JSON body, image references in xAI's shape, to
-    /// `/images/edits` or `/images/generations` by the inbound route.
-    pub async fn images(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        request_path: &str,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        let cfg = scoped(credential, cfg);
-        let path = if request_path.ends_with(IMAGES_EDITS) {
-            IMAGES_EDITS
-        } else {
-            IMAGES_GENERATIONS
-        };
-        let payload = media_rules(&req, cfg.as_ref(), request::normalize_image_refs(req.body.to_vec()));
-        self.media(credential, &req, cfg.as_ref(), wreq::Method::POST, path, payload, None)
-            .await
-    }
-
-    /// `executeVideos`: generations, edits and extensions by the inbound route; any other
-    /// route with a `request_id` polls `GET /videos/{request_id}`. A poll of a job this process
-    /// neither created nor charged is refused before anything is sent ([`VideoJobs`]).
-    pub async fn videos(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        request_path: &str,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        let cfg = scoped(credential, cfg);
-        let payload = media_rules(&req, cfg.as_ref(), request::normalize_image_refs(req.body.to_vec()));
-        let route = [VIDEOS_EDITS, VIDEOS_EXTENSIONS, VIDEOS_GENERATIONS]
-            .into_iter()
-            .find(|p| request_path.ends_with(p));
-        let request_id = text(&gj::get(&payload, "request_id"));
-        let (method, path) = match route {
-            Some(path) => (wreq::Method::POST, path.to_owned()),
-            None if !request_id.is_empty() => (wreq::Method::GET, format!("/videos/{}", path_escape(&request_id))),
-            None => (wreq::Method::POST, VIDEOS_GENERATIONS.to_owned()),
-        };
-        let job = if method == wreq::Method::GET {
-            let Some(admission) = self.jobs.admit(&req.caller, JobKind::Video, &request_id) else {
-                return Err(unknown_job(JobKind::Video, &request_id));
-            };
-            VideoJob::Poll(admission)
-        } else {
-            let binding = JobBinding {
-                credential: credential.id.clone(),
-                model: req.model.trim().to_owned(),
-            };
-            VideoJob::Create(
-                self.jobs
-                    .reserve(&req.caller, JobKind::Video, binding)
-                    .ok_or_else(|| jobs_full(JobKind::Video))?,
-            )
-        };
-        self.media(credential, &req, cfg.as_ref(), method, &path, payload, Some(job))
-            .await
-    }
-
-    /// The shared media request: plain xAI headers on the chat base URL, the whole
-    /// response returned as is. `payload` is sent with a POST; a GET poll sends no body,
-    /// though Go's capture still logs the payload.
-    #[allow(clippy::too_many_arguments)]
-    async fn media(
-        &self,
-        credential: &Credential,
-        req: &ExecRequest,
-        cfg: &Config,
-        method: wreq::Method,
-        path: &str,
-        payload: Vec<u8>,
-        video: Option<VideoJob>,
-    ) -> Result<ExecResponse, ExecError> {
-        let logged = payload.as_slice();
-        let body = (method == wreq::Method::POST).then(|| payload.clone());
-        let (token, _) = creds(credential);
-        let headers = plain_headers(credential, &token, false, "", req);
-        // xAI documents no idempotency key for video creates (https://docs.x.ai/openapi.json,
-        // `POST /v1/videos/generations`, `/edits`, `/extensions`: no header parameters), so
-        // none is sent: a replayed create must not hand back a job a previous process charged.
-        let url = self.url(endpoint(&chat_base_url(credential), path));
-        let (status, headers, data) = self
-            .send_buffered(credential, req, cfg, method, &url, headers, body, Some(logged))
-            .await?;
-        if !(200..300).contains(&status) {
-            let mut error = response::status_error(status, &data);
-            error.headers = Box::new(headers);
-            return Err(error);
-        }
-        // A video is a job: its usage is that of the job, which a poll repeats. A create names
-        // it as the server's `video_id` reads it; a poll settles against the job its admission
-        // holds, so only the first settlement that finds the job uncharged charges it.
-        let admission = match video {
-            None => None,
-            Some(VideoJob::Poll(admission)) => Some(admission),
-            Some(VideoJob::Create(slot)) => {
-                let id = text(&gj::get(&data, "request_id"));
-                let job = if id.trim().is_empty() {
-                    text(&gj::get(&data, "id"))
-                } else {
-                    id
-                };
-                slot.created(&job)
-            }
-        };
-        if req.usage.enabled() {
-            // An image, or a create naming no job, has nothing a later report could repeat.
-            if reports_usage(&data) && admission.as_ref().is_none_or(Admission::settle) {
-                // The top-level usage of an image or video body, read as a Responses body's.
-                req.usage.response_body(Format::Codex, &data);
-            } else {
-                // The body without its usage: the model, and a record with no count.
-                let mut quiet = data.to_vec();
-                gj::delete(&mut quiet, "usage");
-                req.usage.response_body(Format::Codex, &quiet);
-            }
-        }
-        Ok(ExecResponse {
-            status: 200,
-            headers,
-            body: ResponseBody::Buffered(data),
-        })
-    }
-}
 
 /// The usage members accounting records from an image or video body: the charge, and every
 /// token count the server's Responses usage reader records (xAI images and videos reference).
@@ -220,13 +72,6 @@ const JOB_TTL: Duration = Duration::from_secs(3 * 3600);
 /// The most jobs and pending creates the table holds (E-Q5). A create beyond it is refused with
 /// 503 before anything is sent, so no upstream job exists that cooker could not track.
 pub(crate) const JOB_CAPACITY: usize = 4096;
-
-/// What a video request is to its job: a create, which holds a reserved slot until its response
-/// names the job, or a poll admitted against it.
-pub(crate) enum VideoJob {
-    Create(Slot),
-    Poll(Admission),
-}
 
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
@@ -578,74 +423,6 @@ impl XaiExecutor {
         capture.read(&data);
         Ok((status, headers, data?))
     }
-
-    /// `executeSpeech`: the speech handler's JSON to `/tts` on the compact base URL (the
-    /// official API unless a custom non-chat-proxy base URL is set; the chat proxy does
-    /// not serve `/tts`, `xaiSpeechRequestURL`), with payload rules for the
-    /// `openai` protocol. The raw audio comes back with the upstream headers.
-    pub async fn speech(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        let cfg = scoped(credential, cfg);
-        let mut model = text(&gj::get(&req.body, "model"));
-        if model.is_empty() {
-            model = req.model.trim().to_owned();
-        }
-        let payload = ck_wire::payload::apply(
-            &ck_wire::payload::Rules::of(cfg.as_ref()),
-            &ck_wire::payload::Request {
-                target_executor: PROVIDER,
-                model: &model,
-                requested_model: request::requested_model(&req),
-                protocol: "openai",
-                from_protocol: SPEECH_SOURCE,
-                root: "",
-                original: &req.body,
-                request_path: &req.request_path,
-                headers: Some(&req.headers),
-            },
-            req.body.to_vec(),
-        );
-        let (token, _) = creds(credential);
-        let mut headers = plain_headers(credential, &token, false, "", &req);
-        // Official TTS answers with raw audio; the media default asks for JSON.
-        headers.set("Accept", "*/*");
-        let url = self.url(endpoint(&compact_base_url(credential), "/tts"));
-        let (status, headers, data) = self
-            .send_buffered(
-                credential,
-                &req,
-                cfg.as_ref(),
-                wreq::Method::POST,
-                &url,
-                headers,
-                Some(payload.clone()),
-                Some(&payload),
-            )
-            .await?;
-        if !(200..300).contains(&status) {
-            let mut error = response::status_error(status, &data);
-            if error.status == 404 && !speech_model_unavailable(&data) {
-                // Go's `xaiSpeechRequestError` (an unknown voice, say): neither rotated nor
-                // cooled. A request scope without upstream headers is the explicit marker
-                // (classify::explicit_request_scoped); Go's xAI status errors carry none.
-                error.scope = FailureScope::Request;
-            } else {
-                error.headers = Box::new(headers);
-            }
-            return Err(error);
-        }
-        // `EnsurePublished`: one record without usage; the audio is never parsed.
-        req.usage.publish();
-        Ok(ExecResponse {
-            status: 200,
-            headers,
-            body: ResponseBody::Buffered(data),
-        })
-    }
 }
 
 /// Go's `openai-speech` handler type, the speech request's source format.
@@ -725,10 +502,18 @@ const SPEECH_LIMIT: u64 = 64 << 20;
 /// The limit of one video job body; the video itself is a separate download.
 const VIDEO_LIMIT: u64 = 1 << 20;
 
-/// Whether xAI serves `media`. A finished video's bytes are fetched from the URL its job names,
-/// which the job table holds (E7), not through an xAI endpoint.
-pub(crate) const fn admits(media: Media) -> bool {
-    !matches!(media, Media::VideoContent)
+/// The finished file's URL a job body names (`xaiVideoContentURLFromPayload`): an absolute http(s)
+/// URL with a host. Without one the content request fails as the old route's did, with 502.
+fn content_url(polled: &[u8]) -> Result<String, ExecError> {
+    let raw = text(&gj::get(polled, "video.url")).trim().to_owned();
+    let message = if raw.is_empty() {
+        "xAI video response did not include video.url"
+    } else if !crate::xai::is_http_url(&raw) {
+        "xAI video response included invalid video.url"
+    } else {
+        return Ok(raw);
+    };
+    Err(ExecError::local(502, FailureScope::Request, message))
 }
 
 /// The fence check of an xAI media request.
@@ -856,6 +641,7 @@ impl XaiExecutor {
                 )
             }
             Media::ImageRetrieve => self.image_poll(&call, streams).await?,
+            Media::VideoContent => self.video_content(&call, streams).await?,
             media => self.video(&call, streams, media).await?,
         };
         Ok(Upstream {
@@ -960,7 +746,7 @@ impl XaiExecutor {
         };
         let upstream = self.media_send(call, method, &path, body, false).await?;
         let polled = (phase == video::Phase::Job).then_some(job.as_deref()).flatten();
-        let ingress = video::Ingress::new(
+        let mut ingress = video::Ingress::new(
             streams.response,
             call.attempt.identity,
             video::Dialect::Xai,
@@ -970,11 +756,95 @@ impl XaiExecutor {
             Box::new(JobLedger { slot, admission }),
         )
         .map_err(xai_exec::encoding)?;
+        let request = call.request.validated.view().document;
+        ingress.echo(streams.response, request).map_err(xai_exec::encoding)?;
         Ok((
             upstream.status,
             upstream.headers,
             upstream.body,
             MediaIngress::Video(Box::new(ingress)),
+        ))
+    }
+
+    /// A finished video's bytes, as the old route fetched them: a poll of the job, admitted against
+    /// the job table like any poll, names the file's URL, which is downloaded through this
+    /// credential's HTTP client and proxy without its credentials. The poll's usage is the job's
+    /// charge when the table finds the job uncharged, as a poll's is.
+    async fn video_content(
+        &self,
+        call: &MediaCall<'_>,
+        streams: Streams<'_>,
+    ) -> Result<(u16, HeaderMap, crate::types::Body, MediaIngress), ExecError> {
+        let (_, job) = media_exec::video_upload(
+            call.request,
+            xai_exec::DESTINATION,
+            video::Dialect::Xai,
+            streams.request,
+        )?;
+        let job = job.ok_or_else(|| xai_exec::encoding(codec::Error::Schema))?;
+        let admission = self
+            .jobs
+            .admit(call.request.client.caller, JobKind::Video, &job)
+            .ok_or_else(|| unknown_job(JobKind::Video, &job))?;
+        let path = format!("/videos/{}", path_escape(&job));
+        let polled = self.media_send(call, wreq::Method::GET, &path, None, false).await?;
+        let polled = crate::proxy::read_all(polled.body, VIDEO_LIMIT as usize, true).await?;
+        let url = content_url(&polled)?;
+        let client = self.clients.for_credential(call.attempt.credential, call.cfg);
+        let usage = call.request.client.usage;
+        // `HTTPStatusFromErrorOr(err, http.StatusBadGateway)`: a failed download is a 502 unless
+        // the error carries its own status.
+        let download = match crate::proxy::request(&client, wreq::Method::GET, &url, GoHeaders::new(), None, None).await
+        {
+            Ok(download) => track_first_byte(download, usage),
+            Err(error) if error.scope == FailureScope::Transport => {
+                let message = String::from_utf8_lossy(&error.body).into_owned();
+                return Err(ExecError::local(502, FailureScope::Request, message));
+            }
+            Err(error) => return Err(error),
+        };
+        if !(200..300).contains(&download.status) {
+            let status = download.status;
+            let body = crate::proxy::read_all(download.body, VIDEO_LIMIT as usize, true)
+                .await
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&body).trim().to_owned();
+            let message = if text.is_empty() {
+                let reason = http::StatusCode::from_u16(status)
+                    .ok()
+                    .and_then(|s| s.canonical_reason())
+                    .unwrap_or("");
+                format!("video content download failed: {status} {reason}")
+            } else {
+                format!("video content download failed: {text}")
+            };
+            return Err(ExecError::local(status, FailureScope::Request, message));
+        }
+        let (mime, length) = media_exec::entity(&download.headers);
+        let mut ingress = video::content::Download::new(streams.response, call.attempt.identity, &job, mime, length)
+            .map_err(xai_exec::encoding)?;
+        // A poll body the codec refuses still names the file; it reports no usage.
+        let decoded = (|| {
+            let phase = video::Phase::Job;
+            let mut decoder =
+                video::Decoder::new(streams.response, video::Dialect::Xai, phase, Some(&job), VIDEO_LIMIT)?;
+            decoder.advance(streams.response, &polled)?;
+            decoder.finish(streams.response)
+        })();
+        if let Ok(decoded) = decoded {
+            let mut ledger = JobLedger {
+                slot: None,
+                admission: Some(admission),
+            };
+            ingress
+                .charge(streams.response, &decoded, video::Dialect::Xai, &mut ledger)
+                .map_err(xai_exec::encoding)?;
+        }
+        Ok((
+            download.status,
+            download.headers,
+            download.body,
+            MediaIngress::VideoContent(Box::new(ingress)),
         ))
     }
 
@@ -991,12 +861,7 @@ impl XaiExecutor {
         speech: bool,
     ) -> Result<wire::Upstream, ExecError> {
         let credential = call.attempt.credential;
-        let base = if speech {
-            compact_base_url(credential)
-        } else {
-            chat_base_url(credential)
-        };
-        let url = self.url(endpoint(&base, path));
+        let url = self.url(endpoint(&media_base_url(credential, speech), path));
         crate::xai_url::new_request(&url)?;
         if let Some(error) = crate::xai_url::transport_refusal(&url) {
             return Err(error);
@@ -1041,6 +906,17 @@ impl XaiExecutor {
     }
 }
 
+/// The base URL of a media request: the chat base URL, or for speech the compact one
+/// (`xaiSpeechRequestURL`), so an OAuth credential on the CLI chat proxy sends speech to the
+/// official API.
+pub(crate) fn media_base_url(credential: &ck_core::credential::Credential, speech: bool) -> String {
+    if speech {
+        compact_base_url(credential)
+    } else {
+        chat_base_url(credential)
+    }
+}
+
 /// One media attempt's facts the upload rules and headers read.
 struct MediaCall<'r> {
     attempt: &'r Attempt<'r>,
@@ -1067,7 +943,7 @@ impl MediaCall<'_> {
     fn with_model(&self, mut upload: Vec<u8>) -> Vec<u8> {
         let model = parse_suffix(self.attempt.model).model_name;
         if !model.trim().is_empty() {
-            crate::openai_compat_payload::set_str_if_different(&mut upload, "model", model.trim());
+            crate::openai_compat_payload::set_str_if_different(&mut upload, "model", upstream_model(model.trim()));
         }
         upload
     }
@@ -1117,5 +993,15 @@ impl MediaCall<'_> {
             headers.set("Accept", "*/*");
         }
         headers
+    }
+}
+
+/// The model xAI is sent for a routed one: the 1.5 preview alias selects credentials under its
+/// own name, but xAI receives `grok-imagine-video-1.5` (Go `canonicalXAIVideosModel`).
+fn upstream_model(model: &str) -> &str {
+    if model.go_eq_fold("grok-imagine-video-1.5-preview") {
+        "grok-imagine-video-1.5"
+    } else {
+        model
     }
 }

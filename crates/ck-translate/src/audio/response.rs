@@ -170,11 +170,14 @@ impl ResponseIngress for Ingress {
     }
 }
 
-/// Raw entity-body egress. Each data record is validated before its decoded bytes
-/// reach the callback. Errors are returned to the HTTP owner, never encoded as
-/// JSON inside an audio file. Once bytes were sent the owner must abort the body.
+/// Raw entity-body egress of one media object: speech audio, or a finished video file. Each
+/// data record is validated before its decoded bytes reach the callback. Errors are returned
+/// to the HTTP owner, never encoded as JSON inside the file. Once bytes were sent the owner
+/// must abort the body.
 pub struct Egress {
     binding: Binding,
+    /// The `media.start` kind the stream must carry.
+    kind: &'static str,
     started: bool,
     media: Option<(LocalId, Document)>,
     index: u64,
@@ -185,9 +188,16 @@ pub struct Egress {
 }
 
 impl Egress {
+    /// The speech audio's egress.
     pub fn new(owner: &Writer, identity: Option<Identity>) -> Self {
+        Self::of(owner, identity, "audio")
+    }
+
+    /// The egress of a media object of `kind` (`audio`, `video`).
+    pub fn of(owner: &Writer, identity: Option<Identity>, kind: &'static str) -> Self {
         Self {
             binding: Binding::new(owner, identity),
+            kind,
             started: false,
             media: None,
             index: 0,
@@ -223,7 +233,7 @@ impl Egress {
         match kind {
             Kind::ResponseStart if !self.started => self.started = true,
             Kind::MediaStart if self.media.is_none() => {
-                if !boundary::is(&doc, root, "kind", "audio")? || !boundary::is(&doc, root, "encoding", "base64")? {
+                if !boundary::is(&doc, root, "kind", self.kind)? || !boundary::is(&doc, root, "encoding", "base64")? {
                     return Err(Error::Schema);
                 }
                 if let Some(mime) = doc.member(root, "mime")? {
@@ -262,7 +272,8 @@ impl Egress {
                 self.closed = true;
                 self.success = true;
             }
-            Kind::Heartbeat => (),
+            // A job's usage snapshot is accounting's; the file does not carry it.
+            Kind::Heartbeat | Kind::Usage => (),
             _ => return Err(Error::Schema),
         }
         Ok(())

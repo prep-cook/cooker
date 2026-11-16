@@ -113,15 +113,6 @@ pub(crate) fn original(req: &ExecRequest) -> &[u8] {
     }
 }
 
-/// `helps.PayloadRequestedModel`.
-pub(crate) fn requested_model(req: &ExecRequest) -> &str {
-    if req.requested_model.trim().is_empty() {
-        req.model.trim()
-    } else {
-        req.requested_model.trim()
-    }
-}
-
 /// `upstream.xai.inject-x-search`, shared by OAuth and API-key credentials.
 pub(crate) fn inject_x_search(cfg: &Config) -> bool {
     cfg.document
@@ -1333,7 +1324,7 @@ fn normalize_input_namespace_tool_calls(mut body: Vec<u8>, fold: bool) -> Vec<u8
 /// `normalizeXAIImageRefs`: `image`, `images` and `reference_images` entries anywhere
 /// in the payload use xAI's `url` field instead of OpenAI's `image_url`. Go re-encodes
 /// the whole document when it changes anything.
-pub(crate) fn normalize_image_refs(body: Vec<u8>) -> Vec<u8> {
+fn normalize_image_refs(body: Vec<u8>) -> Vec<u8> {
     if !gj::valid(&body) {
         return body;
     }

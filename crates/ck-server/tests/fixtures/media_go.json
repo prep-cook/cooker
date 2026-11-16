@@ -690,12 +690,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "169",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"progress\":0,\"status\":\"queued\",\"id\":\"req-vid-1\",\"model\":\"grok-imagine-video\",\"prompt\":\"waves\",\"seconds\":\"15\",\"size\":\"1280x720\",\"created_at\":\"\u003cnow\u003e\"}",
+      "response": "{\"id\":\"req-vid-1\",\"object\":\"video\",\"status\":\"queued\",\"model\":\"grok-imagine-video\",\"prompt\":\"waves\",\"seconds\":\"15\",\"size\":\"1280x720\",\"created_at\":\"\u003cnow\u003e\",\"progress\":0}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 147\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"waves\",\"duration\":15,\"aspect_ratio\":\"16:9\",\"resolution\":\"720p\",\"image\":{\"url\":\"https://example.com/i.png\"}}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 147\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"waves\",\"duration\":15,\"resolution\":\"720p\",\"aspect_ratio\":\"16:9\",\"image\":{\"url\":\"https://example.com/i.png\"}}"
       ]
     },
     {
@@ -716,10 +716,10 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "187",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-vid-1\",\"model\":\"grok-imagine-video\",\"created_at\":1700000100,\"status\":\"completed\",\"progress\":100,\"seconds\":\"8\",\"video_url\":\"http://UPSTREAM/files/v.mp4\"}",
+      "response": "{\"id\":\"req-vid-1\",\"object\":\"video\",\"status\":\"completed\",\"progress\":100,\"created_at\":1700000100,\"model\":\"grok-imagine-video\",\"video_url\":\"http://UPSTREAM/files/v.mp4\",\"seconds\":\"8\"}",
       "requests": [
         "GET /v1/videos/req-vid-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
@@ -742,10 +742,10 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "101",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-vid-1\",\"model\":\"grok-imagine-video\",\"status\":\"in_progress\",\"progress\":40}",
+      "response": "{\"id\":\"req-vid-1\",\"object\":\"video\",\"status\":\"in_progress\",\"progress\":40,\"model\":\"grok-imagine-video\"}",
       "requests": [
         "GET /v1/videos/req-vid-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
@@ -790,10 +790,8 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Disposition": "attachment; filename=\"v.mp4\"",
-        "Content-Length": "7",
-        "Content-Type": "video/mp4",
-        "Etag": "\"abc\""
+        "Cache-Control": "no-store",
+        "Content-Type": "video/mp4"
       },
       "response": "MP4DATA",
       "requests": [
@@ -973,12 +971,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "175",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"progress\":5,\"status\":\"queued\",\"id\":\"req-vid-2\",\"model\":\"grok-imagine-video-1.5\",\"prompt\":\"hi there\",\"seconds\":\"4\",\"size\":\"720x1280\",\"created_at\":\"\u003cnow\u003e\"}",
+      "response": "{\"id\":\"req-vid-2\",\"object\":\"video\",\"status\":\"queued\",\"progress\":5,\"model\":\"grok-imagine-video-1.5\",\"prompt\":\"hi there\",\"seconds\":\"4\",\"size\":\"720x1280\",\"created_at\":\"\u003cnow\u003e\"}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 182\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video-1.5\",\"prompt\":\"hi there\",\"duration\":4,\"aspect_ratio\":\"16:9\",\"resolution\":\"480p\",\"reference_images\":[{\"url\":\"https://a/1.png\"},{\"url\":\"https://a/2.png\"}]}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 182\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video-1.5\",\"prompt\":\"hi there\",\"duration\":4,\"resolution\":\"480p\",\"aspect_ratio\":\"16:9\",\"reference_images\":[{\"url\":\"https://a/1.png\"},{\"url\":\"https://a/2.png\"}]}"
       ]
     },
     {
@@ -999,10 +997,10 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "142",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-vid-2\",\"model\":\"grok-imagine-video\",\"status\":\"failed\",\"progress\":0,\"error\":{\"code\":\"outer\",\"message\":\"moderated\"}}",
+      "response": "{\"id\":\"req-vid-2\",\"object\":\"video\",\"status\":\"failed\",\"error\":{\"message\":\"moderated\",\"code\":\"content_policy\"},\"model\":\"grok-imagine-video\"}",
       "requests": [
         "GET /v1/videos/req-vid-2 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
@@ -1027,12 +1025,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "173",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"progress\":0,\"status\":\"in_progress\",\"id\":\"req-vid-3\",\"model\":\"grok-imagine-video\",\"prompt\":\"rain\",\"seconds\":\"1\",\"size\":\"1024x1792\",\"created_at\":\"\u003cnow\u003e\"}",
+      "response": "{\"id\":\"req-vid-3\",\"object\":\"video\",\"status\":\"in_progress\",\"model\":\"grok-imagine-video\",\"prompt\":\"rain\",\"seconds\":\"1\",\"size\":\"1024x1792\",\"created_at\":\"\u003cnow\u003e\",\"progress\":0}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 145\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"rain\",\"duration\":1,\"aspect_ratio\":\"9:16\",\"resolution\":\"720p\",\"image\":{\"url\":\"https://example.com/r.png\"}}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 145\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"rain\",\"duration\":1,\"resolution\":\"720p\",\"aspect_ratio\":\"9:16\",\"image\":{\"url\":\"https://example.com/r.png\"}}"
       ]
     },
     {
@@ -1053,10 +1051,10 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "82",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-vid-3\",\"model\":\"grok-imagine-video\",\"status\":\"queued\"}",
+      "response": "{\"id\":\"req-vid-3\",\"object\":\"video\",\"status\":\"queued\",\"model\":\"grok-imagine-video\"}",
       "requests": [
         "GET /v1/videos/req-vid-3 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
@@ -1079,10 +1077,10 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "82",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-vid-3\",\"model\":\"grok-imagine-video\",\"status\":\"queued\"}",
+      "response": "{\"id\":\"req-vid-3\",\"object\":\"video\",\"status\":\"queued\",\"model\":\"grok-imagine-video\"}",
       "requests": [
         "GET /v1/videos/req-vid-3 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
@@ -1173,6 +1171,16 @@
             ]
           ],
           "body": "{\"status\":\"queued\"}"
+        },
+        {
+          "status": 200,
+          "headers": [
+            [
+              "Content-Type",
+              "application/json"
+            ]
+          ],
+          "body": "{\"status\":\"queued\"}"
         }
       ],
       "status": 502,
@@ -1182,7 +1190,8 @@
       },
       "response": "{\"error\":{\"message\":\"xAI video response did not include request_id\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 98\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"x\",\"duration\":4,\"aspect_ratio\":\"9:16\",\"resolution\":\"720p\"}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 98\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"x\",\"duration\":4,\"resolution\":\"720p\",\"aspect_ratio\":\"9:16\"}",
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 98\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"x\",\"duration\":4,\"resolution\":\"720p\",\"aspect_ratio\":\"9:16\"}"
       ]
     },
     {
@@ -1218,7 +1227,7 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "29",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"request_id\":\"req-native-1\"}",
@@ -1244,7 +1253,7 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "70",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"status\":\"done\",\"video\":{\"url\":\"http://UPSTREAM/files/n.mp4\"}}",
@@ -1272,12 +1281,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "29",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"request_id\":\"req-native-2\"}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 43\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"prompt\":\"p\",\"model\":\"grok-imagine-video\"}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 43\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"p\"}"
       ]
     },
     {
@@ -1300,12 +1309,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "29",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"request_id\":\"req-native-3\"}",
       "requests": [
-        "POST /v1/videos/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 87\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"p\",\"video\":{\"url\":\"https://example.com/v.mp4\"}}"
+        "POST /v1/videos/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 87\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"p\",\"video\":{\"url\":\"https://example.com/v.mp4\"}}"
       ]
     },
     {
@@ -1328,12 +1337,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "29",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"request_id\":\"req-native-4\"}",
       "requests": [
-        "POST /v1/videos/extensions HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 69\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"p\",\"video_id\":\"req-native-1\"}"
+        "POST /v1/videos/extensions HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 69\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"p\",\"video_id\":\"req-native-1\"}"
       ]
     },
     {
@@ -1387,7 +1396,7 @@
       },
       "response": "{\"error\":\"not found\"}",
       "requests": [
-        "GET /v1/videos/req-native-2 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
+        "GET /v1/videos/req-native-2 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
     },
     {
@@ -1682,11 +1691,12 @@
       ],
       "status": 200,
       "response_headers": {
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "\n{\"object\":\"video\",\"progress\":0,\"status\":\"queued\",\"id\":\"req-slow-1\",\"model\":\"grok-imagine-video\",\"prompt\":\"slow\",\"seconds\":\"4\",\"size\":\"720x1280\",\"created_at\":\"\u003cnow\u003e\"}",
+      "response": "{\"id\":\"req-slow-1\",\"object\":\"video\",\"status\":\"queued\",\"model\":\"grok-imagine-video\",\"prompt\":\"slow\",\"seconds\":\"4\",\"size\":\"720x1280\",\"created_at\":\"\u003cnow\u003e\",\"progress\":0}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 101\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"slow\",\"duration\":4,\"aspect_ratio\":\"9:16\",\"resolution\":\"720p\"}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 101\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"slow\",\"duration\":4,\"resolution\":\"720p\",\"aspect_ratio\":\"9:16\"}"
       ]
     },
     {
@@ -1718,12 +1728,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "7",
+        "Cache-Control": "no-store",
         "Content-Type": "video/mp4"
       },
       "response": "SLOWMP4",
       "requests": [
-        "GET /v1/videos/req-slow-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n",
+        "GET /v1/videos/req-slow-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n",
         "GET /files/slow.mp4 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
     },
@@ -1746,11 +1756,12 @@
       ],
       "status": 200,
       "response_headers": {
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "\n{\"status\":\"queued\"}",
+      "response": "{\"status\":\"pending\"}",
       "requests": [
-        "GET /v1/videos/req-slow-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
+        "GET /v1/videos/req-slow-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
     },
     {

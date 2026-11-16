@@ -27,6 +27,10 @@ pub enum Protocol {
     Speech,
     /// OpenAI Images, with results as base64 or URLs, as the client asked.
     Images(ck_translate::images::Delivery),
+    /// Codex Alpha Search: the result JSON.
+    Search,
+    /// Video jobs in the client's dialect (JSON), or a finished video's file (`Raw`).
+    Video(ck_translate::video::Dialect),
 }
 
 /// Client body framing. `Json` is a buffered body; `Sse` and `JsonArray` stream, the latter

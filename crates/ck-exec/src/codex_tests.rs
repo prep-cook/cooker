@@ -609,49 +609,6 @@ async fn truncated_error_body_is_a_transport_failure_not_an_auth_failure() {
     assert_ne!(error.status, 401);
 }
 
-#[tokio::test]
-async fn alpha_search_reads_at_most_32_mib_whatever_the_status() {
-    use crate::codex_testkit::Reply;
-    let mock = Mock::start().await;
-    let big = "x".repeat(ALPHA_SEARCH_MAX_RESPONSE + 4096);
-    let error_body = "e".repeat(100 * 1024);
-    mock.script(
-        "/alpha/search",
-        vec![
-            Reply {
-                status: 200,
-                headers: vec![("content-type".into(), "application/json".into())],
-                body: big,
-            },
-            Reply {
-                status: 500,
-                headers: vec![("content-type".into(), "application/json".into())],
-                body: error_body.clone(),
-            },
-        ],
-    );
-    let executor = executor().with_alpha_base_url(&mock.url);
-    let cred = oauth_credential(&mock.url);
-    for (status, expected) in [(200, ALPHA_SEARCH_MAX_RESPONSE), (500, error_body.len())] {
-        let response = executor
-            .alpha_search(
-                &cred,
-                b"{}",
-                &HeaderMap::new(),
-                "",
-                &Config::default(),
-                &Default::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status, status);
-        let ResponseBody::Buffered(body) = response.body else {
-            unreachable!()
-        };
-        assert_eq!(body.len(), expected, "status {status}");
-    }
-}
-
 /// Records what the executor reports to the attempt's usage record.
 #[derive(Default)]
 struct Recorded(std::sync::Mutex<Vec<(&'static str, Format, String)>>);
@@ -778,250 +735,6 @@ async fn usage_records_the_payload_override_reasoning_effort() {
         let reports = recorded.0.lock().unwrap().clone();
         assert_eq!(reports[0].0, "request", "{name}");
         assert_eq!(reports[0].2, sent, "{name}: the usage record reads the sent body");
-    }
-}
-
-/// Go `TestCodexImageResolvedModelOnWire` ("custom upstream", "routing and thinking
-/// suffix" and the two "final payload" rows, 51bde0ff and 868e137) through the executor:
-/// a configured, prefixed upstream name reaches the direct Images endpoint as resolved,
-/// for a JSON generation and a multipart edit, and the payload rules run once, last.
-#[tokio::test]
-async fn direct_images_send_the_configured_upstream_model() {
-    let executor = executor();
-    let form = "--XB\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nREQ\r\n--XB\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\ndiagnostic\r\n--XB--\r\n";
-    let models = "[{name: openai/gpt-image-2-cpr, protocol: openai, match: [{model: openai/gpt-image-2-cpr}]}]";
-    let override_rules = format!(
-        "requests:\n  payload:\n    override:\n      - models: {models}\n        params: {{model: policy/image-model}}\n      - models: [{{name: \"*\"}}]\n        params: {{\"audit.-1\": once}}\n"
-    );
-    let filter_rules =
-        format!("requests:\n  payload:\n    filter:\n      - models: {models}\n        params: [model]\n");
-    for (requested, resolved, configured, want, rules) in [
-        (
-            "gpt-image-2",
-            "openai/gpt-image-2-cpr",
-            "openai/gpt-image-2-cpr",
-            "openai/gpt-image-2-cpr",
-            "",
-        ),
-        (
-            "tenant/gpt-image-2(high)",
-            "OpenAI/GPT-Image-2(high)",
-            "OpenAI/GPT-Image-2",
-            "OpenAI/GPT-Image-2",
-            "",
-        ),
-        (
-            "gpt-image-2",
-            "openai/gpt-image-2-cpr",
-            "openai/gpt-image-2-cpr",
-            "policy/image-model",
-            override_rules.as_str(),
-        ),
-        (
-            "gpt-image-2",
-            "openai/gpt-image-2-cpr",
-            "openai/gpt-image-2-cpr",
-            "",
-            filter_rules.as_str(),
-        ),
-    ] {
-        for (request_path, upstream_path, content_type, body) in [
-            (
-                "/v1/images/generations",
-                "/images/generations",
-                "application/json",
-                format!(r#"{{"model":"{requested}","prompt":"diagnostic"}}"#),
-            ),
-            (
-                "/v1/images/edits",
-                "/images/edits",
-                "multipart/form-data; boundary=XB",
-                form.replace("REQ", requested),
-            ),
-        ] {
-            let mock = Mock::start().await;
-            mock.script(
-                upstream_path,
-                vec![crate::codex_testkit::json(
-                    200,
-                    r#"{"created":1713833628,"data":[{"b64_json":"AA=="}]}"#,
-                )],
-            );
-            let cfg = Config::parse(&format!(
-                "api-keys:\n  codex:\n  - name: codex-1\n    base-url: {}\n    prefix: tenant\n    models:\n      - name: {configured}\n        alias: gpt-image-2\n    keys:\n      - api-key: codex-token\n{rules}",
-                mock.url
-            ))
-            .unwrap();
-            let credential = ck_core::config::credentials::from_config(&cfg)
-                .into_iter()
-                .find(|c| c.provider == "codex")
-                .unwrap();
-            let mut headers = HeaderMap::new();
-            headers.insert(http::header::CONTENT_TYPE, content_type.parse().unwrap());
-            let body = Bytes::from(body);
-            let req = ExecRequest {
-                operation: Operation::Generate,
-                source_format: Format::OpenAI,
-                response_format: Format::OpenAI,
-                requested_model: requested.into(),
-                model: resolved.into(),
-                original_body: body.clone(),
-                body,
-                stream: false,
-                alt: None,
-                session: None,
-                headers,
-                execution_session: None,
-                derived_session: None,
-                resolved_model: None,
-                usage: Default::default(),
-                request_path: request_path.into(),
-                caller: Caller {
-                    principal: "client-key-FAKE".into(),
-                    source: "authorization",
-                    provider: String::new(),
-                },
-            };
-            executor.images(&credential, req, request_path, &cfg).await.unwrap();
-            let captured = mock.take();
-            assert_eq!(captured.len(), 1, "{resolved} {request_path}");
-            assert_eq!(captured[0].path, upstream_path);
-            let sent: Value = serde_json::from_slice(&captured[0].body).unwrap();
-            assert_eq!(
-                sent["model"].as_str().unwrap_or_default(),
-                want,
-                "{resolved} {request_path}"
-            );
-            assert_eq!(sent["prompt"], "diagnostic", "{request_path}");
-            if rules.contains("audit") {
-                assert_eq!(sent["audit"], serde_json::json!(["once"]), "{request_path}");
-            }
-        }
-    }
-}
-
-/// The Images API cases (`GO["images"]`): Go's `CodexExecutor` ran each with source
-/// format `openai-image`, the route in `request_path` metadata and the client headers in
-/// the gin context, as the images handler calls it.
-#[tokio::test]
-async fn images_match_go_on_every_fixture_case() {
-    use base64::Engine;
-    let executor = executor();
-    for case in GO["images"].as_array().unwrap() {
-        let name = case["name"].as_str().unwrap();
-        let mock = Mock::start().await;
-        let path = case["upstream"]["path"].as_str().unwrap_or("/responses");
-        mock.script(path, vec![reply(case)]);
-        let credential = credential(case, &mock.url);
-        let config_text = case["config"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("{}");
-        let cfg = Config::parse(config_text).unwrap();
-        let mut headers = HeaderMap::new();
-        for (k, v) in case["headers"].as_object().into_iter().flatten() {
-            headers.insert(
-                http::HeaderName::try_from(k.as_str()).unwrap(),
-                v.as_str().unwrap().parse().unwrap(),
-            );
-        }
-        let body = Bytes::from(
-            base64::engine::general_purpose::STANDARD
-                .decode(case["payload_b64"].as_str().unwrap())
-                .unwrap(),
-        );
-        let request_path = case["request_path"].as_str().unwrap();
-        let model = case["model"].as_str().unwrap();
-        let req = ExecRequest {
-            operation: Operation::Generate,
-            source_format: Format::OpenAI,
-            response_format: Format::OpenAI,
-            requested_model: model.into(),
-            model: model.into(),
-            original_body: body.clone(),
-            body,
-            stream: case["stream"].as_bool().unwrap_or(false),
-            alt: None,
-            session: None,
-            headers,
-            execution_session: None,
-            derived_session: None,
-            resolved_model: None,
-            usage: Default::default(),
-            request_path: request_path.into(),
-            caller: Caller {
-                principal: "client-key-FAKE".into(),
-                source: "authorization",
-                provider: String::new(),
-            },
-        };
-        let result = executor.images(&credential, req, request_path, &cfg).await;
-        let captured = mock.take();
-        match case.get("upstream").filter(|u| !u.is_null()) {
-            None => assert!(captured.is_empty(), "{name}: no upstream request"),
-            Some(go) => {
-                assert_eq!(captured.len(), 1, "{name}: one upstream request");
-                let mut go = go.clone();
-                if name == "direct_edit_multipart" {
-                    // Go ranges over its form map: field order varies per run.
-                    let go_body: Value = serde_json::from_str(go["body"].as_str().unwrap()).unwrap();
-                    let rust_body: Value = serde_json::from_slice(&captured[0].body).unwrap();
-                    assert_eq!(rust_body, go_body, "{name}: upstream body fields");
-                    go["body"] = Value::String(String::from_utf8_lossy(&captured[0].body).into_owned());
-                }
-                assert_same_upstream(name, &captured[0], &go, View::new(&credential).api_key);
-            }
-        }
-        let output = &case["output"];
-        if let Some(go_error) = output.get("error") {
-            let error = result.err().unwrap_or_else(|| panic!("{name}: expected error"));
-            match go_error.get("status") {
-                Some(_) => assert_same_error(name, &error, go_error),
-                // A plain Go error: the handler answers 500.
-                None => {
-                    assert_eq!(error.status, 500, "{name}: status");
-                    assert_eq!(
-                        String::from_utf8_lossy(&error.body),
-                        go_error["message"].as_str().unwrap(),
-                        "{name}: message"
-                    );
-                }
-            }
-            continue;
-        }
-        let response = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-        match response.body {
-            ResponseBody::Buffered(body) => {
-                assert_eq!(
-                    String::from_utf8_lossy(&body),
-                    output["payload"]
-                        .as_str()
-                        .unwrap_or_else(|| panic!("{name}: Go streamed")),
-                    "{name}: payload"
-                );
-            }
-            ResponseBody::Stream(mut stream) => {
-                let mut items = Vec::new();
-                while let Some(item) = stream.next().await {
-                    items.push(item);
-                }
-                let joined: String = items
-                    .iter()
-                    .filter_map(|i| i.as_ref().ok())
-                    .map(|b| String::from_utf8_lossy(b).into_owned())
-                    .collect();
-                let go_joined: String = output["chunks"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("{name}: Go answered without a stream"))
-                    .iter()
-                    .map(|c| c.as_str().unwrap())
-                    .collect();
-                assert_eq!(joined, go_joined, "{name}: stream bytes");
-                match (items.last(), output.get("stream_error")) {
-                    (Some(Err(error)), Some(go)) => assert_same_error(name, error, go),
-                    (_, Some(_)) => panic!("{name}: expected a terminal stream error"),
-                    (Some(Err(error)), None) => panic!("{name}: unexpected stream error {error}"),
-                    _ => {}
-                }
-            }
-        }
     }
 }
 
@@ -1275,9 +988,8 @@ async fn capture_stops_at_the_terminal_line() {
 }
 
 /// Body read failures follow each Go call site: Execute (`data, errRead := io.ReadAll`)
-/// records every byte that arrived, the unfinished tail included, then the error; Alpha
-/// Search records the partial body, then the error; the stream path's error response
-/// records only the read error and returns it.
+/// records every byte that arrived, the unfinished tail included, then the error; the stream
+/// path's error response records only the read error and returns it.
 #[tokio::test]
 async fn capture_keeps_each_sites_read_error_policy() {
     // Execute: the whole partial body, then the error.
@@ -1304,25 +1016,6 @@ async fn capture_keeps_each_sites_read_error_policy() {
     assert!(matches!(&taps[3], Tap::Error(_)), "{taps:?}");
     assert_eq!(taps.len(), 4, "{taps:?}");
 
-    // Alpha Search: the prefix, then the error.
-    let url = broken_upstream(200, "application/json", vec!["{\"results\":["], true).await;
-    let tap = Arc::new(Wiretap::default());
-    let mut cred = oauth_credential(&url);
-    cred.attributes.insert("api_key".into(), "sk-FAKE".into());
-    let _ = executor()
-        .alpha_search(
-            &cred,
-            b"{}",
-            &HeaderMap::new(),
-            "",
-            &Config::default(),
-            &ck_core::exec::CaptureSink::new(tap.clone()),
-        )
-        .await;
-    let taps = tap.taps();
-    assert_eq!(taps[2], Tap::Chunk("{\"results\":[".into()), "{taps:?}");
-    assert!(matches!(&taps[3], Tap::Error(_)), "{taps:?}");
-
     // Stream: an error body that breaks is the read error, not a status error.
     let url = broken_upstream(401, "application/json", vec!["{\"error\":"], true).await;
     let (req, tap) = tapped_request(true, None);
@@ -1338,42 +1031,6 @@ async fn capture_keeps_each_sites_read_error_policy() {
         [Tap::Error(String::from_utf8_lossy(&error.body).into_owned())],
         "{taps:?}"
     );
-}
-
-/// The direct Images endpoints (`executeDirectOpenAIImage` and its stream form) read a
-/// non-2xx body with `io.ReadAll` and, when it breaks, record the read error and return
-/// it in place of the status error.
-#[tokio::test]
-async fn direct_images_return_the_read_error_of_a_broken_error_body() {
-    for stream in [false, true] {
-        let url = broken_upstream(401, "application/json", vec!["{\"error\":"], true).await;
-        let (mut req, tap) = tapped_request(stream, None);
-        let body = Bytes::from_static(br#"{"model":"gpt-image-2","prompt":"a lighthouse"}"#);
-        req.source_format = Format::OpenAI;
-        req.response_format = Format::OpenAI;
-        req.requested_model = "gpt-image-2".into();
-        req.model = "gpt-image-2".into();
-        req.original_body = body.clone();
-        req.body = body;
-        let error = executor()
-            .images(
-                &oauth_credential(&url),
-                req,
-                "/v1/images/generations",
-                &Config::default(),
-            )
-            .await
-            .err()
-            .expect("read error");
-        assert_ne!(error.status, 401, "stream={stream}: {error}");
-        let taps = tap.taps();
-        assert!(matches!(&taps[0], Tap::Request { .. }), "stream={stream}: {taps:?}");
-        assert_eq!(
-            taps[2..],
-            [Tap::Error(String::from_utf8_lossy(&error.body).into_owned())],
-            "stream={stream}: {taps:?}"
-        );
-    }
 }
 
 /// A streamed (or buffered, `stream: false`) Responses request whose upstream sends `sse`:
@@ -1676,6 +1333,11 @@ async fn siwc_requests_match_go() {
     for case in go["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let call = case["call"].as_str().unwrap();
+        if call == "image" {
+            // The Images routes run on the execution contract; `tests/exec_media.rs` sends a
+            // Sign in with ChatGPT image request through the tool.
+            continue;
+        }
         let mut metadata = case["metadata"].clone();
         metadata["type"] = "codex".into();
         let synthetic = serde_json::json!({
@@ -1735,31 +1397,6 @@ async fn siwc_requests_match_go() {
                 .collect();
             expected.sort();
             assert_eq!(actual, expected, "{name}: headers");
-            continue;
-        }
-        if call == "image" {
-            let sse = concat!(
-                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"id\":\"ig_0\",\"status\":\"completed\",\"result\":\"SU1HMQ==\",\"output_format\":\"png\"}}\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_img\",\"created_at\":1700000000,\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
-            );
-            mock.script(
-                "/responses",
-                vec![Reply {
-                    status: 200,
-                    headers: vec![("content-type".into(), "text/event-stream".into())],
-                    body: sse.into(),
-                }],
-            );
-            let path = "/v1/images/generations";
-            let mut req = request(&synthetic);
-            (req.source_format, req.response_format, req.request_path) = (Format::OpenAI, Format::OpenAI, path.into());
-            executor.images(&credential, req, path, &cfg).await.unwrap();
-            assert_same_upstream(
-                name,
-                &mock.take().pop().unwrap(),
-                &go_upstream,
-                View::new(&credential).api_key,
-            );
             continue;
         }
         let (path, content_type, reply) = if call == "compact" {
