@@ -29,6 +29,7 @@ impl Usage {
         for key in BILLED {
             count(&next, next.root(), key)?;
         }
+        reported_total(&next, next.root())?;
         if let Some(ttl) = object_member(&next, next.root(), "cache_creation")? {
             for key in ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"] {
                 count(&next, ttl, key)?;
@@ -61,8 +62,10 @@ impl Usage {
             ),
             None => None,
         };
-        let total = match (input, output) {
-            (Some(a), Some(b)) => Some(a.checked_add(b).ok_or(Error::Schema)?),
+        let reported = reported_total(doc, root)?;
+        let total = match (reported, input, output) {
+            (Some(total), _, _) => Some(total),
+            (None, Some(a), Some(b)) => Some(a.checked_add(b).ok_or(Error::Schema)?),
             _ => None,
         };
         for (name, value) in [
@@ -101,12 +104,20 @@ impl Usage {
         }
         if input.is_some() {
             e.bytes(b",\"derived\":[\"input_tokens\"")?;
-            if total.is_some() {
+            if total.is_some() && reported.is_none() {
                 e.bytes(b",\"total_tokens\"")?;
             }
             e.bytes(b"]")?;
         }
         e.bytes(b"}")
+    }
+}
+/// A total the source reported beside the Anthropic counts, which have no member for it. Only
+/// the gateway's Antigravity bridge writes `x_ck.total_tokens`; Anthropic egress drops `x_ck`.
+fn reported_total(doc: &Document, root: usize) -> Result<Option<u64>> {
+    match object_member(doc, root, "x_ck")? {
+        Some(x) => count(doc, x, "total_tokens"),
+        None => Ok(None),
     }
 }
 /// The token counts a response bills.
