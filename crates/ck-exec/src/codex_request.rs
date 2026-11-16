@@ -467,8 +467,13 @@ impl Finalizer {
 /// The payload rules on a `response.steer` frame: the frame is its own baseline, and
 /// its `type` stays `response.steer`.
 pub(crate) fn steer_rules(req: &ExecRequest, settings: &Settings, payload: String) -> String {
+    steer_rules_for(&Inbound::of(req), settings, payload)
+}
+
+/// [`steer_rules`] for the request `inbound` describes.
+pub(crate) fn steer_rules_for(inbound: &Inbound<'_>, settings: &Settings, payload: String) -> String {
     let original = settings.payload.baseline("", payload.as_bytes()).unwrap_or_default();
-    let out = apply_payload(&Inbound::of(req), settings, Call::Websocket, payload, &original);
+    let out = apply_payload(inbound, settings, Call::Websocket, payload, &original);
     set_str(&out, "type", "response.steer")
 }
 

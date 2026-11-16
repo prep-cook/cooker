@@ -14,14 +14,14 @@ use crate::support::upstream::{Reply, StreamUpstream};
 
 /// Every usage and capture call, by name.
 #[derive(Default)]
-struct Observed(Mutex<Vec<String>>);
+pub struct Observed(Mutex<Vec<String>>);
 
 impl Observed {
     fn push(&self, call: String) {
         self.0.lock().unwrap().push(call);
     }
 
-    fn calls(&self) -> Vec<String> {
+    pub fn calls(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
     }
 }

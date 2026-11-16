@@ -9,7 +9,8 @@
 //! upstream, as the backend requires; the client's own `stream` only picks Go's rule set.
 //! Upstream events pass through the Codex event rules (`codex_events`) into the Responses
 //! response ingress. The HTTP transport, headers and quota snapshots are the old path's
-//! (`CodexExecutor::open`, `codex_request::http_headers`).
+//! (`CodexExecutor::open`, `codex_request::http_headers`). A Responses WebSocket turn
+//! (`codex_ws::turns`) shapes its frame here too, for [`Call::Websocket`].
 
 use std::sync::Arc;
 
@@ -90,14 +91,7 @@ impl Execute for CodexExecutor {
         let shaped = Shape::new(attempt, request, &upload)?;
         let call = if stream { Call::Stream } else { Call::NonStream };
         let scratch = streams.response.allocator();
-        let ingress = Ingress::new(
-            streams.response,
-            attempt.identity,
-            Operation::Generate,
-            BodyMode::Streaming,
-            SCANNER_MAX_LINE as u64,
-        )
-        .map_err(encoding)?;
+        let ingress = generation(streams.response, attempt)?;
         let (view, settings) = shaped.view();
         let body = shaped.generate(&view, &settings, call, &self.replay)?;
         let upstream = self
@@ -116,7 +110,7 @@ impl Execute for CodexExecutor {
             status: upstream.status,
             headers: upstream.headers,
             body: events::body(upstream.body, rules),
-            ingress: CodexIngress::Responses(Box::new(ingress)),
+            ingress,
         })
     }
 
@@ -279,20 +273,33 @@ impl ResponseIngress for CodexIngress {
     }
 }
 
+/// The Responses ingress of one streamed generation on `response`.
+pub(crate) fn generation(response: &mut ck_stream::Writer, attempt: &Attempt<'_>) -> Result<CodexIngress, ExecError> {
+    let ingress = Ingress::new(
+        response,
+        attempt.identity,
+        Operation::Generate,
+        BodyMode::Streaming,
+        SCANNER_MAX_LINE as u64,
+    )
+    .map_err(encoding)?;
+    Ok(CodexIngress::Responses(Box::new(ingress)))
+}
+
 /// A finished upstream body and what sending it and reading its answer need.
-struct Shaped<'r> {
-    text: String,
+pub(crate) struct Shaped<'r> {
+    pub(crate) text: String,
     headers: &'r http::HeaderMap,
-    base_model: String,
-    cache: Option<String>,
+    pub(crate) base_model: String,
+    pub(crate) cache: Option<String>,
     /// The `collaboration` namespace was renamed upstream.
-    optimized: bool,
+    pub(crate) optimized: bool,
     scope: Scope,
 }
 
 /// What the Codex body rules read from one attempt, with the encoded upload as the
 /// client-side payload (lite marker, explicit instructions, prompt cache keys).
-struct Shape<'r> {
+pub(crate) struct Shape<'r> {
     attempt: &'r Attempt<'r>,
     request: &'r Request<'r>,
     upload: &'r [u8],
@@ -301,7 +308,7 @@ struct Shape<'r> {
 }
 
 impl<'r> Shape<'r> {
-    fn new(attempt: &'r Attempt<'r>, request: &'r Request<'r>, upload: &'r [u8]) -> Result<Self, ExecError> {
+    pub(crate) fn new(attempt: &'r Attempt<'r>, request: &'r Request<'r>, upload: &'r [u8]) -> Result<Self, ExecError> {
         let requested = gjson::get(&String::from_utf8_lossy(upload), "model")
             .str()
             .trim()
@@ -315,7 +322,7 @@ impl<'r> Shape<'r> {
         })
     }
 
-    fn inbound(&self) -> Inbound<'_> {
+    pub(crate) fn inbound(&self) -> Inbound<'_> {
         let client = &self.request.client;
         Inbound {
             model: self.attempt.model,
@@ -333,7 +340,7 @@ impl<'r> Shape<'r> {
     }
 
     /// The credential's view with the request's explicit session, and its settings.
-    fn view(&self) -> (View<'r>, Settings) {
+    pub(crate) fn view(&self) -> (View<'r>, Settings) {
         let session = ck_wire::session::cpa_session_id(self.request.client.session);
         let view = View::for_request(self.attempt.credential, self.attempt.cfg).with_session(session);
         let settings = Settings::scoped(self.attempt.cfg, &view);
@@ -366,8 +373,10 @@ impl<'r> Shape<'r> {
     }
 
     /// A `/responses` body: Go's stream and non-stream rules, the replay, the prompt cache
-    /// key, the input ids and the payload rules.
-    fn generate(
+    /// key, the input ids and the payload rules. A WebSocket frame body takes the same steps
+    /// with the WebSocket rules and never continues upstream state: the request carries the
+    /// expanded history, so `previous_response_id` goes (Q2).
+    pub(crate) fn generate(
         &self,
         view: &View<'_>,
         settings: &Settings,
@@ -376,7 +385,10 @@ impl<'r> Shape<'r> {
     ) -> Result<Shaped<'r>, ExecError> {
         let body = crate::codex_upload::require(self.upload.to_vec());
         let baseline = settings.payload.baseline("", &body).unwrap_or_default();
-        let thought = self.think(body, Format::Codex)?;
+        let mut thought = self.think(body, Format::Codex)?;
+        if call == Call::Websocket {
+            thought = crate::codex_json::delete(&thought, "previous_response_id");
+        }
         let inbound = self.inbound();
         let shaped = codex_shape::shape_body(&inbound, view, settings, call, thought, baseline);
         let (body, scope) = if self.source == Format::Claude {
@@ -388,7 +400,14 @@ impl<'r> Shape<'r> {
         } else {
             (shaped.body, Scope::default())
         };
-        Ok(self.finish(&inbound, settings, &shaped.finalize, body, shaped.optimized, scope))
+        Ok(self.finish(
+            view,
+            &inbound,
+            settings,
+            &shaped.finalize,
+            body,
+            (shaped.optimized, scope),
+        ))
     }
 
     /// A `/responses/compact` body: the upload is already the Responses request compact sends.
@@ -398,27 +417,37 @@ impl<'r> Shape<'r> {
         let inbound = self.inbound();
         let shaped = codex_shape::shape_body(&inbound, view, settings, Call::Compact, thought, baseline);
         Ok(self.finish(
+            view,
             &inbound,
             settings,
             &shaped.finalize,
             shaped.body,
-            shaped.optimized,
-            Scope::default(),
+            (shaped.optimized, Scope::default()),
         ))
     }
 
-    /// The prompt cache key, the input ids and the payload rules.
+    /// The prompt cache key, the input ids and the payload rules; a WebSocket body gets the
+    /// SIWC WebSocket rules between the last two, as the old WebSocket path applies them.
     fn finish(
         &self,
+        view: &View<'_>,
         inbound: &Inbound<'_>,
         settings: &Settings,
         finalize: &request::Finalizer,
         body: String,
-        optimized: bool,
-        scope: Scope,
+        (optimized, scope): (bool, Scope),
     ) -> Shaped<'r> {
         let (body, cache) = codex_shape::prompt_cache_for(inbound, body, None, false);
-        let text = finalize.finish(inbound, settings, request::sanitize_input_ids(body));
+        let mut body = request::sanitize_input_ids(body);
+        if finalize.call == Call::Websocket && view.siwc {
+            body = request::siwc_body(
+                body,
+                Call::Websocket,
+                request::explicit_instructions(self.upload),
+                ck_wire::thinking::has_thinking_suffix(self.attempt.model),
+            );
+        }
+        let text = finalize.finish(inbound, settings, body);
         Shaped {
             text,
             headers: self.request.client.headers,
@@ -477,7 +506,7 @@ impl<'r> Shape<'r> {
 }
 
 /// The upload request egress encodes for this destination, as one body.
-fn encode(
+pub(crate) fn encode(
     request: &codec::ValidatedRequest<'_>,
     stream: &mut ck_stream::Writer,
     upstream_stream: bool,
@@ -519,7 +548,7 @@ pub(crate) fn streaming(doc: &Document) -> codec::Result<bool> {
 /// The request-side usage facts of a body sent upstream: the body, for the reasoning
 /// effort (as the old path reports it: Codex for generation, Responses for compact), and
 /// the model the upstream is expected to serve.
-fn report(usage: &UsageSink, generate: bool, body: &str) {
+pub(crate) fn report(usage: &UsageSink, generate: bool, body: &str) {
     if !usage.enabled() {
         return;
     }

@@ -1,11 +1,14 @@
 //! The Codex executor under the execution contract, against the DT local upstream: the request
 //! every client protocol puts on the wire, the canonical response every client egress accepts,
-//! the local count, the native compact, and failures before and after the upstream answered.
+//! the local count, the native compact, failures before and after the upstream answered, and
+//! Responses WebSocket turns on the upstream socket.
 
 mod support;
 
 #[path = "exec_codex/alpha.rs"]
 mod alpha;
+#[path = "exec_codex/codex_socket.rs"]
+mod codex_socket;
 #[path = "exec_codex/common.rs"]
 mod common;
 #[path = "exec_codex/count.rs"]
@@ -14,6 +17,8 @@ mod count;
 mod failures;
 #[path = "exec_codex/parity.rs"]
 mod parity;
+#[path = "exec_codex/socket.rs"]
+mod socket;
 #[path = "exec_codex/usage.rs"]
 mod usage;
 

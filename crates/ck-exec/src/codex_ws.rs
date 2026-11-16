@@ -10,6 +10,10 @@
 //!
 //! Lifecycle: the reader task ends with the socket; [`Pool::close`] (downstream gone)
 //! aborts it and sends a close frame. No task outlives its session.
+//!
+//! [`turns`] runs a turn on the execution contract (`session::Turns`) over the same pool:
+//! expanded history every turn, one attempt per upstream response, no redial. The server's
+//! Responses WebSocket handler still drives the old turn path here until it moves to it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -45,6 +49,7 @@ mod execute;
 mod io;
 mod session;
 mod turn;
+mod turns;
 pub(crate) use io::{UpgradeError, offer_compression, read_loop, upgrade};
 use turn::{bootstrap, rest};
 
@@ -511,6 +516,7 @@ pub(crate) mod deflate;
 #[path = "codex_duplex.rs"]
 mod duplex;
 pub use duplex::{ClientFrames, SteeringInput};
+pub use turns::{Next, Successor, TurnControl};
 
 #[cfg(test)]
 #[path = "codex_ws_tests.rs"]
