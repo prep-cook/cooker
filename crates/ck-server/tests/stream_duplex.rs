@@ -581,14 +581,14 @@ async fn every_end_finishes_the_session_before_the_upstream_closes() {
             Cause::ClientClose,
             Stall::Never,
             End::ClientClose(bye.clone()),
-            Terminal::Cancelled,
+            Terminal::ClientDisconnected,
             Some(bye.clone()),
         ),
         (
             Cause::ClientGone,
             Stall::Never,
             End::ClientGone,
-            Terminal::Cancelled,
+            Terminal::ClientDisconnected,
             Some(going_away.clone()),
         ),
         (
@@ -596,7 +596,7 @@ async fn every_end_finishes_the_session_before_the_upstream_closes() {
             Stall::Never,
             End::UpstreamClose(None),
             Terminal::Done,
-            None,
+            Some(None),
         ),
         (
             Cause::UpstreamGone,
@@ -638,14 +638,14 @@ async fn every_end_finishes_the_session_before_the_upstream_closes() {
             Cause::ClientGone,
             Stall::UpstreamMessage,
             End::ClientGone,
-            Terminal::Cancelled,
+            Terminal::ClientDisconnected,
             Some(going_away.clone()),
         ),
         (
             Cause::ClientClose,
             Stall::UpstreamMessage,
             End::ClientClose(bye.clone()),
-            Terminal::Cancelled,
+            Terminal::ClientDisconnected,
             Some(bye.clone()),
         ),
         (
@@ -902,7 +902,7 @@ async fn a_session_releases_its_storage_once_it_ends_or_fails_to_start() {
                 Some("counters"),
                 "held: readable after the end"
             );
-            assert_eq!(terminal, Terminal::Cancelled);
+            assert_eq!(terminal, Terminal::ClientDisconnected);
             drop(reader);
         }
         assert!(store.reader(id, 0).is_err(), "held={held}: the stream left the cache");

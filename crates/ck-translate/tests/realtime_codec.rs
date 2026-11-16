@@ -373,7 +373,7 @@ fn projection_carries_metadata_never_media_or_text() {
         json!({"event":"x_ck.opaque","name":"error","format":"json",
             "value":{"error":{"type":"invalid_request_error","code":"invalid_value","event_id":"c4"}},
             "source":source("error","upstream",json!({"event_id":"e7"}))}),
-        json!({"event":"x_ck.usage","usage":{
+        json!({"event":"x_ck.usage","scope":"response:resp_1","usage":{
                 "native":{"protocol":"openai_realtime","value":{"total_tokens":300,"input_tokens":120,"output_tokens":180,
                     "input_token_details":{"text_tokens":20,"audio_tokens":100,"image_tokens":0,"cached_tokens":64,
                         "cached_tokens_details":{"text_tokens":0,"audio_tokens":64,"image_tokens":0}},
@@ -518,48 +518,107 @@ fn every_documented_event_type_is_projected_or_counted() {
 }
 
 #[test]
-fn usage_is_read_once_from_each_response_done() {
+fn usage_is_read_once_per_response_and_per_transcription() {
     let undocumented = json!({"input_tokens":1,"output_tokens":2,"total_tokens":3,
         "instructions":"SECRET-INSTRUCTIONS","arguments":"SECRET-ARGUMENTS","audio":"U0VDUkVU",
         "input_token_details":{"note":"SECRET-NOTE","cached_tokens_details":{"audio_tokens":1,"text":"SECRET"}},
         "output_token_details":null});
-    // (usage sent, Some((native value kept, canonical snapshot)) or None for no record)
-    let rows = [
-        (
-            json!({"input_tokens":10,"output_tokens":5,"output_token_details":{"audio_tokens":4}}),
-            Some((
-                json!({"input_tokens":10,"output_tokens":5,"output_token_details":{"audio_tokens":4}}),
-                json!({"final":true,"input_tokens":10,"output_tokens":5,"total_tokens":15,
-                    "output_audio_tokens":4,"derived":["total_tokens"]}),
-            )),
-        ),
-        (
-            json!({"input_tokens":null,"output_tokens":5,"total_tokens":9}),
-            Some((
-                json!({"input_tokens":null,"output_tokens":5,"total_tokens":9}),
-                json!({"final":true,"output_tokens":5,"total_tokens":9}),
-            )),
-        ),
-        (
-            undocumented,
-            Some((
-                json!({"input_tokens":1,"output_tokens":2,"total_tokens":3,
-                    "input_token_details":{"cached_tokens_details":{"audio_tokens":1}},"output_token_details":null}),
-                json!({"final":true,"input_tokens":1,"output_tokens":2,"total_tokens":3}),
-            )),
-        ),
-        (json!({}), Some((json!({}), json!({"final":true})))),
-        (json!(null), None),
-    ];
-    for (usage, expected) in rows {
-        let mut mapped = Mapped::new();
-        let mut session = open(&mut mapped, Events::Realtime);
-        // `response.created` may carry the same object; only `response.done` is read.
-        let messages = [
+    // `response.created` may carry the same object; only `response.done` is read.
+    let response = |usage: &Value| {
+        vec![
             json!({"type":"response.created","response":{"id":"resp_1","status":"in_progress","usage":usage}}),
             json!({"type":"response.done","response":{"id":"resp_1","status":"completed","usage":usage}}),
             json!({"type":"response.done","response":{"id":"resp_2","status":"cancelled"}}),
-        ];
+        ]
+    };
+    let transcription = |usage: Value| {
+        vec![
+            json!({"type":"conversation.item.input_audio_transcription.completed","item_id":"item_1",
+            "content_index":0,"transcript":"SECRET-TRANSCRIPT","usage":usage}),
+        ]
+    };
+    let scope = |scope: &str| json!(scope);
+    // (upstream messages, [(usage scope, native value kept, canonical snapshot)])
+    let rows = [
+        (
+            response(&json!({"input_tokens":10,"output_tokens":5,"output_token_details":{"audio_tokens":4}})),
+            vec![(
+                scope("response:resp_1"),
+                json!({"input_tokens":10,"output_tokens":5,"output_token_details":{"audio_tokens":4}}),
+                json!({"final":true,"input_tokens":10,"output_tokens":5,"total_tokens":15,
+                    "output_audio_tokens":4,"derived":["total_tokens"]}),
+            )],
+        ),
+        (
+            response(&json!({"input_tokens":null,"output_tokens":5,"total_tokens":9})),
+            vec![(
+                scope("response:resp_1"),
+                json!({"input_tokens":null,"output_tokens":5,"total_tokens":9}),
+                json!({"final":true,"output_tokens":5,"total_tokens":9}),
+            )],
+        ),
+        (
+            response(&undocumented),
+            vec![(
+                scope("response:resp_1"),
+                json!({"input_tokens":1,"output_tokens":2,"total_tokens":3,
+                    "input_token_details":{"cached_tokens_details":{"audio_tokens":1}},"output_token_details":null}),
+                json!({"final":true,"input_tokens":1,"output_tokens":2,"total_tokens":3}),
+            )],
+        ),
+        (
+            response(&json!({})),
+            vec![(scope("response:resp_1"), json!({}), json!({"final":true}))],
+        ),
+        (response(&json!(null)), vec![]),
+        // Without a response id the usage is the session's own.
+        (
+            vec![json!({"type":"response.done","response":{"status":"completed","usage":{"output_tokens":2}}})],
+            vec![(
+                Value::Null,
+                json!({"output_tokens":2}),
+                json!({"final":true,"output_tokens":2}),
+            )],
+        ),
+        // Two responses keep two scopes.
+        (
+            vec![
+                json!({"type":"response.done","response":{"id":"resp_a","usage":{"output_tokens":1}}}),
+                json!({"type":"response.done","response":{"id":"resp_b","usage":{"output_tokens":2}}}),
+            ],
+            vec![
+                (
+                    scope("response:resp_a"),
+                    json!({"output_tokens":1}),
+                    json!({"final":true,"output_tokens":1}),
+                ),
+                (
+                    scope("response:resp_b"),
+                    json!({"output_tokens":2}),
+                    json!({"final":true,"output_tokens":2}),
+                ),
+            ],
+        ),
+        // A transcription's token usage is its own scope (owner ruling E10a-3).
+        (
+            transcription(
+                json!({"type":"tokens","input_tokens":14,"output_tokens":3,"total_tokens":17,
+                "input_token_details":{"text_tokens":0,"audio_tokens":14}}),
+            ),
+            vec![(
+                scope("transcription:item_1"),
+                json!({"input_tokens":14,"output_tokens":3,"total_tokens":17,
+                    "input_token_details":{"text_tokens":0,"audio_tokens":14}}),
+                json!({"final":true,"input_tokens":14,"output_tokens":3,"total_tokens":17,
+                    "input_audio_tokens":14,"details":{"input_text_tokens":0}}),
+            )],
+        ),
+        // Duration usage has no tokens to record.
+        (transcription(json!({"type":"duration","seconds":2.5})), vec![]),
+    ];
+    for (messages, expected) in rows {
+        let mut mapped = Mapped::new();
+        let mut session = open(&mut mapped, Events::Realtime);
         for message in &messages {
             let payload = serde_json::to_vec_pretty(message).unwrap();
             session
@@ -567,17 +626,17 @@ fn usage_is_read_once_from_each_response_done() {
                 .unwrap();
         }
         let output = mapped.output(&mapped.writer);
-        assert!(!output.windows(6).any(|w| w == b"SECRET"), "{usage}");
-        let usages: Vec<(Value, Value)> = records(&mapped)
+        assert!(!output.windows(6).any(|w| w == b"SECRET"), "{messages:?}");
+        let usages: Vec<(Value, Value, Value)> = records(&mapped)
             .into_iter()
             .filter(|r| r["event"] == "x_ck.usage")
             .map(|mut r| {
                 let native = r["usage"].as_object_mut().unwrap().remove("native").unwrap();
                 assert_eq!(native["protocol"], "openai_realtime");
-                (native["value"].clone(), r["usage"].take())
+                (r["scope"].take(), native["value"].clone(), r["usage"].take())
             })
             .collect();
-        assert_eq!(usages, expected.into_iter().collect::<Vec<_>>(), "{usage}");
+        assert_eq!(usages, expected, "{messages:?}");
     }
 }
 

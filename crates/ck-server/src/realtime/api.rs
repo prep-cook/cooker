@@ -18,9 +18,9 @@
 //! Request logs capture the live call and hangup upstream exchanges at Go's
 //! `helps.Record*` call sites. The sockets are GET requests, which Go never logs.
 //!
-//! ponytail: usage logging of live exchanges is not ported. Go also records a failed
-//! downstream write of the call's answer; the text is the socket's own error, which
-//! `TrackedBody` cannot see.
+//! Each Realtime socket and sideband records its responses' usage ([`session`]); the call
+//! and hangup exchanges record none. ponytail: Go also records a failed downstream write of
+//! the call's answer; the text is the socket's own error, which `TrackedBody` cannot see.
 
 mod calls;
 #[cfg(test)]
@@ -32,6 +32,7 @@ mod http;
 mod media;
 mod relay;
 mod secrets;
+mod session;
 mod socket;
 #[cfg(feature = "media-relay")]
 mod tunnel;
@@ -48,19 +49,74 @@ use ck_core::credential::Credential;
 
 use crate::runtime::state::{AcquireError, Lease, Runtime, Selection};
 
-/// Realtime state shared by every route: remembered calls and ephemeral keys.
+/// Realtime state shared by every route: remembered calls, ephemeral keys, the client socket
+/// settings read at startup and the open sockets per key.
 pub(crate) struct Live {
     calls: Arc<calls::Calls>,
     secrets: secrets::Secrets,
     relays: relay::Relays,
+    settings: ck_core::config::Realtime,
+    sockets: Arc<Sockets>,
 }
 
 impl Default for Live {
     fn default() -> Self {
+        Self::new(ck_core::config::Realtime::default())
+    }
+}
+
+impl Live {
+    fn new(settings: ck_core::config::Realtime) -> Self {
         Self {
             calls: calls::Calls::new(),
             secrets: secrets::Secrets::default(),
             relays: relay::Relays::default(),
+            settings,
+            sockets: Arc::new(Sockets {
+                limit: settings.max_sockets_per_key,
+                open: Default::default(),
+            }),
+        }
+    }
+}
+
+/// Open realtime sockets per client key, against `realtime.max-sockets-per-key`.
+struct Sockets {
+    /// 0 is no limit.
+    limit: u32,
+    open: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+}
+
+/// One open socket of a key; dropping it frees its place.
+struct Slot(Arc<Sockets>, String);
+
+impl Sockets {
+    /// A place for one more socket of `key`; `None` past the limit.
+    fn take(self: &Arc<Self>, key: &str) -> Option<Slot> {
+        if self.limit == 0 {
+            return Some(Slot(self.clone(), String::new()));
+        }
+        let mut open = self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = open.entry(key.to_owned()).or_default();
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(Slot(self.clone(), key.to_owned()))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if self.0.limit == 0 {
+            return;
+        }
+        let mut open = self.0.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = open.get_mut(&self.1) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.1);
+            }
         }
     }
 }
@@ -73,7 +129,8 @@ impl Drop for Live {
 }
 
 pub fn routes(rt: &Arc<Runtime>) -> Router<Arc<Runtime>> {
-    routes_with(rt, Arc::new(Live::default()))
+    // Deploy-only: read once when the routes are built.
+    routes_with(rt, Arc::new(Live::new(rt.config().realtime())))
 }
 
 fn routes_with(rt: &Arc<Runtime>, live: Arc<Live>) -> Router<Arc<Runtime>> {
@@ -123,9 +180,50 @@ pub(crate) struct Principal {
     pub key: String,
     pub provider: String,
     pub secret: Option<Arc<secrets::Grant>>,
+    /// The downstream peer, as the listener records it.
+    pub peer: Option<std::net::SocketAddr>,
 }
 
 impl Principal {
+    /// Who owns the session stream: the key, and the ephemeral key's call scope.
+    fn owner(&self) -> crate::inference::streams::Owner {
+        crate::inference::streams::Owner {
+            caller: ck_core::exec::Caller {
+                principal: self.key.clone(),
+                source: "authorization",
+                provider: self.provider.clone(),
+            },
+            scope: self.secret.as_ref().map(|grant| grant.principal.clone()),
+        }
+    }
+
+    /// The usage record's request facts for a socket on `endpoint` asking for `model`.
+    fn facts(
+        &self,
+        cfg: &Config,
+        headers: &HeaderMap,
+        endpoint: &str,
+        model: &str,
+    ) -> Arc<crate::observability::usage_record::Facts> {
+        let trace = crate::inference::dispatch::Trace::with_request_id(crate::observability::api::current_request_id());
+        let client = crate::observability::usage_record::Client {
+            request_id: trace.request_id(),
+            endpoint: endpoint.to_owned(),
+            api_key: self.key.clone(),
+            access_provider: self.provider.clone(),
+            ..crate::inference::dispatch::request_client(cfg, headers, self.peer)
+        };
+        Arc::new(crate::observability::usage_record::Facts::new(
+            client,
+            ck_core::format::Format::OpenAI,
+            ck_core::format::Format::OpenAI,
+            model,
+            b"{}",
+            true,
+            &trace,
+        ))
+    }
+
     /// `liveSelectionHeaders`: a local ephemeral key never reaches session affinity.
     fn selection_headers(&self, headers: &HeaderMap) -> HeaderMap {
         let mut headers = headers.clone();
@@ -167,6 +265,7 @@ async fn authenticate(
                 .cloned()
                 .unwrap_or_else(|| "realtime-client-secret".into()),
             secret: Some(grant),
+            peer: None,
         }
     } else {
         match crate::net::access::client_caller(&rt, req.headers(), req.uri().query().unwrap_or_default()) {
@@ -175,6 +274,7 @@ async fn authenticate(
                 key: caller.principal,
                 provider: caller.provider,
                 secret: None,
+                peer: None,
             },
             Err(message) if matches!(mode, Mode::Ordinary) => {
                 let body = crate::http::gojson::Obj::new().str("error", message).finish();
@@ -185,7 +285,11 @@ async fn authenticate(
             }
         }
     };
-    req.extensions_mut().insert(principal);
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0);
+    req.extensions_mut().insert(Principal { peer, ..principal });
     next.run(req).await
 }
 

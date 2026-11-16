@@ -356,7 +356,7 @@ pub(crate) fn stored(error: &ck_stream::Error) -> ExecError {
 /// The routing outcome of a stream another party ended.
 fn stopped_outcome(terminal: Terminal) -> Result<(), ExecError> {
     match terminal {
-        Terminal::Done | Terminal::Cancelled | Terminal::Shutdown => Ok(()),
+        Terminal::Done | Terminal::Cancelled | Terminal::ClientDisconnected | Terminal::Shutdown => Ok(()),
         Terminal::Gone => Err(gone()),
         Terminal::StorageExhausted => Err(stored(&ck_stream::Error::StorageExhausted)),
         Terminal::UpstreamError | Terminal::ProducerLost => Err(defective()),

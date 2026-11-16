@@ -289,11 +289,7 @@ pub async fn read(mut stream: Writer, mut reader: Reader) -> (Usage, ResponseFac
     let mut facts = ResponseFacts::default();
     while let Some(Read::Record(lease)) = reader.next().await {
         let observed = internal::decode(&mut stream, lease).and_then(|(kind, doc)| match kind {
-            Kind::Usage => snapshot(&doc).and_then(|snapshot| {
-                let scope = text(&doc, "scope")?.flatten();
-                usage.replace(scope, snapshot);
-                Ok(())
-            }),
+            Kind::Usage => observe(&doc, &mut usage),
             Kind::ResponseStart => text(&doc, "model").map(|model| {
                 if let Some(model) = model {
                     facts.model = model;
@@ -313,6 +309,14 @@ pub async fn read(mut stream: Writer, mut reader: Reader) -> (Usage, ResponseFac
         }
     }
     (usage, facts)
+}
+
+/// Replaces the snapshot of the scope a `usage` record names with the record's.
+pub(crate) fn observe(doc: &Document, usage: &mut Usage) -> codec::Result<()> {
+    let snapshot = snapshot(doc)?;
+    let scope = text(doc, "scope")?.flatten();
+    usage.replace(scope, snapshot);
+    Ok(())
 }
 
 fn snapshot(doc: &Document) -> codec::Result<CanonicalUsage> {

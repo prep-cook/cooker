@@ -569,7 +569,9 @@ fn ended(terminal: Terminal) -> ExecError {
     match terminal {
         // ponytail: the client status of a cancel or shutdown before commitment is not
         // specified; 499 and 503 name them until the routes switch (D2-3a).
-        Terminal::Cancelled => ExecError::local(499, FailureScope::Request, "stream.cancelled"),
+        Terminal::Cancelled | Terminal::ClientDisconnected => {
+            ExecError::local(499, FailureScope::Request, "stream.cancelled")
+        }
         Terminal::Shutdown => ExecError::local(503, FailureScope::Request, "stream.shutdown"),
         Terminal::Gone => stored(&ck_stream::Error::Gone),
         Terminal::StorageExhausted => stored(&ck_stream::Error::StorageExhausted),

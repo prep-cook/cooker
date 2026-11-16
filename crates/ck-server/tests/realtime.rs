@@ -390,12 +390,16 @@ struct WsMock {
     created: Vec<(String, String)>,
     seen: Option<WsSeen>,
     done: Option<Arc<tokio::sync::Notify>>,
+    /// Replies to the next text messages, one entry each, instead of the echo.
+    script: std::collections::VecDeque<Vec<axum::extract::ws::Message>>,
 }
 
 type WsShared = Arc<Mutex<WsMock>>;
 
 /// The Go harness's upstream: calls answer 201 with the `Thread-Id` as call ID; sockets
 /// echo with `echo:`, close with 4001 on `upstream-close`, and reject marked targets.
+/// Beyond Go's: `upstream-gone` drops the connection without a close, `flood` sends
+/// megabyte messages until the connection fails, and a scripted reply replaces the echo.
 async fn ws_upstream(
     State(mock): State<WsShared>,
     uri: Uri,
@@ -473,7 +477,7 @@ async fn ws_upstream(
             let reply = match message {
                 Message::Text(text) => {
                     record.received.push(Frame::Text(text.as_str().into()));
-                    if text.as_str() == "upstream-close" {
+                    if text.as_str().contains("upstream-close") {
                         let close = axum::extract::ws::CloseFrame {
                             code: 4001,
                             reason: "bye".into(),
@@ -485,6 +489,21 @@ async fn ws_upstream(
                             _ => Frame::Gone,
                         });
                         break;
+                    }
+                    if text.as_str().contains("upstream-gone") {
+                        break;
+                    }
+                    if text.as_str().contains("flood") {
+                        let chunk = Bytes::from(vec![0u8; 1 << 20]);
+                        while socket.send(Message::Binary(chunk.clone())).await.is_ok() {}
+                        break;
+                    }
+                    let script = mock.lock().unwrap().script.pop_front();
+                    if let Some(replies) = script {
+                        for reply in replies {
+                            let _ = socket.send(reply).await;
+                        }
+                        continue;
                     }
                     Message::Text(format!("echo:{}", text.as_str()).into())
                 }
@@ -834,9 +853,10 @@ async fn sideband_claims_and_hangup_teardown() {
     let first = join("call-a").await.unwrap();
     assert_eq!(first.status().as_u16(), 101);
     let mut first = first.into_websocket().await.unwrap();
-    first.send(Message::text("ping")).await.unwrap();
+    let clear = r#"{"type":"input_audio_buffer.clear"}"#;
+    first.send(Message::text(clear)).await.unwrap();
     let echoed = tokio::time::timeout(std::time::Duration::from_secs(2), first.recv()).await;
-    assert!(matches!(echoed, Ok(Some(Ok(Message::Text(t)))) if t.as_str() == "echo:ping"));
+    assert!(matches!(echoed, Ok(Some(Ok(Message::Text(t)))) if t.as_str() == format!("echo:{clear}")));
 
     let second = join("call-a").await.unwrap();
     assert_eq!(second.status().as_u16(), 409, "one sideband per call");
@@ -1101,4 +1121,433 @@ async fn direct_realtime_refuses_a_siwc_credential_without_its_token_with_401() 
             "type": "authentication_error", "param": null, "code": "realtime_upstream_unauthorized"}})
     );
     assert!(mock.lock().unwrap().seen.is_empty());
+}
+
+/// A router over `ws_upstream` with one Codex credential and the access key `owner-key`.
+async fn live_proxy(config: &str) -> (String, Arc<ck_server::Runtime>, WsShared) {
+    let mock = WsShared::default();
+    let upstream_url = serve(axum::Router::new().fallback(ws_upstream).with_state(mock.clone())).await;
+    let executor = CodexExecutor::with_client(wreq::Client::new(), CodexOAuth::new(wreq::Client::new()))
+        .with_live_endpoints(
+            format!("{upstream_url}/backend-api/codex/realtime/calls"),
+            format!("ws{}/v1", upstream_url.trim_start_matches("http")),
+        );
+    let rt = Arc::new(ck_server::testing::runtime(
+        Config::parse(&format!("access: {{api-keys: [owner-key]}}\n{config}")).unwrap(),
+        vec![credential(
+            "only-oauth",
+            serde_json::json!({"type":"codex","access_token":"only-token"}),
+            &[],
+        )],
+        Executors {
+            claude: ck_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            codex: executor,
+            devices: Default::default(),
+            openai: Default::default(),
+            google: Default::default(),
+        },
+    ));
+    let proxy = serve(router(rt.clone())).await;
+    (proxy, rt, mock)
+}
+
+async fn open_realtime(proxy: &str) -> wreq::ws::WebSocket {
+    let response = wreq::Client::new()
+        .websocket(format!(
+            "ws{}/v1/realtime?model=gpt-realtime",
+            proxy.trim_start_matches("http")
+        ))
+        .header("authorization", "Bearer owner-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 101);
+    response.into_websocket().await.unwrap()
+}
+
+async fn next_frame(socket: &mut wreq::ws::WebSocket) -> Frame {
+    use wreq::ws::message::Message;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv()).await {
+            Ok(Some(Ok(Message::Text(t)))) => return Frame::Text(t.as_str().into()),
+            Ok(Some(Ok(Message::Binary(b)))) => return Frame::Binary(b.to_vec()),
+            Ok(Some(Ok(Message::Close(f)))) => return Frame::Close(f.map_or(1005, |f| u16::from(f.code))),
+            Ok(Some(Ok(_))) => continue,
+            _ => return Frame::Gone,
+        }
+    }
+}
+
+/// What the mock upstream received once its socket ended.
+async fn upstream_seen(mock: &WsShared) -> Vec<Frame> {
+    for _ in 0..500 {
+        if let Some(seen) = mock.lock().unwrap().seen.take() {
+            return seen.received;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the upstream socket never ended");
+}
+
+/// Media messages, control messages carrying media fields and plain control messages, with
+/// irregular whitespace and member order, reach the other side with the same opcode, bytes
+/// and order; a client event outside the session's configuration reaches nobody and gets the
+/// protocol's `error` event.
+#[tokio::test]
+async fn live_messages_are_forwarded_byte_for_byte() {
+    use axum::extract::ws::Message as Up;
+    use wreq::ws::message::Message;
+    let (proxy, _rt, mock) = live_proxy("").await;
+    let refused = r#"{"type":"error","error":{"type":"invalid_request_error","code":"unknown_event_type","message":"This session does not accept this event type. Send a documented client event.","param":"type"}}"#;
+    // (client text message, what the upstream replies, what the client then receives)
+    let rows: [(&str, Option<Up>, Option<Frame>); 6] = [
+        (
+            "{ \"type\" : \"input_audio_buffer.append\" ,\n \"audio\":\"AAAA//8=\" }",
+            Some(Up::Text(
+                r#"{"type":"response.output_audio.delta","response_id":"resp_1","item_id":"i1","output_index":0,"content_index":0,"delta":"AAAA"}"#.into(),
+            )),
+            None,
+        ),
+        (
+            r#"{"audio":"AQID","event_id":"e2","type":"input_audio_buffer.append"}"#,
+            Some(Up::Binary(Bytes::from_static(&[0, 1, 2, 255]))),
+            None,
+        ),
+        (
+            r#"{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_audio","audio":"UklGRg=="},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}}"#,
+            Some(Up::Text("{\"type\":\"response.audio.delta\",  \"delta\":\"AQI=\"}".into())),
+            None,
+        ),
+        (
+            r#"{"type":"response.create","response":{"input":[{"type":"message","role":"user","content":[{"type":"input_audio","audio":"AAA="}]}]}}"#,
+            Some(Up::Text(r#"{"delta":"AA==","type":"session.output_audio.delta"}"#.into())),
+            None,
+        ),
+        (r#"{"type":"no.such.event","audio":"AAA="}"#, None, Some(Frame::Text(refused.into()))),
+        (r#"{"type":"input_audio_buffer.commit"}"#, Some(Up::Text(r#"{"type":"input_audio_buffer.committed"}"#.into())), None),
+    ];
+    for (_, reply, _) in &rows {
+        if let Some(reply) = reply {
+            mock.lock().unwrap().script.push_back(vec![reply.clone()]);
+        }
+    }
+    let mut socket = open_realtime(&proxy).await;
+    let mut want_upstream = Vec::new();
+    for (sent, reply, client) in rows {
+        socket.send(Message::text(sent)).await.unwrap();
+        let want = match (reply, client) {
+            (Some(Up::Text(text)), None) => Frame::Text(text.as_str().into()),
+            (Some(Up::Binary(data)), None) => Frame::Binary(data.to_vec()),
+            (None, Some(frame)) => frame,
+            _ => unreachable!(),
+        };
+        if !matches!(want, Frame::Text(ref t) if t.as_str() == refused) {
+            want_upstream.push(Frame::Text(sent.into()));
+        }
+        assert_eq!(next_frame(&mut socket).await, want, "after {sent}");
+    }
+    socket
+        .send(Message::Close(Some(wreq::ws::message::CloseFrame {
+            code: 1000.into(),
+            reason: "".into(),
+        })))
+        .await
+        .unwrap();
+    want_upstream.push(Frame::Close(1000));
+    assert_eq!(upstream_seen(&mock).await, want_upstream);
+}
+
+/// Each response's `response.done` usage and each transcription's token usage is its own
+/// usage record beside the session's own; a response without usage records nothing.
+#[tokio::test]
+async fn live_usage_comes_from_response_done() {
+    use axum::extract::ws::Message as Up;
+    use wreq::ws::message::Message;
+    let (proxy, rt, mock) = live_proxy("").await;
+    rt.usage_queue().configure(
+        true,
+        &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+    );
+    let replies = [
+        r#"{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#,
+        r#"{"type":"response.done","response":{"id":"resp_1","status":"completed","usage":{"total_tokens":15,"input_tokens":10,"output_tokens":5,"input_token_details":{"audio_tokens":8,"text_tokens":2},"output_token_details":{"audio_tokens":4,"text_tokens":1}}}}"#,
+        r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_1","content_index":0,"transcript":"hi","usage":{"type":"tokens","input_tokens":7,"output_tokens":2,"total_tokens":9}}"#,
+        r#"{"type":"response.created","response":{"id":"resp_2","status":"in_progress"}}"#,
+        r#"{"type":"response.done","response":{"id":"resp_2","status":"cancelled"}}"#,
+    ];
+    mock.lock()
+        .unwrap()
+        .script
+        .push_back(replies.iter().map(|r| Up::Text((*r).into())).collect());
+    let mut socket = open_realtime(&proxy).await;
+    socket
+        .send(Message::text(r#"{"type":"response.create"}"#))
+        .await
+        .unwrap();
+    for reply in replies {
+        assert_eq!(next_frame(&mut socket).await, Frame::Text(reply.into()));
+    }
+    socket.send(Message::Close(None)).await.unwrap();
+    upstream_seen(&mock).await;
+    let mut records = Vec::new();
+    for _ in 0..500 {
+        records.extend(rt.usage_queue().pop_oldest(10));
+        if records.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut got: Vec<(String, Option<u64>, Option<u64>, String)> = records
+        .iter()
+        .map(|record| {
+            let record: Value = serde_json::from_slice(record).unwrap();
+            // The session's own record reports no tokens.
+            (
+                record["usage_scope"].as_str().unwrap_or_default().to_owned(),
+                record["tokens"]["input_tokens"].as_u64(),
+                record["tokens"]["output_tokens"].as_u64(),
+                record["endpoint"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    got.sort();
+    let endpoint = "GET /v1/realtime".to_owned();
+    assert_eq!(
+        got,
+        [
+            (String::new(), None, None, endpoint.clone()),
+            ("response:resp_1".into(), Some(10), Some(5), endpoint.clone()),
+            ("transcription:item_1".into(), Some(7), Some(2), endpoint),
+        ]
+    );
+}
+
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogCapture {
+    /// The `live_session_end` lines so far, each as its `key=value` fields.
+    fn ends(&self) -> Vec<BTreeMap<String, String>> {
+        let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+        text.lines()
+            .filter(|line| line.contains("live_session_end"))
+            .map(|line| {
+                line.split_whitespace()
+                    .filter_map(|pair| pair.split_once('='))
+                    .map(|(k, v)| (k.to_owned(), v.trim_matches('"').to_owned()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn raw(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+/// How a session ends in [`live_session_end_is_logged_once_with_cause`].
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    ClientClose,
+    ClientGone,
+    MissingPong,
+    StalledWrite,
+    UpstreamClose,
+    UpstreamGone,
+    Hangup,
+    SocketLimit,
+}
+
+/// Every way a session ends writes one `live_session_end` with its cause, initiator and the
+/// fields that explain it, and no key, token or message content; a client end closes the
+/// upstream session. Timeouts run on shortened settings.
+#[tokio::test]
+async fn live_session_end_is_logged_once_with_cause() {
+    use wreq::ws::message::{CloseFrame, Message};
+    let capture = LogCapture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let (proxy, _rt, mock) = live_proxy(
+        "realtime: {ping-interval-seconds: 1, read-timeout-seconds: 2, write-timeout-seconds: 1, max-sockets-per-key: 1}",
+    )
+    .await;
+    let event = |id: &str| Message::text(format!(r#"{{"type":"input_audio_buffer.clear","event_id":"{id}"}}"#));
+    // (how it ends, the causes logged, the extra field the cause needs, the upstream's last frame)
+    let rows = [
+        (
+            Ending::ClientClose,
+            vec!["client_close"],
+            Some("close_code"),
+            Some(Frame::Close(4002)),
+        ),
+        (Ending::ClientGone, vec!["client_gone"], None, Some(Frame::Close(1001))),
+        (
+            Ending::MissingPong,
+            vec!["client_read_timeout"],
+            Some("idle_ms"),
+            Some(Frame::Close(1001)),
+        ),
+        (
+            Ending::StalledWrite,
+            vec!["client_write_timeout"],
+            Some("write_blocked_ms"),
+            None,
+        ),
+        (
+            Ending::UpstreamClose,
+            vec!["upstream_close"],
+            Some("close_code"),
+            Some(Frame::Close(4001)),
+        ),
+        (Ending::UpstreamGone, vec!["upstream_gone"], None, None),
+        (
+            Ending::Hangup,
+            vec!["hangup"],
+            Some("call_id"),
+            Some(Frame::Close(1001)),
+        ),
+        (
+            Ending::SocketLimit,
+            vec!["socket_limit", "client_close"],
+            None,
+            Some(Frame::Close(1005)),
+        ),
+    ];
+    let client = wreq::Client::new();
+    for (ending, causes, field, upstream_last) in rows {
+        capture.0.lock().unwrap().clear();
+        // Another test's thread may have cached the end log's callsite as uninteresting.
+        tracing::callsite::rebuild_interest_cache();
+        let mut socket = match ending {
+            Ending::Hangup => {
+                let created = client
+                    .post(format!("{proxy}/v1/live"))
+                    .header("authorization", "Bearer owner-key")
+                    .header("thread-id", "call-hangup")
+                    .body(r#"{"sdp":"v=0"}"#)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(created.status().as_u16(), 201);
+                let joined = client
+                    .websocket(format!(
+                        "ws{}/v1/realtime/calls/call-hangup",
+                        proxy.trim_start_matches("http")
+                    ))
+                    .header("authorization", "Bearer owner-key")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(joined.status().as_u16(), 101);
+                joined.into_websocket().await.unwrap()
+            }
+            _ => open_realtime(&proxy).await,
+        };
+        match ending {
+            Ending::ClientClose => socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: 4002.into(),
+                    reason: "bye".into(),
+                })))
+                .await
+                .unwrap(),
+            Ending::ClientGone => drop(socket),
+            // The socket is not read, so no pong answers the pings.
+            Ending::MissingPong => {
+                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                drop(socket);
+            }
+            Ending::StalledWrite => {
+                socket.send(event("flood")).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+                drop(socket);
+            }
+            Ending::UpstreamClose => {
+                socket.send(event("upstream-close")).await.unwrap();
+                assert_eq!(next_frame(&mut socket).await, Frame::Close(4001));
+            }
+            Ending::UpstreamGone => {
+                socket.send(event("upstream-gone")).await.unwrap();
+                assert_eq!(next_frame(&mut socket).await, Frame::Close(1000));
+            }
+            Ending::Hangup => {
+                let hangup = client
+                    .post(format!("{proxy}/v1/realtime/calls/call-hangup/hangup"))
+                    .header("authorization", "Bearer owner-key")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(hangup.status().as_u16(), 201);
+                assert_eq!(next_frame(&mut socket).await, Frame::Close(1000));
+            }
+            Ending::SocketLimit => {
+                let second = client
+                    .websocket(format!(
+                        "ws{}/v1/realtime?model=gpt-realtime",
+                        proxy.trim_start_matches("http")
+                    ))
+                    .header("authorization", "Bearer owner-key")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(second.status().as_u16(), 429, "a second socket of the key is refused");
+                socket.send(Message::Close(None)).await.unwrap();
+            }
+        }
+        let mut ends = capture.ends();
+        for _ in 0..500 {
+            if ends.len() >= causes.len() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            ends = capture.ends();
+        }
+        // The upstream ended too; a stalled flood or a dropped upstream records no close.
+        let upstream = upstream_seen(&mock).await;
+        if let Some(last) = upstream_last {
+            assert_eq!(upstream.last(), Some(&last), "{ending:?}: {upstream:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let ends = capture.ends();
+        let logged: Vec<&str> = ends.iter().map(|end| end["cause"].as_str()).collect();
+        assert_eq!(logged, causes, "{ending:?}: {}", capture.raw());
+        let end = ends.last().unwrap();
+        for required in [
+            "initiator",
+            "auth_id",
+            "ping_interval_s",
+            "read_timeout_s",
+            "write_timeout_s",
+            "duration_ms",
+        ]
+        .into_iter()
+        .chain(field)
+        {
+            assert!(end.contains_key(required), "{ending:?}: {required} missing in {end:?}");
+        }
+        let raw = capture.raw();
+        let lines: Vec<&str> = raw.lines().filter(|line| line.contains("live_session_end")).collect();
+        for secret in ["owner-key", "only-token", "input_audio_buffer", "flood"] {
+            assert!(
+                lines.iter().all(|line| !line.contains(secret)),
+                "{ending:?}: the end log carries {secret}: {lines:?}"
+            );
+        }
+    }
 }

@@ -22,7 +22,10 @@ pub const FRAME_BYTES: usize = 50_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Terminal {
     Done,
+    /// The client cancelled the exchange explicitly.
     Cancelled,
+    /// The client of a live session or Responses WebSocket turn disconnected (Settled 55, 56).
+    ClientDisconnected,
     Shutdown,
     UpstreamError,
     StorageExhausted,
@@ -39,7 +42,7 @@ impl Terminal {
             Self::StorageExhausted => Some("stream.storage_exhausted"),
             Self::Gone => Some("stream.gone"),
             Self::ProducerLost => Some("stream.producer_lost"),
-            Self::Done | Self::Cancelled | Self::Shutdown | Self::UpstreamError => None,
+            Self::Done | Self::Cancelled | Self::ClientDisconnected | Self::Shutdown | Self::UpstreamError => None,
         }
     }
 
@@ -47,6 +50,7 @@ impl Terminal {
     pub fn cancel_reason(self) -> Option<&'static str> {
         match self {
             Self::Cancelled => Some("client_cancel"),
+            Self::ClientDisconnected => Some("client_disconnect"),
             Self::Shutdown => Some("shutdown"),
             Self::Done | Self::UpstreamError | Self::StorageExhausted | Self::Gone | Self::ProducerLost => None,
         }
