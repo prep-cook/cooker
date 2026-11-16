@@ -19,7 +19,7 @@ mod request_multipart;
 mod response;
 mod response_egress;
 
-pub use request::{Decoder, Destination, Mode, RequestFailure, check, encode};
+pub use request::{Decoder, Destination, Mode, RequestFailure, check, encode, retrieve, retrieved_job};
 pub use request_form::from_form;
-pub use response::{Ingress, Wire};
+pub use response::{Deferred, Ingress, Wire};
 pub use response_egress::{Delivery, Dropped, Egress, Format};

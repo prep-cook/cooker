@@ -23,6 +23,8 @@ pub(super) enum Control {
     Unsigned,
     Bool,
     Refs,
+    /// A JSON object, written as received.
+    Object,
 }
 
 /// Every option the codec maps, in the order encoders write them. `model`, `prompt` and `n` are
@@ -45,6 +47,9 @@ pub(super) const CONTROLS: &[(&str, Control)] = &[
     ("images", Control::Refs),
     ("image", Control::Refs),
     ("mask", Control::Refs),
+    ("deferred", Control::Bool),
+    ("storage_options", Control::Object),
+    ("output", Control::Object),
 ];
 pub(super) const KNOWN: &[&str] = &[
     "model",
@@ -67,6 +72,9 @@ pub(super) const KNOWN: &[&str] = &[
     "images",
     "image",
     "mask",
+    "deferred",
+    "storage_options",
+    "output",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,6 +201,37 @@ impl Decoder {
     }
 }
 
+/// The longest job id a poll may name.
+const MAX_JOB_ID: usize = 256;
+
+/// The canonical request of a poll of a deferred image job (`image_retrieve`, X16): the job id
+/// the client named. An empty or overlong id is refused.
+pub fn retrieve(owner: &mut Writer, job: &str) -> Result<Document, RequestFailure> {
+    if job.trim().is_empty() || job.len() > MAX_JOB_ID {
+        return Err(Error::Schema.into());
+    }
+    Ok(boundary::mapped(owner, |e| {
+        e.bytes(b"{\"job_id\":")?;
+        e.string(job)?;
+        e.bytes(b",\"x_ck\":{\"v\":1,\"operation\":\"image_retrieve\",\"original_protocol\":")?;
+        e.string(PROTOCOL)?;
+        e.bytes(b"}}")
+    })?)
+}
+
+/// The `job_id` node of an `image_retrieve` request: a non-empty string.
+pub fn retrieved_job(doc: &Document) -> Result<usize> {
+    let root = doc.root();
+    object(doc, root)?;
+    let x = doc.required(root, "x_ck")?;
+    if !boundary::is(doc, x, "operation", "image_retrieve")? {
+        return Err(Error::Schema);
+    }
+    let job = doc.required(root, "job_id")?;
+    nonempty(doc, job)?;
+    Ok(job)
+}
+
 /// The member of `parent` unless it is absent or null: the references mark these members
 /// nullable, and a null is the same as no member.
 pub(super) fn present(doc: &Document, parent: usize, name: &str) -> Result<Option<usize>> {
@@ -288,7 +327,12 @@ fn validate_controls(doc: &Document, parent: usize, mode: Mode) -> Result<()> {
                 Value::Object if *name != "images" => reference(doc, node)?,
                 _ => return Err(Error::Schema),
             },
+            Control::Object => object(doc, node)?,
         }
+    }
+    // xAI answers a deferred request with a job id only, so it has no event stream (X16).
+    if is_true(doc, parent, "deferred")? && is_true(doc, parent, "stream")? {
+        return Err(Error::Schema);
     }
     let images = present(doc, parent, "images")?.is_some();
     let image = present(doc, parent, "image")?.is_some();
@@ -302,6 +346,14 @@ fn validate_controls(doc: &Document, parent: usize, mode: Mode) -> Result<()> {
         Mode::Generate if images || image || masked => Err(Error::Schema),
         _ => Ok(()),
     }
+}
+
+/// Whether `parent`'s member `name` is `true`.
+fn is_true(doc: &Document, parent: usize, name: &str) -> Result<bool> {
+    Ok(match present(doc, parent, name)? {
+        Some(node) => matches!(doc.node(node)?.value, Value::Bool(true)),
+        None => false,
+    })
 }
 
 /// Where an encoded request goes. `OpenAiForm` and `Codex` carry what the executor owns: the
@@ -318,11 +370,25 @@ pub enum Destination<'a> {
 impl Destination<'_> {
     fn allows(self, name: &str, mode: Mode) -> bool {
         match self {
-            Self::OpenAi | Self::OpenAiForm(_) => !matches!(name, "aspect_ratio" | "resolution"),
-            // `stream` only selects how the client is answered; xAI has no event stream.
+            Self::OpenAi | Self::OpenAiForm(_) => !matches!(
+                name,
+                "aspect_ratio" | "resolution" | "deferred" | "storage_options" | "output"
+            ),
+            // `stream` only selects how the client is answered; xAI has no event stream. `size`
+            // becomes xAI's ratio and resolution ([`xai_shape`]).
             Self::Xai => matches!(
                 name,
-                "response_format" | "aspect_ratio" | "resolution" | "images" | "image" | "user" | "stream"
+                "response_format"
+                    | "aspect_ratio"
+                    | "resolution"
+                    | "size"
+                    | "images"
+                    | "image"
+                    | "user"
+                    | "stream"
+                    | "deferred"
+                    | "storage_options"
+                    | "output"
             ),
             Self::Codex(_) => match name {
                 "size" | "quality" | "background" | "output_format" | "moderation" | "output_compression"
@@ -549,10 +615,11 @@ fn originals(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     Ok(())
 }
 
-/// xAI names a reference's address `url` (and also accepts `image_url`).
+/// xAI names a reference's address `url` (and also accepts `image_url`), typed `image_url` as the
+/// old path sent it.
 fn xai_ref(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     if let Some(url) = address(doc, node)? {
-        e.bytes(b"{\"url\":")?;
+        e.bytes(b"{\"type\":\"image_url\",\"url\":")?;
         doc.write(url, e)?;
     } else {
         e.bytes(b"{\"file_id\":")?;
@@ -561,9 +628,104 @@ fn xai_ref(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"}")
 }
 
+/// The aspect ratios and resolutions xAI documents
+/// (https://docs.x.ai/developers/rest-api-reference/inference/images.md).
+const XAI_RATIOS: &[&str] = &[
+    "1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2", "9:19.5", "19.5:9", "9:20", "20:9", "1:2", "2:1", "21:9", "5:2",
+    "auto",
+];
+const XAI_RESOLUTIONS: &[&str] = &["1k", "1.5k", "2k"];
+
+/// The text of `node`, ASCII-lowercased and trimmed: the xAI controls are ASCII tokens.
+fn token(doc: &Document, node: usize) -> Result<String> {
+    let mut out = String::new();
+    let mut chars = doc.chars(node)?;
+    while let Some(c) = chars.next_scalar()? {
+        out.push(c.to_ascii_lowercase());
+    }
+    Ok(out.trim().to_owned())
+}
+
+/// xAI's `response_format`, `aspect_ratio` and `resolution` for a request, as Go's xAI images
+/// handler builds them (`buildXAIImagesBaseRequest`): `url` in any case, else base64; a documented
+/// ratio or one of Go's aliases, else the one an OpenAI `size` names, else `1:1` for a
+/// generation; a documented resolution, else `2k` for a 2048-pixel `size`, else `1k` for a
+/// generation. A ratio or resolution xAI does not document is refused, not replaced.
+fn xai_shape(doc: &Document, c: &Canonical) -> Result<(&'static str, Option<String>, Option<String>)> {
+    // A deferred job answers with URLs only (xAI, "Only `response_format: "url"` is supported in
+    // this mode").
+    let deferred = is_true(doc, c.controls, "deferred")?;
+    let format = match present(doc, c.controls, "response_format")? {
+        Some(node) if token(doc, node)? == "url" => "url",
+        Some(_) if deferred => return Err(Error::Unsupported),
+        None if deferred => "url",
+        _ => "b64_json",
+    };
+    let size = match present(doc, c.controls, "size")? {
+        Some(node) => token(doc, node)?,
+        None => String::new(),
+    };
+    let generate = c.mode == Mode::Generate;
+    let ratio = match present(doc, c.controls, "aspect_ratio")? {
+        Some(node) => {
+            let ratio = token(doc, node)?;
+            let ratio = match ratio.as_str() {
+                "square" => "1:1".to_owned(),
+                "landscape" => "16:9".to_owned(),
+                "portrait" => "9:16".to_owned(),
+                _ => ratio,
+            };
+            if !XAI_RATIOS.contains(&ratio.as_str()) {
+                return Err(Error::Unsupported);
+            }
+            Some(ratio)
+        }
+        None => match size.as_str() {
+            "1024x1024" | "2048x2048" => Some("1:1".to_owned()),
+            "1792x1024" => Some("16:9".to_owned()),
+            "1024x1792" => Some("9:16".to_owned()),
+            "1536x1024" => Some("3:2".to_owned()),
+            "1024x1536" => Some("2:3".to_owned()),
+            ratio if XAI_RATIOS.contains(&ratio) => Some(ratio.to_owned()),
+            _ => generate.then(|| "1:1".to_owned()),
+        },
+    };
+    let resolution = match present(doc, c.controls, "resolution")? {
+        Some(node) => {
+            let resolution = token(doc, node)?;
+            if !XAI_RESOLUTIONS.contains(&resolution.as_str()) {
+                return Err(Error::Unsupported);
+            }
+            Some(resolution)
+        }
+        None if size.contains("2048") => Some("2k".to_owned()),
+        None => generate.then(|| "1k".to_owned()),
+    };
+    Ok((format, ratio, resolution))
+}
+
 fn xai_body(doc: &Document, c: &Canonical, e: &mut Encoder<'_, '_>) -> Result<()> {
-    head(doc, c, "prompt", e)?;
-    for name in ["response_format", "aspect_ratio", "resolution", "user"] {
+    let (format, ratio, resolution) = xai_shape(doc, c)?;
+    e.bytes(b"{")?;
+    if let Some(model) = present(doc, c.root, "model")? {
+        e.bytes(b"\"model\":")?;
+        doc.write(model, e)?;
+        e.bytes(b",")?;
+    }
+    e.bytes(b"\"prompt\":")?;
+    doc.write(doc.required(c.root, "text")?, e)?;
+    e.bytes(b",\"response_format\":")?;
+    e.string(format)?;
+    if let Some(ratio) = &ratio {
+        e.bytes(b",\"aspect_ratio\":")?;
+        e.string(ratio)?;
+    }
+    if let Some(resolution) = &resolution {
+        e.bytes(b",\"resolution\":")?;
+        e.string(resolution)?;
+    }
+    member(doc, c.root, "n", e)?;
+    for name in ["user", "deferred", "storage_options", "output"] {
         member(doc, c.controls, name, e)?;
     }
     if let Some(image) = present(doc, c.controls, "image")? {

@@ -135,6 +135,8 @@ pub enum Operation {
 pub enum Media {
     ImageGenerate,
     ImageEdit,
+    /// A poll of a deferred image job (xAI).
+    ImageRetrieve,
     /// Bounded speech (TTS).
     Speech,
     VideoCreate,
@@ -153,6 +155,7 @@ impl Operation {
             Self::Compact => "compact",
             Self::Media(Media::ImageGenerate) => "image_generate",
             Self::Media(Media::ImageEdit) => "image_edit",
+            Self::Media(Media::ImageRetrieve) => "image_retrieve",
             Self::Media(Media::Speech) => "speech",
             Self::Media(Media::VideoCreate) => "video_create",
             Self::Media(Media::VideoEdit) => "video_edit",

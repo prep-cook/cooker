@@ -62,6 +62,7 @@ fn destination(label: &str) -> Destination<'static> {
         "openai" => Destination::OpenAi,
         "xai" => Destination::Xai,
         "codex" => Destination::Codex("gpt-5.4-mini"),
+        "openai form" => Destination::OpenAiForm("cooker-images-boundary-0123456789abcdef"),
         other => panic!("destination {other}"),
     }
 }
@@ -92,7 +93,7 @@ fn image_requests_encode_for_each_destination_or_are_refused() {
     let single = json!({"prompt":"hat","images":[{"image_url":PNG}],"response_format":"url"});
     let xai = json!({"model":"grok-imagine","prompt":"a cat","n":2,"response_format":"url","aspect_ratio":"16:9","resolution":"2k"});
     // (mode, wire request, destination, expected upstream body or the refusal)
-    let cases: Vec<(Mode, Value, &str, Result<Value, ()>)> = vec![
+    let mut cases: Vec<(Mode, Value, &str, Result<Value, ()>)> = vec![
         (Mode::Generate, generation.clone(), "openai", Ok(generation.clone())),
         (Mode::Edit, edit.clone(), "openai", Ok(edit.clone())),
         (Mode::Generate, xai.clone(), "xai", Ok(xai.clone())),
@@ -102,13 +103,15 @@ fn image_requests_encode_for_each_destination_or_are_refused() {
             Mode::Edit,
             single.clone(),
             "xai",
-            Ok(json!({"prompt":"hat","response_format":"url","image":{"url":PNG}})),
+            Ok(json!({"prompt":"hat","response_format":"url","image":{"type":"image_url","url":PNG}})),
         ),
         (
             Mode::Edit,
             json!({"prompt":"hat","images":[{"image_url":PNG},{"file_id":"f","image_url":null}]}),
             "xai",
-            Ok(json!({"prompt":"hat","images":[{"url":PNG},{"file_id":"f"}]})),
+            Ok(
+                json!({"prompt":"hat","response_format":"b64_json","images":[{"type":"image_url","url":PNG},{"file_id":"f"}]}),
+            ),
         ),
         (
             Mode::Edit,
@@ -126,7 +129,9 @@ fn image_requests_encode_for_each_destination_or_are_refused() {
             Mode::Edit,
             json!({"prompt":"hat","image":{"url":"https://x/a.png"}}),
             "xai",
-            Ok(json!({"prompt":"hat","image":{"url":"https://x/a.png"}})),
+            Ok(
+                json!({"prompt":"hat","response_format":"b64_json","image":{"type":"image_url","url":"https://x/a.png"}}),
+            ),
         ),
         (
             Mode::Edit,
@@ -140,13 +145,45 @@ fn image_requests_encode_for_each_destination_or_are_refused() {
                 ],
             )),
         ),
-        // xAI: `stream` only selects the client's delivery, `user` is a documented xAI member.
+        // xAI: `stream` only selects the client's delivery, `user` is a documented xAI member; a
+        // generation names its format, ratio and resolution as the old path did.
         (
             Mode::Generate,
             json!({"model":"grok-imagine-image","prompt":"a cat","stream":true,"user":"u"}),
             "xai",
-            Ok(json!({"model":"grok-imagine-image","prompt":"a cat","user":"u"})),
+            Ok(
+                json!({"model":"grok-imagine-image","prompt":"a cat","response_format":"b64_json","aspect_ratio":"1:1",
+                "resolution":"1k","user":"u"}),
+            ),
         ),
+        // xAI keeps every documented ratio and resolution (X17), reads an OpenAI `size` as the ratio
+        // and resolution it names, and refuses what it does not document.
+        (
+            Mode::Generate,
+            json!({"prompt":"p","aspect_ratio":"19.5:9","resolution":"1.5k"}),
+            "xai",
+            Ok(json!({"prompt":"p","response_format":"b64_json","aspect_ratio":"19.5:9","resolution":"1.5k"})),
+        ),
+        (
+            Mode::Generate,
+            json!({"prompt":"p","size":"2048x2048","response_format":"URL"}),
+            "xai",
+            Ok(json!({"prompt":"p","response_format":"url","aspect_ratio":"1:1","resolution":"2k"})),
+        ),
+        (
+            Mode::Edit,
+            json!({"prompt":"p","size":"1792x1024","image":{"url":"https://x/a.png"}}),
+            "xai",
+            Ok(json!({"prompt":"p","response_format":"b64_json","aspect_ratio":"16:9",
+                "image":{"type":"image_url","url":"https://x/a.png"}})),
+        ),
+        (
+            Mode::Generate,
+            json!({"prompt":"p","aspect_ratio":"7:3"}),
+            "xai",
+            Err(()),
+        ),
+        (Mode::Generate, json!({"prompt":"p","resolution":"4k"}), "xai", Err(())),
         // Nullable members are absent (OpenAI `n`, `model`, `size`, `quality`; xAI `n`, `model`).
         (
             Mode::Generate,
@@ -188,7 +225,48 @@ fn image_requests_encode_for_each_destination_or_are_refused() {
             "codex",
             Err(()),
         ),
+        // xAI deferred generation and storage (X16): the three controls follow `user` as sent, a
+        // deferred job answers with URLs only, and `deferred: false` is the ordinary request.
+        (
+            Mode::Generate,
+            json!({"prompt":"p","user":"u","deferred":true,"storage_options":{"bucket":"b","path":"p/"},
+                "output":{"upload_urls":["https://u/1"]}}),
+            "xai",
+            Ok(
+                json!({"prompt":"p","response_format":"url","aspect_ratio":"1:1","resolution":"1k","user":"u",
+                "deferred":true,"storage_options":{"bucket":"b","path":"p/"},"output":{"upload_urls":["https://u/1"]}}),
+            ),
+        ),
+        (
+            Mode::Generate,
+            json!({"prompt":"p","deferred":true,"response_format":"b64_json"}),
+            "xai",
+            Err(()),
+        ),
+        (
+            Mode::Generate,
+            json!({"prompt":"p","deferred":false,"stream":true}),
+            "xai",
+            Ok(
+                json!({"prompt":"p","response_format":"b64_json","aspect_ratio":"1:1","resolution":"1k","deferred":false}),
+            ),
+        ),
     ];
+    // Every other destination refuses each of them, nothing sent.
+    for control in [
+        json!({"deferred":true}),
+        json!({"deferred":false}),
+        json!({"storage_options":{"bucket":"b"}}),
+        json!({"output":{"upload_urls":["https://u/1"]}}),
+    ] {
+        for label in ["openai", "openai form", "codex"] {
+            let mut wire = json!({"prompt":"p"});
+            wire.as_object_mut()
+                .unwrap()
+                .extend(control.as_object().unwrap().clone());
+            cases.push((Mode::Generate, wire, label, Err(())));
+        }
+    }
     for (mode, wire, label, expected) in cases {
         let raw = serde_json::to_vec_pretty(&wire).unwrap();
         for chunk in [1, raw.len()] {
@@ -220,6 +298,10 @@ fn image_request_rejections_produce_no_upstream_body() {
         (Mode::Generate, r#"{"prompt":"p","n":-1}"#, 400),
         (Mode::Generate, r#"{"prompt":"p","size":1024}"#, 400),
         (Mode::Generate, r#"{"prompt":"p","stream":"true"}"#, 400),
+        (Mode::Generate, r#"{"prompt":"p","deferred":true,"stream":true}"#, 400),
+        (Mode::Generate, r#"{"prompt":"p","deferred":"true"}"#, 400),
+        (Mode::Generate, r#"{"prompt":"p","storage_options":"b"}"#, 400),
+        (Mode::Generate, r#"{"prompt":"p","output":["https://u/1"]}"#, 400),
         (Mode::Generate, r#"{"prompt":"p","partial_images":-1}"#, 400),
         (Mode::Generate, r#"{"prompt":"p","images":[{"image_url":"u"}]}"#, 400),
         (Mode::Generate, r#"{"prompt":"p","prompt":"q"}"#, 400),
@@ -459,7 +541,7 @@ fn image_edit_forms_keep_order_bytes_and_unknown_fields_for_every_destination() 
     let xai: Value = serde_json::from_slice(&form(&plain, 3, Destination::Xai).unwrap()).unwrap();
     assert_eq!(
         xai,
-        json!({"prompt":"p","response_format":"url","image":{"url":data_url("image/png",&first)}})
+        json!({"prompt":"p","response_format":"url","image":{"type":"image_url","url":data_url("image/png",&first)}})
     );
     let codex: Value = serde_json::from_slice(&form(&plain, 3, Destination::Codex("m")).unwrap()).unwrap();
     assert_eq!(
@@ -501,6 +583,14 @@ fn image_edit_forms_with_invalid_fields_are_client_errors() {
             vec![text("prompt", "p"), text("stream", "yes"), png.clone()],
         ),
         (
+            "storage options as a form part",
+            vec![
+                text("prompt", "p"),
+                text("storage_options", r#"{"bucket":"b"}"#),
+                png.clone(),
+            ],
+        ),
+        (
             "image without type",
             vec![text("prompt", "p"), file("image", "a.png", None, b"x")],
         ),
@@ -528,6 +618,8 @@ fn image_edit_forms_with_invalid_fields_are_client_errors() {
 // ---- responses ----
 
 struct Run {
+    /// The client's HTTP status.
+    status: u16,
     /// Subjects the egress reported as dropped.
     dropped: Vec<&'static str>,
     canonical: Vec<u8>,
@@ -554,7 +646,19 @@ fn drain(
 fn run(wire: Wire, mode: BodyMode, body: &[u8], chunk: usize, format: Format, delivery: Delivery) -> Run {
     let mut mapped = Mapped::new();
     let limit = body.len() as u64 * 2 + 4096;
-    let mut ingress = Ingress::new(&mut mapped.writer, identity(Direction::Response), wire, mode, limit).unwrap();
+    let ingress = Ingress::new(&mut mapped.writer, identity(Direction::Response), wire, mode, limit).unwrap();
+    run_ingress(mapped, ingress, body, chunk, format, delivery)
+}
+
+/// `body` through `ingress` and the client's egress.
+fn run_ingress(
+    mut mapped: Mapped,
+    mut ingress: Ingress,
+    body: &[u8],
+    chunk: usize,
+    format: Format,
+    delivery: Delivery,
+) -> Run {
     let dropped = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = dropped.clone();
     let mut egress = Egress::new(
@@ -584,6 +688,7 @@ fn run(wire: Wire, mode: BodyMode, body: &[u8], chunk: usize, format: Format, de
         egress_result = egress.finish();
     }
     Run {
+        status: egress.status(),
         dropped: dropped.lock().unwrap().clone(),
         canonical: mapped.output(&mapped.writer),
         client,
@@ -714,7 +819,7 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             )
             .unwrap(),
             Delivery::Base64,
-            json!({"created":0,"usage":xai_usage,"data":[{"b64_json":f}]}),
+            json!({"created":0,"usage":xai_usage,"data":[{"b64_json":f,"mime_type":"image/jpeg","storage_error":null}]}),
         ),
         (
             "OpenAI SSE with previews and repeated usage",
@@ -746,7 +851,7 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             Wire::Xai,
             BodyMode::Buffered,
             serde_json::to_vec(&json!({"created":null,"data":[{"url":"https://x/a.png","revised_prompt":null,
-                "b64_json":null,"mime_type":null}]}))
+                "b64_json":null}]}))
             .unwrap(),
             Delivery::Url,
             json!({"created":0,"data":[{"url":"https://x/a.png"}]}),
@@ -755,7 +860,7 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             "base64 without a media type is a data URL without one",
             Wire::Xai,
             BodyMode::Buffered,
-            serde_json::to_vec(&json!({"created":1,"data":[{"b64_json":"AAEC","mime_type":null}]})).unwrap(),
+            serde_json::to_vec(&json!({"created":1,"data":[{"b64_json":"AAEC"}]})).unwrap(),
             Delivery::Url,
             json!({"created":1,"data":[{"url":"data:;base64,AAEC"}]}),
         ),
@@ -768,7 +873,7 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             .unwrap(),
             Delivery::Url,
             json!({"created":5,"output_format":"png","quality":"high","size":"1024x1024",
-                "data":[{"url":"https://x/a.png"}]}),
+                "data":[{"url":"https://x/a.png","mime_type":"image/jpeg"}]}),
         ),
         (
             "settings come from the first result that has them",
@@ -795,7 +900,7 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             BodyMode::Buffered,
             serde_json::to_vec(&json!({"created":1,"data":[{"b64_json":"AAEC","mime_type":"image/jpeg"}]})).unwrap(),
             Delivery::Url,
-            json!({"created":1,"data":[{"url":"data:image/jpeg;base64,AAEC"}]}),
+            json!({"created":1,"data":[{"url":"data:image/jpeg;base64,AAEC","mime_type":"image/jpeg"}]}),
         ),
         (
             "Codex creation time from the first event, and a call without a result yet",
@@ -1037,12 +1142,20 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             assert_eq!(start["x_ck"]["source"]["sse"][0]["name"], "id");
         }
     }
-    // Members of the xAI source have no place in an OpenAI Images response either.
-    let xai = br#"{"data":[{"b64_json":"AAEC","storage_error":null}],"future":1}"#;
+    // xAI's Images API extends OpenAI's on the same endpoints, so its members reach the client
+    // (X19): the media type, the stored file and a storage failure of each image.
+    let xai =
+        br#"{"data":[{"b64_json":"AAEC","mime_type":"image/png","file_output":{"file_id":"f1"},"storage_error":null},
+        {"url":"https://x/b.png","mime_type":"image/webp","storage_error":"upload failed"}],"future":1}"#;
     let result = run(Wire::Xai, BodyMode::Buffered, xai, 7, Format::Json, Delivery::Base64);
     result.egress.as_ref().unwrap();
-    assert_eq!(client_json(&result), json!({"created":0,"data":[{"b64_json":"AAEC"}]}));
-    assert_eq!(result.dropped, vec!["members of another protocol"; 2]);
+    assert_eq!(
+        client_json(&result),
+        json!({"created":0,"future":1,"data":[
+            {"b64_json":"AAEC","mime_type":"image/png","file_output":{"file_id":"f1"},"storage_error":null},
+            {"url":"https://x/b.png","mime_type":"image/webp","storage_error":"upload failed"}]})
+    );
+    assert!(result.dropped.is_empty(), "{:?}", result.dropped);
 }
 
 #[test]
@@ -1452,7 +1565,7 @@ fn incomplete_or_failed_image_responses_end_in_error_never_success() {
 }
 
 #[test]
-fn urls_are_not_base64_and_unknown_events_never_reach_the_client() {
+fn urls_stay_urls_and_unknown_events_never_reach_the_client() {
     let url = serde_json::to_vec(&json!({"created":1,"data":[{"url":"https://example.invalid/a.png"}]})).unwrap();
     let result = run(
         Wire::OpenAi,
@@ -1463,8 +1576,9 @@ fn urls_are_not_base64_and_unknown_events_never_reach_the_client() {
         Delivery::Base64,
     );
     result.ingress.unwrap();
-    assert!(matches!(result.egress, Err(Error::Unsupported)));
-    assert!(result.client.is_empty());
+    result.egress.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&result.client).unwrap();
+    assert_eq!(body["data"], json!([{"url": "https://example.invalid/a.png"}]));
 
     let events = sse(&[
         json!({"type":"image_generation.future","x":1}),
@@ -1579,4 +1693,191 @@ fn image_response_ingress_refuses_foreign_writers_and_unsupported_framings() {
         Err(Error::EventTooLarge)
     ));
     assert!(matches!(ingress.advance(&mut mapped.writer, b"{"), Err(Error::Closed)));
+}
+
+/// The job table a deferred answer settles against: the jobs it accepted and whether the job is
+/// charged.
+#[derive(Clone, Default)]
+struct Book(std::sync::Arc<std::sync::Mutex<(Vec<String>, bool)>>);
+
+impl ck_translate::video::Ledger for Book {
+    fn accepted(&mut self, job: &str) {
+        self.0.lock().unwrap().0.push(job.to_owned());
+    }
+
+    fn charge(
+        &mut self,
+        _: &str,
+        publish: &mut dyn FnMut() -> ck_translate::codec::Result<()>,
+    ) -> ck_translate::codec::Result<bool> {
+        let mut book = self.0.lock().unwrap();
+        if book.1 {
+            return Ok(false);
+        }
+        publish()?;
+        book.1 = true;
+        Ok(true)
+    }
+}
+
+/// A deferred xAI image job (X16): the create's answer names the job, a poll answered 202 or with
+/// an `error` body reaches the client as xAI wrote it, and a finished poll is the Images response
+/// whose usage is the job's charge, claimed once (E-Q13).
+#[test]
+fn deferred_image_jobs_reach_the_client_as_xai_answers_and_charge_once() {
+    use images::Deferred::{Accepted, Pending, Polled};
+    let done = json!({"data":[{"url":"https://x/1.png","mime_type":"image/png"}],
+        "usage":{"cost_in_usd_ticks":7,"input_tokens":1,"output_tokens":2,"total_tokens":3}});
+    let error = json!({"error":{"code":"internal_error","message":"failed"}});
+    // (case, phase, polled job, upstream body (null: none), already charged, client status, client body,
+    // job usage records, jobs accepted, charged after)
+    type Case = (
+        &'static str,
+        images::Deferred,
+        Option<&'static str>,
+        Value,
+        bool,
+        u16,
+        Option<Value>,
+        usize,
+        Vec<&'static str>,
+        bool,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "a create names its job",
+            Accepted,
+            None,
+            json!({"request_id":"img_1"}),
+            false,
+            200,
+            Some(json!({"request_id":"img_1"})),
+            0,
+            vec!["img_1"],
+            false,
+        ),
+        (
+            "a create naming no job fails",
+            Accepted,
+            None,
+            json!({"id":"img_1"}),
+            false,
+            0,
+            None,
+            0,
+            vec![],
+            false,
+        ),
+        (
+            "a pending poll is 202 with xAI's body",
+            Pending,
+            Some("img_1"),
+            json!({"status":"pending"}),
+            false,
+            202,
+            Some(json!({"status":"pending"})),
+            0,
+            vec![],
+            false,
+        ),
+        (
+            "a pending poll without a body is the polled job, running",
+            Pending,
+            Some("img_1"),
+            Value::Null,
+            false,
+            202,
+            Some(json!({})),
+            0,
+            vec![],
+            false,
+        ),
+        (
+            "a finished poll is the Images response and the job's charge",
+            Polled,
+            Some("img_1"),
+            done.clone(),
+            false,
+            200,
+            Some(
+                json!({"created":0,"usage":done["usage"].clone(),"data":[{"url":"https://x/1.png","mime_type":"image/png"}]}),
+            ),
+            1,
+            vec![],
+            true,
+        ),
+        (
+            "a finished poll of a charged job charges nothing",
+            Polled,
+            Some("img_1"),
+            done.clone(),
+            true,
+            200,
+            Some(json!({"created":0,"data":[{"url":"https://x/1.png","mime_type":"image/png"}]})),
+            0,
+            vec![],
+            true,
+        ),
+        (
+            "an empty usage is no charge",
+            Polled,
+            Some("img_1"),
+            json!({"data":[{"url":"https://x/1.png"}],"usage":{}}),
+            false,
+            200,
+            Some(json!({"created":0,"data":[{"url":"https://x/1.png"}]})),
+            0,
+            vec![],
+            false,
+        ),
+        (
+            "a failed job is 200 with xAI's error body",
+            Polled,
+            Some("img_1"),
+            error.clone(),
+            false,
+            200,
+            Some(error.clone()),
+            0,
+            vec![],
+            false,
+        ),
+    ];
+    for (case, phase, job, body, charged, status, client, usages, accepted, charged_after) in cases {
+        let raw = if body.is_null() {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&body).unwrap()
+        };
+        let book = Book::default();
+        book.0.lock().unwrap().1 = charged;
+        let mut mapped = Mapped::new();
+        let ingress = Ingress::deferred(
+            &mut mapped.writer,
+            identity(Direction::Response),
+            phase,
+            job,
+            raw.len() as u64 + 4096,
+            Box::new(book.clone()),
+        )
+        .unwrap();
+        let run = run_ingress(mapped, ingress, &raw, raw.len().max(1), Format::Json, Delivery::Base64);
+        let jobs = records(&run.canonical)
+            .into_iter()
+            .filter(|(name, data)| name == "x_ck.usage" && data["scope"] == "job:img_1")
+            .count();
+        assert_eq!(jobs, usages, "{case}");
+        match client {
+            Some(client) => {
+                run.ingress.as_ref().unwrap_or_else(|e| panic!("{case}: {e:?}"));
+                run.egress.as_ref().unwrap_or_else(|e| panic!("{case}: {e:?}"));
+                assert_eq!(client_json(&run), client, "{case}");
+                assert_eq!(run.status, status, "{case}");
+            }
+            None => assert!(run.ingress.is_err(), "{case}"),
+        }
+        let (seen, now) = book.0.lock().unwrap().clone();
+        assert_eq!(seen, accepted, "{case}");
+        assert_eq!(now, charged_after, "{case}");
+    }
 }

@@ -137,6 +137,7 @@ fn decoded(streams: &Streams, ask: Ask) -> Held {
             decoder.advance(&mut w, ask.body.as_bytes()).unwrap();
             decoder.finish(&mut w).unwrap()
         }
+        Media::ImageRetrieve => images::retrieve(&mut w, ask.job.unwrap()).unwrap(),
         Media::Speech => {
             let mut decoder = audio::Decoder::new(&mut w, LIMIT).unwrap();
             decoder.advance(&mut w, ask.body.as_bytes()).unwrap();
@@ -382,6 +383,20 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
             "/v1/images/edits",
             json!({"model":"up-image","prompt":"add a hat","image":"image1;image/png;3"}),
             &[],
+        ),
+        (
+            "OpenAI-compatible edit naming its image by URL as the Images JSON body",
+            Provider::Compat,
+            "up-image",
+            ask(
+                Media::ImageEdit,
+                r#"{"prompt":"add a hat","images":[{"image_url":"https://img.x/a.png"}]}"#,
+            ),
+            Reply::json(IMAGES_JSON),
+            "POST",
+            "/v1/images/edits",
+            json!({"model":"up-image","prompt":"add a hat","images":[{"image_url":"https://img.x/a.png"}]}),
+            &[("content-type", Some("application/json"))],
         ),
         (
             "Codex gpt-image model aliased to a custom upstream name stays direct",
@@ -825,16 +840,6 @@ async fn refused_media_requests_send_nothing() {
             false,
         ),
         (
-            "a multipart edit carries image data, not a URL",
-            Provider::Compat,
-            "up-image",
-            ask(
-                Media::ImageEdit,
-                r#"{"prompt":"add a hat","images":[{"image_url":"https://img.x/a.png"}]}"#,
-            ),
-            false,
-        ),
-        (
             "a client-only fence authorizes no upload",
             Provider::Xai,
             "grok-imagine-image",
@@ -1183,4 +1188,141 @@ async fn video_jobs_belong_to_their_caller_and_a_full_table_sends_nothing() {
         }
         assert_eq!(upstream.requests(), sent, "step {i}");
     }
+}
+
+const LARGE_DONE: &str = r#"{"data":[{"url":"https://x/1.png"}],"usage":{"cost_in_usd_ticks":7,"input_tokens":1000000000000000000,"output_tokens":1000000000000000000,"total_tokens":2000000000000000000}}"#;
+const DEFERRED: &str = r#"{"model":"grok-imagine-image","prompt":"a cat","deferred":true,"storage_options":{"bucket":"b"},"output":{"upload_urls":["https://u/1"]}}"#;
+
+/// A deferred xAI image create (X16) sends its controls and takes a place in the job table before
+/// anything is sent, which it shares with video jobs: a full table refuses the next create with
+/// 503 and sends nothing (E-Q5). The job is polled on the credential it was created on, and only
+/// by its caller as an image job.
+#[tokio::test]
+async fn deferred_image_creates_take_a_place_and_polls_go_to_the_jobs_credential() {
+    let callers = ["sk-client-a", "sk-client-b"];
+    // (case, caller, request, refusal status, upstream requests after the step)
+    let steps: [(&str, usize, Ask, Option<u16>, usize); 6] = [
+        ("a deferred create", 0, ask(Media::ImageGenerate, DEFERRED), None, 1),
+        (
+            "a create while the table is full",
+            1,
+            ask(Media::ImageGenerate, DEFERRED),
+            Some(503),
+            1,
+        ),
+        (
+            "a video create while the table is full",
+            0,
+            ask(Media::VideoCreate, VIDEO),
+            Some(503),
+            1,
+        ),
+        (
+            "another caller's poll",
+            1,
+            foreign(Media::ImageRetrieve, "img_1"),
+            Some(404),
+            1,
+        ),
+        (
+            "a video poll of the image job",
+            0,
+            foreign(Media::VideoRetrieve, "img_1"),
+            Some(404),
+            1,
+        ),
+        ("the creator's poll", 0, foreign(Media::ImageRetrieve, "img_1"), None, 2),
+    ];
+    let upstream = StreamUpstream::start([
+        Reply::json(r#"{"request_id":"img_1"}"#),
+        Reply::status(202, "application/json", r#"{"status":"pending"}"#),
+        Reply::json(LARGE_DONE),
+        Reply::json(LARGE_DONE),
+        Reply::json(LARGE_DONE),
+    ])
+    .await;
+    let executors = ck_exec::Executors {
+        claude: ck_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+        codex: Default::default(),
+        devices: Default::default(),
+        openai: ck_exec::OpenAIExecutors {
+            xai: XaiExecutor::with_client(wreq::Client::new()).with_video_capacity(1),
+            ..Default::default()
+        },
+        google: Default::default(),
+    };
+    let xai = &executors.openai.xai;
+    for (case, who, ask, refused, sent) in steps {
+        let streams = Streams::new();
+        let mut exchange = exchange(Provider::Xai, &upstream, "grok-imagine-image");
+        exchange.caller.principal = callers[who].into();
+        let mut held = decoded(&streams, ask);
+        let operation = Operation::Media(ask.op);
+        let (outcome, records, ..) = run_on(xai, &streams, &exchange, &mut held, operation, false)
+            .await
+            .unwrap();
+        match refused {
+            None => outcome.unwrap_or_else(|e| panic!("{case}: {e:?}")),
+            Some(status) => {
+                let error = outcome.expect_err("refused");
+                assert_eq!((error.status, error.scope), (status, FailureScope::Request), "{case}");
+                assert!(records.is_empty(), "{case}: nothing published");
+                if case == "a create while the table is full" {
+                    let body: Value = serde_json::from_slice(&error.body).unwrap();
+                    assert_eq!(body["error"]["code"], "image_jobs_full", "{case}");
+                }
+            }
+        }
+        assert_eq!(upstream.requests(), sent, "{case}");
+        if case == "a deferred create" {
+            let job = records
+                .iter()
+                .find(|(name, _)| name == "operation")
+                .map(|(_, v)| v.clone());
+            assert_eq!(
+                job.unwrap()["value"],
+                json!({"job_id":"img_1","status":"queued"}),
+                "{case}"
+            );
+            let bound = executors
+                .image_binding(&exchange.caller, "img_1")
+                .expect("the job's binding");
+            assert_eq!(bound.credential, exchange.credential.id, "{case}");
+            assert_eq!(executors.video_binding(&exchange.caller, "img_1"), None, "{case}");
+        }
+    }
+    // A finished poll's usage is the job's charge only once it is published (E-Q13).
+    // (case, the stream holds the usage record, the poll publishes the job's usage)
+    let polls = [
+        ("a finished poll whose usage record does not fit", false, false),
+        ("the next finished poll", true, true),
+        ("a later finished poll", true, false),
+    ];
+    for (case, room, charged) in polls {
+        let streams = if room {
+            Streams::new()
+        } else {
+            Streams::with_event_bytes(400)
+        };
+        let mut exchange = exchange(Provider::Xai, &upstream, "grok-imagine-image");
+        exchange.caller.principal = callers[0].into();
+        let ask = foreign(Media::ImageRetrieve, "img_1");
+        let mut held = decoded(&streams, ask);
+        let operation = Operation::Media(ask.op);
+        let (outcome, records, ..) = run_on(xai, &streams, &exchange, &mut held, operation, false)
+            .await
+            .unwrap();
+        assert_eq!(outcome.is_ok(), room, "{case}");
+        let job = usages(&records).iter().any(|usage| usage["scope"] == "job:img_1");
+        assert_eq!(job, charged, "{case}");
+    }
+    let captured = upstream.captured();
+    let sent = sent_body(&captured[0]);
+    assert_eq!(sent["deferred"], true);
+    assert_eq!(sent["storage_options"], json!({"bucket":"b"}));
+    assert_eq!(sent["output"], json!({"upload_urls":["https://u/1"]}));
+    assert_eq!(
+        (captured[1].method.as_str(), captured[1].path.as_str()),
+        ("GET", "/images/img_1")
+    );
 }

@@ -18,15 +18,11 @@ use ck_wire::json::{self as gj, Kind};
 use crate::http::gojson::trim;
 use crate::inference::claude::read_failed;
 use ck_translate::audio;
-use ck_translate::codec::document::Document;
-use ck_translate::codec::event::LocalId;
-use ck_translate::codec::media::Registry;
-use ck_translate::codec::{ClientCapability, RequestFence, RequestView};
 
 use crate::http::egress::{self, Framing, Protocol};
 use crate::inference::dispatch::{self, Call, Failure, Media, MediaKind};
 use crate::inference::images::{bad_request, text};
-use crate::inference::streams::{Exchange, Owner};
+use crate::inference::media::Decoded;
 use crate::{Runtime, inference::errors};
 
 const DEFAULT_MODEL: &str = "grok-tts";
@@ -87,7 +83,17 @@ pub async fn speech(
         Ok(built) => built,
         Err(message) => return bad_request(&message),
     };
-    let decoded = match Decoded::new(&rt, &caller, &request) {
+    let output = egress::Output {
+        protocol: Protocol::Speech,
+        operation: OPERATION,
+        framing: Framing::Raw,
+    };
+    let decode = |writer: &mut ck_stream::Writer, _: &ck_stream::Store| {
+        let mut decoder = audio::Decoder::new(writer, DECODED_LIMIT).map_err(refused)?;
+        decoder.advance(writer, &request).map_err(refused)?;
+        decoder.finish(writer).map_err(refused)
+    };
+    let decoded = match Decoded::new(&rt, &caller, output, decode, |error| refused(error.into())) {
         Ok(decoded) => decoded,
         Err(failure) => return errors::openai(&failure),
     };
@@ -115,86 +121,18 @@ pub async fn speech(
             disallow_free: false,
         })),
     };
-    let Decoded {
-        exchange,
-        document,
-        registry,
-        request_id,
-    } = decoded;
-    let codec = dispatch::Codec {
-        exchange,
-        view: RequestView {
-            document: &document,
-            media: &registry,
-            operation: OPERATION,
-        },
-        request_id,
-    };
-    dispatch::serve_exchange(&rt, call, codec, move |result| async move {
-        match result {
-            Err(failure) => errors::openai(&failure),
-            Ok(_) => unreachable!("speech is served on the execution contract"),
-        }
-    })
-    .await
+    decoded
+        .serve(&rt, call, move |result| async move {
+            match result {
+                Err(failure) => errors::openai(&failure),
+                Ok(_) => unreachable!("speech is served on the execution contract"),
+            }
+        })
+        .await
 }
 
 const OPERATION: ck_translate::codec::Operation =
     ck_translate::codec::Operation::Media(ck_translate::codec::Media::Speech);
-
-/// The normalized request decoded into a new exchange's request stream, closed against the
-/// client capability (contract G8).
-struct Decoded {
-    exchange: Exchange,
-    document: Document,
-    registry: Registry,
-    request_id: LocalId,
-}
-
-impl Decoded {
-    fn new(rt: &Runtime, caller: &Caller, request: &[u8]) -> Result<Self, Failure> {
-        let store = rt
-            .streams()
-            .store()
-            .map_err(|error| Failure::Exec(dispatch::stored(&error)))?;
-        // The same owner a resume presents (`streams/resume.rs`).
-        let owner = Owner {
-            caller: caller.clone(),
-            scope: None,
-        };
-        let output = egress::Output {
-            protocol: Protocol::Speech,
-            operation: OPERATION,
-            framing: Framing::Raw,
-        };
-        let mut exchange =
-            Exchange::new(owner, output, &store).map_err(|error| Failure::Exec(dispatch::stored(&error)))?;
-        let writer = &mut exchange.request;
-        let decoded = (|| {
-            let mut decoder = audio::Decoder::new(writer, DECODED_LIMIT)?;
-            decoder.advance(writer, request)?;
-            let document = decoder.finish(writer)?;
-            let registry = Registry::new(writer).map_err(audio::RequestFailure::from)?;
-            Ok::<_, audio::RequestFailure>((document, registry))
-        })();
-        let (document, registry) = decoded.map_err(refused)?;
-        let view = RequestView {
-            document: &document,
-            media: &registry,
-            operation: OPERATION,
-        };
-        RequestFence::default()
-            .end(view, &ClientCapability)
-            .map_err(|error| refused(error.into()))?;
-        let request_id = LocalId::new(&uuid::Uuid::new_v4().simple().to_string()).expect("32 ASCII digits");
-        Ok(Self {
-            exchange,
-            document,
-            registry,
-            request_id,
-        })
-    }
-}
 
 /// The normalized request is at most six bytes per body byte (an invalid byte becomes
 /// `\ufffd`), plus the defaults.

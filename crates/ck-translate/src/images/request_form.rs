@@ -124,6 +124,8 @@ impl Form<'_> {
                     }
                 }
                 Control::Refs => {}
+                // A form part is text, never the JSON object these controls take.
+                Control::Object => return Err(Error::Schema),
             }
         }
         for name in ["model", "prompt"] {
@@ -234,6 +236,7 @@ impl Form<'_> {
                         self.raw(part, |bytes| e.bytes(bytes))?;
                     }
                 }
+                Control::Object => {}
             }
         }
         e.bytes(b"}}")?;

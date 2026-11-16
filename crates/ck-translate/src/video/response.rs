@@ -29,12 +29,11 @@ use crate::{
 pub trait Ledger: Send {
     /// A create, edit or extension was accepted as `job`.
     fn accepted(&mut self, job: &str);
-    /// Whether this report of `job`'s usage is its charge: true only for the job's first. The
-    /// claim excludes every other report until it is published or released.
-    fn charge(&mut self, job: &str) -> bool;
-    /// The usage this ledger claimed for `job` was not published, so the job is uncharged again
-    /// and a later report charges it.
-    fn release(&mut self, job: &str);
+    /// Publishes this report of `job`'s usage with `publish` when it is the job's charge, and
+    /// answers whether it was. Only the job's first published report charges it: the job counts
+    /// as charged once `publish` succeeds, and a concurrent report waits for that outcome, so a
+    /// failed publication leaves the charge to the next report.
+    fn charge(&mut self, job: &str, publish: &mut dyn FnMut() -> Result<()>) -> Result<bool>;
 }
 
 pub struct Ingress {
@@ -94,31 +93,31 @@ impl Ingress {
         let pending = ["queued", "running"].iter().try_fold(false, |found, status| {
             Ok::<_, Error>(found || boundary::is(operation, value, "status", status)?)
         })?;
-        if let Some(usage) = usage.filter(|_| self.ledger.charge(&id)) {
+        if let Some(usage) = usage {
             let protocol = self.dialect.name();
-            let published = self.emitter.emit(
-                owner,
-                Kind::Usage,
-                Scope::default(),
-                |e| {
-                    e.bytes(b",\"scope\":\"job:")?;
-                    operation.write_contents(job, e)?;
-                    e.bytes(b"\",\"usage\":{\"native\":{\"protocol\":")?;
-                    e.string(protocol)?;
-                    e.bytes(b",\"value\":{")?;
-                    counts(&usage, true, e)?;
-                    e.bytes(b"}},\"final\":")?;
-                    e.bytes(if pending { b"false" } else { b"true" })?;
-                    counts(&usage, false, e)?;
-                    e.bytes(b"}")
-                },
-                |_| Ok(()),
-            );
-            // A snapshot that never reached the stream charged nothing.
-            if let Err(error) = published {
-                self.ledger.release(&id);
-                return Err(error);
-            }
+            let Self { ledger, emitter, .. } = self;
+            ledger.charge(&id, &mut || {
+                emitter
+                    .emit(
+                        owner,
+                        Kind::Usage,
+                        Scope::default(),
+                        |e| {
+                            e.bytes(b",\"scope\":\"job:")?;
+                            operation.write_contents(job, e)?;
+                            e.bytes(b"\",\"usage\":{\"native\":{\"protocol\":")?;
+                            e.string(protocol)?;
+                            e.bytes(b",\"value\":{")?;
+                            counts(&usage, true, e)?;
+                            e.bytes(b"}},\"final\":")?;
+                            e.bytes(if pending { b"false" } else { b"true" })?;
+                            counts(&usage, false, e)?;
+                            e.bytes(b"}")
+                        },
+                        |_| Ok(()),
+                    )
+                    .map(drop)
+            })?;
         }
         let x = operation.required(root, "x_ck")?;
         self.emitter.emit(
