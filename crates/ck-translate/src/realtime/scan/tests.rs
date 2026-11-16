@@ -1,5 +1,5 @@
 use super::{Fault, Reader};
-use crate::realtime::envelope::{Base64, Count, N, T};
+use crate::realtime::envelope::{At, Base64, Count, N, T};
 
 /// Messages covering every reader state: escapes split across feeds, surrogate pairs,
 /// multi-byte UTF-8, numbers in every form, media runs, nested and skipped containers.
@@ -15,19 +15,88 @@ const MESSAGES: [&str; 8] = [
 ];
 
 fn whole(message: &[u8]) -> Result<super::Envelope, Fault> {
-    Reader::new().read(message).cloned()
+    Reader::new().read(message, false).cloned()
+}
+
+/// Reads `message` whole and one byte at a time; both must agree.
+fn both(message: &str, validate: bool) -> Result<super::Envelope, Fault> {
+    let mut reader = Reader::new();
+    reader.start(validate);
+    let fed = message
+        .as_bytes()
+        .iter()
+        .try_for_each(|byte| reader.feed(std::slice::from_ref(byte)))
+        .and_then(|()| reader.end().cloned());
+    let read = Reader::new().read(message.as_bytes(), validate).cloned();
+    assert_eq!(fed, read, "{message}");
+    read
 }
 
 #[test]
 fn one_byte_feed_equals_whole_feed() {
     for message in MESSAGES {
-        let mut reader = Reader::new();
-        let fed = message
-            .as_bytes()
-            .iter()
-            .try_for_each(|byte| reader.feed(std::slice::from_ref(byte)))
-            .and_then(|()| reader.end().cloned());
-        assert_eq!(fed, whole(message.as_bytes()), "{message}");
+        both(message, false).ok();
+        both(message, true).ok();
+    }
+}
+
+#[test]
+fn numbers_of_any_length_are_read_in_constant_state() {
+    let digits = |len: usize| "1234567890".chars().cycle().take(len).collect::<String>();
+    let mut numbers = Vec::new();
+    for len in [1, 2, 3, 4, 19, 20, 21, 255, 256, 257, 1000, 4096] {
+        let d = digits(len);
+        numbers.extend([
+            d.clone(),
+            format!("-{d}"),
+            format!("0.{d}"),
+            format!("{d}.{d}"),
+            format!("1e{d}"),
+            format!("1.5E-{d}"),
+            format!("-0.{d}e+{d}"),
+        ]);
+    }
+    for number in &numbers {
+        let skipped = format!(r#"{{"type":"input_audio_buffer.commit","x":{number}}}"#);
+        assert!(both(&skipped, true).is_ok(), "{number}");
+        let checked = format!(
+            r#"{{"type":"session.update","session":{{"type":"realtime","audio":{{"input":{{"turn_detection":{{"threshold":{number},"prefix_padding_ms":{number}}}}}}}}}}}"#
+        );
+        let integer = !number.contains(['.', 'e', 'E']);
+        let fault = both(&checked, true).unwrap().subtree[0];
+        assert_eq!(fault.is_none(), integer, "{number}");
+        let limits = format!(
+            r#"{{"type":"rate_limits.updated","rate_limits":[{{"name":"t","remaining":1,"reset_seconds":{number}}}]}}"#
+        );
+        assert!(both(&limits, false).is_ok(), "{number}");
+        let index = format!(r#"{{"type":"x","content_index":{number}}}"#);
+        let expected = number
+            .parse::<u64>()
+            .map(Count::Known)
+            .map_err(|_| Fault::Kind("content_index"));
+        assert_eq!(
+            both(&index, false).map(|e| e.count(N::ContentIndex)),
+            expected,
+            "{number}"
+        );
+    }
+    let reset = |number: String| {
+        let limits = format!(
+            r#"{{"type":"rate_limits.updated","rate_limits":[{{"name":"t","remaining":1,"reset_seconds":{number}}}]}}"#
+        );
+        both(&limits, false).unwrap().limits()[0].reset_ms
+    };
+    let rows = [
+        ("5".to_owned(), Some(5000)),
+        ("1.2345".to_owned(), Some(1234)),
+        ("0.0009".to_owned(), Some(0)),
+        (format!("0.{}", "1".repeat(256)), Some(111)),
+        ("1".repeat(19), None),
+        ("2.5e3".to_owned(), None),
+        ("-1".to_owned(), None),
+    ];
+    for (number, expected) in rows {
+        assert_eq!(reset(number.clone()), expected, "{number}");
     }
 }
 
@@ -38,8 +107,7 @@ fn the_reader_keeps_control_fields_and_media_sizes() {
     assert_eq!(done.text(T::ResponseObjectId).get(), Some("resp_1"));
     assert_eq!(done.count(N::Total), Count::Known(3));
     assert_eq!(done.count(N::OutAudio), Count::Known(2));
-    let (start, end) = done.usage.unwrap();
-    assert!(MESSAGES[0][start..end].starts_with("{\"total_tokens\"") && MESSAGES[0][..end].ends_with("2}}"));
+    assert!(done.entered(At::Usage) && done.null(At::Details));
 
     let append = whole(MESSAGES[1].as_bytes()).unwrap();
     assert_eq!(append.root_audio, Some(Base64 { chars: 6, padding: 2 }));

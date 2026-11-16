@@ -6,9 +6,11 @@
 //! kept for reconnection. [`Session`] reads each message in one linear scan:
 //!
 //! - [`Session::admit`] checks a client message before it is forwarded (E-Q14): a JSON text
-//!   message whose `type` the session admits, no repeated member the gateway reads, the
-//!   control fields the gateway reads typed as documented, and `session.model` unchanged.
-//!   Media fields are checked by type only.
+//!   message whose `type` the session admits; for that event, every documented control
+//!   field present with its documented JSON kind, every documented required field, and a
+//!   documented `type` (and `role`) for each item, part, tool and session variant
+//!   ([`schema`]); no repeated member the gateway reads or checks; and `session.model`
+//!   unchanged. Media and text fields are checked by kind only.
 //! - [`Session::project`] publishes the metadata projection of a forwarded message: event
 //!   type, ids, session model, statuses, rate limits and usage. Media messages (audio
 //!   appends, audio deltas, reflected sideband audio, binary frames) are only counted, and
@@ -35,9 +37,11 @@
 //! voice server controls guide for sideband commands and reflected audio
 //! (<https://developers.openai.com/api/docs/guides/voice-server-controls>).
 
+mod check;
 mod envelope;
 mod project;
 mod scan;
+mod schema;
 
 use ck_stream::Writer;
 
@@ -191,16 +195,20 @@ impl Session {
         if opcode == Opcode::Binary {
             return Err(refusal::BINARY);
         }
-        let envelope = self.client.read(payload).map_err(refusal::fault)?;
+        let envelope = self.client.read(payload, true).map_err(refusal::fault)?;
         let event = match envelope.text(T::Type) {
             Text::Absent | Text::Null => return Err(refusal::missing("type")),
             text => text.get().filter(|event| self.admission.events.admits(event)),
         };
         let event = event.ok_or(refusal::EVENT)?;
+        let subtree = schema::SUBTREES.iter().position(|&(_, owner)| owner == event);
+        if let Some(fault) = subtree.and_then(|index| envelope.subtree[index]) {
+            return Err(refusal::fault(fault));
+        }
         let required: &[(&str, bool)] = match event {
             "input_audio_buffer.append" => &[("audio", envelope.root_audio.is_some())],
-            "session.update" => &[("session", envelope.entered(At::Session))],
-            "conversation.item.create" => &[("item", envelope.entered(At::Item))],
+            "session.update" | "transcription_session.update" => &[("session", envelope.entered(At::Session))],
+            "conversation.item.create" | "response.item.create" => &[("item", envelope.entered(At::Item))],
             "conversation.item.retrieve" | "conversation.item.delete" => {
                 &[("item_id", envelope.text(T::ItemId).get().is_some())]
             }
@@ -276,7 +284,7 @@ impl Projector for Session {
             Sender::Client => &mut self.client,
             Sender::Upstream => &mut self.upstream,
         };
-        if !reused && reader.read(payload).is_err() {
+        if !reused && reader.read(payload, false).is_err() {
             counts.unreadable += 1;
             return Ok(());
         }
@@ -306,7 +314,7 @@ impl Projector for Session {
             ordinal,
             output_audio,
         };
-        record.publish(&mut self.emitter, owner, payload)
+        record.publish(&mut self.emitter, owner)
     }
 
     fn finish(&mut self, owner: &mut Writer) -> Result<()> {
@@ -369,6 +377,12 @@ mod refusal {
             Fault::Kind(param) => with(
                 "invalid_type",
                 "A field has the wrong JSON type. Correct it and send the event again.",
+                Some(param),
+            ),
+            Fault::Missing(param) => missing(param),
+            Fault::Value(param) => with(
+                "invalid_value",
+                "A type or role names no documented variant. Use a documented value.",
                 Some(param),
             ),
         }

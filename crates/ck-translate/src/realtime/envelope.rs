@@ -1,6 +1,8 @@
 //! What one scan of a message keeps: the envelope, the control fields the gateway reads and
 //! the size of each media field. Nothing here holds a media or text payload.
 
+use super::{scan::Fault, schema::SUBTREES};
+
 /// A captured string of at most [`Text::MAX`] printable ASCII bytes. Any other string is
 /// `Unreadable`: projection omits it and checks match it against nothing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -92,6 +94,9 @@ pub(crate) enum N {
     InText,
     InAudio,
     InImage,
+    CachedText,
+    CachedAudio,
+    CachedImage,
     OutText,
     OutAudio,
 }
@@ -109,6 +114,7 @@ pub(crate) enum At {
     DetailsError,
     Usage,
     InputDetails,
+    Cached,
     OutputDetails,
     Error,
     Limits,
@@ -142,7 +148,7 @@ pub(crate) enum Role {
 
 /// Members the gateway reads, by container. The index is the member's duplicate bit; the
 /// last column is its dotted path for refusals.
-pub(crate) const FIELDS: [(At, &str, Role, &str); 41] = [
+pub(crate) const FIELDS: [(At, &str, Role, &str); 45] = [
     (At::Root, "type", Role::Text(T::Type), "type"),
     (At::Root, "event_id", Role::Text(T::EventId), "event_id"),
     (At::Root, "item_id", Role::Text(T::ItemId), "item_id"),
@@ -255,6 +261,30 @@ pub(crate) const FIELDS: [(At, &str, Role, &str); 41] = [
         "response.usage.input_token_details.image_tokens",
     ),
     (
+        At::InputDetails,
+        "cached_tokens_details",
+        Role::Enter(At::Cached),
+        "response.usage.input_token_details.cached_tokens_details",
+    ),
+    (
+        At::Cached,
+        "text_tokens",
+        Role::Count(N::CachedText),
+        "response.usage.input_token_details.cached_tokens_details.text_tokens",
+    ),
+    (
+        At::Cached,
+        "audio_tokens",
+        Role::Count(N::CachedAudio),
+        "response.usage.input_token_details.cached_tokens_details.audio_tokens",
+    ),
+    (
+        At::Cached,
+        "image_tokens",
+        Role::Count(N::CachedImage),
+        "response.usage.input_token_details.cached_tokens_details.image_tokens",
+    ),
+    (
         At::OutputDetails,
         "text_tokens",
         Role::Count(N::OutText),
@@ -338,8 +368,10 @@ pub(crate) struct Envelope {
     pub(crate) limit_count: usize,
     /// Containers read as objects (or `rate_limits` as an array), by [`At`] bit.
     pub(crate) entered: u16,
-    /// Byte range of `response.usage` when it is an object.
-    pub(crate) usage: Option<(usize, usize)>,
+    /// Containers read as JSON null, by [`At`] bit.
+    pub(crate) nulls: u16,
+    /// The first schema fault inside each checked subtree (`schema::SUBTREES`).
+    pub(crate) subtree: [Option<Fault>; SUBTREES.len()],
     /// Root `audio` as a string.
     pub(crate) root_audio: Option<Base64>,
     /// Root `delta` as a string; media only for audio delta events.
@@ -356,7 +388,8 @@ impl Default for Envelope {
             limits: [Limit::default(); MAX_LIMITS],
             limit_count: 0,
             entered: 0,
-            usage: None,
+            nulls: 0,
+            subtree: [None; SUBTREES.len()],
             root_audio: None,
             delta: None,
             media: 0,
@@ -373,6 +406,9 @@ impl Envelope {
     }
     pub(crate) fn entered(&self, at: At) -> bool {
         self.entered & (1 << at as u16) != 0
+    }
+    pub(crate) fn null(&self, at: At) -> bool {
+        self.nulls & (1 << at as u16) != 0
     }
     pub(crate) fn limits(&self) -> &[Limit] {
         &self.limits[..self.limit_count]

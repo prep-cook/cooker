@@ -1,11 +1,12 @@
 //! The records of the metadata projection. Every value written here is a captured id,
-//! enum-like string, count or the upstream's own usage object; no media or text payload.
+//! enum-like string or count; no media or text payload. Usage, including its native form,
+//! is written from the documented numeric fields alone.
 
 use ck_stream::Writer;
 
 use super::{
     Counts,
-    envelope::{Envelope, N, T, Text},
+    envelope::{At, Count, Envelope, N, T, Text},
 };
 use crate::codec::{
     Error, Result,
@@ -40,6 +41,81 @@ const DETAILS: [(&str, N); 3] = [
     ("input_image_tokens", N::InImage),
 ];
 
+/// The documented `response.usage` tree; nothing else of the upstream object is written.
+enum Native {
+    Count(&'static str, N),
+    Object(&'static str, At, &'static [Native]),
+}
+
+const NATIVE: &[Native] = &[
+    Native::Count("input_tokens", N::Input),
+    Native::Count("output_tokens", N::Output),
+    Native::Count("total_tokens", N::Total),
+    Native::Object(
+        "input_token_details",
+        At::InputDetails,
+        &[
+            Native::Count("cached_tokens", N::Cached),
+            Native::Count("text_tokens", N::InText),
+            Native::Count("audio_tokens", N::InAudio),
+            Native::Count("image_tokens", N::InImage),
+            Native::Object(
+                "cached_tokens_details",
+                At::Cached,
+                &[
+                    Native::Count("text_tokens", N::CachedText),
+                    Native::Count("audio_tokens", N::CachedAudio),
+                    Native::Count("image_tokens", N::CachedImage),
+                ],
+            ),
+        ],
+    ),
+    Native::Object(
+        "output_token_details",
+        At::OutputDetails,
+        &[
+            Native::Count("text_tokens", N::OutText),
+            Native::Count("audio_tokens", N::OutAudio),
+        ],
+    ),
+];
+
+/// Writes the members of `tree` the upstream sent, keeping JSON nulls as nulls.
+fn native(e: &mut Encoder<'_, '_>, envelope: &Envelope, tree: &[Native]) -> Result<()> {
+    e.bytes(b"{")?;
+    let mut first = true;
+    let mut name_of = |e: &mut Encoder<'_, '_>, name: &str| {
+        e.bytes(if std::mem::take(&mut first) { b"" } else { b"," })?;
+        e.string(name)?;
+        e.bytes(b":")
+    };
+    for node in tree {
+        match *node {
+            Native::Count(name, slot) => match envelope.count(slot) {
+                Count::Absent => {}
+                Count::Null => {
+                    name_of(e, name)?;
+                    e.bytes(b"null")?;
+                }
+                Count::Known(value) => {
+                    name_of(e, name)?;
+                    e.unsigned(value)?;
+                }
+            },
+            Native::Object(name, at, members) if envelope.entered(at) => {
+                name_of(e, name)?;
+                native(e, envelope, members)?;
+            }
+            Native::Object(name, at, _) if envelope.null(at) => {
+                name_of(e, name)?;
+                e.bytes(b"null")?;
+            }
+            Native::Object(..) => {}
+        }
+    }
+    e.bytes(b"}")
+}
+
 /// One forwarded message's projection.
 pub(super) struct Record<'a> {
     pub(super) envelope: &'a Envelope,
@@ -52,14 +128,10 @@ pub(super) struct Record<'a> {
 }
 
 impl Record<'_> {
-    pub(super) fn publish(&self, emitter: &mut Emitter, owner: &mut Writer, payload: &[u8]) -> Result<()> {
+    pub(super) fn publish(&self, emitter: &mut Emitter, owner: &mut Writer) -> Result<()> {
         let source = |e: &mut Encoder<'_, '_>| self.source(e);
-        if self.sender == Sender::Upstream
-            && self.event == "response.done"
-            && let Some((start, end)) = self.envelope.usage
-        {
-            let native = payload.get(start..end).ok_or(Error::Position)?;
-            emitter.emit(owner, Kind::Usage, Scope::default(), |e| self.usage(e, native), source)?;
+        if self.sender == Sender::Upstream && self.event == "response.done" && self.envelope.entered(At::Usage) {
+            emitter.emit(owner, Kind::Usage, Scope::default(), |e| self.usage(e), source)?;
         }
         let action = self.control();
         let rates = action.is_none() && self.sender == Sender::Upstream && self.event == "rate_limits.updated";
@@ -213,12 +285,9 @@ impl Record<'_> {
         e.bytes(b"}")
     }
 
-    fn usage(&self, e: &mut Encoder<'_, '_>, native: &[u8]) -> Result<()> {
+    fn usage(&self, e: &mut Encoder<'_, '_>) -> Result<()> {
         e.bytes(b",\"usage\":{\"native\":{\"protocol\":\"openai_realtime\",\"value\":")?;
-        // Line breaks are insignificant whitespace in JSON and would end the SSE data line.
-        for part in native.split(|&b| b == b'\n' || b == b'\r') {
-            e.bytes(part)?;
-        }
+        native(e, self.envelope, NATIVE)?;
         e.bytes(b"},\"final\":true")?;
         let envelope = self.envelope;
         for (name, slot) in USAGE {
@@ -232,7 +301,7 @@ impl Record<'_> {
             envelope.count(N::Input),
             envelope.count(N::Output),
         ) {
-            (super::envelope::Count::Absent, input, output) => input.known().zip(output.known()),
+            (Count::Absent, input, output) => input.known().zip(output.known()),
             _ => None,
         };
         if let Some((input, output)) = derived {

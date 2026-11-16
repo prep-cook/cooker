@@ -1,9 +1,14 @@
 //! One linear, resumable scan of a Realtime message (RFC 8259 JSON). It validates the whole
 //! message, decodes the keys and the few strings the gateway reads, and measures media
-//! strings by length without decoding or copying them. State is bounded: a fixed container
-//! stack, one key buffer and the [`Envelope`].
+//! strings by length without decoding or copying them. A client message is also checked
+//! against the documented control fields ([`Check`]). State is bounded: a fixed container
+//! stack, one key buffer and the [`Envelope`]; a number of any length takes constant state.
 
-use super::envelope::{At, Base64, Count, Envelope, FIELDS, MAX_LIMITS, Role, Text, member};
+use super::{
+    check::Check,
+    envelope::{At, Base64, Count, Envelope, FIELDS, MAX_LIMITS, Role, Text, member},
+    schema,
+};
 use crate::codec::json::StringDecoder;
 
 /// Containers nested deeper than this make the message unreadable.
@@ -18,10 +23,14 @@ pub(crate) enum Fault {
     /// The root is not an object.
     NotObject,
     TooDeep,
-    /// A member the gateway reads appears twice in its object.
+    /// A member the gateway reads or checks appears twice in its object.
     Duplicate(&'static str),
-    /// A member the gateway reads has the wrong JSON type.
+    /// A member the gateway reads or checks has the wrong JSON type.
     Kind(&'static str),
+    /// A documented required member is absent.
+    Missing(&'static str),
+    /// A `type` or `role` names no documented variant.
+    Value(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,20 +69,22 @@ struct Frame {
 }
 
 /// A JSON number: `uint` while it is a plain non-negative integer, `millis` while it is a
-/// decimal with at most three fraction digits (`reset_seconds`).
+/// non-negative decimal without exponent, truncated to milliseconds (`reset_seconds`).
+/// `fraction` counts retained fraction digits and stops at three, so state is the same
+/// for any number of digits.
 #[derive(Clone, Copy, Debug, Default)]
 struct Number {
     step: u8,
     uint: Option<u64>,
     millis: Option<u64>,
-    fraction: u8,
+    fraction: usize,
+    integer: bool,
 }
 
 pub(crate) struct Reader {
     state: State,
     stack: [Frame; MAX_DEPTH],
     depth: usize,
-    offset: usize,
     decoder: StringDecoder,
     key: [u8; KEY],
     key_len: usize,
@@ -83,6 +94,7 @@ pub(crate) struct Reader {
     number: Number,
     literal: &'static [u8],
     seen: u64,
+    check: Check,
     pub(crate) envelope: Envelope,
 }
 
@@ -95,7 +107,6 @@ impl Reader {
                 array: false,
             }; MAX_DEPTH],
             depth: 0,
-            offset: 0,
             decoder: StringDecoder::default(),
             key: [0; KEY],
             key_len: 0,
@@ -105,15 +116,21 @@ impl Reader {
             number: Number::default(),
             literal: b"",
             seen: 0,
+            check: Check::new(false),
             envelope: Envelope::default(),
         }
     }
 
-    /// Reads one whole message.
-    pub(crate) fn read(&mut self, message: &[u8]) -> Result<&Envelope, Fault> {
-        *self = Self::new();
+    /// Reads one whole message; `validate` checks it as a client event.
+    pub(crate) fn read(&mut self, message: &[u8], validate: bool) -> Result<&Envelope, Fault> {
+        self.start(validate);
         self.feed(message)?;
         self.end()
+    }
+
+    pub(crate) fn start(&mut self, validate: bool) {
+        *self = Self::new();
+        self.check = Check::new(validate);
     }
 
     pub(crate) fn feed(&mut self, mut bytes: &[u8]) -> Result<(), Fault> {
@@ -125,7 +142,6 @@ impl Reader {
                 continue;
             }
             if self.byte(byte)? {
-                self.offset += 1;
                 bytes = &bytes[1..];
             }
         }
@@ -136,6 +152,7 @@ impl Reader {
         if self.state != State::End {
             return Err(Fault::Json);
         }
+        self.envelope.subtree = self.check.faults;
         Ok(&self.envelope)
     }
 
@@ -145,7 +162,7 @@ impl Reader {
             Sink::Skip | Sink::Base64(_) | Sink::DataUri { data: Some(_), .. } => true,
             Sink::Text | Sink::DataUri { data: None, .. } => false,
         };
-        if self.state != State::String || !counting || !self.decoder.complete() {
+        if self.state != State::String || !counting || !self.decoder.complete() || self.check.capturing() {
             return 0;
         }
         bytes
@@ -155,7 +172,6 @@ impl Reader {
     }
 
     fn bulk(&mut self, run: &[u8]) {
-        self.offset += run.len();
         let trailing = run.iter().rev().take_while(|&&b| b == b'=').count() as u64;
         let base64 = match &mut self.sink {
             Sink::Base64(base64) | Sink::DataUri { data: Some(base64), .. } => base64,
@@ -218,6 +234,7 @@ impl Reader {
                 Role::Skip
             };
             self.index = None;
+            self.check.element(self.depth);
             self.state = State::Value;
         } else {
             self.state = State::Key;
@@ -245,6 +262,7 @@ impl Reader {
             }
             return Ok(());
         }
+        self.check.char(self.depth, c);
         if let Sink::Text = self.sink {
             self.text().push(c);
             return Ok(());
@@ -286,6 +304,7 @@ impl Reader {
             }
             self.seen |= 1 << index;
         }
+        self.check.key(self.depth, key)?;
         self.role = role;
         self.index = index;
         self.state = State::Colon;
@@ -305,6 +324,15 @@ impl Reader {
             role,
             Role::Skip | Role::Audio | Role::Image | Role::Delta | Role::LimitItem
         );
+        let kind = match byte {
+            b'{' => schema::O,
+            b'[' => schema::A,
+            b'"' => schema::S,
+            b't' | b'f' => schema::B,
+            b'n' => schema::Z,
+            _ => schema::I | schema::N,
+        };
+        self.check.value(self.depth, kind)?;
         match byte {
             b'{' | b'[' => self.open(byte == b'[', role, typed)?,
             b'"' => {
@@ -318,6 +346,7 @@ impl Reader {
                     Role::Skip | Role::LimitItem => Sink::Skip,
                     _ => return Err(Fault::Kind(self.param())),
                 };
+                self.check.string(self.depth);
                 self.state = State::String;
             }
             b'-' | b'0'..=b'9' => {
@@ -338,7 +367,6 @@ impl Reader {
                 self.literal = b"ull";
                 self.state = State::Literal;
             }
-            b't' | b'f' if typed => return Err(Fault::Kind(self.param())),
             b't' => (self.literal, self.state) = (b"rue", State::Literal),
             b'f' => (self.literal, self.state) = (b"alse", State::Literal),
             _ => return Err(Fault::Json),
@@ -356,9 +384,7 @@ impl Reader {
         if self.depth == MAX_DEPTH {
             return Err(Fault::TooDeep);
         }
-        if at == At::Usage {
-            self.envelope.usage = Some((self.offset, self.offset));
-        }
+        self.check.open(self.depth, array);
         if at != At::Other {
             self.envelope.entered |= 1 << at as u16;
         }
@@ -375,15 +401,12 @@ impl Reader {
         if top.array != (byte == b']') {
             return Err(Fault::Json);
         }
+        if !top.array {
+            self.check.close(self.depth)?;
+        }
         self.depth -= 1;
-        match top.at {
-            At::Usage => {
-                if let Some((start, _)) = self.envelope.usage {
-                    self.envelope.usage = Some((start, self.offset + 1));
-                }
-            }
-            At::Limit => self.envelope.limit_count += 1,
-            _ => {}
+        if top.at == At::Limit {
+            self.envelope.limit_count += 1;
         }
         self.close_value();
         Ok(())
@@ -394,6 +417,7 @@ impl Reader {
     }
 
     fn end_string(&mut self) {
+        self.check.end_string();
         let sink = std::mem::replace(&mut self.sink, Sink::Skip);
         let base64 = match sink {
             Sink::Base64(base64) | Sink::DataUri { data: Some(base64), .. } => base64,
@@ -434,6 +458,7 @@ impl Reader {
         if n.step == 0 {
             n.uint = Some(0);
             n.millis = Some(0);
+            n.integer = true;
         }
         let value = u64::from(byte.wrapping_sub(b'0'));
         match next {
@@ -441,15 +466,15 @@ impl Reader {
                 n.uint = n.uint.and_then(|v| v.checked_mul(10)?.checked_add(value));
                 n.millis = n.uint.and_then(|v| v.checked_mul(1000));
             }
+            4 => (n.uint, n.integer) = (None, false),
             5 => {
-                n.uint = None;
-                n.fraction += 1;
-                if n.fraction <= 3 {
-                    let scale = [100, 10, 1][usize::from(n.fraction - 1)];
+                if let Some(&scale) = [100, 10, 1].get(n.fraction) {
                     n.millis = n.millis.and_then(|v| v.checked_add(value * scale));
+                    n.fraction += 1;
                 }
             }
-            1 | 6 | 7 | 8 => (n.uint, n.millis) = (None, None),
+            6 => (n.uint, n.millis, n.integer) = (None, None, false),
+            1 | 7 | 8 => (n.uint, n.millis) = (None, None),
             _ => {}
         }
         n.step = next;
@@ -457,7 +482,10 @@ impl Reader {
     }
 
     fn end_number(&mut self) -> Result<(), Fault> {
-        let Number { uint, millis, .. } = self.number;
+        let Number {
+            uint, millis, integer, ..
+        } = self.number;
+        self.check.number(self.depth, integer)?;
         let count = |value: Option<u64>| value.map(Count::Known);
         let limit = self.envelope.limit_count;
         match self.role {
@@ -487,6 +515,7 @@ impl Reader {
             Role::Count(slot) => self.envelope.counts[slot as usize] = Count::Null,
             Role::LimitLimit => self.envelope.limits[limit].limit = Count::Null,
             Role::LimitRemaining => self.envelope.limits[limit].remaining = Count::Null,
+            Role::Enter(at) => self.envelope.nulls |= 1 << at as u16,
             _ => {}
         }
     }

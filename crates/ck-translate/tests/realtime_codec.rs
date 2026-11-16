@@ -67,6 +67,17 @@ type Reason = (&'static str, Option<&'static str>);
 #[test]
 fn client_messages_pass_unchanged_or_are_refused_with_a_reason() {
     use Events::{Realtime, Sideband};
+    let documented_session = json!({"type":"session.update","session":{"type":"realtime","model":"gpt-realtime",
+        "output_modalities":["audio"],"max_output_tokens":4096,"tool_choice":"auto","tracing":null,"truncation":"auto",
+        "audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"turn_detection":null,"transcription":{"model":"whisper-1"}},
+            "output":{"voice":{"id":"v"},"speed":1.0}},
+        "tools":[{"type":"mcp","server_label":"s","require_approval":"never"}]}})
+    .to_string();
+    // A documented number with more fraction digits than any counter holds.
+    let long_threshold = format!(
+        "{{\"type\":\"session.update\",\"session\":{{\"type\":\"realtime\",\"audio\":{{\"input\":{{\"turn_detection\":{{\"type\":\"server_vad\",\"threshold\":0.{}}}}}}}}}}}",
+        "1".repeat(256)
+    );
     let long_type = format!("{{\"type\":\"session.update{}\",\"session\":{{}}}}", "x".repeat(60));
     let deep = format!(
         "{{\"type\":\"session.update\",\"x\":{}{}}}",
@@ -83,10 +94,10 @@ fn client_messages_pass_unchanged_or_are_refused_with_a_reason() {
                 .to_vec(),
             None,
         ),
-        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"model":"gpt-realtime","instructions":"hi"}}"#.to_vec(), None),
-        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"model":null}}"#.to_vec(), None),
-        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"model":"gpt-other"}}"#.to_vec(), Some(("invalid_value", Some("session.model")))),
-        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"mod\u0065l":"gpt-other"}}"#.to_vec(), Some(("invalid_value", Some("session.model")))),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"type":"realtime","model":"gpt-realtime","instructions":"hi"}}"#.to_vec(), None),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"type":"realtime","model":null}}"#.to_vec(), Some(("invalid_type", Some("session.model")))),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"type":"realtime","model":"gpt-other"}}"#.to_vec(), Some(("invalid_value", Some("session.model")))),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"type":"realtime","mod\u0065l":"gpt-other"}}"#.to_vec(), Some(("invalid_value", Some("session.model")))),
         (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"model":"gpt-realtime","model":"gpt-other"}}"#.to_vec(), Some(("duplicate_parameter", Some("session.model")))),
         (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"model":"gpt-realtime"},"session":{}}"#.to_vec(), Some(("duplicate_parameter", Some("session")))),
         (Realtime, Opcode::Text, br#"{"type":"input_audio_buffer.commit","type":"session.update"}"#.to_vec(), Some(("duplicate_parameter", Some("type")))),
@@ -94,7 +105,7 @@ fn client_messages_pass_unchanged_or_are_refused_with_a_reason() {
         (Realtime, Opcode::Text, br#"{"type":"session.update"}"#.to_vec(), Some(("missing_required_parameter", Some("session")))),
         (Realtime, Opcode::Text, br#"{"type":"session.update","session":"x"}"#.to_vec(), Some(("invalid_type", Some("session")))),
         (Realtime, Opcode::Text, br#"{"type":"input_audio_buffer.append"}"#.to_vec(), Some(("missing_required_parameter", Some("audio")))),
-        (Realtime, Opcode::Text, br#"{"type":"input_audio_buffer.append","audio":null}"#.to_vec(), Some(("missing_required_parameter", Some("audio")))),
+        (Realtime, Opcode::Text, br#"{"type":"input_audio_buffer.append","audio":null}"#.to_vec(), Some(("invalid_type", Some("audio")))),
         (Realtime, Opcode::Text, br#"{"type":"input_audio_buffer.append","audio":7}"#.to_vec(), Some(("invalid_type", Some("audio")))),
         (Realtime, Opcode::Text, br#"{"type":"conversation.item.create","item":[]}"#.to_vec(), Some(("invalid_type", Some("item")))),
         (Realtime, Opcode::Text, br#"{"type":"conversation.item.retrieve","item_id":5}"#.to_vec(), Some(("invalid_type", Some("item_id")))),
@@ -106,11 +117,38 @@ fn client_messages_pass_unchanged_or_are_refused_with_a_reason() {
         (Realtime, Opcode::Text, br#"{"type":"input_audio_buffer.flush"}"#.to_vec(), Some(("unknown_event_type", Some("type")))),
         (Realtime, Opcode::Text, long_type.into_bytes(), Some(("unknown_event_type", Some("type")))),
         (Realtime, Opcode::Text, br#"{"type":"conversation.item.create","item":true}"#.to_vec(), Some(("invalid_type", Some("item")))),
-        (Realtime, Opcode::Text, "{\"type\":\"session.update\",\"session\":{\"model\":\"gpt-realtim\u{e9}\"}}".as_bytes().to_vec(), Some(("invalid_value", Some("session.model")))),
+        (Realtime, Opcode::Text, "{\"type\":\"session.update\",\"session\":{\"type\":\"realtime\",\"model\":\"gpt-realtim\u{e9}\"}}".as_bytes().to_vec(), Some(("invalid_value", Some("session.model")))),
         (Realtime, Opcode::Text, br#"{"type":"session.close"}"#.to_vec(), Some(("unknown_event_type", Some("type")))),
         (Sideband, Opcode::Text, br#"{"type":"session.close"}"#.to_vec(), None),
         (Realtime, Opcode::Text, br#"{"type":"response.cancel","response_id":"resp_1"}"#.to_vec(), None),
         (Realtime, Opcode::Text, br#"{"type":"response.cancel","event_id":{}}"#.to_vec(), Some(("invalid_type", Some("event_id")))),
+        (Realtime, Opcode::Text, br#"{"type":"input_audio_buffer.commit","event_id":null}"#.to_vec(), Some(("invalid_type", Some("event_id")))),
+        (Realtime, Opcode::Text, br#"{"type":"transcription_session.update"}"#.to_vec(), Some(("missing_required_parameter", Some("session")))),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"model":"gpt-realtime"}}"#.to_vec(), Some(("missing_required_parameter", Some("session.type")))),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"type":"chat"}}"#.to_vec(), Some(("invalid_value", Some("session.type")))),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"type":"realtime","tools":false,"tool_choice":7,"audio":false}}"#.to_vec(), Some(("invalid_type", Some("session.tools")))),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"type":"realtime","tools":[{"type":"mcp"}]}}"#.to_vec(), Some(("missing_required_parameter", Some("tools[].server_label")))),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"type":"realtime","truncation":{"type":"retention_ratio"}}}"#.to_vec(), Some(("missing_required_parameter", Some("truncation.retention_ratio")))),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"type":"realtime","audio":{"input":{"turn_detection":{"type":"server_vad","prefix_padding_ms":1.5}}}}}"#.to_vec(), Some(("invalid_type", Some("turn_detection.prefix_padding_ms")))),
+        (Realtime, Opcode::Text, documented_session.into_bytes(), None),
+        (Realtime, Opcode::Text, long_threshold.into_bytes(), None),
+        (Realtime, Opcode::Text, br#"{"type":"conversation.item.create","item":{}}"#.to_vec(), Some(("missing_required_parameter", Some("item.type")))),
+        (Realtime, Opcode::Text, br#"{"type":"conversation.item.create","item":{"type":"note"}}"#.to_vec(), Some(("invalid_value", Some("item.type")))),
+        (Realtime, Opcode::Text, br#"{"type":"conversation.item.create","item":{"type":"message","role":7,"content":false}}"#.to_vec(), Some(("invalid_type", Some("item.role")))),
+        (Realtime, Opcode::Text, br#"{"type":"conversation.item.create","item":{"type":"message","role":"bot","content":[]}}"#.to_vec(), Some(("invalid_value", Some("item.role")))),
+        (Realtime, Opcode::Text, br#"{"type":"conversation.item.create","item":{"type":"message","role":"user"}}"#.to_vec(), Some(("missing_required_parameter", Some("item.content")))),
+        (Realtime, Opcode::Text, br#"{"type":"conversation.item.create","item":{"type":"message","type":"function_call","role":"user","content":[]}}"#.to_vec(), Some(("duplicate_parameter", Some("item.type")))),
+        (Realtime, Opcode::Text, br#"{"type":"conversation.item.create","item":{"type":"function_call_output","call_id":"c"}}"#.to_vec(), Some(("missing_required_parameter", Some("item.output")))),
+        (Realtime, Opcode::Text, br#"{"type":"conversation.item.create","item":{"type":"function_call_output","call_id":"c","output":"{}"}}"#.to_vec(), None),
+        (Realtime, Opcode::Text, br#"{"type":"response.create","response":{"output_modalities":7,"tools":false}}"#.to_vec(), Some(("invalid_type", Some("response.output_modalities")))),
+        (Realtime, Opcode::Text, br#"{"type":"response.create","response":{"tool_choice":{"type":"function"}}}"#.to_vec(), Some(("missing_required_parameter", Some("tool_choice.name")))),
+        (Realtime, Opcode::Text, br#"{"type":"response.create","response":{"input":[{"type":"message","role":"user","content":[{"type":"input_text"}]}]}}"#.to_vec(), Some(("missing_required_parameter", Some("response.input[].content[].text")))),
+        (Realtime, Opcode::Text, br#"{"type":"response.create","response":{"input":[{"type":"item_reference","id":"i"}],"conversation":"none","max_output_tokens":"inf","metadata":null,"tool_choice":{"type":"function","name":"f"},"tools":[{"type":"function","name":"f","parameters":{"type":"object"}}]}}"#.to_vec(), None),
+        (Realtime, Opcode::Text, br#"{"type":"session.update","session":{"type":"realtime","audio":{"output":{"voice":{}}}}}"#.to_vec(), Some(("missing_required_parameter", Some("voice.id")))),
+        (Realtime, Opcode::Text, br#"{"type":"response.create","response":{"prompt":{"version":"1"}}}"#.to_vec(), Some(("missing_required_parameter", Some("prompt.id")))),
+        (Realtime, Opcode::Text, br#"{"type":"response.create","item":{}}"#.to_vec(), None),
+        (Sideband, Opcode::Text, br#"{"type":"response.item.create","item":{}}"#.to_vec(), None),
+        (Sideband, Opcode::Text, br#"{"type":"response.item.create"}"#.to_vec(), Some(("missing_required_parameter", Some("item")))),
         (Realtime, Opcode::Binary, b"\x00\x01".to_vec(), Some(("binary_not_allowed", None))),
         (Realtime, Opcode::Text, br#"{"type":"input_audio_buffer.commit""#.to_vec(), Some(("invalid_json", None))),
         (Realtime, Opcode::Text, br#"{"type":"input_audio_buffer.commit"} {}"#.to_vec(), Some(("invalid_json", None))),
@@ -144,7 +182,7 @@ fn projection_carries_metadata_never_media_or_text() {
             Sender::Client,
             Opcode::Text,
             text(&json!({"type":"session.update","event_id":"c1",
-            "session":{"model":"gpt-realtime","instructions":"SECRET-INSTRUCTIONS","tools":[]}})),
+            "session":{"type":"realtime","model":"gpt-realtime","instructions":"SECRET-INSTRUCTIONS","tools":[]}})),
         ),
         (
             Sender::Upstream,
@@ -227,6 +265,13 @@ fn projection_carries_metadata_never_media_or_text() {
         ),
         (Sender::Upstream, Opcode::Binary, b"\x00\x01\x02".to_vec()),
         (Sender::Upstream, Opcode::Text, b"SECRET not json".to_vec()),
+        // A repeated member makes the message unreadable: no usage from either value.
+        (
+            Sender::Upstream,
+            Opcode::Text,
+            br#"{"type":"response.done","response":{"id":"resp_x","usage":{"input_tokens":1,"input_tokens":9}}}"#
+                .to_vec(),
+        ),
         (
             Sender::Upstream,
             Opcode::Text,
@@ -261,14 +306,14 @@ fn projection_carries_metadata_never_media_or_text() {
         counts.bytes += payload.len() as u64;
     }
     session.finish(&mut mapped.writer).unwrap();
-    let (append, deltas) = (&script[2].2, [&script[8].2, &script[17].2]);
+    let (append, deltas) = (&script[2].2, [&script[8].2, &script[18].2]);
     client.media_messages = 1;
     client.media_bytes = append.len() as u64;
     client.decoded_bytes = 11 + 11 + 6;
     upstream.media_messages = 3;
     upstream.media_bytes = (deltas[0].len() + deltas[1].len() + 3) as u64;
     upstream.decoded_bytes = 11 + 3 + 3;
-    upstream.unreadable = 1;
+    upstream.unreadable = 2;
     assert_eq!(session.counts(Sender::Client), client);
     assert_eq!(session.counts(Sender::Upstream), upstream);
 
@@ -424,13 +469,13 @@ const MEDIA_EVENTS: [&str; 5] = [
 #[test]
 fn every_documented_event_type_is_projected_or_counted() {
     let client = [
-        json!({"type":"session.update","session":{}}),
+        json!({"type":"session.update","session":{"type":"realtime"}}),
         json!({"type":"transcription_session.update","session":{}}),
         json!({"type":"input_audio_buffer.append","audio":"QUJD"}),
         json!({"type":"input_audio_buffer.commit"}),
         json!({"type":"input_audio_buffer.clear"}),
         json!({"type":"output_audio_buffer.clear"}),
-        json!({"type":"conversation.item.create","item":{"type":"message"}}),
+        json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[]}}),
         json!({"type":"conversation.item.retrieve","item_id":"i"}),
         json!({"type":"conversation.item.truncate","item_id":"i","content_index":0,"audio_end_ms":0}),
         json!({"type":"conversation.item.delete","item_id":"i"}),
@@ -473,19 +518,36 @@ fn every_documented_event_type_is_projected_or_counted() {
 
 #[test]
 fn usage_is_read_once_from_each_response_done() {
+    let undocumented = json!({"input_tokens":1,"output_tokens":2,"total_tokens":3,
+        "instructions":"SECRET-INSTRUCTIONS","arguments":"SECRET-ARGUMENTS","audio":"U0VDUkVU",
+        "input_token_details":{"note":"SECRET-NOTE","cached_tokens_details":{"audio_tokens":1,"text":"SECRET"}},
+        "output_token_details":null});
+    // (usage sent, Some((native value kept, canonical snapshot)) or None for no record)
     let rows = [
         (
             json!({"input_tokens":10,"output_tokens":5,"output_token_details":{"audio_tokens":4}}),
-            Some(
+            Some((
+                json!({"input_tokens":10,"output_tokens":5,"output_token_details":{"audio_tokens":4}}),
                 json!({"final":true,"input_tokens":10,"output_tokens":5,"total_tokens":15,
-                "output_audio_tokens":4,"derived":["total_tokens"]}),
-            ),
+                    "output_audio_tokens":4,"derived":["total_tokens"]}),
+            )),
         ),
         (
             json!({"input_tokens":null,"output_tokens":5,"total_tokens":9}),
-            Some(json!({"final":true,"output_tokens":5,"total_tokens":9})),
+            Some((
+                json!({"input_tokens":null,"output_tokens":5,"total_tokens":9}),
+                json!({"final":true,"output_tokens":5,"total_tokens":9}),
+            )),
         ),
-        (json!({}), Some(json!({"final":true}))),
+        (
+            undocumented,
+            Some((
+                json!({"input_tokens":1,"output_tokens":2,"total_tokens":3,
+                    "input_token_details":{"cached_tokens_details":{"audio_tokens":1}},"output_token_details":null}),
+                json!({"final":true,"input_tokens":1,"output_tokens":2,"total_tokens":3}),
+            )),
+        ),
+        (json!({}), Some((json!({}), json!({"final":true})))),
         (json!(null), None),
     ];
     for (usage, expected) in rows {
@@ -503,16 +565,15 @@ fn usage_is_read_once_from_each_response_done() {
                 .project(&mut mapped.writer, Sender::Upstream, Opcode::Text, &payload)
                 .unwrap();
         }
-        let usages: Vec<Value> = records(&mapped)
+        let output = mapped.output(&mapped.writer);
+        assert!(!output.windows(6).any(|w| w == b"SECRET"), "{usage}");
+        let usages: Vec<(Value, Value)> = records(&mapped)
             .into_iter()
             .filter(|r| r["event"] == "x_ck.usage")
             .map(|mut r| {
-                let snapshot = r["usage"].as_object_mut().unwrap();
-                assert_eq!(
-                    snapshot.remove("native").unwrap(),
-                    json!({"protocol":"openai_realtime","value":usage})
-                );
-                r["usage"].take()
+                let native = r["usage"].as_object_mut().unwrap().remove("native").unwrap();
+                assert_eq!(native["protocol"], "openai_realtime");
+                (native["value"].clone(), r["usage"].take())
             })
             .collect();
         assert_eq!(usages, expected.into_iter().collect::<Vec<_>>(), "{usage}");
@@ -529,19 +590,19 @@ fn media_counts_use_the_base64_length_without_decoding() {
         (json!({"type":"input_audio_buffer.append","audio":""}), 0),
         (json!({"type":"input_audio_buffer.append","audio":"QU/D"}), 3),
         (
-            json!({"type":"conversation.item.create","item":{"content":[{"type":"input_image","image_url":"data:image/png;base64,QUJD"}]}}),
+            json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,QUJD"}]}}),
             3,
         ),
         (
-            json!({"type":"conversation.item.create","item":{"content":[{"type":"input_image","image_url":"DATA:image/png;base64,QQ=="}]}}),
+            json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"DATA:image/png;base64,QQ=="}]}}),
             1,
         ),
         (
-            json!({"type":"conversation.item.create","item":{"content":[{"type":"input_image","image_url":"https://example.com/a.png"}]}}),
+            json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"https://example.com/a.png"}]}}),
             0,
         ),
         (
-            json!({"type":"response.create","response":{"input":[{"content":[{"type":"input_audio","audio":"QUJDRA=="}]}]}}),
+            json!({"type":"response.create","response":{"input":[{"type":"message","role":"user","content":[{"type":"input_audio","audio":"QUJDRA=="}]}]}}),
             4,
         ),
     ];
