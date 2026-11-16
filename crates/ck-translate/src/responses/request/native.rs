@@ -28,7 +28,7 @@ pub(super) fn native(doc: &Document, target: usize, name: &str) -> Result<Option
 }
 /// The native item type normalization kept for `message`: reasoning, compaction or the type of
 /// an item kept opaque; `None` for a message item.
-pub(super) fn item_type(doc: &Document, message: usize) -> Result<Option<usize>> {
+pub(in crate::responses) fn item_type(doc: &Document, message: usize) -> Result<Option<usize>> {
     let Some(kind) = native(doc, message, "type")? else {
         return Ok(None);
     };
@@ -38,7 +38,7 @@ pub(super) fn item_type(doc: &Document, message: usize) -> Result<Option<usize>>
     Ok(Some(kind))
 }
 /// Whether the native item type `kind` is the string `name`.
-pub(super) fn typed(doc: &Document, kind: Option<usize>, name: &str) -> Result<bool> {
+pub(in crate::responses) fn typed(doc: &Document, kind: Option<usize>, name: &str) -> Result<bool> {
     match kind {
         Some(kind) if matches!(doc.node(kind)?.value, Value::String(_)) => doc.string_is(kind, name),
         _ => Ok(false),

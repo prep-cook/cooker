@@ -14,6 +14,10 @@ use super::{
 };
 use ck_stream::Writer;
 
+pub(crate) mod admit;
+pub(crate) use admit::attached;
+pub use admit::{Admission, Producer, admit, drop_foreign};
+
 /// `x_ck` lists whose entries may carry a trusted `binding`.
 pub const BOUND_LISTS: [&str; 5] = ["original", "replay", "tools", "chat_legacy_calls", "anthropic_order"];
 

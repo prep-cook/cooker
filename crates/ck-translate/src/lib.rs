@@ -96,6 +96,8 @@ mod gemini_interactions_response;
 mod gemini_responses;
 mod gemini_responses_response;
 mod gemini_web_search;
+#[cfg(test)]
+mod history_tests;
 pub mod images;
 mod interactions_claude;
 pub mod meta;

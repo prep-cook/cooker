@@ -27,7 +27,10 @@ use ck_core::exec::{ExecError, ExecRequest, FailureScope};
 use ck_exec::pipeline::{Producer, Started};
 use ck_exec::types::{Attempt, Client, Request};
 use ck_stream::{Terminal, Writer};
+use ck_translate::codec::document::Document;
 use ck_translate::codec::event::{Direction, Identity, LocalId};
+use ck_translate::codec::media::Registry;
+use ck_translate::codec::provenance::{self, Admission};
 use ck_translate::codec::{self, RequestView, ValidatedRequest};
 use tokio::sync::oneshot;
 
@@ -154,14 +157,55 @@ pub(super) async fn run<X: Arms>(
         store: &store,
         identity,
     };
-    let Some(destination) = arm.arms.destination(&attempt) else {
+    // §3.2 step 2 (owner ruling Q-C): the provenance check runs for every candidate, either arm.
+    let auth_index = ck_core::config::credentials::auth_index(&credential);
+    let producer = provenance::Producer {
+        provider: &credential.provider,
+        credential: &auth_index,
+    };
+    let admission = match provenance::admit(arm.view.document, producer) {
+        Ok(admission) => admission,
+        Err(_) => return Ran::Stop(fault(defect())),
+    };
+    let destination = arm.arms.destination(&attempt);
+    if admission == Admission::Refuse {
+        return Ran::Skip(skip(&attempt, trace, destination.unwrap_or("old arm"), Refusal::ForeignCompaction));
+    }
+    let Some(destination) = destination else {
         return Ran::Old;
     };
-    let validated = match arm.arms.refence(&attempt, arm.view) {
+    // Reasoning another account produced is withheld from this attempt only: its view is
+    // rebuilt from the request stream, as resume does, and the exchange's view stays whole.
+    let own;
+    let view = if admission == Admission::Drop {
+        let Some(exchange) = arm.exchange.as_mut() else {
+            return Ran::Stop(fault(defect()));
+        };
+        own = match withhold(&store, exchange, producer) {
+            Ok(own) => own,
+            Err(codec::Error::Storage(error)) => return Ran::Stop(fault(stored(&error))),
+            Err(_) => return Ran::Stop(fault(defect())),
+        };
+        tracing::info!(
+            target: "ck_dispatch",
+            request_id = %trace.request_id(),
+            auth_index = %auth_index,
+            provider = %credential.provider,
+            "reasoning from another account withheld"
+        );
+        RequestView {
+            document: &own.0,
+            media: &own.1,
+            operation: arm.view.operation,
+        }
+    } else {
+        arm.view
+    };
+    let validated = match arm.arms.refence(&attempt, view) {
         Ok(validated) => validated,
         Err(codec::Error::Destination) => return Ran::Old,
         Err(error @ (codec::Error::Unsupported | codec::Error::Schema | codec::Error::MaxTokensRequired)) => {
-            return Ran::Skip(skip(&attempt, trace, destination, error));
+            return Ran::Skip(skip(&attempt, trace, destination, Refusal::Fence(error)));
         }
         Err(codec::Error::Storage(ck_stream::Error::Closed)) => {
             let Some(exchange) = arm.exchange.as_mut() else {
@@ -207,8 +251,8 @@ pub(super) async fn run<X: Arms>(
             execution_session: req.execution_session.as_deref(),
             derived_session: req.derived_session.as_deref(),
             usage: &sink,
-            // ponytail: G5 reads the handler-rewritten body without a copy; D2-6a passes the
-            // envelope-unwrapped copy instead when the request carries envelopes.
+            // G5 reads the handler-rewritten body without a copy. Requests carry no cooker
+            // envelope to unwrap (D2-6k cut, owner 2026-11-15).
             original: &call.body,
         },
     };
@@ -366,18 +410,40 @@ fn uncommitted_error(
     }
 }
 
+/// The request view without the reasoning another account produced, rebuilt from the
+/// exchange's request stream: the view every attempt shares is that stream's document.
+fn withhold(
+    store: &ck_stream::Store,
+    exchange: &mut Exchange,
+    producer: provenance::Producer<'_>,
+) -> codec::Result<(Document, Registry)> {
+    let mut records = store.reader(exchange.request.id(), 0)?;
+    let (mut document, media) = codec::chat::request::read_request(&mut exchange.request, &mut records)?;
+    provenance::drop_foreign(&mut exchange.request, &mut document, producer)?;
+    Ok((document, media))
+}
+
+/// Why a candidate is skipped before anything is sent.
+enum Refusal {
+    /// The destination's fence refused the request.
+    Fence(codec::Error),
+    /// The history holds a compaction item another account produced (Q-C).
+    ForeignCompaction,
+}
+
 /// A destination refusal: logged without content, neutral for the credential, which the
 /// selection already excluded for this request.
-fn skip(attempt: &Attempt<'_>, trace: &Trace, destination: &str, error: codec::Error) -> Fault {
+fn skip(attempt: &Attempt<'_>, trace: &Trace, destination: &str, refusal: Refusal) -> Fault {
     // `MaxTokensRequired` is the destination's own refusal and the client reads it as is (Q-H).
-    let reason = match error {
-        codec::Error::Schema => "the destination's schema refused the request",
-        codec::Error::MaxTokensRequired => "max_tokens is required",
-        _ => "the destination does not support the request",
+    let reason = match refusal {
+        Refusal::Fence(codec::Error::Schema) => "the destination's schema refused the request",
+        Refusal::Fence(codec::Error::MaxTokensRequired) => "max_tokens is required",
+        Refusal::Fence(_) => "the destination does not support the request",
+        Refusal::ForeignCompaction => "another account produced the compaction item",
     };
     // Only a missing limit names the setting that would have supplied it.
-    let missing_setting =
-        matches!(error, codec::Error::MaxTokensRequired).then_some("model-catalog default-max-tokens");
+    let missing_setting = matches!(refusal, Refusal::Fence(codec::Error::MaxTokensRequired))
+        .then_some("model-catalog default-max-tokens");
     tracing::info!(
         target: "ck_dispatch",
         request_id = %trace.request_id(),
