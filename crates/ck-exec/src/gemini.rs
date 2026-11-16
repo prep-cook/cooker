@@ -759,7 +759,11 @@ impl Output {
             translator,
             client,
             raw: alt(req).is_some(),
-            claude: ClaudeInputTokens::new(req.source_format, upstream, client, original_request(req).clone()),
+            // A canonical attempt accounts the answer's usage, so no estimate may enter it.
+            claude: match options.reported_usage {
+                true => ClaudeInputTokens::new(req.source_format, upstream, client, Bytes::new()).disabled(),
+                false => ClaudeInputTokens::new(req.source_format, upstream, client, original_request(req).clone()),
+            },
             usage: req.usage.clone(),
             capture: req.capture().clone(),
             claude_errors: false,

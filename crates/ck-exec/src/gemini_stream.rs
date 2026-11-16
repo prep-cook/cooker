@@ -220,6 +220,12 @@ impl ClaudeInputTokens {
         self
     }
 
+    /// The same state, never estimating: `message_start` keeps the upstream's own counts.
+    pub(crate) fn disabled(mut self) -> Self {
+        self.handled = true;
+        self
+    }
+
     /// `state.apply`: patches the first chunk holding a `message_start` event.
     pub(crate) fn apply(&mut self, chunks: &mut [Bytes]) {
         if self.handled {

@@ -1402,15 +1402,16 @@ pub fn lines(
                     return Some((Ok(drop_cr(&line[..at])), st));
                 }
                 st.scanned = window;
-                // A full buffer without a newline: more data is too long, while the end
-                // of the body makes it the final line.
+                // A full buffer without a newline: more data is too long, while a clean end
+                // of the body makes it the final line. A read error leaves it unterminated,
+                // so it is dropped and the error ends the lines.
                 if st.buf.len() > max {
                     st.finished = true;
                     let error = ExecError::local(500, FailureScope::Request, "bufio.Scanner: token too long");
                     return Some((Err(error), st));
                 }
                 if st.ended {
-                    if !st.buf.is_empty() {
+                    if st.error.is_none() && !st.buf.is_empty() {
                         let line = st.buf.split();
                         st.scanned = 0;
                         return Some((Ok(drop_cr(&line)), st));
@@ -1442,7 +1443,8 @@ mod tests {
     /// A body read line by line fails with Go's scanner text `unexpected EOF` only when
     /// the upstream ended it early; a reset keeps the generic transport text. Every
     /// reply sends five of the hundred bytes or a partial chunked body, then, once the
-    /// client holds the response, closes or resets the connection.
+    /// client holds the response, closes or resets the connection. The unterminated line
+    /// the cut left is dropped: the error is the only item.
     #[tokio::test]
     async fn scanned_bodies_name_only_an_early_end_unexpected_eof() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -1479,12 +1481,15 @@ mod tests {
                 .unwrap();
             holds_response.send(()).unwrap();
             let mut read = lines(upstream.body, 1 << 20);
-            let error = loop {
-                match read.next().await.expect("a read error") {
-                    Ok(_) => {}
-                    Err(error) => break error,
-                }
-            };
+            let error = read
+                .next()
+                .await
+                .expect("a read error")
+                .expect_err("the cut line `hello` is not a line");
+            assert!(
+                read.next().await.is_none(),
+                "{head:?} reset={reset}: the error ends the lines"
+            );
             assert_eq!(
                 (
                     String::from_utf8_lossy(&error.body).into_owned(),
@@ -1846,6 +1851,7 @@ mod tests {
     /// Every case runs the real `bufio.Scanner` in tests/reference/proxy/main.go.
     #[tokio::test]
     async fn lines_follow_go_bufio_scanner() {
+        const CUT_LINE_DROPPED: [&str; 2] = ["partial-then-io-error", "exact-max-then-io-error"];
         for case in go_fixture()["lines"].as_array().unwrap() {
             let name = case["name"].as_str().unwrap();
             let mut items: Vec<Result<Bytes, ExecError>> = case["chunks"]
@@ -1877,12 +1883,17 @@ mod tests {
                 .into_iter()
                 .map(|t| String::from_utf8(t.unwrap().to_vec()).unwrap())
                 .collect();
-            let want: Vec<&str> = case["tokens"]
+            let mut want: Vec<&str> = case["tokens"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|t| t.as_str().unwrap())
                 .collect();
+            // Go hands the line a read error cut to the split function; cooker drops it, so a
+            // truncated body never ends on a line its upstream did not finish.
+            if CUT_LINE_DROPPED.contains(&name) {
+                want.pop();
+            }
             assert_eq!(tokens, want, "{name}");
             let error = errors.into_iter().map(|e| e.unwrap_err()).collect::<Vec<_>>();
             match case["error"].as_str().unwrap() {

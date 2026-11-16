@@ -360,10 +360,14 @@ pub fn stream_with(
     options: stream::StreamOptions,
 ) -> Option<Box<dyn StreamTranslator>> {
     registered(client, upstream).map(|r| {
+        let mut inner = (r.go_stream)(ctx);
+        if options.reported_usage {
+            inner.report_usage_only();
+        }
         stream::framed_with(
             client,
             upstream,
-            (r.go_stream)(ctx),
+            inner,
             levels(&[ctx.original_request, ctx.translated_request]),
             options,
         )

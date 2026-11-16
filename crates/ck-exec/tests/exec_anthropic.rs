@@ -393,22 +393,32 @@ async fn an_upstream_refusal_fails_the_attempt_before_commitment() {
     ));
 }
 
+/// A body cut anywhere before its end fails the attempt with exactly one error: mid-stream,
+/// inside the final `message_stop` line, at that line's missing newline, and before the
+/// blank line ending its event.
 #[tokio::test]
-async fn a_body_cut_mid_stream_publishes_exactly_one_error() {
-    let cut = SSE.find("event: message_delta").unwrap();
-    let upstream = StreamUpstream::start([Reply::sse(SSE).cut_after(cut)]).await;
-    let fixture = Fixture::new(&upstream, SONNET);
-    let body = br#"{"model":"m","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
-    let (started, id, _request) = fixture.anthropic(body, Operation::Generate).await;
-    let outcome = started.unwrap().producer.await.unwrap();
-    assert!(outcome.is_err(), "a cut body fails the attempt");
-    let (records, terminal) = events(&fixture.streams, id).await;
-    assert_eq!(terminal, Some(Terminal::UpstreamError));
-    assert_eq!(
-        records.iter().filter(|(name, _)| name == "x_ck.error").count(),
-        1,
-        "{records:?}"
-    );
+async fn a_body_cut_before_its_end_publishes_exactly_one_error() {
+    let cuts = [
+        SSE.find("event: message_delta").unwrap(),
+        SSE.len() - 4,
+        SSE.len() - 2,
+        SSE.len() - 1,
+    ];
+    for cut in cuts {
+        let upstream = StreamUpstream::start([Reply::sse(SSE).cut_after(cut)]).await;
+        let fixture = Fixture::new(&upstream, SONNET);
+        let body = br#"{"model":"m","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let (started, id, _request) = fixture.anthropic(body, Operation::Generate).await;
+        let outcome = started.unwrap().producer.await.unwrap();
+        assert!(outcome.is_err(), "cut at {cut}: a cut body fails the attempt");
+        let (records, terminal) = events(&fixture.streams, id).await;
+        assert_eq!(terminal, Some(Terminal::UpstreamError), "cut at {cut}");
+        assert_eq!(
+            records.iter().filter(|(name, _)| name == "x_ck.error").count(),
+            1,
+            "cut at {cut}: {records:?}"
+        );
+    }
 }
 
 #[tokio::test]

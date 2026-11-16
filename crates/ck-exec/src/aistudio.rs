@@ -365,6 +365,7 @@ impl AiStudioExecutor {
             StreamOptions {
                 whole_events: true,
                 chunk: Some(ensure_colon_spaced_json),
+                ..Default::default()
             },
         )
         .with_claude_stream_errors();
