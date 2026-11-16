@@ -712,31 +712,36 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
     assert_eq!(reply["model"], "friendly", "force-mapping rewrites the response model");
     // An alias passes the candidate's fence whichever arm serves it, and nothing invents a
     // `max_tokens` (Q-H): the catalog default is sent, a payload default rule does not replace
-    // it (Settled 49) but serves when no catalog or registered limit exists, and without
-    // either the only candidate is refused before any upstream request.
+    // it (Settled 49) but serves when no catalog or registered limit exists and it matches the
+    // request body, and otherwise the only candidate is refused before any upstream request.
     let catalog = format!("model-catalog: [{{match: {MODEL}, overrides: {{default-max-tokens: 777}}}}]\n");
     let payload = "requests:\n  payload:\n    default:\n      - models: [{name: \"*\", protocol: claude}]\n        params: {max_tokens: 16384}\n";
     let both = format!("{catalog}{payload}");
+    let unless_system = "requests:\n  payload:\n    default:\n      - models: [{name: \"*\", protocol: claude, not-exist: [system]}]\n        params: {max_tokens: 16384}\n";
     let unlimited = r#"{"model":"team/friendly","messages":[{"role":"user","content":"x"}]}"#;
-    // (config, force-mapping, status, sent max_tokens)
+    let system =
+        r#"{"model":"team/friendly","messages":[{"role":"system","content":"s"},{"role":"user","content":"x"}]}"#;
+    // (config, request, force-mapping, status, sent max_tokens)
     let rows = [
-        (String::new(), true, 400, None),
-        (catalog, true, 200, Some(777)),
-        (both.clone(), true, 200, Some(777)),
-        (both, false, 200, Some(777)),
-        // Without a catalog default, a configured payload default rule is the limit.
-        (payload.to_owned(), true, 200, Some(16384)),
-        (payload.to_owned(), false, 200, Some(16384)),
+        (String::new(), unlimited, true, 400, None),
+        (catalog, unlimited, true, 200, Some(777)),
+        (both.clone(), unlimited, true, 200, Some(777)),
+        (both, unlimited, false, 200, Some(777)),
+        (payload.to_owned(), unlimited, true, 200, Some(16384)),
+        (payload.to_owned(), unlimited, false, 200, Some(16384)),
+        (unless_system.to_owned(), unlimited, false, 200, Some(16384)),
+        (unless_system.to_owned(), system, true, 400, None),
+        (unless_system.to_owned(), system, false, 400, None),
     ];
-    for (config, force, status, sent) in rows {
+    for (config, body, force, status, sent) in rows {
         let mut key = key.clone();
         key.metadata["models"][0]["force-mapping"] = Value::Bool(force);
         let p = proxy(&config, vec![key]).await;
-        let (got, _, text) = post(&p.url, "/v1/chat/completions", unlimited).await;
-        assert_eq!(got, status, "{config} force {force}: {text}");
+        let (got, _, text) = post(&p.url, "/v1/chat/completions", body).await;
+        assert_eq!(got, status, "{config} {body} force {force}: {text}");
         let seen = p.seen.requests.lock().unwrap().clone();
         let max_tokens = seen.first().map(|request| request.1["max_tokens"].clone());
-        assert_eq!(max_tokens, sent.map(Value::from), "{config} force {force}");
+        assert_eq!(max_tokens, sent.map(Value::from), "{config} {body} force {force}");
     }
     // The registry lists the alias and its prefixed copy, not the upstream name.
     let models: Value = wreq::Client::new()

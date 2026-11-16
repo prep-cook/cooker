@@ -107,11 +107,15 @@ pub(super) fn max_tokens_for(catalog: &ck_core::config::model_catalog::ModelCata
     })
 }
 
-/// The `max_tokens` the payload default rules set on an empty Claude body for `model`.
-/// ponytail: rules are matched by model, protocol and headers only; a rule gated on the source
-/// protocol, the requested alias or body conditions is not seen here, so such a candidate is
-/// still refused. Evaluate against the request view if such rules need to count.
-fn payload_max_tokens(rules: &ck_wire::payload::Rules, model: &str, headers: &http::HeaderMap) -> Option<u64> {
+/// The `max_tokens` the payload default rules set on an empty Claude body for `model`: the
+/// fence's precheck, which cannot see the encoded body. A rule gated on body conditions may
+/// pass here and not match the request; `Ctx::prepare_messages` refuses that request before
+/// sending. A rule gated on the source protocol or the requested alias does not pass here.
+pub(super) fn payload_max_tokens(
+    rules: &ck_wire::payload::Rules,
+    model: &str,
+    headers: &http::HeaderMap,
+) -> Option<u64> {
     if !rules.has_defaults() {
         return None;
     }
@@ -211,7 +215,9 @@ impl ClaudeExecutor {
                 (original, &translated)
             }
             None => {
-                let default_max_tokens = default_max_tokens(attempt.cfg, attempt.model, attempt.headers);
+                // A limit only a payload default rule sets is left to the rules, which see this body.
+                let default_max_tokens =
+                    max_tokens_for(&ck_core::config::model_catalog::catalog(attempt.cfg), attempt.model);
                 encoded = encode(
                     attempt,
                     &request.validated(),

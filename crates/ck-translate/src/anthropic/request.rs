@@ -200,21 +200,28 @@ impl AnthropicCapability {
 pub struct Egress {
     pub destination: &'static str,
     pub upstream_stream: bool,
-    /// The [`AnthropicCapability::default_max_tokens`] the request passed.
+    /// The limit for a request without one; `None` leaves `max_tokens` out for the executor's
+    /// payload rules to set (the fence admitted the request).
     pub default_max_tokens: Option<u64>,
 }
 impl Egress {
     /// Writes `,"max_tokens":` when a generation or compaction request has none: its
-    /// `max_completion_tokens`, else the default.
+    /// `max_completion_tokens`, else the default, else nothing.
     pub(super) fn fill_max_tokens(&self, view: RequestView<'_>, e: &mut encode::Encoder<'_, '_>) -> Result<()> {
         let (doc, root) = (view.document, view.document.root());
         if view.operation == Operation::CountTokens || doc.member(root, "max_tokens")?.is_some() {
             return Ok(());
         }
-        e.bytes(b",\"max_tokens\":")?;
-        match doc.member(root, "max_completion_tokens")? {
-            Some(limit) => doc.write(limit, e),
-            None => e.unsigned(self.default_max_tokens.ok_or(Error::MaxTokensRequired)?),
+        match (doc.member(root, "max_completion_tokens")?, self.default_max_tokens) {
+            (Some(limit), _) => {
+                e.bytes(b",\"max_tokens\":")?;
+                doc.write(limit, e)
+            }
+            (None, Some(limit)) => {
+                e.bytes(b",\"max_tokens\":")?;
+                e.unsigned(limit)
+            }
+            (None, None) => Ok(()),
         }
     }
 }

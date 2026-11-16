@@ -1768,6 +1768,13 @@ impl<'a> Ctx<'a> {
         if touched.contains("diagnostics") {
             diagnostics = session::Continuity::default();
         }
+        // The fence admitted a limit a payload default rule might set (`payload_max_tokens`);
+        // these rules saw the real body, and nothing guesses one when they did not set it (Q-H).
+        if !rawjson::get(&body, "max_tokens").exists()
+            && execute::payload_max_tokens(&self.payload_rules, &self.base_model, req.headers).is_some()
+        {
+            return Err(ExecError::local(400, FailureScope::Request, "max_tokens is required"));
+        }
         let (extra_betas, stripped) = extract_betas(body);
         body = cloak::compaction::refuse_context(cloak::strip_prompt_cache_options(stripped))?;
         if cch {
