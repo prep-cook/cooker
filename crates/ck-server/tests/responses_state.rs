@@ -39,7 +39,7 @@ const SETTLE: Duration = Duration::from_millis(200);
 const MODEL: &str = "claude-sonnet-5";
 
 /// What a credential's upstream does with its next attempt.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Script {
     /// A Chat answer: `text` and a stop.
     Answers(&'static str),
@@ -422,16 +422,58 @@ fn begin(
     };
     let request_id = LocalId::new("request").unwrap();
     let expanded = responses_state::begin(streams, &mut exchange, view, request_id, Default::default())?;
-    let (document, media) = expanded.unwrap_or((document, media));
+    let (mut document, media) = expanded.unwrap_or((document, media));
+    responses_state::withdraw_background(&mut document).unwrap();
     Ok((exchange, document, media))
 }
 
 /// Runs `ask` through request ingress, `responses_state::begin` and the contract arm.
 async fn send(fixture: &Fixture, fake: &Fake, ask: Ask) -> Answer {
-    let (exchange, document, media) = match begin(fixture, &ask, Operation::Generate) {
-        Ok(begun) => begun,
+    let (codec, call) = match prepare(fixture, ask) {
+        Ok(prepared) => prepared,
         Err(refused) => return Answer::Refused(refused),
     };
+    let trace = Trace::with_request_id(Some("trace".into()));
+    let served = tokio::time::timeout(
+        Duration::from_secs(5),
+        dispatch::run_exchange(&fixture.rt, fake, call, &trace, codec, None),
+    )
+    .await
+    .expect("the request is decided");
+    match served {
+        Ok(Served::Committed(response)) => Answer::Committed(response),
+        Ok(Served::Old(_)) => panic!("the old arm answered"),
+        Err(error) => Answer::Failed(error.failure.status()),
+    }
+}
+
+/// Runs a buffered `background` ask as its route does: the turn goes to a stream task and the
+/// client gets the queued response.
+async fn send_background(fixture: &Fixture, fake: &'static Fake, mut ask: Ask) -> Answer {
+    ask = ask.buffered();
+    ask.body["background"] = json!(true);
+    let (codec, call) = match prepare(fixture, ask) {
+        Ok(prepared) => prepared,
+        Err(refused) => return Answer::Refused(refused),
+    };
+    let streams = fixture.rt.streams();
+    let pending = match responses_state::background(streams, &codec.exchange, MODEL) {
+        Ok(pending) => pending.expect("a buffered background turn"),
+        Err(refused) => return Answer::Refused(refused),
+    };
+    let rt = fixture.rt.clone();
+    let turn = async move {
+        let trace = Trace::with_request_id(Some("trace".into()));
+        dispatch::run_exchange(&rt, fake, call, &trace, codec, None)
+            .await
+            .map_err(|error| error.failure)
+    };
+    Answer::Committed(pending.spawn(streams, turn))
+}
+
+/// Request ingress and `responses_state::begin` for a generation `ask`: its codec and call.
+fn prepare(fixture: &Fixture, ask: Ask) -> Result<(Codec, Call), Refused> {
+    let (exchange, document, media) = begin(fixture, &ask, Operation::Generate)?;
     let body = serde_json::to_vec(&ask.body).unwrap();
     let request_id = LocalId::new("request").unwrap();
     let codec = Codec {
@@ -462,18 +504,7 @@ async fn send(fixture: &Fixture, fake: &Fake, ask: Ask) -> Answer {
         media: None,
     };
     call.headers.clear();
-    let trace = Trace::with_request_id(Some("trace".into()));
-    let served = tokio::time::timeout(
-        Duration::from_secs(5),
-        dispatch::run_exchange(&fixture.rt, fake, call, &trace, codec, None),
-    )
-    .await
-    .expect("the request is decided");
-    match served {
-        Ok(Served::Committed(response)) => Answer::Committed(response),
-        Ok(Served::Old(_)) => panic!("the old arm answered"),
-        Err(error) => Answer::Failed(error.failure.status()),
-    }
+    Ok((codec, call))
 }
 
 /// The committed response of `answer`.
@@ -757,6 +788,14 @@ async fn every_miss_is_the_same_not_found() {
 /// it and logged, and the conversation's text goes on (Settled 73).
 #[tokio::test]
 async fn another_credential_continues_without_foreign_reasoning() {
+    for background in [false, true] {
+        continues_without_foreign_reasoning(background).await;
+    }
+}
+
+/// The rebuilt request of a `background` continuation carries no `background`, which a Chat
+/// destination would refuse.
+async fn continues_without_foreign_reasoning(background: bool) {
     let fixture = fixture(|_| {});
     let fake = Fake::new();
     fake.set("a", Script::Signed("signed"));
@@ -772,12 +811,14 @@ async fn another_credential_continues_without_foreign_reasoning() {
         .with_max_level(tracing::Level::INFO)
         .with_writer(move || writer.clone())
         .finish();
-    let text = read(committed(
-        send(&fixture, &fake, Ask::new("more").after(&first))
-            .with_subscriber(subscriber)
-            .await,
-    ))
-    .await;
+    let mut ask = Ask::new("more").after(&first);
+    ask.body["background"] = json!(background);
+    let answer = send(&fixture, &fake, ask).with_subscriber(subscriber).await;
+    let text = match answer {
+        Answer::Committed(response) => read(response).await,
+        Answer::Refused(refused) => panic!("background {background}: refused {refused:?}"),
+        Answer::Failed(status) => panic!("background {background}: failed with {status}"),
+    };
     assert!(text.contains("again"), "{text}");
     let sent = fake.sent();
     let (_, body) = sent.iter().find(|(credential, _)| credential == "b").unwrap();
@@ -820,18 +861,23 @@ async fn an_idle_turn_expires_after_an_hour() {
 }
 
 /// A token count reads the stored turn its `previous_response_id` names, but is no turn itself:
-/// it issues no response id and stores nothing to continue.
+/// it issues no response id, stores nothing to continue and never runs in the background.
 #[tokio::test]
 async fn a_count_reads_the_stored_turn_and_is_no_turn() {
-    let fixture = fixture(|_| {});
-    let fake = Fake::new();
-    let first = turn(&fixture, &fake, Ask::new("hi")).await;
-    let mut ask = Ask::new("again").after(&first).buffered();
-    ask.body.as_object_mut().unwrap().remove("stream");
-    let (exchange, document, _) = begin(&fixture, &ask, Operation::CountTokens).unwrap();
-    assert!(exchange.turn.is_none(), "a count issues no response id");
-    let messages = document.member(document.root(), "messages").unwrap().unwrap();
-    assert_eq!(document.children(messages).unwrap().count(), 3, "hi, hello, again");
+    for background in [false, true] {
+        let fixture = fixture(|_| {});
+        let fake = Fake::new();
+        let first = turn(&fixture, &fake, Ask::new("hi")).await;
+        let mut ask = Ask::new("again").after(&first).buffered();
+        ask.body.as_object_mut().unwrap().remove("stream");
+        ask.body["background"] = json!(background);
+        let (exchange, document, _) = begin(&fixture, &ask, Operation::CountTokens).unwrap();
+        assert!(exchange.turn.is_none(), "a count issues no response id");
+        let reserved = responses_state::background(fixture.rt.streams(), &exchange, MODEL).unwrap();
+        assert!(reserved.is_none(), "a count reserves no background slot");
+        let messages = document.member(document.root(), "messages").unwrap().unwrap();
+        assert_eq!(document.children(messages).unwrap().count(), 3, "hi, hello, again");
+    }
 }
 
 /// With four stream headers, a chain of ten continuations evicts the oldest turns and their
@@ -885,7 +931,7 @@ async fn a_history_over_the_metadata_quota_is_refused() {
     panic!("the history never outgrew the quota");
 }
 
-/// `conversation` is refused before dispatch (Q-G).
+/// `conversation`, and `background` without `store`, are refused before dispatch (Q-G).
 #[tokio::test]
 async fn a_conversation_is_refused() {
     let fixture = fixture(|_| {});
@@ -900,5 +946,232 @@ async fn a_conversation_is_refused() {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(text.contains("\"param\":\"conversation\""), "{text}");
     }
+    // Nothing could retrieve a background response that is not stored.
+    let mut ask = Ask::new("hi").buffered();
+    ask.body["background"] = json!(true);
+    ask.body["store"] = json!(false);
+    let Answer::Refused(refused @ Refused::Background) = send(&fixture, &fake, ask).await else {
+        panic!("dispatched")
+    };
+    let (status, text) = status_body(refused.response()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("\"param\":\"background\""), "{text}");
     assert!(fake.sent().is_empty());
+}
+
+/// `method` on `/v1/responses/{id}{suffix}` with a bearer `key`: status and JSON body.
+async fn resource(fixture: &Fixture, key: &str, method: &str, id: &str, suffix: &str) -> (StatusCode, Value) {
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(format!("/v1/responses/{id}{suffix}"))
+        .header("authorization", format!("Bearer {key}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = fixture.app().oneshot(request).await.unwrap();
+    let (status, text) = status_body(response).await;
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("{status}: {text}")),
+    )
+}
+
+/// Only the owner retrieves, cancels or deletes a stored response, streamed in the background or
+/// not; every other id gets the one not-found answer, and a deleted response is neither found
+/// nor continued. Cancelling a completed background response shows it as it is.
+#[tokio::test]
+async fn a_stored_response_is_served_to_its_owner_only() {
+    for background in [false, true] {
+        stored_response_rows(background).await;
+    }
+}
+
+async fn stored_response_rows(background: bool) {
+    let fixture = fixture(|_| {});
+    let fake = Fake::new();
+    let mut ask = Ask::new("hi");
+    ask.body["background"] = json!(background);
+    let id = turn(&fixture, &fake, ask).await;
+    let cancelled = if background { 200 } else { 400 };
+    let unknown = "resp_0123456789abcdef0123456789abcdef";
+    let (_, not_found) = resource(&fixture, KEY, "GET", unknown, "").await;
+    assert_eq!(not_found["error"]["type"], "invalid_request_error", "{not_found}");
+    for (key, method, id, suffix, status) in [
+        (KEY, "GET", id.as_str(), "", 200),
+        (OTHER, "GET", &id, "", 404),
+        (KEY, "GET", "not-an-id", "", 404),
+        (OTHER, "DELETE", &id, "", 404),
+        (OTHER, "POST", &id, "/cancel", 404),
+        (KEY, "POST", &id, "/cancel", cancelled),
+        (KEY, "DELETE", &id, "", 200),
+        (KEY, "GET", &id, "", 404),
+        (KEY, "DELETE", &id, "", 404),
+        (KEY, "POST", &id, "/cancel", 404),
+    ] {
+        let (actual, body) = resource(&fixture, key, method, id, suffix).await;
+        let row = format!("background {background}, {key} {method} {id}{suffix}: {body}");
+        assert_eq!(actual.as_u16(), status, "{row}");
+        match (status, method) {
+            (404, _) => assert_eq!(body, not_found, "{row}"),
+            (200, "GET" | "POST") => {
+                assert_eq!(body["id"], id, "{row}");
+                assert_eq!(body["status"], "completed", "{row}");
+                assert_eq!(body["output"][0]["content"][0]["text"], "hello", "{row}");
+                assert_eq!(body["background"] == json!(true), background, "{row}");
+            }
+            (200, "DELETE") => assert_eq!(body, json!({"id": id, "object": "response", "deleted": true})),
+            _ => assert_eq!(body["error"]["type"], "invalid_request_error", "{row}"),
+        }
+    }
+    let answer = send(&fixture, &fake, Ask::new("more").after(&id)).await;
+    assert!(
+        matches!(answer, Answer::Refused(Refused::NotFound)),
+        "a deleted turn is not continued"
+    );
+}
+
+/// A buffered background turn answers queued at once; its resource shows it running, then
+/// what came of it, and only a completed one continues.
+#[tokio::test]
+async fn a_background_turn_answers_at_once_and_shows_its_outcome() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Then {
+        Waits,
+        Cancels,
+        Deletes,
+        /// Cancels or deletes once the producer ended, while delivery waits at the held
+        /// publication gate.
+        CancelsWhilePublishing,
+        DeletesWhilePublishing,
+    }
+    for (script, then, outcome) in [
+        (Script::Held, Then::Waits, "completed"),
+        (Script::FailsAfterContent, Then::Waits, "failed"),
+        (Script::Held, Then::Cancels, "cancelled"),
+        (Script::Held, Then::Deletes, ""),
+        (Script::Held, Then::CancelsWhilePublishing, "cancelled"),
+        (Script::Held, Then::DeletesWhilePublishing, ""),
+    ] {
+        let row = format!("{script:?} {then:?}");
+        let fixture = fixture(|_| {});
+        let fake: &'static Fake = Box::leak(Box::new(Fake::new()));
+        fake.set("a", script);
+        fake.set("b", Script::Skips);
+        let mut release = Some(fake.hold());
+        let queued = committed(send_background(&fixture, fake, Ask::new("hi")).await);
+        let queued: Value = serde_json::from_str(&read(queued).await).unwrap();
+        assert_eq!(queued["status"], "queued", "{row}: {queued}");
+        assert_eq!(queued["background"], true, "{row}");
+        let id = queued["id"].as_str().unwrap().to_owned();
+        let running = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, body) = resource(&fixture, KEY, "GET", &id, "").await;
+                if !fake.sent.lock().unwrap().is_empty() || body["status"] != "in_progress" {
+                    return body;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the turn starts upstream");
+        assert_eq!(running["status"], "in_progress", "{row}: {running}");
+        let (_, foreign) = resource(&fixture, OTHER, "GET", &id, "").await;
+        assert_eq!(foreign["error"]["message"], "The response was not found.", "{row}");
+        let (stop, publishing) = match then {
+            Then::Waits => (None, false),
+            Then::Cancels => (Some(true), false),
+            Then::Deletes => (Some(false), false),
+            Then::CancelsWhilePublishing => (Some(true), true),
+            Then::DeletesWhilePublishing => (Some(false), true),
+        };
+        if publishing {
+            fixture.rt.streams().holds.publication.close();
+            let _ = release.take().unwrap().send(());
+            tokio::time::sleep(SETTLE).await;
+        }
+        match stop {
+            Some(true) => {
+                let (status, body) = resource(&fixture, KEY, "POST", &id, "/cancel").await;
+                assert_eq!(
+                    (status, &body["status"]),
+                    (StatusCode::OK, &json!("cancelled")),
+                    "{row}: {body}"
+                );
+            }
+            Some(false) => {
+                let (status, body) = resource(&fixture, KEY, "DELETE", &id, "").await;
+                assert_eq!(
+                    (status, &body["deleted"]),
+                    (StatusCode::OK, &json!(true)),
+                    "{row}: {body}"
+                );
+            }
+            None => {}
+        }
+        if publishing {
+            fixture.rt.streams().holds.publication.open();
+        } else {
+            let _ = release.take().unwrap().send(());
+        }
+        let (status, body) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (status, body) = resource(&fixture, KEY, "GET", &id, "").await;
+                if body["status"] != "in_progress" {
+                    return (status, body);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the turn ends");
+        // A late publication would only show after the producer ended.
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(
+            resource(&fixture, KEY, "GET", &id, "").await,
+            (status, body.clone()),
+            "{row}"
+        );
+        if outcome.is_empty() {
+            assert_eq!(status, StatusCode::NOT_FOUND, "{row}: {body}");
+        } else {
+            assert_eq!(
+                (status, &body["status"]),
+                (StatusCode::OK, &json!(outcome)),
+                "{row}: {body}"
+            );
+            assert_eq!(body["background"], true, "{row}: {body}");
+        }
+        if outcome == "completed" {
+            assert_eq!(body["output"][0]["content"][0]["text"], "held", "{row}: {body}");
+        }
+        fake.set("a", Script::Answers("hello"));
+        let answer = send(&fixture, fake, Ask::new("more").after(&id)).await;
+        let continued = matches!(answer, Answer::Committed(_));
+        assert_eq!(continued, outcome == "completed", "{row}");
+    }
+}
+
+/// `POST {path}` with a bearer key and a JSON `body`: status and body text.
+async fn post(fixture: &Fixture, path: &str, body: &Value) -> (StatusCode, String) {
+    use tower::ServiceExt;
+    let request = axum::http::Request::post(path)
+        .header("authorization", format!("Bearer {KEY}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    status_body(fixture.app().oneshot(request).await.unwrap()).await
+}
+
+/// Only a buffered generation runs in the background: a compact request naming `background`
+/// gets the answer it gets without it, never a queued response.
+#[tokio::test]
+async fn compact_answers_in_the_request_whatever_background_says() {
+    let fixture = fixture(|_| {});
+    let body = json!({"model": MODEL, "input": "hi"});
+    let plain = post(&fixture, "/v1/responses/compact", &body).await;
+    let mut background = body.clone();
+    background["background"] = json!(true);
+    let answer = post(&fixture, "/v1/responses/compact", &background).await;
+    assert!(!answer.1.contains("\"queued\""), "{answer:?}");
+    assert_eq!(answer, plain);
 }

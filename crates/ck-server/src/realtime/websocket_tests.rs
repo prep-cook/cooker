@@ -460,7 +460,7 @@ async fn run(row: Row) {
             completed(&client.turn(json!({"input": "warm"})).await);
             let capacity = p.rt.streams().store().unwrap().limits().header_slots as usize;
             let index = p.rt.streams().responses();
-            while index.reserve(capacity, crate::inference::responses_state::ResponseId::random()) {}
+            while index.reserve(capacity, crate::inference::responses_state::ResponseId::random(), false) {}
             let id = completed(&client.turn(json!({"input": "first question"})).await);
             not_found(&client.turn(next(&id)).await);
             client.close().await;

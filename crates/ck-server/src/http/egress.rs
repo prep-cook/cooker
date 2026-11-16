@@ -74,6 +74,7 @@ pub fn prepare(exchange: &Exchange, response: &Writer, identity: Identity, reque
         exchange.turn.map(|turn| turn.id.text()),
         exchange.model.as_deref(),
         exchange.turn.is_some_and(|turn| turn.stored),
+        exchange.turn.is_some_and(|turn| turn.background),
     );
     let protocol = ProtocolEgress::new(exchange.output, &mut egress, identity, request, shown);
     Prepared(protocol.map(|protocol| (egress, protocol)))

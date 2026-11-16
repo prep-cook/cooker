@@ -30,13 +30,14 @@ impl ProtocolEgress {
     /// whose Chat `stream_options.include_usage` decides the usage chunk and whose Responses
     /// fields seed the response echo. `id` is the response id a Responses exchange issued
     /// (`responses_state`), the only id its client sees, `model` the alias it shows, and
-    /// `stored` whether the turn is stored for continuation, which shows `store: true`.
+    /// `stored` whether the turn is stored for continuation, which shows `store: true`, and
+    /// `background` whether cooker runs it in the background.
     pub fn new(
         output: Output,
         stream: &mut Writer,
         identity: Identity,
         request: RequestView<'_>,
-        (id, model, stored): (Option<LocalId>, Option<&str>, bool),
+        (id, model, stored, background): (Option<LocalId>, Option<&str>, bool, bool),
     ) -> codec::Result<Self> {
         let mode = match output.framing {
             Framing::Json | Framing::Raw => BodyMode::Buffered,
@@ -90,6 +91,9 @@ impl ProtocolEgress {
                 }
                 if stored {
                     egress.show_stored();
+                }
+                if background {
+                    egress.show_background();
                 }
                 Self::Responses(egress)
             }

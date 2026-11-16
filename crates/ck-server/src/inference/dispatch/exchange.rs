@@ -34,8 +34,19 @@ where
     F: FnOnce(Result<Done, Failure>) -> Fut,
     Fut: Future<Output = Response>,
 {
-    let trace = Trace::with_request_id(crate::observability::api::current_request_id());
-    let result = run(rt, call, output, &trace).await;
+    let trace = Arc::new(Trace::with_request_id(crate::observability::api::current_request_id()));
+    let result = match prepare(rt, &call, output) {
+        Ok(codec) => match crate::inference::responses_state::background(rt.streams(), &codec.exchange, &call.model) {
+            Ok(Some(pending)) => {
+                let (task_rt, task_trace) = (rt.clone(), trace.clone());
+                let turn = async move { select(&task_rt, call, output, &task_trace, codec).await };
+                return traced(rt, &trace, pending.spawn(rt.streams(), turn), None);
+            }
+            Ok(None) => select(rt, call, output, &trace, codec).await,
+            Err(refused) => Err(Failure::Exec(refused.error())),
+        },
+        Err(failure) => Err(failure),
+    };
     let result = match result {
         Ok(Served::Committed(response)) => return traced(rt, &trace, response, None),
         Ok(Served::Old(done)) => Ok(done),
@@ -48,9 +59,29 @@ where
 /// Decodes `call` and runs it through the model router and the selection loop. A router's
 /// `fallback-models` decodes the client's request again into a new exchange.
 pub(crate) async fn run(rt: &Arc<Runtime>, call: Call, output: Output, trace: &Trace) -> Result<Served, Failure> {
+    let codec = prepare(rt, &call, output)?;
+    select(rt, call, output, trace, codec).await
+}
+
+/// Decodes `call` and closes its client fence. Client errors answer here, before selection and
+/// before a router's judge, with nothing sent.
+fn prepare(rt: &Runtime, call: &Call, output: Output) -> Result<Codec, Failure> {
     let store = rt.streams().store().map_err(|error| Failure::Exec(stored(&error)))?;
-    // Client errors answer before selection, and before a router's judge, with nothing sent.
-    let mut fenced = Some(Decoded::new(&store, &call, output)?.codec(rt, call.socket_key())?);
+    Decoded::new(&store, call, output)?.codec(rt, call.socket_key())
+}
+
+/// The model router and the selection loop for `call`, whose decoded exchange is `fenced`.
+async fn select(
+    rt: &Arc<Runtime>,
+    call: Call,
+    output: Output,
+    trace: &Trace,
+    fenced: Codec,
+) -> Result<Served, Failure> {
+    let store = rt.streams().store().map_err(|error| Failure::Exec(stored(&error)))?;
+    // The client holds the first decode's response id, whichever model serves the turn.
+    let issued = fenced.exchange.turn.map(|turn| turn.id);
+    let mut fenced = Some(fenced);
     let mut call = call;
     let mut picked = None;
     if call.forced_provider.is_none()
@@ -64,7 +95,13 @@ pub(crate) async fn run(rt: &Arc<Runtime>, call: Call, output: Output, trace: &T
     loop {
         let codec = match fenced.take() {
             Some(codec) => codec,
-            None => Decoded::new(&store, &call, output)?.codec(rt, call.socket_key())?,
+            None => {
+                let mut codec = Decoded::new(&store, &call, output)?.codec(rt, call.socket_key())?;
+                if let (Some(id), Some(turn)) = (issued, codec.exchange.turn.as_mut()) {
+                    turn.id = id;
+                }
+                codec
+            }
         };
         if call.operation == ck_core::exec::Operation::Generate && rt.usage_queue().accepts() {
             trace.prompt_prefix(call.entry, &call.body);
@@ -184,7 +221,7 @@ impl Decoded {
         .map_err(refused)?;
         let request = match exchange.output.protocol {
             Protocol::Responses => {
-                match crate::inference::responses_state::begin(
+                let mut request = match crate::inference::responses_state::begin(
                     rt.streams(),
                     &mut exchange,
                     request.view(),
@@ -198,7 +235,9 @@ impl Decoded {
                     },
                     Ok(None) => request,
                     Err(refused) => return Err(Failure::Exec(refused.error())),
-                }
+                };
+                crate::inference::responses_state::withdraw_background(&mut request.document).map_err(refused)?;
+                request
             }
             _ => request,
         };

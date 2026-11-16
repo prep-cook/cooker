@@ -567,7 +567,8 @@ fn rebuild(
     operation: codec::Operation,
 ) -> codec::Result<OwnedRequest> {
     let mut records = store.reader(exchange.request.id(), 0)?;
-    let (document, media) = codec::chat::request::read_request(&mut exchange.request, &mut records)?;
+    let (mut document, media) = codec::chat::request::read_request(&mut exchange.request, &mut records)?;
+    crate::inference::responses_state::withdraw_background(&mut document)?;
     Ok(OwnedRequest {
         document,
         media,
