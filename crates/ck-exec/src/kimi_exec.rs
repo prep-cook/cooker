@@ -1,25 +1,9 @@
-//! The Kimi executor over the internal stream (`docs/EXECUTION-CONTRACT.md`): Chat and Gemini
-//! clients go to `/v1/chat/completions` through the Chat request egress, Responses clients to
-//! the native `/v1/responses` through the Responses request egress, and the upstream body
-//! goes into the matching response ingress.
+//! Kimi execution over the internal stream. Chat and Gemini clients use Chat egress;
+//! Responses clients use native Responses egress, including grammar custom tools.
 //!
-//! The executor shapes its own encoded upload, one heap body, in the old path's order: the
-//! normalized upstream model, the model suffix's thinking, Kimi's message, tool and temperature
-//! normalizations, and the payload rules last. A Responses upload first gets back a string
-//! `input`, since the old path forwarded the client's body. Headers, capture,
-//! transport and error classification are the old path's (`kimi`), and so are the line limits
-//! of the response ingress. A Chat stream that ends cleanly without `[DONE]` completes, as the
-//! old path's synthetic `[DONE]` completes it.
-//!
-//! These requests keep the old route through a fence `Err(Destination)`:
-//! - Claude Messages clients and every token count. The old path delegates them to the
-//!   Claude executor at Kimi's Anthropic-compatible base, with model normalization,
-//!   response-model restoration and Kimi's reasoning replay; the contract's Claude path builds
-//!   its context with the default delegation and has no seam for any of the three.
-//! - Responses requests that declare, choose or replay Codex's freeform `apply_patch` tool:
-//!   only the old path's bridge sends it as the JSON function Kimi takes and turns the calls
-//!   back.
-//!
+//! Upload shaping applies the credential product, model-specific reasoning, message and
+//! tool normalization, then configured payload rules. Temperature reaches upstream unchanged.
+//! Messages and token counts retain the delegated path until its contract seam lands.
 //! Kimi has no native compact; the capability refuses it.
 
 use ck_core::exec::{ExecError, FailureScope, UsageSink};
@@ -31,7 +15,7 @@ use ck_translate::codec::{self, BodyMode, Capability, Operation, RequestEgress, 
 use ck_translate::responses::request::{Egress as ResponsesEgress, ResponsesCapability};
 use ck_translate::responses::response::Ingress as ResponsesIngress;
 use ck_wire::json as gj;
-use ck_wire::thinking::{ModelCaps, RequestThinking, apply_request_thinking, parse_suffix};
+use ck_wire::thinking::{ModelCaps, RequestThinking, parse_suffix};
 use futures_util::StreamExt;
 
 use crate::gemini_exec::{copy, encoding, streaming};
@@ -65,10 +49,7 @@ impl Capability for KimiCapability {
             Format::Claude => Err(codec::Error::Destination),
             Format::OpenAIResponse => {
                 ResponsesCapability.validate(view)?;
-                if custom_apply_patch(view.document)? {
-                    return Err(codec::Error::Destination);
-                }
-                Ok(())
+                validate_custom_tools(view.document)
             }
             _ => ChatCapability.validate(view),
         }
@@ -194,7 +175,7 @@ impl<'r> Shape<'r> {
         if !(stream || self.stream_member) {
             drop_stream(&mut body);
         }
-        // No translator targets Kimi's Chat dialect, so the thinking target is `kimi`.
+        // Kimi policy chooses the model's Chat reasoning dialect.
         body = self.thinking(body, Format::OpenAI.as_str(), "kimi")?;
         if stream && !gj::set_raw(&mut body, "stream_options.include_usage", "true") {
             return Err(ExecError::local(
@@ -205,7 +186,6 @@ impl<'r> Shape<'r> {
         }
         body = kimi::normalize_tool_message_links(body)?;
         body = kimi::normalize_tools(body);
-        body = kimi::normalize_temperature(body);
         Ok(self.rules(Format::OpenAI, body, baseline, &requested))
     }
 
@@ -219,7 +199,6 @@ impl<'r> Shape<'r> {
         body = self.thinking(body, Format::OpenAIResponse.as_str(), Format::Codex.as_str())?;
         body = kimi::normalize_responses_input(body);
         body = kimi::normalize_tools(body);
-        body = kimi::normalize_temperature(body);
         Ok(self.rules(Format::OpenAIResponse, body, baseline, &requested))
     }
 
@@ -241,7 +220,7 @@ impl<'r> Shape<'r> {
 
     /// Names the normalized upstream model and reports it.
     fn model(&self, mut body: Vec<u8>) -> Vec<u8> {
-        let model = kimi::normalize_upstream_model(&self.base_model);
+        let model = kimi::upstream_model(self.attempt.credential, &self.base_model);
         gj::set_str(&mut body, "model", &model);
         self.request.client.usage.upstream_model(&model);
         body
@@ -262,8 +241,7 @@ impl<'r> Shape<'r> {
             has_request_transformer: false,
             updates_changed: false,
         };
-        apply_request_thinking(&request, body)
-            .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))
+        kimi::apply_kimi_thinking(self.attempt.credential, &request, body)
     }
 
     /// Reports the body sent upstream, then applies the configured payload rules, the last
@@ -361,124 +339,45 @@ fn string_input(doc: &Document) -> codec::Result<bool> {
     Ok(false)
 }
 
-/// Whether a Responses request declares, chooses or replays Codex's freeform `apply_patch`
-/// tool. Only the carriers Go's bridge rewrites are read: the native tool declarations
-/// (`x_ck.tools`), the root `tool_choice`, and each turn's tool calls and `additional_tools`
-/// items. Arguments, schemas and unknown members are never searched.
-fn custom_apply_patch(doc: &Document) -> codec::Result<bool> {
-    let root = doc.root();
-    if let Some(x) = member(doc, root, "x_ck")?
-        && let Some(tools) = member(doc, x, "tools")?
-    {
-        for entry in doc.children(tools)? {
-            if let Some(declaration) = member(doc, entry, "declaration")?
-                && declares(doc, declaration)?
-            {
-                return Ok(true);
-            }
-        }
-    }
-    if let Some(choice) = member(doc, root, "tool_choice")?
-        && chooses(doc, choice)?
-    {
-        return Ok(true);
-    }
-    let Some(messages) = member(doc, root, "messages")? else {
-        return Ok(false);
+/// Validate declarations only; native choices and replay items retain their wire shapes.
+fn validate_custom_tools(doc: &Document) -> codec::Result<()> {
+    let Some(x) = member(doc, doc.root(), "x_ck")? else {
+        return Ok(());
     };
-    for message in doc.children(messages)? {
-        if replays(doc, message)? {
-            return Ok(true);
+    let Some(tools) = member(doc, x, "tools")? else {
+        return Ok(());
+    };
+    for entry in doc.children(tools)? {
+        if let Some(tool) = member(doc, entry, "declaration")? {
+            validate_custom_tool(doc, tool)?;
         }
     }
-    Ok(false)
+    Ok(())
 }
 
-/// A custom `apply_patch` tool, or a namespace whose first tool list holds one.
-fn declares(doc: &Document, tool: usize) -> codec::Result<bool> {
-    if named_patch(doc, tool, "custom")? {
-        return Ok(true);
-    }
-    if !kind_is(doc, tool, "namespace")? {
-        return Ok(false);
-    }
-    for key in ["tools", "children"] {
-        if let Some(list) = member(doc, tool, key)?
-            && matches!(doc.node(list)?.value, Value::Array)
+fn validate_custom_tool(doc: &Document, tool: usize) -> codec::Result<()> {
+    if kind_is(doc, tool, "custom")? {
+        let format = doc.required(tool, "format")?;
+        if !kind_is(doc, format, "grammar")?
+            || !text_is(doc, doc.required(format, "syntax")?, "lark", false)?
+            || !matches!(
+                doc.node(doc.required(format, "definition")?)?.value,
+                Value::String(_) | Value::Text(_)
+            )
         {
-            for child in doc.children(list)? {
-                if declares(doc, child)? {
-                    return Ok(true);
-                }
-            }
-            return Ok(false);
+            return Err(codec::Error::Schema);
         }
     }
-    Ok(false)
-}
-
-/// A custom `apply_patch` choice, alone or in the tools an `allowed_tools` choice allows. Other
-/// members of a choice are not choices.
-fn chooses(doc: &Document, choice: usize) -> codec::Result<bool> {
-    if named_patch(doc, choice, "custom")? {
-        return Ok(true);
-    }
-    if !kind_is(doc, choice, "allowed_tools")? {
-        return Ok(false);
-    }
-    let Some(tools) = member(doc, choice, "tools")? else {
-        return Ok(false);
-    };
-    for child in doc.children(tools)? {
-        if named_patch(doc, child, "custom")? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// A turn that calls the custom `apply_patch` tool, or an `additional_tools` item (kept as an
-/// opaque Responses part) that declares it.
-fn replays(doc: &Document, message: usize) -> codec::Result<bool> {
-    if let Some(calls) = member(doc, message, "tool_calls")? {
-        for call in doc.children(calls)? {
-            if kind_is(doc, call, "custom")?
-                && let Some(function) = member(doc, call, "function")?
-                && let Some(name) = member(doc, function, "name")?
-                && text_is(doc, name, "apply_patch", true)?
-            {
-                return Ok(true);
-            }
-        }
-    }
-    let Some(content) = member(doc, message, "content")? else {
-        return Ok(false);
-    };
-    for part in doc.children(content)? {
-        if kind_is(doc, part, "opaque")?
-            && let Some(item) = member(doc, part, "value")?
-            && kind_is(doc, item, "additional_tools")?
-            && let Some(tools) = member(doc, item, "tools")?
-        {
-            for tool in doc.children(tools)? {
-                if declares(doc, tool)? {
-                    return Ok(true);
+    if kind_is(doc, tool, "namespace")? {
+        for key in ["tools", "children"] {
+            if let Some(list) = member(doc, tool, key)? {
+                for child in doc.children(list)? {
+                    validate_custom_tool(doc, child)?;
                 }
             }
         }
     }
-    Ok(false)
-}
-
-/// An object of type `kind` whose `name` is `apply_patch` (Go trims the name).
-fn named_patch(doc: &Document, object: usize, kind: &str) -> codec::Result<bool> {
-    if !kind_is(doc, object, kind)? {
-        return Ok(false);
-    }
-    match member(doc, object, "name")? {
-        Some(name) => text_is(doc, name, "apply_patch", true),
-        None => Ok(false),
-    }
+    Ok(())
 }
 
 /// Whether node `object` is an object whose `type` is the string `kind`.

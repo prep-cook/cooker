@@ -484,14 +484,15 @@ where
         crate::http::respond::keepalive(&rt.config())
     } else {
         nonstream_keepalive(&call, &rt.config())
-    };
+    }
+    .filter(|_| !waits_for_kimi_proof(rt, &call));
     let trace = Arc::new(Trace::with_request_id(crate::observability::api::current_request_id()));
     let mut run = Box::pin({
         let (rt, trace) = (rt.clone(), trace.clone());
         async move {
             let result = run_with_bootstrap_retries(&rt, call, &trace).await;
             let cfg = rt.config();
-            let upstream = upstream_headers(&cfg, &result);
+            let upstream = upstream_headers(&cfg, &result, trace.served_by_kimi(&rt));
             let result = match result {
                 // Go's speech handler reads the downstream headers the execution hands
                 // back (`downstreamHeadersAfterInterceptors`): the final filtered headers
@@ -611,17 +612,60 @@ enum Upstream {
 
 /// An error contributes only its [`ExecError::addon`] (Go `executionErrorMessage` reads
 /// `Headers()`); speech errors, like most, carry none.
-fn upstream_headers(cfg: &Config, result: &Result<Done, Failure>) -> Option<Upstream> {
-    if !respond::passthrough_headers(cfg) {
+///
+/// A Kimi credential's proof headers reach the client even without passthrough.
+fn upstream_headers(cfg: &Config, result: &Result<Done, Failure>, kimi: bool) -> Option<Upstream> {
+    let passthrough = respond::passthrough_headers(cfg);
+    if !passthrough && !kimi {
         return None;
     }
     match result {
         Ok(Done::Buffered { headers, .. } | Done::Stream { headers, .. }) => {
-            Some(Upstream::Success(respond::filter_upstream_headers(headers)))
+            let filtered = respond::filter_upstream_headers(headers);
+            if passthrough {
+                return Some(Upstream::Success(filtered));
+            }
+            let mut proof = HeaderMap::new();
+            for name in ["msh-request-timestamp", "msh-request-signature"] {
+                for value in filtered.get_all(name) {
+                    proof.append(name, value.clone());
+                }
+            }
+            Some(Upstream::Success(proof))
         }
-        Err(Failure::Exec(error)) if !error.direct => error.addon.as_deref().cloned().map(Upstream::Error),
+        Err(Failure::Exec(error)) if passthrough && !error.direct => {
+            error.addon.as_deref().cloned().map(Upstream::Error)
+        }
         Err(_) => None,
     }
+}
+
+/// Whether a keep-alive would commit the response headers before a Kimi proof can reach them:
+/// the client sent a nonce (a model router may pick the provider after the first beat), or the
+/// call can reach a Kimi credential carrying a configured nonce.
+fn waits_for_kimi_proof(rt: &Runtime, call: &Call) -> bool {
+    if call.headers.contains_key("x-msh-request-nonce") {
+        return true;
+    }
+    // A configured router can shadow a non-Kimi registry model before selection.
+    let routers = call.forced_provider.is_none()
+        && call.media.is_none()
+        && rt.config().document["model-routers"]
+            .as_sequence()
+            .is_some_and(|r| !r.is_empty());
+    if !routers
+        && let Ok((providers, _)) = route(rt, &rt.registry(), call)
+        && !providers.iter().any(|p| ck_exec::kimi::PROVIDERS.contains(&p.as_str()))
+    {
+        return false;
+    }
+    rt.store().snapshot().iter().any(|credential| {
+        ck_exec::kimi::PROVIDERS.contains(&credential.provider.as_str())
+            && credential
+                .attributes
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case("header:X-Msh-Request-Nonce") && !value.trim().is_empty())
+    })
 }
 
 /// `requests.nonstream-keepalive-interval` seconds (Go `NonStreamingKeepAliveInterval`;
@@ -841,6 +885,13 @@ impl Trace {
 
     fn stopped(&self) -> bool {
         self.7.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the last selected credential is a Kimi one.
+    fn served_by_kimi(&self, rt: &Runtime) -> bool {
+        let id = self.6.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        id.and_then(|id| rt.store().get(&id))
+            .is_some_and(|c| ck_exec::kimi::PROVIDERS.contains(&c.provider.as_str()))
     }
 
     /// The provider selector (`routing.providers`) of the last selected credential.
