@@ -207,12 +207,16 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 cooker \
  && useradd --system --uid 10001 --gid 10001 --home-dir /data --shell /usr/sbin/nologin cooker \
- && mkdir -p /data \
- && chown cooker:cooker /data
+ && mkdir -p /data /run/cooker-runtime \
+ && chown cooker:cooker /data /run/cooker-runtime \
+ && chmod 0700 /run/cooker-runtime
 COPY --from=build /home/builder/out/cooker /usr/local/bin/cooker
 # The license, the MIT notices it carries forward, and the third-party licenses the binary needs.
 COPY LICENSE LICENSE-MIT NOTICE THIRD-PARTY-NOTICES /usr/share/doc/cooker/
 USER cooker
+# The stream pool opens under $XDG_RUNTIME_DIR/cooker. Mount a tmpfs there so pooled bodies
+# stay in memory: --tmpfs /run/cooker-runtime:rw,noexec,nosuid,mode=0700,uid=10001,gid=10001
+ENV XDG_RUNTIME_DIR=/run/cooker-runtime
 # The config database (/data/cooker.db) and credentials live in /data; mount a volume there.
 # A first start imports /data/config.yaml when it exists, and otherwise starts with defaults
 # on port 8317. No VOLUME instruction: some hosts, Railway among them, refuse to build a

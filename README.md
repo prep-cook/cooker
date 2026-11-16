@@ -10,7 +10,7 @@ cooker ships as the Docker image `ghcr.io/prep-cook/cooker` (tags `<version>` su
 ```sh
 mkdir -m 700 -p data
 sudo chown -R 10001:10001 data
-docker run -d --name cooker -p 127.0.0.1:8317:8317 -v "$PWD/data:/data" -e CK_MANAGEMENT_PASSWORD='REPLACE-WITH-A-STRONG-PASSWORD' ghcr.io/prep-cook/cooker:latest
+docker run -d --name cooker -p 127.0.0.1:8317:8317 -v "$PWD/data:/data" --tmpfs /run/cooker-runtime:rw,noexec,nosuid,mode=0700,uid=10001,gid=10001 -e CK_MANAGEMENT_PASSWORD='REPLACE-WITH-A-STRONG-PASSWORD' ghcr.io/prep-cook/cooker:latest
 ```
 
 An empty volume starts with defaults on port 8317 and creates `/data/cooker.db`. Open <http://127.0.0.1:8317/management.html> and sign in with the password you passed. Without `CK_MANAGEMENT_PASSWORD` (or `management.secret-key` in an imported `data/config.yaml`), every management request answers 403 and the dashboard cannot sign in. See [docs/INSTALL.md](docs/INSTALL.md) for the config file, upgrades, backups and building from source.
