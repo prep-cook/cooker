@@ -84,23 +84,21 @@ impl Usage {
                 e.unsigned(value)?;
             }
         }
-        if let Some(ttl) = object_member(doc, root, "cache_creation")? {
-            let mut first = true;
-            for (native, seconds) in [
-                ("ephemeral_5m_input_tokens", "300"),
-                ("ephemeral_1h_input_tokens", "3600"),
-            ] {
-                if let Some(value) = count(doc, ttl, native)? {
-                    e.bytes(if first { b",\"cache_write_by_ttl\":{" } else { b"," })?;
-                    first = false;
-                    e.string(seconds)?;
-                    e.bytes(b":")?;
-                    e.unsigned(value)?;
-                }
+        let mut first = true;
+        for (native, seconds) in [
+            ("ephemeral_5m_input_tokens", "300"),
+            ("ephemeral_1h_input_tokens", "3600"),
+        ] {
+            if let Some(value) = billed_ttl(doc, root, native)? {
+                e.bytes(if first { b",\"cache_write_by_ttl\":{" } else { b"," })?;
+                first = false;
+                e.string(seconds)?;
+                e.bytes(b":")?;
+                e.unsigned(value)?;
             }
-            if !first {
-                e.bytes(b"}")?;
-            }
+        }
+        if !first {
+            e.bytes(b"}")?;
         }
         if input.is_some() {
             e.bytes(b",\"derived\":[\"input_tokens\"")?;
@@ -131,12 +129,23 @@ const BILLED: [&str; 4] = [
 /// reports its tokens only there and leaves the top level at 0, and with server-side compaction
 /// the top level leaves the compaction iterations out. Otherwise the top-level count.
 fn billed(doc: &Document, root: usize, key: &str) -> Result<Option<u64>> {
+    summed(doc, root, |node| count(doc, node, key))
+}
+/// A cache-write TTL bucket of `cache_creation`, from the usage objects [`billed`] reads.
+fn billed_ttl(doc: &Document, root: usize, key: &str) -> Result<Option<u64>> {
+    summed(doc, root, |node| match object_member(doc, node, "cache_creation")? {
+        Some(ttl) => count(doc, ttl, key),
+        None => Ok(None),
+    })
+}
+/// `read` of the top level, or the sum of what it reads in each of the usage's `iterations`.
+fn summed(doc: &Document, root: usize, read: impl Fn(usize) -> Result<Option<u64>>) -> Result<Option<u64>> {
     let Some(iterations) = iterations(doc, root)? else {
-        return count(doc, root, key);
+        return read(root);
     };
     let mut total: Option<u64> = None;
     for entry in doc.children(iterations)? {
-        if let Some(value) = count(doc, entry, key)? {
+        if let Some(value) = read(entry)? {
             total = Some(total.unwrap_or(0).checked_add(value).ok_or(Error::Schema)?);
         }
     }

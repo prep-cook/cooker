@@ -767,11 +767,41 @@ pub fn parse_codex(data: &[u8]) -> Option<Detail> {
 }
 
 /// Go `parseClaudeUsageNode`: cache buckets are separate from `input_tokens`;
-/// thinking is part of `output_tokens`.
+/// thinking is part of `output_tokens`. A usage listing `iterations` bills their sum, as the
+/// canonical Anthropic reader does: an on-demand compaction reports its tokens only there and
+/// leaves the top level at 0, and server-side compaction leaves its iteration out of the top level.
 fn parse_claude_node(node: &Res<'_>) -> Detail {
-    let cache_read = node.get("cache_read_input_tokens").int();
-    let cache_creation = node.get("cache_creation_input_tokens").int();
-    let output = node.get("output_tokens").int();
+    let iterations = node.get("iterations");
+    let iterations = if iterations.is_array() {
+        iterations.array()
+    } else {
+        Vec::new()
+    };
+    let billed = |key: &str| match iterations.as_slice() {
+        [] => node.get(key).int(),
+        entries => entries
+            .iter()
+            .map(|entry| entry.get(key).int())
+            .fold(0i64, i64::wrapping_add),
+    };
+    // A cache-write TTL bucket comes from the usage objects its write count comes from; absent
+    // when none of them splits its writes.
+    let ttl = |path: &str| {
+        let objects = if iterations.is_empty() {
+            std::slice::from_ref(node)
+        } else {
+            iterations.as_slice()
+        };
+        objects
+            .iter()
+            .map(|object| object.get(path))
+            .filter(Res::exists)
+            .map(|count| count.int())
+            .reduce(i64::wrapping_add)
+    };
+    let cache_read = billed("cache_read_input_tokens");
+    let cache_creation = billed("cache_creation_input_tokens");
+    let output = billed("output_tokens");
     let reasoning = first(
         node,
         &[
@@ -790,20 +820,14 @@ fn parse_claude_node(node: &Res<'_>) -> Detail {
         output
     };
     let mut d = Detail {
-        input: node.get("input_tokens").int(),
+        input: billed("input_tokens"),
         output,
         reasoning,
         cached: cache_read,
         cache_read,
         cache_creation,
-        cache_creation_5m: node
-            .get("cache_creation.ephemeral_5m_input_tokens")
-            .exists()
-            .then(|| node.get("cache_creation.ephemeral_5m_input_tokens").int()),
-        cache_creation_1h: node
-            .get("cache_creation.ephemeral_1h_input_tokens")
-            .exists()
-            .then(|| node.get("cache_creation.ephemeral_1h_input_tokens").int()),
+        cache_creation_5m: ttl("cache_creation.ephemeral_5m_input_tokens"),
+        cache_creation_1h: ttl("cache_creation.ephemeral_1h_input_tokens"),
         response_service_tier: native_tier("anthropic", node),
         dimensions: native_dimensions("anthropic", node),
         dimension_members: reported_members("anthropic", node),
@@ -1079,6 +1103,8 @@ fn merge_dimensions(update: &mut Detail, existing: &Detail) {
 pub struct StreamUsage {
     detail: Detail,
     ok: bool,
+    /// Each choice's latest choice-local usage, by choice index ([`Self::choice_usage`]).
+    choices: Vec<(i64, Detail)>,
 }
 
 impl StreamUsage {
@@ -1169,6 +1195,9 @@ impl StreamUsage {
             if has_openai_token_fields(&node) {
                 detail = parse_openai_node(&node);
                 usage_ok = true;
+            } else if let Some(choices) = self.choice_usage(payload) {
+                detail = choices;
+                usage_ok = true;
             }
         }
         if tier_candidate {
@@ -1177,6 +1206,40 @@ impl StreamUsage {
         if usage_ok || !detail.response_service_tier.is_empty() {
             self.observe(detail);
         }
+    }
+
+    /// Kimi's usage in `choices[i].usage` of each choice's last chunk, a stream without an
+    /// aggregate: every choice reports the same prompt and its own completion. The usage is the
+    /// prompt once and the completions summed, each choice's latest report replacing its earlier
+    /// one. A later top-level usage replaces the whole detail ([`Self::observe`]).
+    fn choice_usage(&mut self, payload: &[u8]) -> Option<Detail> {
+        let mut last = None;
+        for choice in gj::get(payload, "choices").array() {
+            let node = choice.get("usage");
+            if !has_openai_token_fields(&node) {
+                continue;
+            }
+            let detail = parse_openai_node(&node);
+            let index = choice.get("index").int();
+            match self.choices.iter_mut().find(|(i, _)| *i == index) {
+                Some((_, slot)) => *slot = detail.clone(),
+                None => self.choices.push((index, detail.clone())),
+            }
+            last = Some(detail);
+        }
+        let mut d = last?;
+        d.output = self.choices.iter().map(|(_, c)| c.output).fold(0, i64::wrapping_add);
+        d.reasoning = self.choices.iter().map(|(_, c)| c.reasoning).fold(0, i64::wrapping_add);
+        d.total = d.input.wrapping_add(d.output);
+        d.breakdown = Some(subset(
+            d.input,
+            d.cache_read,
+            d.cache_creation,
+            d.output,
+            d.reasoning,
+            d.total,
+        ));
+        Some(d)
     }
 
     /// One client-visible stream line of `format`.
@@ -2154,12 +2217,60 @@ struct Reported {
     claude_cache: Option<ck_core::exec::ClaudeCacheTelemetry>,
     /// The executor type and model of the built-in executor the attempt was handed to.
     delegated: Option<(String, String)>,
+    /// Kimi's cache-write TTL: the Chat request's, or the one a Responses response says it applied.
+    kimi_cache_ttl: Option<KimiCacheTtl>,
+}
+
+/// A Kimi `prompt_cache_options.ttl`. Kimi bills a cache write by the TTL it was written with and
+/// reports no TTL in the usage; an omitted option writes at 5m.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KimiCacheTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+impl KimiCacheTtl {
+    /// The TTL of a request or response's `prompt_cache_options` at `path`, if it names one.
+    fn at(payload: &[u8], path: &str) -> Option<Self> {
+        match gj::get(payload, path).str().as_ref() {
+            "5m" => Some(Self::FiveMinutes),
+            "1h" => Some(Self::OneHour),
+            _ => None,
+        }
+    }
 }
 
 impl Reported {
-    /// The usage reported so far: a body, else the stream's last usage.
+    /// The usage reported so far: a body, else the stream's last usage. A Kimi Chat or Responses
+    /// cache write lands in the bucket of the TTL it was written with; the input still counts it
+    /// once.
     fn usage(&self) -> Option<Detail> {
-        self.body.clone().or_else(|| self.stream.detail().cloned())
+        let mut d = self.body.clone().or_else(|| self.stream.detail().cloned())?;
+        if let Some(ttl) = self.kimi_cache_ttl
+            && d.cache_creation > 0
+        {
+            let bucket = match ttl {
+                KimiCacheTtl::FiveMinutes => &mut d.cache_creation_5m,
+                KimiCacheTtl::OneHour => &mut d.cache_creation_1h,
+            };
+            *bucket = Some(d.cache_creation);
+        }
+        Some(d)
+    }
+
+    /// A Kimi Responses response's applied `prompt_cache_options`, from the buffered response
+    /// object or a stream event's `response`. Chat responses echo none.
+    fn kimi_applied_ttl(&mut self, payload: &[u8]) {
+        const MEMBER: &[u8] = b"\"prompt_cache_options\"";
+        let payload = json_payload(payload).unwrap_or(payload);
+        if !payload.windows(MEMBER.len()).any(|w| w == MEMBER) {
+            return;
+        }
+        if let Some(ttl) = KimiCacheTtl::at(payload, "response.prompt_cache_options.ttl")
+            .or_else(|| KimiCacheTtl::at(payload, "prompt_cache_options.ttl"))
+        {
+            self.kimi_cache_ttl = Some(ttl);
+        }
     }
 }
 
@@ -2172,6 +2283,11 @@ struct Observer {
 }
 
 impl Observer {
+    /// The attempt runs on the Kimi executor, under any provider name it serves.
+    fn kimi(&self) -> bool {
+        ck_exec::kimi::PROVIDERS.contains(&self.provider.as_str())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Reported> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -2213,6 +2329,9 @@ impl ck_core::exec::UsageObserver for Observer {
         r.seen = true;
         r.body = Some(parse_body(format, body));
         r.model.observe(body, &self.provider);
+        if self.kimi() {
+            r.kimi_applied_ttl(body);
+        }
     }
 
     fn response_line(&self, format: Format, line: &[u8]) {
@@ -2220,6 +2339,9 @@ impl ck_core::exec::UsageObserver for Observer {
         r.seen = true;
         r.stream.line(format, line);
         r.model.observe(line, &self.provider);
+        if self.kimi() {
+            r.kimi_applied_ttl(line);
+        }
     }
 
     fn response_usage_line(&self, format: Format, line: &[u8]) {
@@ -2237,9 +2359,17 @@ impl ck_core::exec::UsageObserver for Observer {
     }
 
     fn request_for(&self, identifier: &str, payload: &[u8]) {
-        self.lock().effort = Some(ck_wire::thinking::extract_translated_reasoning_effort(
+        let mut r = self.lock();
+        r.effort = Some(ck_wire::thinking::extract_translated_reasoning_effort(
             payload, identifier,
         ));
+        // Kimi's Chat and Responses requests (identifier `kimi`) carry `prompt_cache_options`; a
+        // Messages request delegated to Claude reports its own buckets, never inferred from the
+        // requested TTL.
+        if self.kimi() && identifier == "kimi" {
+            r.kimi_cache_ttl =
+                Some(KimiCacheTtl::at(payload, "prompt_cache_options.ttl").unwrap_or(KimiCacheTtl::FiveMinutes));
+        }
     }
 
     fn upstream_model(&self, model: &str) {
@@ -3502,6 +3632,256 @@ mod tests {
                 rt.usage_queue().pop_oldest(10).is_empty(),
                 "discarded attempt (fail: {fail})"
             );
+        }
+    }
+
+    /// What an executor reports reaches the queued record's token counts: one record whose counts
+    /// are the upstream's, whatever shape the provider reports them in.
+    #[test]
+    fn provider_reported_usage_reaches_the_record() {
+        // Anthropic on-demand compaction bills only in `iterations` and leaves the top level at 0;
+        // server-side compaction leaves its iteration out of the top level.
+        const COMPACTED: &str = r#"{"input_tokens":0,"output_tokens":0,"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217}]}"#;
+        const ITERATION_WRITES: &str = r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217,"cache_read_input_tokens":0,"cache_creation_input_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":15}}]}"#;
+        const ITERATION_WRITES_UNSPLIT: &str = r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":0},"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217,"cache_read_input_tokens":0,"cache_creation_input_tokens":20}]}"#;
+        const SERVER_COMPACTED: &str = r#"{"input_tokens":30,"output_tokens":5,"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217},{"type":"message","input_tokens":30,"output_tokens":5}]}"#;
+        // Kimi reports each choice's usage in that choice's last chunk: the same prompt, its own
+        // completion.
+        let choice = |index: u8, completion: u8| {
+            format!(
+                r#"data: {{"id":"c","model":"kimi-k3","choices":[{{"index":{index},"delta":{{}},"finish_reason":"stop","usage":{{"prompt_tokens":10,"completion_tokens":{completion},"total_tokens":{}}}}}]}}"#,
+                10 + u16::from(completion)
+            )
+        };
+        let aggregate = r#"data: {"id":"c","model":"kimi-k3","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":13,"total_tokens":23}}"#;
+        // Kimi bills a cache write by the TTL it was written with; the usage reports no TTL.
+        let chat_request = |options: &str| format!(r#"{{"model":"kimi-k3","messages":[]{options}}}"#);
+        let chat_write = r#"data: {"id":"c","model":"kimi-k3","choices":[],"usage":{"prompt_tokens":300,"completion_tokens":5,"total_tokens":305,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":256}}}"#;
+        let responses_write = |ttl: &str| {
+            format!(
+                r#"{{"id":"r","object":"response","prompt_cache_options":{{"mode":"implicit","ttl":"{ttl}"}},"usage":{{"input_tokens":300,"output_tokens":5,"total_tokens":305,"input_tokens_details":{{"cached_tokens":0,"cache_write_tokens":256}}}}}}"#
+            )
+        };
+        enum Report {
+            Body(Format, String),
+            Lines(Format, Vec<String>),
+            /// The lines, then an upstream failure that keeps the usage seen so far.
+            Cut(Format, Vec<String>),
+        }
+        let claude_lines = |usage: &str| {
+            vec![
+                r#"data: {"type":"message_start","message":{"model":"claude-haiku-5-5","usage":{"input_tokens":0,"output_tokens":0}}}"#.to_owned(),
+                format!(r#"data: {{"type":"message_delta","delta":{{"stop_reason":"compaction"}},"usage":{usage}}}"#),
+            ]
+        };
+        // (label, provider, request as (identifier, body), report, expected tokens).
+        type Row = (
+            &'static str,
+            &'static str,
+            Option<(&'static str, String)>,
+            Report,
+            Value,
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "buffered compaction bills its iterations",
+                "claude",
+                None,
+                Report::Body(Format::Claude, format!(r#"{{"usage":{COMPACTED}}}"#)),
+                serde_json::json!({"input_tokens": 119, "output_tokens": 217, "total_tokens": 336}),
+            ),
+            (
+                "streamed compaction bills its iterations",
+                "claude",
+                None,
+                Report::Lines(Format::Claude, claude_lines(COMPACTED)),
+                serde_json::json!({"input_tokens": 119, "output_tokens": 217, "total_tokens": 336}),
+            ),
+            (
+                "server-side compaction bills every iteration",
+                "claude",
+                None,
+                Report::Body(Format::Claude, format!(r#"{{"usage":{SERVER_COMPACTED}}}"#)),
+                serde_json::json!({"input_tokens": 149, "output_tokens": 222, "total_tokens": 371}),
+            ),
+            (
+                "compaction iteration cache writes keep their TTL split",
+                "claude",
+                None,
+                Report::Lines(Format::Claude, claude_lines(ITERATION_WRITES)),
+                serde_json::json!({"input_tokens": 119, "cache_creation_tokens": 20, "cache_creation_5m_tokens": 5, "cache_creation_1h_tokens": 15}),
+            ),
+            (
+                "a top-level TTL split does not cover compaction iteration writes",
+                "claude",
+                None,
+                Report::Lines(Format::Claude, claude_lines(ITERATION_WRITES_UNSPLIT)),
+                serde_json::json!({"input_tokens": 119, "cache_creation_tokens": 20}),
+            ),
+            (
+                "choice usage counts the prompt once and each completion",
+                "kimi",
+                None,
+                Report::Lines(Format::OpenAI, vec![choice(0, 5), choice(1, 7)]),
+                serde_json::json!({"input_tokens": 10, "output_tokens": 12, "total_tokens": 22}),
+            ),
+            (
+                "a later choice report replaces that choice's",
+                "kimi",
+                None,
+                Report::Lines(Format::OpenAI, vec![choice(0, 5), choice(1, 7), choice(1, 9)]),
+                serde_json::json!({"input_tokens": 10, "output_tokens": 14, "total_tokens": 24}),
+            ),
+            (
+                "an aggregate after choice usage replaces it",
+                "kimi",
+                None,
+                Report::Lines(Format::OpenAI, vec![choice(0, 5), choice(1, 7), aggregate.to_owned()]),
+                serde_json::json!({"input_tokens": 10, "output_tokens": 13, "total_tokens": 23}),
+            ),
+            (
+                "a disconnect keeps the choice usage already reported",
+                "kimi",
+                None,
+                Report::Cut(Format::OpenAI, vec![choice(0, 5)]),
+                serde_json::json!({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}),
+            ),
+            (
+                "a Chat cache write is billed at the requested 1h TTL",
+                "kimi",
+                Some(("kimi", chat_request(
+                    r#","prompt_cache_options":{"mode":"implicit","ttl":"1h"}"#,
+                ))),
+                Report::Lines(Format::OpenAI, vec![chat_write.to_owned()]),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_1h_tokens": 256}),
+            ),
+            (
+                "a Kimi.ai Chat cache write is billed at the requested 1h TTL",
+                "kimi-ai",
+                Some((
+                    "kimi",
+                    chat_request(r#","prompt_cache_options":{"mode":"implicit","ttl":"1h"}"#),
+                )),
+                Report::Lines(Format::OpenAI, vec![chat_write.to_owned()]),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_1h_tokens": 256}),
+            ),
+            (
+                "a Chat cache write is billed at the requested 5m TTL",
+                "kimi",
+                Some(("kimi", chat_request(
+                    r#","prompt_cache_options":{"mode":"implicit","ttl":"5m"}"#,
+                ))),
+                Report::Lines(Format::OpenAI, vec![chat_write.to_owned()]),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_5m_tokens": 256}),
+            ),
+            (
+                "a Chat cache write without options is billed at the default 5m TTL",
+                "kimi",
+                Some(("kimi", chat_request(""))),
+                Report::Lines(Format::OpenAI, vec![chat_write.to_owned()]),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_5m_tokens": 256}),
+            ),
+            (
+                "a delegated Messages response keeps the TTL buckets it reports",
+                "kimi",
+                Some((
+                    "claude",
+                    r#"{"model":"kimi-k3.1-pro","max_tokens":16,"messages":[],"cache_control":{"type":"ephemeral","ttl":"1h"}}"#.to_owned(),
+                )),
+                Report::Body(
+                    Format::Claude,
+                    r#"{"usage":{"input_tokens":9,"output_tokens":1,"cache_creation_input_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":7,"ephemeral_1h_input_tokens":5}}}"#.to_owned(),
+                ),
+                serde_json::json!({"cache_creation_tokens": 12, "cache_creation_5m_tokens": 7, "cache_creation_1h_tokens": 5}),
+            ),
+            (
+                "a Kimi Messages write without a TTL split fills no bucket",
+                "kimi",
+                Some((
+                    "claude",
+                    r#"{"model":"kimi-k3.1-pro","max_tokens":16,"messages":[],"cache_control":{"type":"ephemeral","ttl":"1h"}}"#.to_owned(),
+                )),
+                Report::Lines(
+                    Format::Claude,
+                    vec![
+                        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#.to_owned(),
+                        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":12}}"#.to_owned(),
+                    ],
+                ),
+                serde_json::json!({"cache_creation_tokens": 12}),
+            ),
+            (
+                "a response without a cache write fills no TTL bucket",
+                "kimi",
+                Some(("kimi", chat_request(
+                    r#","prompt_cache_options":{"mode":"implicit","ttl":"1h"}"#,
+                ))),
+                Report::Lines(Format::OpenAI, vec![choice(0, 5)]),
+                serde_json::json!({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}),
+            ),
+            (
+                "a Responses cache write is billed at the applied TTL, not the requested one",
+                "kimi",
+                Some(("kimi", r#"{"model":"kimi-k3","input":"hi","prompt_cache_options":{"ttl":"5m"}}"#.to_owned())),
+                Report::Body(Format::Codex, responses_write("1h")),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_1h_tokens": 256}),
+            ),
+            (
+                "a streamed Responses cache write is billed at the applied TTL",
+                "kimi",
+                Some(("kimi", r#"{"model":"kimi-k3","input":"hi","prompt_cache_options":{"ttl":"1h"}}"#.to_owned())),
+                // What the Kimi executor's stream tap reports: each event live without its usage,
+                // then the held usage once the stream succeeded.
+                Report::Lines(
+                    Format::Codex,
+                    vec![
+                        r#"data: {"type":"response.completed","response":{"prompt_cache_options":{"mode":"implicit","ttl":"5m"}}}"#.to_owned(),
+                        r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":300,"output_tokens":5,"total_tokens":305,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":256}}}}"#.to_owned(),
+                    ],
+                ),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_5m_tokens": 256}),
+            ),
+        ];
+        let rt = usage_runtime();
+        for (label, provider, request, report, expected) in rows {
+            let facts = std::sync::Arc::new(Facts::new(
+                Client::default(),
+                Format::OpenAI,
+                Format::OpenAI,
+                "m",
+                b"{}",
+                true,
+                &crate::inference::dispatch::Trace::default(),
+            ));
+            let tracker = Tracker::start(&rt, &facts, &credential_for(provider), "m");
+            let sink = tracker.sink();
+            if let Some((identifier, request)) = request {
+                sink.request_for(identifier, request.as_bytes());
+            }
+            match report {
+                Report::Body(format, body) => sink.response_body(format, body.as_bytes()),
+                Report::Lines(format, lines) => lines.iter().for_each(|l| sink.response_line(format, l.as_bytes())),
+                Report::Cut(format, lines) => {
+                    lines.iter().for_each(|l| sink.response_line(format, l.as_bytes()));
+                    sink.publish_failure_with_usage(0, "upstream stream ended");
+                }
+            }
+            tracker.succeed();
+            let raw = rt.usage_queue().pop_oldest(10);
+            assert_eq!(raw.len(), 1, "{label}: one record");
+            let tokens = &serde_json::from_slice::<Value>(&raw[0]).unwrap()["tokens"];
+            let got: serde_json::Map<String, Value> = expected
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| (k.clone(), tokens[k].clone()))
+                .collect();
+            assert_eq!(Value::Object(got), expected, "{label}: {tokens}");
+            for bucket in ["cache_creation_5m_tokens", "cache_creation_1h_tokens"] {
+                if expected.get(bucket).is_none() {
+                    assert!(tokens.get(bucket).is_none(), "{label}: {tokens}");
+                }
+            }
         }
     }
 

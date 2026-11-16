@@ -253,6 +253,8 @@ pub struct Usage {
     scopes: Vec<(Option<String>, CanonicalUsage)>,
     /// Each scope's slot in `scopes`.
     slots: std::collections::HashMap<Option<String>, usize>,
+    /// The attempt's choice-scoped snapshots by choice index, latest per choice ([`Self::choice`]).
+    choices: Vec<(u64, CanonicalUsage)>,
 }
 
 impl Usage {
@@ -277,6 +279,32 @@ impl Usage {
                 self.scopes.push((scope, usage));
             }
         }
+    }
+
+    /// Replaces choice `index`'s snapshot. Each choice reports the shared prompt and its own
+    /// completion (Kimi's `choices[i].usage`): the attempt's usage is the prompt once and the
+    /// completions summed. An attempt-wide snapshot replaces it, and the Chat codec publishes that
+    /// after every choice's.
+    fn choice(&mut self, index: u64, usage: CanonicalUsage) {
+        match self.choices.iter_mut().find(|(i, _)| *i == index) {
+            Some((_, slot)) => *slot = usage.clone(),
+            None => self.choices.push((index, usage.clone())),
+        }
+        let sum = |count: fn(&CanonicalUsage) -> Option<u64>| {
+            self.choices
+                .iter()
+                .filter_map(|(_, c)| count(c))
+                .reduce(u64::saturating_add)
+        };
+        let output_tokens = sum(|c| c.output_tokens);
+        let combined = CanonicalUsage {
+            output_tokens,
+            reasoning_tokens: sum(|c| c.reasoning_tokens),
+            total_tokens: usage.input_tokens.zip(output_tokens).map(|(a, b)| a.saturating_add(b)),
+            final_snapshot: self.choices.iter().all(|(_, c)| c.final_snapshot),
+            ..usage
+        };
+        self.replace(None, combined);
     }
 }
 
@@ -314,8 +342,10 @@ pub async fn read(mut stream: Writer, mut reader: Reader) -> (Usage, ResponseFac
 /// Replaces the snapshot of the scope a `usage` record names with the record's.
 pub(crate) fn observe(doc: &Document, usage: &mut Usage) -> codec::Result<()> {
     let snapshot = snapshot(doc)?;
-    let scope = text(doc, "scope")?.flatten();
-    usage.replace(scope, snapshot);
+    match (text(doc, "scope")?.flatten(), choice_index(doc)?) {
+        (None, Some(index)) => usage.choice(index, snapshot),
+        (scope, _) => usage.replace(scope, snapshot),
+    }
     Ok(())
 }
 
@@ -424,6 +454,14 @@ fn native_tier(doc: &Document, usage: usize) -> codec::Result<Option<String>> {
         return Ok(Some(tier));
     }
     Ok(None)
+}
+
+/// The `x_ck.choice_index` a record is scoped to.
+fn choice_index(doc: &Document) -> codec::Result<Option<u64>> {
+    match at(doc, doc.root(), &["x_ck", "choice_index"])? {
+        Some(node) => doc.unsigned(node).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// The root member `name`: `None` when absent, `Some(None)` for `null`, else its text.

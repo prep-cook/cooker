@@ -85,7 +85,8 @@ fn anything_but_one_compaction_block_is_invalid_upstream_data() {
 }
 
 /// With server-side compaction the top level leaves the compaction iteration out, so the bill
-/// is the sum of every iteration; without `iterations` it is the top level.
+/// is the sum of every iteration; without `iterations` it is the top level. A cache write's TTL
+/// split comes from the same usage objects as its count.
 #[test]
 fn every_iteration_is_billed() {
     let message = |usage: &str| {
@@ -103,18 +104,35 @@ fn every_iteration_is_billed() {
             5,
         );
         let usage = canonical.iter().rev().find_map(|e| e.get("usage")).unwrap().clone();
-        (usage["input_tokens"].clone(), usage["output_tokens"].clone())
+        json!([
+            usage["input_tokens"],
+            usage["output_tokens"],
+            usage["cache_write_tokens"],
+            usage["cache_write_by_ttl"]
+        ])
     };
-    let iterations = r#"{"input_tokens":30,"output_tokens":5,"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217},{"type":"message","input_tokens":30,"output_tokens":5}]}"#;
-    assert_eq!(billed(iterations), (json!(149), json!(222)));
-    assert_eq!(
-        billed(r#"{"input_tokens":30,"output_tokens":5}"#),
-        (json!(30), json!(5))
-    );
-    assert_eq!(
-        billed(r#"{"input_tokens":30,"output_tokens":5,"iterations":[]}"#),
-        (json!(30), json!(5))
-    );
+    // (usage, [input, output, cache write, cache write by TTL]).
+    for (usage, expected) in [
+        (
+            r#"{"input_tokens":30,"output_tokens":5,"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217},{"type":"message","input_tokens":30,"output_tokens":5}]}"#,
+            json!([149, 222, null, null]),
+        ),
+        (r#"{"input_tokens":30,"output_tokens":5}"#, json!([30, 5, null, null])),
+        (
+            r#"{"input_tokens":30,"output_tokens":5,"iterations":[]}"#,
+            json!([30, 5, null, null]),
+        ),
+        (
+            r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217,"cache_creation_input_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":15}}]}"#,
+            json!([139, 217, 20, {"300": 5, "3600": 15}]),
+        ),
+        (
+            r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":0},"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217,"cache_creation_input_tokens":20}]}"#,
+            json!([139, 217, 20, null]),
+        ),
+    ] {
+        assert_eq!(billed(usage), expected, "{usage}");
+    }
 }
 
 /// Fences an Anthropic client's `body` and encodes it for Anthropic; returns whether the request

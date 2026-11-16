@@ -359,3 +359,47 @@ pub(crate) fn report_model(sink: &ck_core::exec::UsageSink, format: ck_core::for
         None => sink.response_line(format, b"{}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    /// The lines a usage sink receives.
+    #[derive(Default)]
+    struct Lines(std::sync::Mutex<Vec<String>>);
+
+    impl ck_core::exec::UsageObserver for Lines {
+        fn response_line(&self, _: ck_core::format::Format, line: &[u8]) {
+            self.0.lock().unwrap().push(String::from_utf8_lossy(line).into_owned());
+        }
+        fn response_body(&self, _: ck_core::format::Format, _: &[u8]) {}
+        fn request(&self, _: ck_core::format::Format, _: &[u8]) {}
+    }
+
+    /// A tapped stream reports each line live without its usage, then the held usage on commit,
+    /// so the usage record still sees what the response says besides its usage.
+    #[tokio::test]
+    async fn the_sink_sees_each_line_then_the_held_usage() {
+        // (rule, upstream lines, lines the sink receives).
+        let rows = [(
+            UsageRule::KimiResponses,
+            vec![
+                r#"data: {"type":"response.completed","response":{"prompt_cache_options":{"mode":"implicit","ttl":"1h"},"usage":{"input_tokens":300,"output_tokens":5,"total_tokens":305,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":256}}}}"#,
+            ],
+            vec![
+                r#"data: {"type":"response.completed","response":{"prompt_cache_options":{"mode":"implicit","ttl":"1h"}}}"#,
+                r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":300,"output_tokens":5,"total_tokens":305,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":256}}}}"#,
+            ],
+        )];
+        for (rule, upstream, expected) in rows {
+            let log = std::sync::Arc::new(Lines::default());
+            let sink = ck_core::exec::UsageSink::new(log.clone());
+            let lines = upstream.iter().map(|l| Ok(bytes::Bytes::from(*l))).collect::<Vec<_>>();
+            let (tapped, deferred) = defer_usage(futures_util::stream::iter(lines).boxed(), &sink, rule);
+            tapped.collect::<Vec<_>>().await;
+            deferred.commit();
+            assert_eq!(*log.0.lock().unwrap(), expected, "{upstream:?}");
+        }
+    }
+}
