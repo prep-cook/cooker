@@ -759,7 +759,11 @@ impl Output {
             translator,
             client,
             raw: alt(req).is_some(),
-            claude: ClaudeInputTokens::new(req.source_format, upstream, client, original_request(req).clone()),
+            // A canonical attempt accounts the answer's usage, so no estimate may enter it.
+            claude: match options.reported_usage {
+                true => ClaudeInputTokens::new(req.source_format, upstream, client, Bytes::new()).disabled(),
+                false => ClaudeInputTokens::new(req.source_format, upstream, client, original_request(req).clone()),
+            },
             usage: req.usage.clone(),
             capture: req.capture().clone(),
             claude_errors: false,
@@ -884,13 +888,6 @@ impl Output {
     /// original request (Antigravity estimates its cleaned request).
     pub(crate) fn with_claude_original(mut self, original: Bytes) -> Self {
         self.claude = self.claude.with_original(original);
-        self
-    }
-
-    /// No Claude input-token estimate or zero default: a canonical attempt accounts the
-    /// usage in `message_start`, so it carries only counts the upstream reported.
-    pub(crate) fn reported_claude_usage(mut self) -> Self {
-        self.claude = self.claude.reported_only();
         self
     }
 

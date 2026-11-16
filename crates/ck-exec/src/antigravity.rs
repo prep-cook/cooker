@@ -481,28 +481,30 @@ impl AntigravityExecutor {
         req: ExecRequest,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
-        self.execute_with(credential, req, cfg, true).await
+        self.execute_with(credential, req, cfg, false).await
     }
 
     /// `execute` for the execution contract: the canonical stream accounts the usage in the
-    /// answer, so the answer carries no Claude input-token estimate or zero default.
+    /// answer, so the answer carries only counts the upstream sent, with no Claude
+    /// input-token estimate and no zero default.
     pub(crate) async fn execute_reported(
         &self,
         credential: &Credential,
         req: ExecRequest,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
-        self.execute_with(credential, req, cfg, false).await
+        self.execute_with(credential, req, cfg, true).await
     }
 
-    /// `claude_estimate`: a Claude client's `message_start` without input tokens gets the
-    /// O200kBase estimate of the request, as Go presents it; otherwise its zero counts go.
+    /// `reported_usage`: the answer's usage holds only counts the upstream sent. Otherwise a
+    /// Claude client's answer is presented as Go does: zero defaults and the O200kBase
+    /// estimate of the request's input.
     async fn execute_with(
         &self,
         credential: &Credential,
         req: ExecRequest,
         cfg: &Config,
-        claude_estimate: bool,
+        reported_usage: bool,
     ) -> Result<ExecResponse, ExecError> {
         if req.operation == Operation::CountTokens {
             return self.count_tokens(credential, req, cfg).await;
@@ -537,7 +539,7 @@ impl AntigravityExecutor {
         let model = parse_suffix(&req.model).model_name;
         self.check_cooldown(credential, cfg, &model)?;
         if req.stream {
-            self.stream(credential, req, cfg, &model, claude_estimate).await
+            self.stream(credential, req, cfg, &model, reported_usage).await
         } else if ag::merges_stream(&model) {
             self.merged(credential, req, cfg, &model).await
         } else {
@@ -795,7 +797,7 @@ impl AntigravityExecutor {
         mut req: ExecRequest,
         cfg: &Config,
         model: &str,
-        claude_estimate: bool,
+        reported_usage: bool,
     ) -> Result<ExecResponse, ExecError> {
         let prepared = self.prepare_request(credential, &mut req, cfg, model, true)?;
         let accumulator = replay::Accumulator::new(&prepared.replay, &prepared.body);
@@ -843,14 +845,12 @@ impl AntigravityExecutor {
         // split over lines before translating it.
         let options = ck_translate::stream::StreamOptions {
             whole_events: true,
+            reported_usage,
             ..Default::default()
         };
         let mut output = Output::with_options(&req, Format::Antigravity, &prepared.translated, options)
             .with_claude_original(req.body.clone())
             .fail_on_client_drop(gemini::DropRule::Antigravity { delivered: false });
-        if !claude_estimate {
-            output = output.reported_claude_usage();
-        }
         if let Some(commit) = commit {
             output = output.with_replay(commit);
         }

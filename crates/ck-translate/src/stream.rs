@@ -28,6 +28,9 @@ pub trait GoStream: Send {
     fn can_finalize_response_stream(&self) -> bool {
         false
     }
+    /// Leave out the usage counts Go fills with defaults; only counts the upstream sent stay.
+    /// Translators whose usage objects hold no defaults ignore it.
+    fn report_usage_only(&mut self) {}
 }
 
 /// bufio.ScanLines over one event: split on `\n`, drop one trailing `\r` per line, and
@@ -290,6 +293,9 @@ pub struct StreamOptions {
     /// framing (AI Studio's `ensureColonSpacedJSON`). The tool-input finalization is
     /// written without it, as Go's `EndApplyPatchStream` does.
     pub chunk: Option<ChunkHook>,
+    /// Usage objects carry only the counts the upstream sent, with no zero defaults, for an
+    /// answer whose usage the canonical stream accounts ([`GoStream::report_usage_only`]).
+    pub reported_usage: bool,
 }
 
 /// geminiInteractionsSSEPayload (gemini_executor.go): a JSON frame as is, else its

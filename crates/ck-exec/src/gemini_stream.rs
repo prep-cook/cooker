@@ -203,8 +203,6 @@ pub(crate) fn json_payload(line: &[u8]) -> Option<&[u8]> {
 pub(crate) struct ClaudeInputTokens {
     original: Bytes,
     handled: bool,
-    /// Removes the unreported zero counts instead of estimating them (`reported_only`).
-    reported: bool,
 }
 
 impl ClaudeInputTokens {
@@ -213,7 +211,6 @@ impl ClaudeInputTokens {
         Self {
             original,
             handled: !enabled,
-            reported: false,
         }
     }
 
@@ -223,11 +220,9 @@ impl ClaudeInputTokens {
         self
     }
 
-    /// The same state for an answer the canonical stream accounts: the first `message_start`
-    /// keeps only counts the upstream reported. Go reads a zero input count there as
-    /// unreported, so zero input and output counts are removed, not estimated.
-    pub(crate) fn reported_only(mut self) -> Self {
-        self.reported = true;
+    /// The same state, never estimating: `message_start` keeps the upstream's own counts.
+    pub(crate) fn disabled(mut self) -> Self {
+        self.handled = true;
         self
     }
 
@@ -280,29 +275,12 @@ impl ClaudeInputTokens {
                     if input.exists() && input.int() != 0 {
                         return Some(None);
                     }
-                    let updated = if self.reported {
-                        let mut updated = payload.to_vec();
-                        let mut removed = false;
-                        for path in ["message.usage.input_tokens", "message.usage.output_tokens"] {
-                            let count = gj::get(&updated, path);
-                            if count.exists() && count.int() == 0 {
-                                removed |= gj::delete(&mut updated, path);
-                            }
-                        }
-                        if !removed {
-                            return Some(None);
-                        }
-                        updated
-                    } else {
-                        let count = match claude_input_tokens(&self.original) {
-                            Some(count) if count != 0 => count,
-                            _ => return Some(None),
-                        };
-                        let Ok(updated) = gj::try_set_raw(payload, "message.usage.input_tokens", count.to_string())
-                        else {
-                            return Some(None);
-                        };
-                        updated
+                    let count = match claude_input_tokens(&self.original) {
+                        Some(count) if count != 0 => count,
+                        _ => return Some(None),
+                    };
+                    let Ok(updated) = gj::try_set_raw(payload, "message.usage.input_tokens", count.to_string()) else {
+                        return Some(None);
                     };
                     let start = line_start + payload_offset;
                     let stop = line_start + payload_end;

@@ -418,6 +418,8 @@ struct Stream {
     model: String,
     names: HashMap<Vec<u8>, Vec<u8>>,
     web_search_mode: bool,
+    /// `message_start` usage holds only the counts the upstream sent (`report_usage_only`).
+    reported_usage: bool,
     out: Vec<u8>,
     has_first_response: bool,
     response_type: u8,
@@ -708,6 +710,9 @@ impl Stream {
         let root = gj::parse(raw);
         if !self.has_first_response {
             let mut start = br#"{"type": "message_start", "message": {"id": "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY", "type": "message", "role": "assistant", "content": [], "model": "claude-3-5-sonnet-20241022", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}"#.to_vec();
+            if self.reported_usage {
+                gj::set_raw(&mut start, "message.usage", "{}");
+            }
             let prompt = gj::get(raw, "response.cpaUsageMetadata.promptTokenCount");
             if prompt.exists() {
                 gj::set_int(&mut start, "message.usage.input_tokens", prompt.int());
@@ -802,6 +807,10 @@ impl Stream {
 }
 
 impl GoStream for Stream {
+    fn report_usage_only(&mut self) {
+        self.reported_usage = true;
+    }
+
     fn line(&mut self, line: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         Ok(self.translate(line))
     }

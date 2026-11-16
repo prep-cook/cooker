@@ -994,25 +994,56 @@ enum Early {
     Short,
 }
 
+/// The first event of a Claude-model answer whose usage object is `counts`.
+fn first_event(counts: &str) -> String {
+    format!(
+        r#"data: {{"response":{{"candidates":[{{"content":{{"role":"model","parts":[{{"text":"hi"}}]}}}}],"usageMetadata":{counts},"modelVersion":"gemini-3-flash","responseId":"resp-early"}},"traceId":"early"}}"#
+    )
+}
+
 /// An answer that ends before its body does fails the attempt with exactly one error on
-/// every client protocol. Rows: scenario, cut, and the input usage the canonical stream
-/// holds afterwards: what the upstream reported in complete lines before the cut, or none
-/// when it reported nothing there. No estimate fills the gap.
+/// every client protocol. Rows: scenario, cut, the usage object replacing the first event's
+/// (`None` keeps the recording), and the input and output counts the canonical stream holds
+/// afterwards. A count is present exactly when the upstream sent it in a complete line
+/// before the cut, zero included; no estimate or default fills the gap.
 #[tokio::test]
 async fn an_upstream_body_that_ends_early_fails_the_attempt() {
-    let rows = [
-        ("gemini_stream", Early::InLastLine, Some(5)),
-        ("openai_stream", Early::InLastLine, None),
-        ("responses_stream", Early::InLastLine, None),
-        ("claude_stream_claude_model", Early::InLastLine, None),
-        ("claude_stream_claude_model", Early::AfterFirstEvent, None),
-        ("claude_stream_gemini_model", Early::InLastLine, Some(5)),
-        ("gemini_stream", Early::AfterFirstEvent, Some(5)),
-        ("gemini_stream", Early::Short, Some(5)),
+    type Row = (&'static str, Early, Option<&'static str>, (Option<u64>, Option<u64>));
+    let rows: [Row; 11] = [
+        ("gemini_stream", Early::InLastLine, None, (Some(5), None)),
+        ("openai_stream", Early::InLastLine, None, (None, None)),
+        ("responses_stream", Early::InLastLine, None, (None, None)),
+        ("claude_stream_claude_model", Early::InLastLine, None, (None, None)),
+        ("claude_stream_claude_model", Early::AfterFirstEvent, None, (None, None)),
+        ("claude_stream_gemini_model", Early::InLastLine, None, (Some(5), None)),
+        (
+            "claude_stream_gemini_model",
+            Early::AfterFirstEvent,
+            Some(r#"{"promptTokenCount":0,"candidatesTokenCount":3}"#),
+            (Some(0), Some(3)),
+        ),
+        (
+            "claude_stream_gemini_model",
+            Early::AfterFirstEvent,
+            Some(r#"{"candidatesTokenCount":0}"#),
+            (None, Some(0)),
+        ),
+        (
+            "claude_stream_gemini_model",
+            Early::AfterFirstEvent,
+            Some(r#"{"promptTokenCount":5}"#),
+            (Some(5), None),
+        ),
+        ("gemini_stream", Early::AfterFirstEvent, None, (Some(5), None)),
+        ("gemini_stream", Early::Short, None, (Some(5), None)),
     ];
-    for (name, early, kept) in rows {
+    for (name, early, counts, want) in rows {
         let s = scenario(name);
-        let body = s["upstream"]["body"].as_str().unwrap().to_owned();
+        let mut body = s["upstream"]["body"].as_str().unwrap().to_owned();
+        if let Some(counts) = counts {
+            let line = body.find("\r\n").unwrap();
+            body.replace_range(..line, &first_event(counts));
+        }
         let first = body.find("\r\n\r\n").unwrap() + 4;
         let reply = match early {
             Early::AfterFirstEvent => Reply::sse(body).cut_after(first),
@@ -1022,20 +1053,26 @@ async fn an_upstream_body_that_ends_early_fails_the_attempt() {
             }
             Early::Short => Reply::sse(body[..first].to_owned()).short_by(body.len() - first),
         };
+        let row = format!("{name} {early:?} {counts:?}");
         let streams = Streams::new();
         let upstream = StreamUpstream::start([reply]).await;
         let run = run_on(&streams, &s, &upstream, UsageSink::default()).await;
-        let started = run.started.unwrap_or_else(|e| panic!("{name} {early:?}: {}", e.status));
+        let started = run.started.unwrap_or_else(|e| panic!("{row}: {}", e.status));
         let (outcome, published, _) = produce(&streams, started).await;
-        assert!(outcome.is_err(), "{name} {early:?}: an early end fails the attempt");
-        assert_eq!(published.terminal, Some(Terminal::UpstreamError), "{name} {early:?}");
+        assert!(outcome.is_err(), "{row}: an early end fails the attempt");
+        assert_eq!(published.terminal, Some(Terminal::UpstreamError), "{row}");
         let errors = published
             .records
             .iter()
             .filter(|r| r.starts_with(b"event: x_ck.error\n"))
             .count();
-        assert_eq!(errors, 1, "{name} {early:?}: one error record");
-        let input = usage(&published).and_then(|u| u["input_tokens"].as_u64());
-        assert_eq!(input, kept, "{name} {early:?}: published input usage");
+        assert_eq!(errors, 1, "{row}: one error record");
+        let usage = usage(&published);
+        let count = |key: &str| usage.as_ref().and_then(|u| u[key].as_u64());
+        assert_eq!(
+            (count("input_tokens"), count("output_tokens")),
+            want,
+            "{row}: published usage"
+        );
     }
 }
