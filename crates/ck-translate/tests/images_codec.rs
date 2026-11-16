@@ -102,13 +102,15 @@ fn image_requests_encode_for_each_destination_or_are_refused() {
             Mode::Edit,
             single.clone(),
             "xai",
-            Ok(json!({"prompt":"hat","response_format":"url","image":{"url":PNG}})),
+            Ok(json!({"prompt":"hat","response_format":"url","image":{"type":"image_url","url":PNG}})),
         ),
         (
             Mode::Edit,
             json!({"prompt":"hat","images":[{"image_url":PNG},{"file_id":"f","image_url":null}]}),
             "xai",
-            Ok(json!({"prompt":"hat","images":[{"url":PNG},{"file_id":"f"}]})),
+            Ok(
+                json!({"prompt":"hat","response_format":"b64_json","images":[{"type":"image_url","url":PNG},{"file_id":"f"}]}),
+            ),
         ),
         (
             Mode::Edit,
@@ -126,7 +128,9 @@ fn image_requests_encode_for_each_destination_or_are_refused() {
             Mode::Edit,
             json!({"prompt":"hat","image":{"url":"https://x/a.png"}}),
             "xai",
-            Ok(json!({"prompt":"hat","image":{"url":"https://x/a.png"}})),
+            Ok(
+                json!({"prompt":"hat","response_format":"b64_json","image":{"type":"image_url","url":"https://x/a.png"}}),
+            ),
         ),
         (
             Mode::Edit,
@@ -140,13 +144,45 @@ fn image_requests_encode_for_each_destination_or_are_refused() {
                 ],
             )),
         ),
-        // xAI: `stream` only selects the client's delivery, `user` is a documented xAI member.
+        // xAI: `stream` only selects the client's delivery, `user` is a documented xAI member; a
+        // generation names its format, ratio and resolution as the old path did.
         (
             Mode::Generate,
             json!({"model":"grok-imagine-image","prompt":"a cat","stream":true,"user":"u"}),
             "xai",
-            Ok(json!({"model":"grok-imagine-image","prompt":"a cat","user":"u"})),
+            Ok(
+                json!({"model":"grok-imagine-image","prompt":"a cat","response_format":"b64_json","aspect_ratio":"1:1",
+                "resolution":"1k","user":"u"}),
+            ),
         ),
+        // xAI keeps every documented ratio and resolution (X17), reads an OpenAI `size` as the ratio
+        // and resolution it names, and refuses what it does not document.
+        (
+            Mode::Generate,
+            json!({"prompt":"p","aspect_ratio":"19.5:9","resolution":"1.5k"}),
+            "xai",
+            Ok(json!({"prompt":"p","response_format":"b64_json","aspect_ratio":"19.5:9","resolution":"1.5k"})),
+        ),
+        (
+            Mode::Generate,
+            json!({"prompt":"p","size":"2048x2048","response_format":"URL"}),
+            "xai",
+            Ok(json!({"prompt":"p","response_format":"url","aspect_ratio":"1:1","resolution":"2k"})),
+        ),
+        (
+            Mode::Edit,
+            json!({"prompt":"p","size":"1792x1024","image":{"url":"https://x/a.png"}}),
+            "xai",
+            Ok(json!({"prompt":"p","response_format":"b64_json","aspect_ratio":"16:9",
+                "image":{"type":"image_url","url":"https://x/a.png"}})),
+        ),
+        (
+            Mode::Generate,
+            json!({"prompt":"p","aspect_ratio":"7:3"}),
+            "xai",
+            Err(()),
+        ),
+        (Mode::Generate, json!({"prompt":"p","resolution":"4k"}), "xai", Err(())),
         // Nullable members are absent (OpenAI `n`, `model`, `size`, `quality`; xAI `n`, `model`).
         (
             Mode::Generate,
@@ -459,7 +495,7 @@ fn image_edit_forms_keep_order_bytes_and_unknown_fields_for_every_destination() 
     let xai: Value = serde_json::from_slice(&form(&plain, 3, Destination::Xai).unwrap()).unwrap();
     assert_eq!(
         xai,
-        json!({"prompt":"p","response_format":"url","image":{"url":data_url("image/png",&first)}})
+        json!({"prompt":"p","response_format":"url","image":{"type":"image_url","url":data_url("image/png",&first)}})
     );
     let codex: Value = serde_json::from_slice(&form(&plain, 3, Destination::Codex("m")).unwrap()).unwrap();
     assert_eq!(
@@ -714,7 +750,7 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             )
             .unwrap(),
             Delivery::Base64,
-            json!({"created":0,"usage":xai_usage,"data":[{"b64_json":f}]}),
+            json!({"created":0,"usage":xai_usage,"data":[{"b64_json":f,"mime_type":"image/jpeg","storage_error":null}]}),
         ),
         (
             "OpenAI SSE with previews and repeated usage",
@@ -746,7 +782,7 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             Wire::Xai,
             BodyMode::Buffered,
             serde_json::to_vec(&json!({"created":null,"data":[{"url":"https://x/a.png","revised_prompt":null,
-                "b64_json":null,"mime_type":null}]}))
+                "b64_json":null}]}))
             .unwrap(),
             Delivery::Url,
             json!({"created":0,"data":[{"url":"https://x/a.png"}]}),
@@ -755,7 +791,7 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             "base64 without a media type is a data URL without one",
             Wire::Xai,
             BodyMode::Buffered,
-            serde_json::to_vec(&json!({"created":1,"data":[{"b64_json":"AAEC","mime_type":null}]})).unwrap(),
+            serde_json::to_vec(&json!({"created":1,"data":[{"b64_json":"AAEC"}]})).unwrap(),
             Delivery::Url,
             json!({"created":1,"data":[{"url":"data:;base64,AAEC"}]}),
         ),
@@ -768,7 +804,7 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             .unwrap(),
             Delivery::Url,
             json!({"created":5,"output_format":"png","quality":"high","size":"1024x1024",
-                "data":[{"url":"https://x/a.png"}]}),
+                "data":[{"url":"https://x/a.png","mime_type":"image/jpeg"}]}),
         ),
         (
             "settings come from the first result that has them",
@@ -795,7 +831,7 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             BodyMode::Buffered,
             serde_json::to_vec(&json!({"created":1,"data":[{"b64_json":"AAEC","mime_type":"image/jpeg"}]})).unwrap(),
             Delivery::Url,
-            json!({"created":1,"data":[{"url":"data:image/jpeg;base64,AAEC"}]}),
+            json!({"created":1,"data":[{"url":"data:image/jpeg;base64,AAEC","mime_type":"image/jpeg"}]}),
         ),
         (
             "Codex creation time from the first event, and a call without a result yet",
@@ -1037,12 +1073,20 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             assert_eq!(start["x_ck"]["source"]["sse"][0]["name"], "id");
         }
     }
-    // Members of the xAI source have no place in an OpenAI Images response either.
-    let xai = br#"{"data":[{"b64_json":"AAEC","storage_error":null}],"future":1}"#;
+    // xAI's Images API extends OpenAI's on the same endpoints, so its members reach the client
+    // (X19): the media type, the stored file and a storage failure of each image.
+    let xai =
+        br#"{"data":[{"b64_json":"AAEC","mime_type":"image/png","file_output":{"file_id":"f1"},"storage_error":null},
+        {"url":"https://x/b.png","mime_type":"image/webp","storage_error":"upload failed"}],"future":1}"#;
     let result = run(Wire::Xai, BodyMode::Buffered, xai, 7, Format::Json, Delivery::Base64);
     result.egress.as_ref().unwrap();
-    assert_eq!(client_json(&result), json!({"created":0,"data":[{"b64_json":"AAEC"}]}));
-    assert_eq!(result.dropped, vec!["members of another protocol"; 2]);
+    assert_eq!(
+        client_json(&result),
+        json!({"created":0,"future":1,"data":[
+            {"b64_json":"AAEC","mime_type":"image/png","file_output":{"file_id":"f1"},"storage_error":null},
+            {"url":"https://x/b.png","mime_type":"image/webp","storage_error":"upload failed"}]})
+    );
+    assert!(result.dropped.is_empty(), "{:?}", result.dropped);
 }
 
 #[test]
@@ -1452,7 +1496,7 @@ fn incomplete_or_failed_image_responses_end_in_error_never_success() {
 }
 
 #[test]
-fn urls_are_not_base64_and_unknown_events_never_reach_the_client() {
+fn urls_stay_urls_and_unknown_events_never_reach_the_client() {
     let url = serde_json::to_vec(&json!({"created":1,"data":[{"url":"https://example.invalid/a.png"}]})).unwrap();
     let result = run(
         Wire::OpenAi,
@@ -1463,8 +1507,9 @@ fn urls_are_not_base64_and_unknown_events_never_reach_the_client() {
         Delivery::Base64,
     );
     result.ingress.unwrap();
-    assert!(matches!(result.egress, Err(Error::Unsupported)));
-    assert!(result.client.is_empty());
+    result.egress.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&result.client).unwrap();
+    assert_eq!(body["data"], json!([{"url": "https://example.invalid/a.png"}]));
 
     let events = sse(&[
         json!({"type":"image_generation.future","x":1}),

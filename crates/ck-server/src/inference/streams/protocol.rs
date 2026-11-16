@@ -6,7 +6,7 @@ use ck_stream::{Lease, Reader, ScratchLease, Writer};
 use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
 use ck_translate::codec::{self, BodyMode, Operation, RequestView, ResponseEgress, internal};
-use ck_translate::{anthropic, audio, gemini, responses};
+use ck_translate::{anthropic, audio, gemini, images, responses};
 
 use crate::http::egress::{Framing, Output, Protocol};
 
@@ -16,6 +16,7 @@ pub enum ProtocolEgress {
     Responses(responses::egress::Egress<fn(&'static str, u64)>),
     Gemini(gemini::egress::Egress),
     Speech(audio::Egress),
+    Images(Box<images::Egress>),
 }
 
 impl ProtocolEgress {
@@ -77,7 +78,7 @@ impl ProtocolEgress {
                 }
                 Self::Responses(egress)
             }
-            Protocol::Speech => Self::speech(stream, identity),
+            Protocol::Speech | Protocol::Images(_) => Self::media(output, stream, identity)?,
             Protocol::Gemini => {
                 let framing = match output.framing {
                     Framing::Json | Framing::Raw => gemini::response::Framing::Json,
@@ -96,9 +97,20 @@ impl ProtocolEgress {
 }
 
 impl ProtocolEgress {
-    /// The speech egress: the audio's bytes, which need no request view.
-    pub fn speech(stream: &Writer, identity: Identity) -> Self {
-        Self::Speech(audio::Egress::new(stream, Some(identity)))
+    /// A media egress, which needs no request view: the speech audio's bytes, or the Images
+    /// response as one JSON body or its generation or edit events.
+    pub fn media(output: Output, stream: &mut Writer, identity: Identity) -> codec::Result<Self> {
+        Ok(match output.protocol {
+            Protocol::Images(delivery) => {
+                let format = match (output.framing, output.operation) {
+                    (Framing::Sse, Operation::Media(codec::Media::ImageEdit)) => images::Format::EditEvents,
+                    (Framing::Sse, _) => images::Format::GenerationEvents,
+                    _ => images::Format::Json,
+                };
+                Self::Images(Box::new(images::Egress::new(stream, Some(identity), format, delivery)?))
+            }
+            _ => Self::Speech(audio::Egress::new(stream, Some(identity))),
+        })
     }
 
     /// Whether the body's `Content-Type` is known: a media egress learns it from the stream's
@@ -141,6 +153,7 @@ impl ResponseEgress for ProtocolEgress {
             Self::Responses(egress) => egress.advance(owner, input, output),
             Self::Gemini(egress) => egress.advance(owner, input, output),
             Self::Speech(egress) => egress.advance(owner, input, output),
+            Self::Images(egress) => egress.advance(owner, input, output),
         }
     }
 
@@ -151,6 +164,7 @@ impl ResponseEgress for ProtocolEgress {
             Self::Responses(egress) => egress.finish(),
             Self::Gemini(egress) => egress.finish(),
             Self::Speech(egress) => egress.finish(),
+            Self::Images(egress) => egress.finish(),
         }
     }
 }

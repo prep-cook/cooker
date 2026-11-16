@@ -9,6 +9,7 @@ pub(crate) mod errors;
 pub(crate) mod gemini;
 pub(crate) mod images;
 pub mod keepalive;
+mod media;
 pub(crate) mod model_router;
 pub mod model_updater;
 pub(crate) mod models;

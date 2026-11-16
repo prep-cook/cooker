@@ -181,8 +181,8 @@ impl Replay {
             ))
         })??;
         let identity = response_identity(&mut response, &mut first).await?;
-        let egress = if output.protocol == Protocol::Speech {
-            ProtocolEgress::speech(&response, identity)
+        let egress = if matches!(output.protocol, Protocol::Speech | Protocol::Images(_)) {
+            ProtocolEgress::media(output, &mut response, identity)?
         } else {
             // The request view is rebuilt from the request stream's records (contract §2).
             let (document, media) = codec::chat::request::read_request(&mut request, &mut records)?;

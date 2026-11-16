@@ -384,6 +384,20 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
             &[],
         ),
         (
+            "OpenAI-compatible edit naming its image by URL as the Images JSON body",
+            Provider::Compat,
+            "up-image",
+            ask(
+                Media::ImageEdit,
+                r#"{"prompt":"add a hat","images":[{"image_url":"https://img.x/a.png"}]}"#,
+            ),
+            Reply::json(IMAGES_JSON),
+            "POST",
+            "/v1/images/edits",
+            json!({"model":"up-image","prompt":"add a hat","images":[{"image_url":"https://img.x/a.png"}]}),
+            &[("content-type", Some("application/json"))],
+        ),
+        (
             "Codex gpt-image model aliased to a custom upstream name stays direct",
             Provider::Codex,
             "relay-image-alias",
@@ -822,16 +836,6 @@ async fn refused_media_requests_send_nothing() {
                 claimed: Some(Media::ImageEdit),
                 ..ask(Media::ImageGenerate, GENERATE)
             },
-            false,
-        ),
-        (
-            "a multipart edit carries image data, not a URL",
-            Provider::Compat,
-            "up-image",
-            ask(
-                Media::ImageEdit,
-                r#"{"prompt":"add a hat","images":[{"image_url":"https://img.x/a.png"}]}"#,
-            ),
             false,
         ),
         (

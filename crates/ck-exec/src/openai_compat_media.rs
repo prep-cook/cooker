@@ -18,8 +18,21 @@ use crate::types::{Attempt, Request, Streams, Upstream};
 /// depend on it.
 pub(crate) const CHECK_BOUNDARY: &str = "cooker-fence-check-boundary-000000";
 
-/// An image generation or edit on `route`: a generation as JSON, an edit as the multipart form
-/// the Images API defines, each with the upstream model and the old path's stream member
+/// Where an edit goes: the multipart form the Images API defines, or its JSON body when the form
+/// cannot carry the request (an image named by URL or file id rather than sent as data).
+pub(crate) fn edit_destination<'a>(
+    document: &ck_translate::codec::document::Document,
+    boundary: &'a str,
+) -> images::Destination<'a> {
+    if images::check(document, images::Destination::OpenAiForm(CHECK_BOUNDARY)).is_ok() {
+        images::Destination::OpenAiForm(boundary)
+    } else {
+        images::Destination::OpenAi
+    }
+}
+
+/// An image generation or edit on `route`: a generation as JSON, an edit as [`edit_destination`]
+/// picks, each with the upstream model and the old path's stream member
 /// (`prepareOpenAICompatImagesPayload`), then the payload rules.
 pub(crate) async fn images(
     attempt: &Attempt<'_>,
@@ -31,13 +44,12 @@ pub(crate) async fn images(
     let document = request.validated.view().document;
     let stream = media_exec::images_stream(document).map_err(encoding)?;
     let boundary = format!("cooker-{}", uuid::Uuid::new_v4().simple());
-    let (target, content_type) = if media == Media::ImageEdit {
-        (
-            images::Destination::OpenAiForm(&boundary),
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-    } else {
-        (images::Destination::OpenAi, "application/json".to_owned())
+    let (target, content_type) = match media {
+        Media::ImageEdit => match edit_destination(document, &boundary) {
+            form @ images::Destination::OpenAiForm(_) => (form, format!("multipart/form-data; boundary={boundary}")),
+            json => (json, "application/json".to_owned()),
+        },
+        _ => (images::Destination::OpenAi, "application/json".to_owned()),
     };
     let upload = media_exec::images_upload(request, DESTINATION, target, streams.request)?;
     let model = parse_suffix(attempt.model).model_name.trim().to_owned();
