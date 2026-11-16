@@ -1,13 +1,14 @@
 //! URLs in error and log text. A configured URL can carry credentials in its userinfo
-//! (`https://user:key@host`), its query (`?key=`) or its fragment, so every error,
-//! capture and request log that names a URL shows only its scheme, host, port and path,
-//! with every query value and a fragment masked (owner ruling Q18, 2026-11-16).
+//! (`https://user:key@host`), its query (`?key=`) or its fragment. [`url`] renders a
+//! URL the caller names with only its scheme, host, port and path, every query value and
+//! a fragment masked (owner ruling Q18). Free text ([`bytes`], [`copy`], [`Pieces`]) is
+//! redacted word by word: a word that may hold a credential prints as [`UNPRINTABLE`]
+//! whole (owner ruling Settled 60, 2026-11-16).
 
 use std::borrow::Cow;
 
-#[path = "redact_stream.rs"]
-mod stream;
-pub use stream::{HOLD_LIMIT, Stream, Writer};
+#[path = "redact_scan.rs"]
+mod scan;
 
 /// What each query value and a fragment print as.
 pub const MASK: &str = "***";
@@ -21,49 +22,129 @@ pub const UNPRINTABLE: &str = "<redacted url>";
 /// host and numeric port: control characters, a bare key or host, an opaque URL
 /// (`https:key`), a malformed authority, and an '@' after the authority but before the
 /// path, where a password holding an unescaped '?' or '#' would leave its start as the
-/// host.
+/// host. A `//` before the query or fragment other than the one that opens `raw` may
+/// start a URL of its own (`/r/https://user:key@host/`, `https://user:key://host`), so
+/// `raw` prints as [`UNPRINTABLE`] then too.
 pub fn url(raw: &str) -> String {
+    let end = raw.find(['?', '#']).unwrap_or(raw.len());
+    let body = raw.trim_start_matches(' ');
+    let opening = match body.find("//") {
+        Some(i) if i == 0 || body[..i].strip_suffix(':').is_some_and(is_scheme) => raw.len() - body.len() + i + 2,
+        _ => 0,
+    };
+    if raw.get(opening..end).is_some_and(|rest| rest.contains("//")) {
+        return UNPRINTABLE.to_owned();
+    }
     render(raw).unwrap_or_else(|| UNPRINTABLE.to_owned())
 }
 
-/// `text` with every URL reference rendered by [`url`]; see [`bytes`].
+/// `text` redacted word by word; see [`bytes`].
 pub fn urls_in(text: &str) -> Cow<'_, str> {
     match bytes(text.as_bytes()) {
         Cow::Borrowed(_) => Cow::Borrowed(text),
-        // Replacements are ASCII and cut only at ASCII bytes, so UTF-8 stays valid.
+        // Words are cut and replaced at ASCII bytes, so UTF-8 stays valid.
         Cow::Owned(out) => {
             Cow::Owned(String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
         }
     }
 }
 
-/// `text` (any bytes) with every URL reference rendered by [`url`], for errors, captures
-/// and logs. A reference is found two ways:
-///
-/// - A span delimited by `"…"`, `'…'`, `<…>` or `` `…` `` whose contents, after leading spaces,
-///   start with `scheme://`, `//` or `/`: the whole contents are the reference, so a
-///   quoted URL holding spaces is redacted whole, and one holding a line break prints as
-///   [`UNPRINTABLE`].
-/// - Otherwise a token running to the next whitespace or `"` that starts after whitespace,
-///   non-ASCII text or a delimiter (`` "'`(<[{=,;: ``) with `scheme://`, `://`, `//` or `/`. A token that is
-///   none of these but carries a query or fragment (`callback?code=…`, `next#…`, `#…`)
-///   is a relative reference and prints as [`UNPRINTABLE`] from the last delimiter
-///   before its `?` or `#`.
-///
-/// A reference that is not UTF-8 prints as [`UNPRINTABLE`]; other bytes are unchanged.
-/// The scan is linear in `text`, and a reference is passed over whole, so text that is
-/// already redacted comes back unchanged.
+/// `text` (any bytes) redacted word by word, for errors, captures and logs (owner ruling
+/// Settled 60, 2026-11-16). A word is the bytes between whitespace and `"`; a byte after
+/// a `\` belongs to the word, so an escaped quote (`\"`) never ends one. A word prints
+/// as [`UNPRINTABLE`] whole when it holds `://`, an `@`, a `?` or a `#`, a `//` at its
+/// start or after punctuation (`//user:key`), or a scheme (a letter, then letters,
+/// digits, `+`, `-` or `.`) and `:` with a byte after them (`https:key`,
+/// `example.com:443`), and when it is longer than 1 MiB. The value it belongs to may go
+/// on past it, so the text after it is dropped: inside a `"` string (an odd number of
+/// unescaped `"` before it on its line) up to the closing unescaped `"`, anywhere else
+/// up to the end of the line. A line that holds a `"`, `'`, backtick, `<` or `>` may leave
+/// a value open, so the following lines go too, up to one holding the same kind and no
+/// `:`, `@`, `?`, `#` or `/`; their line breaks print. Past 64 KiB of such lines the rest
+/// of the text goes. No URL structure is parsed, so an e-mail address, `user@host`,
+/// `mailto:…`, `name:port` and a word such as `what?` or `C#` print as the placeholder
+/// too, with the rest of their line.
 pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
-    if !text.iter().any(|b| matches!(b, b'/' | b'?' | b'#')) {
+    if text.len() <= scan::HOLD && !text.iter().any(|b| matches!(b, b':' | b'@' | b'?' | b'#' | b'/')) {
         return Cow::Borrowed(text);
     }
     let mut out = Vec::with_capacity(text.len());
-    stream::whole(text, &mut out);
+    let mut words = scan::Words::new(scan::HOLD);
+    words.push(text, &mut out);
+    words.finish(&mut out);
     if out == text {
         Cow::Borrowed(text)
     } else {
         Cow::Owned(out)
     }
+}
+
+/// Copies `input` to `out` redacted as [`bytes`] redacts it, holding back only the word
+/// being read, for a capture too large to hold in memory.
+pub fn copy(input: &mut dyn std::io::Read, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    scan::copy(input, out, scan::HOLD)
+}
+
+/// Writes `text` to `out` redacted as [`bytes`] redacts it, without a copy of the whole
+/// text.
+pub fn write(text: &[u8], out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    scan::write(text, out, scan::HOLD)
+}
+
+/// Redacts a text that reaches a log in pieces with other text between them, such as
+/// the messages of a WebSocket timeline between their event headers. The pieces are
+/// redacted as one text, as [`copy`] redacts it, except at each [`Pieces::cut`]: the
+/// next piece may go on with the word a piece ends in, whatever its last byte, so that
+/// word prints as [`UNPRINTABLE`] and the next piece is dropped as the rest of a redacted
+/// word is. The text between pieces is redacted on its own,
+/// with [`write`].
+pub struct Pieces {
+    words: scan::Words,
+    written: Vec<u8>,
+}
+
+impl Default for Pieces {
+    fn default() -> Self {
+        Self::holding(scan::HOLD)
+    }
+}
+
+impl Pieces {
+    fn holding(hold: usize) -> Self {
+        Self {
+            words: scan::Words::new(hold),
+            written: Vec::new(),
+        }
+    }
+
+    /// More bytes of the current piece.
+    pub fn push(&mut self, bytes: &[u8], out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        self.words.push(bytes, &mut self.written);
+        self.flush(out)
+    }
+
+    /// Ends the current piece; the next [`Pieces::push`] starts the next one.
+    pub fn cut(&mut self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        self.words.cut(&mut self.written);
+        self.flush(out)
+    }
+
+    /// Ends the text.
+    pub fn finish(mut self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        self.words.finish(&mut self.written);
+        self.flush(out)
+    }
+
+    fn flush(&mut self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        out.write_all(&self.written)?;
+        self.written.clear();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn copy_holding(input: &mut dyn std::io::Read, out: &mut dyn std::io::Write, hold: usize) -> std::io::Result<()> {
+    scan::copy(input, out, hold)
 }
 
 /// A raw query (without its `?`) with every value masked: `name=value` prints as

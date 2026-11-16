@@ -486,22 +486,22 @@ pub(crate) fn http_capture_problems(events: &[Captured], a: &HttpAttempt<'_>) ->
         }
         return problems;
     }
-    // bufio.ScanLines: lines without their newline or a trailing CR; the scan stops at
-    // Go's terminal frame, so the chunks are a prefix of the lines, then at most one
-    // error.
-    let lines: Vec<&str> = a
+    // bufio.ScanLines: lines without their newline or a trailing CR, each recorded with a
+    // newline; the scan stops at Go's terminal frame, so the chunks are a prefix of the
+    // lines, then at most one error.
+    let lines: Vec<String> = a
         .body
         .strip_suffix('\n')
         .unwrap_or(a.body)
         .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .map(|l| format!("{}\n", l.strip_suffix('\r').unwrap_or(l)))
         .collect();
     let (chunks, tail) = match rest.iter().position(|e| !matches!(e, Captured::Chunk(_))) {
         Some(i) => rest.split_at(i),
         None => (rest, &[][..]),
     };
     for (i, chunk) in chunks.iter().enumerate() {
-        if *chunk != Captured::Chunk(lines.get(i).copied().unwrap_or("<none>").to_owned()) {
+        if *chunk != Captured::Chunk(lines.get(i).map_or("<none>", String::as_str).to_owned()) {
             problems.push(format!("capture line {i}: {chunk:?} != {:?}", lines.get(i)));
             break;
         }

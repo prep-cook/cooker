@@ -379,7 +379,7 @@ pub(crate) fn captured_lines(lines: ExecStream, capture: CaptureSink) -> ExecStr
     }
     lines
         .inspect(move |item| match item {
-            Ok(line) => capture.record(CaptureEvent::ResponseChunk(line)),
+            Ok(line) => crate::proxy::capture_line(&capture, line),
             Err(error) => capture.record(CaptureEvent::ResponseError(&String::from_utf8_lossy(&error.body))),
         })
         .boxed()

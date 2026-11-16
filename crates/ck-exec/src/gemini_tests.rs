@@ -298,7 +298,12 @@ pub(crate) fn check_attempt(
                 .map(|c| String::from_utf8_lossy(c).into_owned())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(text(&chunks), text(&scan_lines(reply_body)), "{name}: stream chunks");
+        // Each scanned line is recorded with its newline.
+        let lines: Vec<_> = scan_lines(reply_body)
+            .into_iter()
+            .map(|line| [line, b"\n".to_vec()].concat())
+            .collect();
+        assert_eq!(text(&chunks), text(&lines), "{name}: stream chunks");
     } else {
         assert_eq!(chunks, vec![reply_body.to_vec()], "{name}: response body");
     }

@@ -1158,8 +1158,12 @@ async fn capture_records_each_attempt_as_go_does() {
             );
             continue;
         }
-        // Streams record every scanned line up to where Go stops reading.
-        let lines: Vec<&str> = upstream.split('\n').filter(|l| !l.trim().is_empty()).collect();
+        // Streams record every scanned line, with its newline, up to where Go stops reading.
+        let lines: Vec<String> = upstream
+            .split('\n')
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| format!("{l}\n"))
+            .collect();
         assert!(!chunks.is_empty(), "{name}: stream lines");
         assert_eq!(chunks, lines[..chunks.len()], "{name}: stream lines");
         match case["output"].get("stream_error") {
@@ -1266,7 +1270,7 @@ async fn capture_stops_at_the_terminal_line() {
             _ => None,
         })
         .collect();
-    assert_eq!(chunks.last().map(String::as_str), Some(COMPLETED), "{chunks:?}");
+    assert_eq!(chunks.last(), Some(&format!("{COMPLETED}\n")), "{chunks:?}");
     assert!(!chunks.iter().any(|c| c.contains("after-terminal")), "{chunks:?}");
 }
 

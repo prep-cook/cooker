@@ -110,15 +110,12 @@ fn timeline_event(timeline: Option<&crate::observability::request_logging::Webso
     if payload.is_empty() {
         return;
     }
-    let mut part = format!(
+    let header = format!(
         "Timestamp: {}\nEvent: websocket.{kind}\n",
         crate::observability::request_logging::timestamp(chrono::Local::now())
-    )
-    .into_bytes();
-    part.extend_from_slice(payload);
-    part.push(b'\n');
+    );
     // Go only warns when a timeline part cannot be written.
-    let _ = timeline.append_part(&part);
+    let _ = timeline.append_part(header.as_bytes(), payload);
 }
 
 /// gorilla's text for the error after this side closed the connection.

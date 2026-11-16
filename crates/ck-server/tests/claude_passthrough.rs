@@ -446,8 +446,8 @@ async fn request_log_masks_upstream_credentials() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     };
     for line in [
-        "Auth: provider=claude",
-        "type=api_key value=sk-u...6789",
+        // `auth_id=claude:apikey:…` takes the rest of the line with it.
+        "Auth: provider=claude, <redacted url>\n",
         "Authorization: Bearer sk-u...6789",
         "X-Api-Key: cust...cdef",
     ] {

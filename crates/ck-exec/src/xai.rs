@@ -909,7 +909,7 @@ impl Pipeline {
                 match fail_if_canceled(&st.usage, lines.next()).await {
                     Some(Ok(line)) => {
                         // AppendAPIResponseChunk per scanned line.
-                        st.capture.chunk(&line);
+                        st.capture.line(&line);
                         st.line(&line);
                     }
                     Some(Err(error)) => st.end(Some(error)),

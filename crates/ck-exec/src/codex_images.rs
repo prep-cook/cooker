@@ -382,7 +382,7 @@ fn frames(upstream: ExecStream, prepared: Prepared, usage: ck_core::exec::UsageS
             for raw in event.split(|b| *b == b'\n') {
                 let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
                 // Go records each scanned line before reading it, and none after the end.
-                st.wire.chunk(raw);
+                st.wire.line(raw);
                 let Some(data) = std::str::from_utf8(raw)
                     .ok()
                     .and_then(|line| line.strip_prefix("data:"))

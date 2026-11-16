@@ -743,9 +743,6 @@ where
             event.metadata().file().zip(event.metadata().line()),
             fields,
         );
-        // Every log line drops URL credentials, whatever field carried them (owner ruling
-        // Q18).
-        let line = ck_wire::redact::urls_in(&line).into_owned();
         fire_hooks(&Entry {
             line: &line,
             level: logrus_level(level),
@@ -811,6 +808,9 @@ fn format_line(now: chrono::NaiveDateTime, level: &Level, caller: Option<(&str, 
         let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
         line.push_str(&format!("[{base}:{number}] "));
     }
+    // The prefix is cooker's own text. The message and fields are redacted word by word,
+    // whatever field carried a credential (owner ruling Settled 60).
+    let prefix = line.len();
     line.push_str(fields.message.trim_end_matches(['\r', '\n']));
     let mut rest = fields.rest;
     // ponytail: Go prints only the known fields; Rust call sites also log structured
@@ -826,6 +826,10 @@ fn format_line(now: chrono::NaiveDateTime, level: &Level, caller: Option<(&str, 
         }
     }
     line.push('\n');
+    if let std::borrow::Cow::Owned(body) = ck_wire::redact::urls_in(&line[prefix..]) {
+        line.truncate(prefix);
+        line.push_str(&body);
+    }
     line
 }
 

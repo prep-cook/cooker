@@ -217,7 +217,7 @@ impl Processor {
                 Some(raw) => {
                     let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
                     // Go records each physical line as read, and none after a terminal.
-                    self.wire.chunk(raw);
+                    self.wire.line(raw);
                     self.sse.push(raw, &mut scanned);
                     let held = self.sse.holding();
                     if held.0 > 0 && raw.starts_with(b"data:") {

@@ -134,7 +134,7 @@ pub(crate) fn capture_lines(
     let capture = capture.clone();
     lines
         .inspect(move |item| match item {
-            Ok(line) => capture_chunk(&capture, line),
+            Ok(line) => crate::proxy::capture_line(&capture, line),
             Err(error) => capture_error(&capture, error),
         })
         .boxed()
@@ -148,6 +148,17 @@ pub(crate) fn auth_error(status: u16, message: impl Into<String>) -> ExecError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each scanned line reaches the request log with the newline the scanner removed,
+    /// so the log keeps the lines apart.
+    #[tokio::test]
+    async fn captured_lines_keep_their_newline() {
+        use futures_util::StreamExt;
+        let log = std::sync::Arc::new(crate::kimi_fixture::CaptureLog::default());
+        let lines = futures_util::stream::iter(["event: a", "data: {}", ""].map(|l| Ok(bytes::Bytes::from(l)))).boxed();
+        let _: Vec<_> = capture_lines(lines, &log.sink()).collect().await;
+        assert_eq!(log.chunks(), [&b"event: a\n"[..], b"data: {}\n", b"\n"]);
+    }
 
     #[test]
     fn response_headers_take_go_response_header_shape() {

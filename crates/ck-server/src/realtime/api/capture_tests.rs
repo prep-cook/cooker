@@ -144,16 +144,13 @@ async fn call_and_hangup_are_captured_like_go() {
         .unwrap();
     assert_eq!(response.status().as_u16(), 201);
 
-    let log = log_with(&dir, "/calls").await;
+    let log = log_with(&dir, "URL: /v1/live\n").await;
     let request = section(&log, "API REQUEST 1");
-    assert!(
-        request.contains(&format!("Upstream URL: {upstream_url}/calls\n")),
-        "{request}"
-    );
+    assert!(request.contains("Upstream URL: <redacted url>\n"), "{request}");
     assert!(request.contains("HTTP Method: POST\n"), "{request}");
-    // AccountInfo: OAuth, so the email is never printed.
+    // AccountInfo: OAuth; the e-mail label prints as the placeholder.
     assert!(
-        request.contains("Auth: provider=codex, auth_id=codex-voice.json, label=voice@example.com, type=oauth\n"),
+        request.contains("Auth: provider=codex, auth_id=codex-voice.json, <redacted url>\n"),
         "{request}"
     );
     // headersForLogging keeps the header and hides its value; the bearer is masked.
@@ -197,12 +194,7 @@ async fn call_and_hangup_are_captured_like_go() {
     assert_eq!(hangup.status().as_u16(), 200);
     let log = log_with(&dir, "/hangup").await;
     let request = section(&log, "API REQUEST 1");
-    assert!(
-        request.contains(&format!(
-            "Upstream URL: {upstream_url}/v1/realtime/calls/call-123/hangup\n"
-        )),
-        "{request}"
-    );
+    assert!(request.contains("Upstream URL: <redacted url>\n"), "{request}");
     assert!(request.contains("HTTP Method: POST\n"), "{request}");
     assert!(
         request.contains("Auth: provider=codex, auth_id=codex-voice.json"),
@@ -229,7 +221,7 @@ async fn transport_errors_are_captured() {
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 502);
-    let log = log_with(&dir, "127.0.0.1:9/calls").await;
+    let log = log_with(&dir, "URL: /v1/live\n").await;
     let answer = section(&log, "API RESPONSE 1");
     assert!(answer.contains("\nError: "), "{answer}");
     assert!(!answer.contains("Status:"), "{answer}");
@@ -276,15 +268,17 @@ async fn sdp_ice_credentials_stay_out_of_the_whole_log() {
         "the upstream gets the offer's credentials: {sent}"
     );
 
-    let log = log_with(&dir, "/calls").await;
+    let log = log_with(&dir, "URL: /v1/live\n").await;
     for secret in ["offerufrag", "offer+pwd", "answerufrag", "answer+pwd", "pwd/secret"] {
         assert!(!log.contains(secret), "{secret} in {log}");
     }
+    // Every SDP attribute line holds `name:value`, so it prints as the placeholder and its
+    // `\r` goes with the rest of the line; the JSON-quoted offer is one word.
     for (name, line) in [
-        ("REQUEST BODY", r"a=ice-ufrag:[REDACTED]\r\na=ice-pwd:[REDACTED]\r\n"),
-        ("API REQUEST 1", r"a=ice-ufrag:[REDACTED]\r\na=ice-pwd:[REDACTED]\r\n"),
-        ("API RESPONSE 1", "a=ice-ufrag:[REDACTED]\r\na=ice-pwd:[REDACTED]"),
-        ("RESPONSE", "a=ice-ufrag:[REDACTED]\r\na=ice-pwd:[REDACTED]\r\n"),
+        ("REQUEST BODY", r#""sdp":"<redacted url>""#),
+        ("API REQUEST 1", r#""sdp":"<redacted url>""#),
+        ("API RESPONSE 1", "<redacted url>\n<redacted url>"),
+        ("RESPONSE", "<redacted url>\n<redacted url>\n"),
     ] {
         let text = section(&log, name);
         assert!(text.contains(line), "{name}: {text}");
@@ -325,14 +319,14 @@ async fn sdp_ice_credentials_stay_out_of_spooled_sections() {
     let text = response.text().await.unwrap();
     assert_eq!(status, 201, "{text}");
     assert_eq!(text, answer);
-    let log = log_with(&dir, "/calls").await;
+    let log = log_with(&dir, "URL: /v1/live\n").await;
     for secret in ["offerufrag", "offerpwd", "answerufrag", "answerpwd"] {
         assert!(!log.contains(secret), "{secret} in the log");
     }
     for name in ["API REQUEST 1", "API RESPONSE 1"] {
         let text = section(&log, name);
-        assert!(text.contains("a=x-pad:"), "{name} logged in full");
-        assert!(text.contains("a=ice-pwd:[REDACTED]"), "{name} redacted");
+        // Each attribute line, `name:value`, prints as the placeholder.
+        assert!(text.matches("<redacted url>\n").count() > 2048, "{name} logged in full");
     }
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -365,13 +359,13 @@ async fn sdp_ice_credentials_stay_out_of_a_spooled_downstream_response() {
         ANSWER,
         "the client gets the answer unchanged"
     );
-    let log = log_with(&dir, "/calls").await;
+    let log = log_with(&dir, "URL: /v1/live\n").await;
     for secret in ["streamufrag", "streampwd"] {
         assert!(!log.contains(secret), "{secret} in {log}");
     }
     let downstream = section(&log, "RESPONSE");
     assert!(
-        downstream.contains("a=ice-ufrag:[REDACTED]\r\na=ice-pwd:[REDACTED]"),
+        downstream.contains("v=0\r\n<redacted url>\n<redacted url>\n"),
         "{downstream}"
     );
     let _ = std::fs::remove_dir_all(dir);

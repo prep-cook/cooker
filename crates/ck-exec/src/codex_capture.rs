@@ -121,6 +121,11 @@ impl Wire {
         self.sink.record(CaptureEvent::ResponseChunk(bytes));
     }
 
+    /// `AppendAPIResponseChunk` of a scanned line ([`crate::proxy::capture_line`]).
+    pub(crate) fn line(&self, line: &[u8]) {
+        crate::proxy::capture_line(&self.sink, line);
+    }
+
     /// `RecordAPIResponseError`.
     pub(crate) fn error(&self, text: &str) {
         self.sink.record(CaptureEvent::ResponseError(text));

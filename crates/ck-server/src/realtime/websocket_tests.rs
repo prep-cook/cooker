@@ -435,6 +435,8 @@ async fn request_log_records_the_websocket_timeline_and_each_turn() {
     let timeline: Vec<(String, String)> = section("WEBSOCKET TIMELINE ===")
         .split("\n\n")
         .filter(|part| !part.trim().is_empty())
+        // A payload the redaction dropped leaves its line break behind.
+        .map(|part| part.trim_start_matches('\n'))
         .map(|part| {
             let mut lines = part.lines();
             assert!(lines.next().unwrap().starts_with("Timestamp: "), "{part}");
@@ -451,13 +453,10 @@ async fn request_log_records_the_websocket_timeline_and_each_turn() {
         "websocket.disconnect".into(),
         "websocket: close 1000 (normal): bye".into(),
     ));
-    assert_eq!(timeline, want, "\n{log}");
+    assert_eq!(timeline, logged(want), "\n{log}");
     // The turn's upstream attempt is captured under the upgrade's log.
     let api_request = section("API REQUEST 1 ===");
-    assert!(
-        api_request.contains(&format!("Upstream URL: http://{upstream}/responses")),
-        "{api_request}"
-    );
+    assert!(api_request.contains("Upstream URL: <redacted url>\n"), "{api_request}");
     assert!(
         section("API RESPONSE").contains(&format!("data: {COMPLETED}")),
         "\n{log}"
@@ -669,6 +668,26 @@ async fn the_socket_closes_before_the_request_log_is_delivered() {
 
 /// One Responses WebSocket turn through the request-log layer against an upstream that
 /// answers `status` with `body`: the text frames the client saw and the written log.
+/// `parts` as a timeline logs them: the payloads are redacted as one text, and at each
+/// message end the last word and the next message's first word fail closed
+/// ([`ck_wire::redact::Pieces`]).
+fn logged<E: Into<String>, P: AsRef<str>>(parts: impl IntoIterator<Item = (E, P)>) -> Vec<(String, String)> {
+    const SEP: &str = "\n\u{1}\n";
+    let (events, payloads): (Vec<String>, Vec<P>) = parts.into_iter().map(|(e, p)| (e.into(), p)).unzip();
+    let mut pieces = ck_wire::redact::Pieces::default();
+    let mut out = Vec::new();
+    for (i, payload) in payloads.iter().enumerate() {
+        if i > 0 {
+            pieces.cut(&mut out).unwrap();
+            out.extend_from_slice(SEP.as_bytes());
+        }
+        pieces.push(payload.as_ref().as_bytes(), &mut out).unwrap();
+    }
+    pieces.finish(&mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    events.into_iter().zip(text.split(SEP).map(str::to_owned)).collect()
+}
+
 async fn logged_failure(status: u16, body: &'static str) -> (Vec<String>, String) {
     use futures_util::StreamExt;
     let mut servers = Servers::default();
@@ -701,6 +720,8 @@ fn timeline_events(log: &str) -> Vec<(String, String)> {
     let body = &body[..body.find("\n=== ").unwrap_or(body.len())];
     body.split("\n\n")
         .filter(|part| !part.trim().is_empty())
+        // A payload the redaction dropped leaves its line break behind.
+        .map(|part| part.trim_start_matches('\n'))
         .map(|part| {
             let mut lines = part.lines();
             assert!(lines.next().unwrap().starts_with("Timestamp: "), "{part}");
@@ -727,11 +748,11 @@ async fn request_log_records_terminal_errors_like_go() {
     assert_eq!(frames.len(), 1, "the exposed error event: {frames:?}");
     assert_eq!(
         timeline_events(&log),
-        [
-            ("websocket.request".to_owned(), REQUEST.to_owned()),
-            ("websocket.response".to_owned(), frames[0].clone()),
-            ("websocket.disconnect".to_owned(), CLOSE_SENT.to_owned()),
-        ],
+        logged([
+            ("websocket.request", REQUEST),
+            ("websocket.response", frames[0].as_str()),
+            ("websocket.disconnect", CLOSE_SENT),
+        ]),
         "\n{log}"
     );
 
@@ -740,14 +761,17 @@ async fn request_log_records_terminal_errors_like_go() {
     assert!(frames.is_empty(), "a quota failure closes silently: {frames:?}");
     let events = timeline_events(&log);
     assert_eq!(events.len(), 3, "\n{log}");
-    assert_eq!(events[0], ("websocket.request".to_owned(), REQUEST.to_owned()));
-    assert_eq!(events[1].0, "websocket.disconnect", "\n{log}");
-    assert!(
-        events[1].1.contains("usage_limit_reached"),
-        "the upstream reason: {}",
-        events[1].1
-    );
-    assert_eq!(events[2], ("websocket.disconnect".to_owned(), CLOSE_SENT.to_owned()));
+    // The first and last parts' redaction depends only on their place in the timeline.
+    let ends = logged([
+        ("websocket.request", REQUEST),
+        ("websocket.disconnect", "x"),
+        ("websocket.disconnect", CLOSE_SENT),
+    ]);
+    assert_eq!(events[0], ends[0]);
+    // The reason follows the redacted end of the request on the same line of text, so
+    // it is dropped with it.
+    assert_eq!(events[1], ("websocket.disconnect".to_owned(), String::new()), "\n{log}");
+    assert_eq!(events[2], ends[2]);
 }
 
 /// Go `TestResponsesInterruptDiagnosticsAreSanitized` and the outcome check of
@@ -867,9 +891,10 @@ async fn interrupt_diagnostics_are_sanitized() {
     assert_eq!(events.len(), 9, "\n{log}");
     // The local outcome and the turn's incomplete event are written concurrently.
     events[6..8].sort();
+    // The redaction of a middle part does not depend on its neighbours, so the sort holds.
     assert_eq!(
         events,
-        [
+        logged([
             part("websocket.interrupt", &hashed(private, "")),
             part("websocket.interrupt.outcome", &hashed(private, "rejected")),
             part("websocket.request", create),
@@ -879,7 +904,7 @@ async fn interrupt_diagnostics_are_sanitized() {
             part("websocket.interrupt.outcome", &hashed(http, "local_http")),
             part("websocket.response", &incomplete),
             part("websocket.disconnect", "websocket: close 1000 (normal): bye"),
-        ],
+        ]),
         "\n{log}"
     );
     for secret in [

@@ -262,7 +262,7 @@ pub(super) fn frames(
             match lines.next().await {
                 Some(Ok(line)) => {
                     // AppendAPIResponseChunk per scanned line.
-                    state.capture.chunk(&line);
+                    state.capture.line(&line);
                     if state.line(&line) {
                         if !state.failed && !state.end_tool_input() {
                             state.finish();
