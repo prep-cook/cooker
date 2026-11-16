@@ -408,21 +408,28 @@ async fn error_frames_and_socket_loss_fail_the_attempt() {
 #[derive(Debug, Clone, Copy)]
 enum Ending {
     Cancel,
+    /// Cancel while holding, unpolled, the response the upstream started after the turn's own.
+    CancelSuccessor,
     DropBody,
 }
 
-/// Cancel sends `response.interrupt` for a response in flight and closes the socket; before
+/// Cancel sends `response.interrupt` for the response in flight, the turn's own or a successor
+/// the upstream started (as after accepted steering), and closes the socket; before
 /// `response.created` it only closes. A body dropped in flight closes it too. A turn whose
 /// response finished leaves the socket to the next turn.
 #[tokio::test]
 async fn ending_a_turn_in_flight_closes_its_socket() {
     const INTERRUPT: &str = r#"{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}"#;
+    const INTERRUPT_R2: &str = r#"{"type":"response.interrupt","response_id":"r2","mode":"discard_partial_items"}"#;
+    let mut successor = answer("r1", 3);
+    successor.push(created("r2"));
     // (frames before the ending, read until, ending, frame sent after, socket closed)
     let rows = [
         (vec![], 0, Ending::Cancel, None, true),
         (vec![created("r1")], 1, Ending::Cancel, Some(INTERRUPT), true),
         (vec![created("r1")], 1, Ending::DropBody, None, true),
         (answer("r1", 3), usize::MAX, Ending::Cancel, None, false),
+        (successor, usize::MAX, Ending::CancelSuccessor, Some(INTERRUPT_R2), true),
     ];
     for (send, read, ending, after, closed) in rows {
         let mut acts = vec![act(send)];
@@ -446,11 +453,18 @@ async fn ending_a_turn_in_flight_closes_its_socket() {
         let held = match ending {
             Ending::Cancel => {
                 control.cancel().await;
-                Some(frames)
+                (Some(frames), None)
+            }
+            Ending::CancelSuccessor => {
+                let Some(Next::Response(successor)) = control.next().await else {
+                    panic!("the successor follows");
+                };
+                control.cancel().await;
+                (Some(frames), Some(successor))
             }
             Ending::DropBody => {
                 drop((control, frames));
-                None
+                (None, None)
             }
         };
         if let Some(after) = after {

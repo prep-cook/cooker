@@ -258,6 +258,14 @@ impl Line {
         }
     }
 
+    /// A response started on the socket (`response.created`): it is the one in flight, which
+    /// cancel interrupts, from here on, whether or not its body was polled yet.
+    fn started(&self, created: &str) {
+        let mut state = self.state();
+        state.open = true;
+        state.response = Some(gjson::get(created, "response.id").str().to_owned());
+    }
+
     /// Ends the socket: what it still carries cannot be told apart from a later turn's.
     fn close(&self, error: &ExecError) {
         self.state().open = false;
@@ -352,11 +360,7 @@ impl Frames {
                 return Some(Err(error));
             }
             match gjson::get(payload, "type").str() {
-                "response.created" => {
-                    let mut state = self.line.state();
-                    state.open = true;
-                    state.response = Some(gjson::get(payload, "response.id").str().to_owned());
-                }
+                "response.created" => self.line.started(payload),
                 "response.completed" | "response.incomplete" => {
                     self.done = true;
                     self.line.state().open = false;
@@ -464,6 +468,7 @@ impl TurnControl {
                 continue;
             }
             if gjson::get(payload, "type").str() == "response.created" {
+                self.line.started(payload);
                 let frames = Frames::new(self.line.clone(), reads, Some(text), None);
                 return Some(Next::Response(Successor { frames }));
             }
