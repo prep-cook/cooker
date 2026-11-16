@@ -57,6 +57,34 @@ impl Capability for RelayCapability {
     }
 }
 
+/// Model-specific relay semantics, selected before any attempt sends bytes.
+pub struct ModelCapability {
+    glm: bool,
+}
+
+impl ModelCapability {
+    fn new(attempt: &Attempt<'_>) -> Self {
+        let (model, _) = thinking::split_suffix(attempt.model);
+        Self {
+            glm: thinking::glm::is_model(model),
+        }
+    }
+}
+
+impl Capability for ModelCapability {
+    fn destination(&self) -> &'static str {
+        if self.glm { "glm-chat" } else { DESTINATION }
+    }
+
+    fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
+        if self.glm {
+            ck_translate::codec::chat::request::GlmCapability.validate(view)
+        } else {
+            RelayCapability.validate(view)
+        }
+    }
+}
+
 /// The response decoder of the upstream protocol the operation used. Boxed: the producer
 /// task moves it once, and the variants differ in size.
 pub enum RelayIngress {
@@ -102,11 +130,11 @@ impl codec::ResponseIngress for RelayIngress {
 }
 
 impl Execute for OpenAICompatExecutor {
-    type Capability = RelayCapability;
+    type Capability = ModelCapability;
     type Ingress = RelayIngress;
 
-    fn capability(&self, _attempt: &Attempt<'_>) -> RelayCapability {
-        RelayCapability
+    fn capability(&self, attempt: &Attempt<'_>) -> ModelCapability {
+        ModelCapability::new(attempt)
     }
 
     async fn execute(
@@ -205,7 +233,7 @@ pub(crate) async fn chat(
     let document = request.validated.view().document;
     let stream = streaming(document).map_err(encoding)?;
     let egress = ChatEgress {
-        destination: DESTINATION,
+        destination: request.validated.destination(),
         upstream_stream: stream,
     };
     let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
@@ -224,7 +252,8 @@ pub(crate) async fn chat(
         mode,
         compat::MAX_LINE as u64,
     )
-    .map_err(encoding)?;
+    .map_err(encoding)?
+    .with_glm(thinking::glm::is_model(&relay.base_model));
     let upstream = send(&route, attempt, request, CHAT_PATH, &relay.base_model, body, stream).await?;
     Ok(Upstream {
         status: upstream.status,
@@ -241,9 +270,11 @@ pub(crate) fn count(attempt: &Attempt<'_>, request: &Request<'_>, streams: Strea
         operation: Operation::Generate,
         ..request.validated.view()
     };
-    let generate = RequestFence::default().end(view, &RelayCapability).map_err(encoding)?;
+    let generate = RequestFence::default()
+        .end(view, &ModelCapability::new(attempt))
+        .map_err(encoding)?;
     let egress = ChatEgress {
-        destination: DESTINATION,
+        destination: generate.destination(),
         upstream_stream: false,
     };
     let upload = copy(&egress.encode(&generate, streams.request).map_err(encoding)?)?;

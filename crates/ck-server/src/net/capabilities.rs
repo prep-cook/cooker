@@ -148,7 +148,7 @@ fn compat_models(cfg: &Config, c: &Credential) -> Option<Vec<Configured>> {
         .map(|m| Configured {
             thinking: m.thinking.or_else(|| {
                 (!m.image).then(|| ThinkingSupport {
-                    levels: vec!["low".into(), "medium".into(), "high".into()],
+                    levels: ck_wire::thinking::glm::default_levels(&m.name),
                     ..ThinkingSupport::default()
                 })
             }),

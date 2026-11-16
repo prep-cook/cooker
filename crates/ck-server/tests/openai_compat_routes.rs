@@ -68,6 +68,10 @@ async fn proxy() -> (String, Arc<Seen>) {
 }
 
 async fn proxy_keys(keys: &[&str]) -> (String, Arc<Seen>) {
+    proxy_model(keys, "up-model").await
+}
+
+async fn proxy_model(keys: &[&str], model: &str) -> (String, Arc<Seen>) {
     let keys: String = keys.iter().map(|k| format!("        - api-key: {k}\n")).collect();
     let seen = Arc::new(Seen::default());
     let upstream_url = serve(axum::Router::new().fallback(upstream).with_state(seen.clone())).await;
@@ -75,7 +79,7 @@ async fn proxy_keys(keys: &[&str]) -> (String, Arc<Seen>) {
     let auth_dir = std::env::temp_dir().join(format!("cooker-compat-auths-{}", std::process::id()));
     std::fs::create_dir_all(&auth_dir).unwrap();
     let config = Config::parse(&format!(
-        "access:\n  api-keys: [client-key]\napi-keys:\n  openai-compatibility:\n    - name: Acme\n      base-url: {upstream_url}/v1\n      models:\n        - name: up-model\n          alias: fast\n      keys:\n{keys}"))
+        "access:\n  api-keys: [client-key]\napi-keys:\n  openai-compatibility:\n    - name: Acme\n      base-url: {upstream_url}/v1\n      models:\n        - name: {model}\n          alias: fast\n      keys:\n{keys}"))
     .unwrap();
     let credentials = ck_core::config::credentials::load(&config);
     let executors = Executors {
@@ -110,25 +114,37 @@ async fn post(url: &str, body: &str) -> (u16, String, String) {
 
 #[tokio::test]
 async fn alias_routes_to_configured_upstream_with_its_key() {
-    let (url, seen) = proxy().await;
-    let (status, content_type, text) =
-        post(&url, r#"{"model":"fast","messages":[{"role":"user","content":"hi"}]}"#).await;
-    assert_eq!(status, 200, "{text}");
-    assert!(content_type.starts_with("application/json"), "{content_type}");
-    assert_eq!(text, CHAT, "OpenAI-to-OpenAI non-stream responses pass through");
-    let seen = seen.0.lock().unwrap().clone();
-    assert_eq!(seen.len(), 1);
-    let (path, auth, body) = &seen[0];
-    assert_eq!(path, "/v1/chat/completions");
-    assert_eq!(
-        auth.as_deref(),
-        Some("Bearer sk-fake-upstream"),
-        "the client key never reaches the upstream"
-    );
-    assert_eq!(
-        body,
-        r#"{"model":"up-model","messages":[{"role":"user","content":"hi"}]}"#
-    );
+    for (model, effort, expected) in [
+        ("up-model", None, None),
+        ("glm-5.3", Some("max"), Some("max")),
+        ("glm-5.2", Some("max"), Some("max")),
+        ("glm-5.2", Some("xhigh"), Some("xhigh")),
+        ("glm-5.2", Some("minimal"), Some("minimal")),
+        ("glm-5.3(max)", Some("max"), Some("max")),
+    ] {
+        let (url, seen) = proxy_model(&["sk-fake-upstream"], model).await;
+        let mut request = serde_json::json!({"model":"fast","messages":[{"role":"user","content":"hi"}]});
+        if let Some(effort) = effort {
+            request["reasoning_effort"] = effort.into();
+        }
+        let (status, content_type, text) = post(&url, &request.to_string()).await;
+        assert_eq!(status, 200, "{model}: {text}");
+        assert!(content_type.starts_with("application/json"), "{content_type}");
+        assert_eq!(text, CHAT, "OpenAI-to-OpenAI non-stream responses pass through");
+        let seen = seen.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let (path, auth, body) = &seen[0];
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(
+            auth.as_deref(),
+            Some("Bearer sk-fake-upstream"),
+            "the client key never reaches the upstream"
+        );
+        let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(sent["model"], ck_wire::thinking::split_suffix(model).0);
+        assert_eq!(sent["messages"], request["messages"]);
+        assert_eq!(sent["reasoning_effort"].as_str(), expected, "{model}");
+    }
 }
 
 #[tokio::test]

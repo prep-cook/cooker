@@ -380,6 +380,76 @@ async fn rejected_history_retries_once_without_completed_thinking() {
 }
 
 #[tokio::test]
+async fn messages_effort_precedence_respects_credential_and_identity() {
+    for (mode, expected) in [
+        ("native", Some("high")),
+        ("oauth", None),
+        ("bearer", None),
+        ("first-party", None),
+        ("cloaked", None),
+        ("fingerprinted", None),
+    ] {
+        let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+        let token = if mode == "oauth" {
+            "sk-ant-oat01-local-test"
+        } else {
+            "local-test"
+        };
+        let mut credential = Credential::from_file(
+            Path::new("/auth"),
+            Path::new("/auth/fixture.json"),
+            serde_json::json!({
+                "type":"claude", "access_token":token,
+                "account_uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "claude_device_ids":["0123456789abcdef".repeat(4)]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap();
+        if !matches!(mode, "oauth" | "bearer") {
+            credential.attributes.insert("api_key".into(), token.into());
+        }
+        if mode != "first-party" {
+            credential
+                .attributes
+                .insert("base_url".into(), "http://127.0.0.1:1".into());
+        }
+        match mode {
+            "cloaked" => {
+                credential.attributes.insert("cloak_mode".into(), "always".into());
+            }
+            "fingerprinted" => {
+                credential
+                    .attributes
+                    .insert("fingerprint_profile".into(), "claude-code-cli".into());
+            }
+            _ => {}
+        }
+        let mut req = request(&serde_json::json!({
+            "request_body": r#"{"model":"glm-5.3","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"},"output_config":{"effort":"high"}}"#,
+            "request_headers": [], "path": "/v1/messages"
+        }));
+        req.model = "glm-5.3".into();
+        let cfg = Config::parse("").unwrap();
+        let ctx = Ctx::new(
+            &executor,
+            &credential,
+            (&req.model, None, None),
+            &cfg,
+            Default::default(),
+        );
+        let prepared = ctx
+            .prepare_messages(&Input::of(&req), &req.body, &req.original_body, false)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&prepared.body).unwrap();
+        assert_eq!(body["output_config"]["effort"].as_str(), expected, "{mode}");
+    }
+}
+
+#[tokio::test]
 async fn pipeline_reproduces_go_upstream_captures() {
     let captures: Value = serde_json::from_str(include_str!("testdata/go_captures.json")).unwrap();
     let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);

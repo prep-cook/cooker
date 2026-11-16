@@ -1427,12 +1427,21 @@ impl<'a> Ctx<'a> {
         !self.contract
     }
 
-    /// Whether the old thinking normalizer runs: always on the old path; on the contract path
-    /// only for the operator's model-name thinking suffix, such as `(8192)`. Otherwise the
-    /// client's thinking and effort go upstream as written, and the fence refused what the
-    /// API would (P8 removes the old path).
+    /// Native GLM API-key Messages keeps its own effort precedence. Cloaked requests keep
+    /// the legacy normalizer; other contract requests run it only for a model suffix.
     pub(super) fn legacy_thinking(&self, req: &Input<'_>) -> bool {
-        !self.contract || ck_wire::thinking::parse_suffix(req.model).has_suffix
+        let (model, suffix) = ck_wire::thinking::split_suffix(req.model);
+        if suffix.is_none()
+            && req.source_format == Format::Claude
+            && !self.bearer
+            && !self.first_party
+            && ck_wire::thinking::glm::is_model(model)
+            && !self.may_cloak()
+            && !detect::detect(req.headers, &utf8(req.original_body), false, &self.settings).confirmed
+        {
+            return false;
+        }
+        !self.contract || suffix.is_some()
     }
 
     /// Whether the cloak may shape this credential's requests (one the detection does not
