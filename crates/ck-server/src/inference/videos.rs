@@ -7,9 +7,7 @@
 // ponytail: the non-streaming keep-alive (`requests.nonstream-keepalive-interval`) and
 // upstream header passthrough are not applied, like the other Rust routes.
 
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock};
 
 use axum::Extension;
 use axum::body::{Body, Bytes};
@@ -40,74 +38,6 @@ const DEFAULT_SECONDS: &str = "4";
 const DEFAULT_SIZE: &str = "720x1280";
 const DEFAULT_RESOLUTION: &str = "720p";
 const MAX_REFERENCES: usize = 7;
-const DEFAULT_BINDING_TTL: Duration = Duration::from_secs(3 * 3600);
-
-// --- credential bindings ------------------------------------------------------------------
-
-struct Binding {
-    auth: String,
-    model: String,
-    expires: Instant,
-}
-
-/// Go's process-wide `videoAuthBindings`.
-static BINDINGS: LazyLock<Mutex<HashMap<String, Binding>>> = LazyLock::new(Mutex::default);
-
-fn bindings() -> std::sync::MutexGuard<'static, HashMap<String, Binding>> {
-    BINDINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// `setWithModel`: expired entries are swept on every write.
-fn bind(video: &str, auth: &str, model: &str, ttl: Duration) {
-    let (video, auth) = (video.trim(), auth.trim());
-    if video.is_empty() || auth.is_empty() {
-        return;
-    }
-    let now = Instant::now();
-    let mut map = bindings();
-    map.retain(|_, b| now <= b.expires);
-    map.insert(
-        video.to_owned(),
-        Binding {
-            auth: auth.to_owned(),
-            model: model.trim().to_owned(),
-            expires: now + ttl,
-        },
-    );
-}
-
-/// `getBinding`: the credential and model, unless expired.
-fn binding(video: &str) -> Option<(String, String)> {
-    let video = video.trim();
-    if video.is_empty() {
-        return None;
-    }
-    let now = Instant::now();
-    let mut map = bindings();
-    match map.get(video) {
-        Some(b) if now > b.expires => {
-            map.remove(video);
-            None
-        }
-        Some(b) => Some((b.auth.clone(), b.model.clone())),
-        None => None,
-    }
-}
-
-/// `videoAuthBindingTTL`: `multimedia.video-result-auth-cache-ttl` when it parses as a
-/// positive Go duration, else three hours.
-fn binding_ttl(rt: &Runtime) -> Duration {
-    rt.config()
-        .document
-        .get("multimedia")
-        .and_then(|m| m.get("video-result-auth-cache-ttl"))
-        .and_then(serde_yaml_ng::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(ck_core::config::parse_duration)
-        .filter(|n| *n > 0)
-        .map_or(DEFAULT_BINDING_TTL, |n| Duration::from_nanos(n as u64))
-}
 
 // --- models -------------------------------------------------------------------------------
 
@@ -621,14 +551,12 @@ struct Request {
 
 /// One buffered execution of `body` on `model` (`ExecuteWithAuthManager` with the
 /// `openai-video` handler type), pinned to `pinned` when set. `render` gets the payload or
-/// the failure, and the last credential selected (`WithSelectedAuthIDCallback`).
+/// the failure.
 async fn execute<F, Fut>(r: &Request, model: &str, body: Vec<u8>, pinned: Option<String>, render: F) -> Response
 where
-    F: FnOnce(Result<Bytes, Failure>, String) -> Fut + Send + 'static,
+    F: FnOnce(Result<Bytes, Failure>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Response> + Send,
 {
-    let selected: Arc<Mutex<String>> = Arc::default();
-    let sink = selected.clone();
     let call = Call {
         entry: Format::OpenAI,
         response: Format::OpenAI,
@@ -648,23 +576,17 @@ where
         media: Some(Arc::new(Media {
             kind: MediaKind::Videos,
             pinned,
-            on_selected: Some(Box::new(move |c| {
-                *sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = c.id.clone();
-            })),
+            on_selected: None,
             sse: false,
             disallow_free: false,
         })),
     };
     dispatch::serve(&r.rt, call, move |result| async move {
-        let selected = selected
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
         let payload = result.map(|done| match done {
             Done::Buffered { body, .. } => body,
             Done::Stream { .. } => unreachable!("a non-stream call is buffered"),
         });
-        render(payload, selected).await
+        render(payload).await
     })
     .await
 }
@@ -673,46 +595,42 @@ fn json_body(body: impl Into<Body>) -> Response {
     respond::json(200, "application/json", body)
 }
 
-/// Go `contextWithVideoAuthBinding` + `modelWithVideoAuthBinding`.
-fn pinned_and_model(video: &str, fallback: &str) -> (Option<String>, String) {
-    match binding(video) {
-        Some((auth, model)) => {
-            let model = if model.trim().is_empty() {
-                fallback.to_owned()
+/// The credential and routing model a poll of `video` is pinned to: those its job was created on
+/// (E-Q5, `VideoJobs`). A job that is not the caller's is not pinned; the executor refuses it
+/// with 404 before anything is sent.
+fn pinned_and_model(r: &Request, video: &str, fallback: &str) -> (Option<String>, String) {
+    match r.rt.executors.video_binding(&r.caller, video) {
+        Some(bound) => {
+            let model = if bound.model.trim().is_empty() {
+                fallback
             } else {
-                model
+                routing(&bound.model)
             };
-            (Some(auth), model)
+            (Some(bound.credential), model.to_owned())
         }
         None => (None, fallback.to_owned()),
     }
 }
 
-/// `collectXAIVideosNative`: the upstream body as is, binding the created (or polled)
-/// video to the serving credential.
-async fn native(r: Request, body: Vec<u8>, model: &str, bind_created: bool) -> Response {
-    let video = video_id(&body);
-    let (pinned, model) = if bind_created {
+/// `collectXAIVideosNative`: the upstream body as is. A create's job is recorded by the
+/// executor; a poll goes to the credential that created it.
+async fn native(r: Request, body: Vec<u8>, model: &str, create: bool) -> Response {
+    let (pinned, model) = if create {
         (None, model.to_owned())
     } else {
-        pinned_and_model(&video, model)
+        pinned_and_model(&r, &video_id(&body), model)
     };
-    let ttl = binding_ttl(&r.rt);
-    let routed = routing(&model);
-    execute(&r, &model, body, pinned, move |result, selected| async move {
-        let payload = match result {
-            Ok(payload) => payload,
-            Err(failure) => return errors::openai(&failure),
-        };
-        let bound = if bind_created { video_id(&payload) } else { video };
-        bind(&bound, &selected, routed, ttl);
-        json_body(payload)
+    execute(&r, &routing(&model), body, pinned, |result| async move {
+        match result {
+            Ok(payload) => json_body(payload),
+            Err(failure) => errors::openai(&failure),
+        }
     })
     .await
 }
 
-/// `VideosRetrieve` and `VideosContent`: polls `id` on its bound credential and model,
-/// rebinding it to the credential that answered.
+/// `VideosRetrieve` and `VideosContent`: polls `id` on the credential and model its job was
+/// created on.
 async fn poll<F, Fut>(r: &Request, id: &str, render: F) -> Response
 where
     F: FnOnce(Bytes) -> Fut + Send + 'static,
@@ -720,16 +638,10 @@ where
 {
     let mut payload = b"{}".to_vec();
     gj::set_str(&mut payload, "request_id", id);
-    let (pinned, model) = pinned_and_model(id, XAI_MODEL);
-    let ttl = binding_ttl(&r.rt);
-    let routed = routing(&model);
-    let id = id.to_owned();
-    execute(r, &model, payload, pinned, move |result, selected| async move {
+    let (pinned, model) = pinned_and_model(r, id, XAI_MODEL);
+    execute(r, &model, payload, pinned, move |result| async move {
         match result {
-            Ok(payload) => {
-                bind(&id, &selected, routed, ttl);
-                render(payload).await
-            }
+            Ok(payload) => render(payload).await,
             Err(failure) => errors::openai(&failure),
         }
     })
@@ -742,9 +654,12 @@ static DOWNLOADS: LazyLock<ck_exec::proxy::GoClients> =
     LazyLock::new(|| ck_exec::proxy::GoClients::new(Default::default()));
 
 /// `writeVideoContentFromURL`.
-async fn download(rt: &Runtime, video: &str, url: &str) -> Response {
+async fn download(rt: &Runtime, caller: &Caller, video: &str, url: &str) -> Response {
     let cfg = rt.config();
-    let credential = binding(video).and_then(|(auth, _)| rt.store().get(&auth));
+    let credential = rt
+        .executors
+        .video_binding(caller, video)
+        .and_then(|bound| rt.store().get(&bound.credential));
     let proxy = match &credential {
         Some(c) => ck_exec::proxy::Proxy::effective(c, &cfg),
         None => ck_exec::proxy::Proxy::parse(
@@ -909,19 +824,15 @@ pub async fn create(
         Err(e) => return failed(400, canonical(&model), &format!("Invalid request: {e}")),
     };
     let r = request(rt, caller, peer, matched, &uri, headers);
-    let ttl = binding_ttl(&r.rt);
-    let routed = meta.routing;
-    execute(&r, routed, req, None, move |result, selected| async move {
+    execute(&r, meta.routing, req, None, move |result| async move {
         let payload = match result {
             Ok(payload) => payload,
             Err(failure) => return errors::openai(&failure),
         };
-        let out = match create_response(&payload, &meta) {
-            Ok(out) => out,
-            Err(message) => return gateway_error(&message),
-        };
-        bind(&video_id(&out), &selected, routed, ttl);
-        json_body(out)
+        match create_response(&payload, &meta) {
+            Ok(out) => json_body(out),
+            Err(message) => gateway_error(&message),
+        }
     })
     .await
 }
@@ -959,7 +870,7 @@ pub async fn native_post(
     let mut raw = body.to_vec();
     gj::set_str(&mut raw, "model", canonical(&model));
     let r = request(rt, caller, peer, matched, &uri, headers);
-    native(r, raw, routing(&model), true).await
+    native(r, raw, &model, true).await
 }
 
 /// `GET /v1/videos/{request_id}` (`XAIVideosRetrieve`).
@@ -1034,11 +945,11 @@ pub async fn content(
         ));
     }
     let r = request(rt, caller, peer, matched, &uri, headers);
-    let rt = r.rt.clone();
+    let (rt, caller) = (r.rt.clone(), r.caller.clone());
     let video = id.clone();
     poll(&r, &id, |payload| async move {
         match content_url(&payload) {
-            Ok(url) => download(&rt, &video, &url).await,
+            Ok(url) => download(&rt, &caller, &video, &url).await,
             Err(message) => gateway_error(&message),
         }
     })

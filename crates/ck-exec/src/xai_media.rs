@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::Credential;
-use ck_core::exec::{ExecError, ExecRequest, ExecResponse, FailureScope, ResponseBody};
+use ck_core::exec::{Caller, ExecError, ExecRequest, ExecResponse, FailureScope, ResponseBody};
 use ck_core::format::Format;
 use ck_wire::gostr::GoStr;
 use ck_wire::json as gj;
@@ -97,12 +97,16 @@ impl XaiExecutor {
             None => (wreq::Method::POST, VIDEOS_GENERATIONS.to_owned()),
         };
         let job = if method == wreq::Method::GET {
-            let Some(admission) = self.jobs.admit(&request_id) else {
+            let Some(admission) = self.jobs.admit(&req.caller, &request_id) else {
                 return Err(unknown_job(&request_id));
             };
             VideoJob::Poll(admission)
         } else {
-            VideoJob::Create
+            let binding = JobBinding {
+                credential: credential.id.clone(),
+                model: req.model.trim().to_owned(),
+            };
+            VideoJob::Create(self.jobs.reserve(&req.caller, binding).ok_or_else(jobs_full)?)
         };
         self.media(credential, &req, cfg.as_ref(), method, &path, payload, Some(job))
             .await
@@ -144,14 +148,14 @@ impl XaiExecutor {
         let admission = match video {
             None => None,
             Some(VideoJob::Poll(admission)) => Some(admission),
-            Some(VideoJob::Create) => {
+            Some(VideoJob::Create(slot)) => {
                 let id = text(&gj::get(&data, "request_id"));
                 let job = if id.trim().is_empty() {
                     text(&gj::get(&data, "id"))
                 } else {
                     id
                 };
-                self.jobs.created(&job)
+                slot.created(&job)
             }
         };
         if req.usage.enabled() {
@@ -205,96 +209,201 @@ fn reports_usage(body: &[u8]) -> bool {
     })
 }
 
-/// How long a job is remembered: well past the binding TTL a client polls within.
-const JOB_TTL: Duration = Duration::from_secs(24 * 3600);
+/// How long a job is remembered after its last create or poll (E-Q5).
+const JOB_TTL: Duration = Duration::from_secs(3 * 3600);
 
-/// What a video request is to its job: a create, whose response names the job, or a poll
-/// admitted against it.
+/// The most jobs and pending creates the table holds (E-Q5). A create beyond it is refused with
+/// 503 before anything is sent, so no upstream job exists that cooker could not track.
+pub(crate) const JOB_CAPACITY: usize = 4096;
+
+/// What a video request is to its job: a create, which holds a reserved slot until its response
+/// names the job, or a poll admitted against it.
 pub(crate) enum VideoJob {
-    Create,
+    Create(Slot),
     Poll(Admission),
 }
 
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
-/// One job's record: whether it was charged, when it was created or charged, and how many
-/// requests hold an [`Admission`] to it.
+/// The caller a cooker-issued job id belongs to (E-Q5): the client key that matched and the
+/// access provider that accepted it. Process memory only; never logged or sent.
+fn owner(caller: &Caller) -> String {
+    format!("{}\u{0}{}", caller.provider, caller.principal)
+}
+
+/// The credential and the model a job was created on, which every poll of it is pinned to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobBinding {
+    pub credential: String,
+    pub model: String,
+}
+
+/// Whether `record` was created or polled within [`JOB_TTL`] of `now`.
+fn live(now: Instant, record: &Job) -> bool {
+    now.saturating_duration_since(record.at) < JOB_TTL
+}
+
+/// One job's record: whether it was charged, when it was created or last polled, how many
+/// requests hold an [`Admission`] to it, and where its polls go.
 struct Job {
     charged: bool,
     at: Instant,
     in_flight: usize,
+    binding: JobBinding,
 }
 
-/// The video jobs this process created or charged (E-Q13): a job is charged at the first poll
-/// that reports usage and never again, however often it is polled after. A job missing here may
-/// already have been charged by an earlier process, so its poll is refused rather than risk a
-/// second charge. A record older than [`JOB_TTL`] admits no new poll, but stays while any
+#[derive(Default)]
+struct Table {
+    /// Keyed by (owner, job id): another caller's id is not found.
+    jobs: HashMap<(String, String), Job>,
+    /// Creates sent or about to be sent whose response has not named the job yet.
+    pending: usize,
+}
+
+/// The video jobs this process created (E-Q5, E-Q13). A job id belongs to the caller that
+/// created it; any other caller, an expired id or one this process never issued is not found.
+/// A job is charged at the first poll that reports usage and never again. A job missing here
+/// may already have been charged by an earlier process, so its poll is refused rather than risk
+/// a second charge. A record unpolled for [`JOB_TTL`] admits no new poll, but stays while any
 /// admitted request holds it, so expiry can only refuse a poll, never erase a charge another
-/// admitted poll settles against.
+/// admitted poll settles against. The table holds at most `capacity` jobs and pending creates.
 // ponytail: process memory, so a job created before a restart cannot be polled through cooker.
 // No store on this path outlives the process: the usage queue is in memory, and SQLite holds
 // configuration and credentials only. A durable job ledger (F06-1) lifts this; its store awaits
 // an owner decision.
 #[derive(Clone)]
-pub(crate) struct VideoJobs {
-    jobs: Arc<Mutex<HashMap<String, Job>>>,
+pub struct VideoJobs {
+    table: Arc<Mutex<Table>>,
     clock: Clock,
+    capacity: usize,
 }
 
 impl Default for VideoJobs {
     fn default() -> Self {
-        Self::with_clock(Arc::new(Instant::now))
+        Self::with_clock(Arc::new(Instant::now), JOB_CAPACITY)
     }
 }
 
 impl VideoJobs {
-    pub(crate) fn with_clock(clock: Clock) -> Self {
+    pub(crate) fn with_clock(clock: Clock, capacity: usize) -> Self {
         Self {
-            jobs: Arc::default(),
+            table: Arc::default(),
             clock,
+            capacity,
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Job>> {
-        self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> std::sync::MutexGuard<'_, Table> {
+        self.table.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// An admission to `job`, or `None` for a job without an ID. A create records the job if it
-    /// is new, keeping a charge it already has; a poll needs a record younger than [`JOB_TTL`].
-    fn enter(&self, job: &str, create: bool) -> Option<Admission> {
+    /// A slot for a create `caller` is about to send on `binding`, or `None` when the table is
+    /// full of live jobs and pending creates.
+    pub(crate) fn reserve(&self, caller: &Caller, binding: JobBinding) -> Option<Slot> {
+        let now = (self.clock)();
+        let mut table = self.lock();
+        if table.jobs.len() + table.pending >= self.capacity {
+            table.jobs.retain(|_, record| record.in_flight > 0 || live(now, record));
+        }
+        if table.jobs.len() + table.pending >= self.capacity {
+            return None;
+        }
+        table.pending += 1;
+        Some(Slot {
+            jobs: self.clone(),
+            owner: owner(caller),
+            binding: Some(binding),
+        })
+    }
+
+    /// Where `caller`'s live job `job` is polled, or `None` when it is not theirs, expired or
+    /// unknown.
+    pub fn binding(&self, caller: &Caller, job: &str) -> Option<JobBinding> {
+        let now = (self.clock)();
+        let key = (owner(caller), job.trim().to_owned());
+        let table = self.lock();
+        let record = table.jobs.get(&key)?;
+        live(now, record).then(|| record.binding.clone())
+    }
+
+    /// A poll's admission to `caller`'s live job, which restarts its expiry; `None` when the job
+    /// is not theirs, expired or unknown.
+    pub(crate) fn admit(&self, caller: &Caller, job: &str) -> Option<Admission> {
         let job = job.trim();
         if job.is_empty() {
             return None;
         }
         let now = (self.clock)();
-        let live = |record: &Job| now.saturating_duration_since(record.at) < JOB_TTL;
-        let mut jobs = self.lock();
-        jobs.retain(|_, record| record.in_flight > 0 || live(record));
-        let record = if create {
-            jobs.entry(job.to_owned()).or_insert(Job {
-                charged: false,
-                at: now,
-                in_flight: 0,
-            })
-        } else {
-            jobs.get_mut(job).filter(|record| live(record))?
-        };
+        let key = (owner(caller), job.to_owned());
+        let mut table = self.lock();
+        let record = table.jobs.get_mut(&key).filter(|record| live(now, record))?;
+        record.at = now;
         record.in_flight += 1;
         Some(Admission {
             jobs: self.clone(),
-            job: job.to_owned(),
+            key,
         })
     }
+}
 
-    /// Records a job this process created; its admission settles a usage the create reported.
-    pub(crate) fn created(&self, job: &str) -> Option<Admission> {
-        self.enter(job, true)
+#[cfg(test)]
+impl VideoJobs {
+    /// Records `job` as `caller` created it on no particular credential, as a create's response
+    /// does.
+    pub(crate) fn created(&self, caller: &Caller, job: &str) -> Option<Admission> {
+        let binding = JobBinding {
+            credential: String::new(),
+            model: String::new(),
+        };
+        self.reserve(caller, binding)?.created(job)
     }
+}
 
-    /// A poll's admission, or `None` when this process neither created nor charged the job, or
-    /// its record expired.
-    pub(crate) fn admit(&self, job: &str) -> Option<Admission> {
-        self.enter(job, false)
+/// A create's reserved place in the table, from before its send until its response names the
+/// job. Dropped unused, as when the create fails, it frees the place.
+pub(crate) struct Slot {
+    jobs: VideoJobs,
+    owner: String,
+    /// Taken when the slot becomes a job.
+    binding: Option<JobBinding>,
+}
+
+impl Slot {
+    /// Records the job the create's response named in this slot; its admission settles a usage
+    /// the create reported. `None` for a response naming no job, which frees the slot.
+    pub(crate) fn created(mut self, job: &str) -> Option<Admission> {
+        let job = job.trim();
+        if job.is_empty() {
+            return None;
+        }
+        let binding = self.binding.take()?;
+        let now = (self.jobs.clock)();
+        let key = (self.owner.clone(), job.to_owned());
+        let mut table = self.jobs.lock();
+        table.pending = table.pending.saturating_sub(1);
+        // A job id the upstream repeats keeps the charge it already has.
+        let record = table.jobs.entry(key.clone()).or_insert(Job {
+            charged: false,
+            at: now,
+            in_flight: 0,
+            binding: binding.clone(),
+        });
+        record.at = now;
+        record.binding = binding;
+        record.in_flight += 1;
+        Some(Admission {
+            jobs: self.jobs.clone(),
+            key,
+        })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if self.binding.is_some() {
+            let mut table = self.jobs.lock();
+            table.pending = table.pending.saturating_sub(1);
+        }
     }
 }
 
@@ -302,30 +411,28 @@ impl VideoJobs {
 /// is dropped.
 pub(crate) struct Admission {
     jobs: VideoJobs,
-    job: String,
+    key: (String, String),
 }
 
 impl Admission {
     /// Claims the job's charge: true only for the first settlement that finds the job uncharged,
-    /// which marks it charged and refreshes its record.
+    /// which marks it charged.
     pub(crate) fn settle(&self) -> bool {
-        let now = (self.jobs.clock)();
-        let mut jobs = self.jobs.lock();
+        let mut table = self.jobs.lock();
         // The admission keeps the record; a missing one charges nothing.
-        let Some(record) = jobs.get_mut(&self.job) else {
+        let Some(record) = table.jobs.get_mut(&self.key) else {
             return false;
         };
         if record.charged {
             return false;
         }
         record.charged = true;
-        record.at = now;
         true
     }
 
     /// Undoes this admission's [`Admission::settle`]: the job is uncharged again.
     pub(crate) fn release(&self) {
-        if let Some(record) = self.jobs.lock().get_mut(&self.job) {
+        if let Some(record) = self.jobs.lock().jobs.get_mut(&self.key) {
             record.charged = false;
         }
     }
@@ -333,24 +440,26 @@ impl Admission {
 
 impl Drop for Admission {
     fn drop(&mut self) {
-        if let Some(record) = self.jobs.lock().get_mut(&self.job) {
+        if let Some(record) = self.jobs.lock().jobs.get_mut(&self.key) {
             record.in_flight = record.in_flight.saturating_sub(1);
         }
     }
 }
 
-/// The job table as a video response's [`video::Ledger`]: an accepted job is recorded, and a
-/// reported usage is the job's charge only when its admission settles it first. Both routes settle
-/// against the same [`VideoJobs`], so one job is charged once whichever route polls it.
+/// The job table as a video response's [`video::Ledger`]: an accepted job takes the create's
+/// reserved slot, and a reported usage is the job's charge only when its admission settles it
+/// first. Both routes settle against the same [`VideoJobs`], so one job is charged once whichever
+/// route polls it.
 struct JobLedger {
-    jobs: VideoJobs,
+    /// A create's reserved slot, until the response names the job.
+    slot: Option<Slot>,
     /// The poll's admission, or the accepted job's.
     admission: Option<Admission>,
 }
 
 impl video::Ledger for JobLedger {
     fn accepted(&mut self, job: &str) {
-        self.admission = self.jobs.created(job);
+        self.admission = self.slot.take().and_then(|slot| slot.created(job));
     }
 
     /// The codec binds a poll's answer to the polled job, so the admission is the job's.
@@ -366,14 +475,20 @@ impl video::Ledger for JobLedger {
     }
 }
 
-/// The 404 for a poll of a job [`VideoJobs`] does not know, in the error shape OpenAI and xAI
-/// give an unknown ID. It is the request's fault: no other credential is tried.
+/// The 404 for a poll of a job [`VideoJobs`] does not know for this caller, in the error shape
+/// OpenAI and xAI give an unknown ID. It is the request's fault: no other credential is tried.
 fn unknown_job(job: &str) -> ExecError {
-    let message = format!(
-        "Video job '{job}' was not created through this server since it last started, or has expired. Create the video again."
-    );
+    let message = format!("Video job '{job}' does not exist for this API key, or has expired. Create the video again.");
     let body = serde_json::json!({"error": {"message": message, "type": "invalid_request_error", "param": null, "code": null}});
     ExecError::local(404, FailureScope::Request, body.to_string())
+}
+
+/// The 503 for a create while the job table is full (E-Q5): nothing is sent, so no upstream job
+/// exists. It is the request's fault for routing: no other credential is tried or cooled.
+fn jobs_full() -> ExecError {
+    let message = "Too many video jobs are being tracked. Retry after polling or waiting out existing jobs.";
+    let body = serde_json::json!({"error": {"message": message, "type": "server_error", "param": null, "code": "video_jobs_full"}});
+    ExecError::local(503, FailureScope::Request, body.to_string())
 }
 
 impl XaiExecutor {
@@ -650,11 +765,26 @@ impl XaiExecutor {
             video::Dialect::Xai,
             streams.request,
         )?;
-        // A poll is admitted against the job table before anything is sent: a job this process
-        // neither created nor charged is refused, as on the buffered route.
-        let admission = match (media, &job) {
-            (Media::VideoRetrieve, Some(job)) => Some(self.jobs.admit(job).ok_or_else(|| unknown_job(job))?),
-            _ => None,
+        // A poll is admitted against the job table before anything is sent: a job this caller did
+        // not create through this process is refused, as on the buffered route. A create reserves
+        // its place first, so a full table sends nothing.
+        let caller = call.request.client.caller;
+        let (admission, slot) = match (media, &job) {
+            (Media::VideoRetrieve, Some(job)) => (
+                Some(self.jobs.admit(caller, job).ok_or_else(|| unknown_job(job))?),
+                None,
+            ),
+            (Media::VideoCreate | Media::VideoEdit | Media::VideoExtend, _) => {
+                let binding = JobBinding {
+                    credential: call.attempt.credential.id.clone(),
+                    model: media_exec::requested_model(call.request.validated.view().document)
+                        .ok()
+                        .filter(|model| !model.is_empty())
+                        .unwrap_or_else(|| call.attempt.model.trim().to_owned()),
+                };
+                (None, Some(self.jobs.reserve(caller, binding).ok_or_else(jobs_full)?))
+            }
+            _ => (None, None),
         };
         let (method, path, phase) = match (media, &job) {
             (Media::VideoCreate, None) => (
@@ -685,10 +815,7 @@ impl XaiExecutor {
             phase,
             polled,
             VIDEO_LIMIT,
-            Box::new(JobLedger {
-                jobs: self.jobs.clone(),
-                admission,
-            }),
+            Box::new(JobLedger { slot, admission }),
         )
         .map_err(xai_exec::encoding)?;
         Ok((
@@ -722,7 +849,7 @@ impl XaiExecutor {
         if let Some(error) = crate::xai_url::transport_refusal(&url) {
             return Err(error);
         }
-        let headers = call.headers(&method, speech);
+        let headers = call.headers(speech);
         let client = self.clients.for_credential(credential, call.cfg);
         let usage = call.request.client.usage;
         let capture = wire::Capture::on(
@@ -809,9 +936,11 @@ impl MediaCall<'_> {
         )
     }
 
-    /// `applyXAIHeaders`; speech asks for any type, since TTS answers with raw audio, and a POST
-    /// carries the client's idempotency key.
-    fn headers(&self, method: &wreq::Method, speech: bool) -> GoHeaders {
+    /// `applyXAIHeaders`; speech asks for any type, since TTS answers with raw audio. xAI documents
+    /// no idempotency key for video creates (https://docs.x.ai/openapi.json: no header
+    /// parameters), so none is sent: a replayed create must not hand back a job a previous
+    /// process charged.
+    fn headers(&self, speech: bool) -> GoHeaders {
         let (token, _) = creds(self.attempt.credential);
         let client = &self.request.client;
         let mut headers = request_headers(
@@ -822,21 +951,6 @@ impl MediaCall<'_> {
         );
         if speech {
             headers.set("Accept", "*/*");
-        } else if *method == wreq::Method::POST {
-            let header = |name: &str| {
-                client
-                    .headers
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::trim)
-                    .unwrap_or_default()
-            };
-            let key = Some(header("Idempotency-Key"))
-                .filter(|k| !k.is_empty())
-                .unwrap_or_else(|| header("x-idempotency-key"));
-            if !key.is_empty() {
-                headers.set("x-idempotency-key", key.to_owned());
-            }
         }
         headers
     }
