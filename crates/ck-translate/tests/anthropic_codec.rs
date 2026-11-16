@@ -534,11 +534,47 @@ fn chat_choices_select_index_zero_not_the_first_array_element() {
             let body: Value = serde_json::from_slice(&output).unwrap();
             assert_eq!(body["content"], json!([{"type":"text","text":"selected"}]));
             assert_eq!(body["stop_reason"], "end_turn");
+            assert_eq!(body.get("stop_sequence"), Some(&Value::Null));
         } else {
             let rows = events(&output);
             assert!(rows.iter().any(|v| v["delta"]["text"] == "selected"));
             assert!(rows.iter().any(|v| v["delta"]["stop_reason"] == "end_turn"));
+            let finish = rows.iter().find(|v| v["delta"]["stop_reason"] == "end_turn").unwrap();
+            assert_eq!(finish["delta"].get("stop_sequence"), Some(&Value::Null));
             assert!(rows.iter().all(|v| v["delta"]["text"] != "discard"));
+        }
+    }
+}
+
+#[test]
+fn native_stop_sequences_survive_every_delivery_mode() {
+    for (reason, sequence) in [("end_turn", Value::Null), ("stop_sequence", json!("END"))] {
+        let body = json!({"id":"m","type":"message","role":"assistant","model":"claude","content":[],
+            "stop_reason":reason,"stop_sequence":sequence,"usage":{"input_tokens":1,"output_tokens":0}});
+        let streamed = sse(&[
+            json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant",
+                "model":"claude","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"message_delta","delta":{"stop_reason":reason,"stop_sequence":sequence},"usage":{"output_tokens":0}}),
+            json!({"type":"message_stop"}),
+        ]);
+        for (upstream, input) in [
+            (BodyMode::Buffered, serde_json::to_vec(&body).unwrap()),
+            (BodyMode::Streaming, streamed),
+        ] {
+            for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+                let (output, _) = response(&input, upstream, downstream, Operation::Generate, 7);
+                let finish: Value = if downstream == BodyMode::Buffered {
+                    serde_json::from_slice(&output).unwrap()
+                } else {
+                    events(&output)
+                        .into_iter()
+                        .find(|v| v["type"] == "message_delta")
+                        .unwrap()["delta"]
+                        .clone()
+                };
+                assert_eq!(finish["stop_reason"], reason);
+                assert_eq!(finish.get("stop_sequence"), Some(&sequence));
+            }
         }
     }
 }
