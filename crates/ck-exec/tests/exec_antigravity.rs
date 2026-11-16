@@ -1,6 +1,6 @@
 //! The Antigravity executor through the pipeline against a local upstream, checked against
 //! CLIProxyAPI's recorded behaviour (`tests/fixtures/antigravity_go.json`, owner rulings
-//! 66-68): the upstream request each client protocol makes, the refusal each failure
+//! 68-70): the upstream request each client protocol makes, the refusal each failure
 //! returns, the usage the canonical stream accounts, and the signatures and text each
 //! client receives.
 
@@ -441,7 +441,7 @@ fn assert_client_output(name: &str, delivered: &str, s: &Value) {
         recorded.push_str(chunk.as_str().unwrap());
     }
     let delivered = &normalize(delivered);
-    // Ruling 66: a Claude model's signature reaches the client as the upstream sent it, where
+    // Ruling 68: a Claude model's signature reaches the client as the upstream sent it, where
     // CLIProxyAPI decodes it; Gemini models keep CLIProxyAPI's carriers.
     let signatures = if s["model"].as_str().unwrap().contains("claude") {
         strings(s["upstream"]["body"].as_str().unwrap(), &["thoughtSignature"])
@@ -655,7 +655,7 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 /// Every recorded CLIProxyAPI exchange, run through the selector's Antigravity arm in
 /// recording order: the upstream request, the refusal or the canonical usage, and what the
 /// client receives. This covers every client protocol, credits, refusals, token counts,
-/// compaction (ruling 68) and the replay ledger's turns (ruling 67).
+/// compaction (ruling 70) and the replay ledger's turns (ruling 69).
 #[tokio::test]
 async fn every_recorded_exchange_matches_cliproxyapi() {
     let (mut failures, mut deviated) = (Vec::new(), 0);
@@ -747,7 +747,7 @@ async fn sent_signatures(source: &str, payload: &Value) -> Vec<String> {
     strings(&body, &["thoughtSignature"])
 }
 
-/// Ruling 66: signed thinking and tool calls go back upstream exactly as the client holds
+/// Ruling 68: signed thinking and tool calls go back upstream exactly as the client holds
 /// them; CLIProxyAPI would wrap the single-layer form. Only CLIProxyAPI's legacy `<group>#`
 /// prefix comes off. Thinking without a Claude signature is dropped, as CLIProxyAPI and
 /// OmniRoute both drop it, and no cached signature fills the gap.
@@ -769,7 +769,7 @@ async fn signed_thinking_goes_upstream_as_the_client_holds_it() {
     }
 }
 
-/// Ruling 66: the client receives a Claude model's thinking and tool-call signatures as the
+/// Ruling 68: the client receives a Claude model's thinking and tool-call signatures as the
 /// upstream sent them, buffered or streamed, and a later turn that drops the signature does
 /// not get it back from a cache.
 #[tokio::test]

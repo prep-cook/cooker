@@ -45,7 +45,7 @@ fn carrier_value(model: &str, signature: &[u8], direction: &str, target: &str) -
     if sig::provider_from_model_name(model) == Provider::Gemini {
         encode_carrier(signature, direction, target)
     } else {
-        // Owner ruling 66: a Claude client gets the upstream's signature as sent;
+        // Owner ruling 68: a Claude client gets the upstream's signature as sent;
         // CLIProxyAPI's `formatClaudeSignatureValue` decodes the double-layer form here.
         signature.to_vec()
     }

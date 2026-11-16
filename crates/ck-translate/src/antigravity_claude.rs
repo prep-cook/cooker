@@ -378,7 +378,7 @@ fn provider(model: &str) -> Provider {
 }
 
 /// resolveProviderCompatibleSignature, except that a valid Claude signature, on a thinking
-/// block or a tool call, goes upstream as the client holds it (ruling 66): only CLIProxyAPI's
+/// block or a tool call, goes upstream as the client holds it (ruling 68): only CLIProxyAPI's
 /// legacy `<group>#` prefix comes off, without its double-layer rewrite.
 fn provider_compatible(target: Provider, raw: &[u8], kind: BlockKind) -> Vec<u8> {
     if raw.is_empty() {
@@ -396,7 +396,7 @@ fn provider_compatible(target: Provider, raw: &[u8], kind: BlockKind) -> Vec<u8>
 }
 
 /// resolveThinkingSignature: Gemini targets unwrap carriers; Claude targets keep a valid
-/// client signature (ruling 66); others use the client signature or, without one, the signature
+/// client signature (ruling 68); others use the client signature or, without one, the signature
 /// cache (cache mode), or the bypass rules.
 fn resolve_thinking_signature(model: &str, text: &[u8], raw: &[u8]) -> Vec<u8> {
     let target = provider(model);
@@ -407,7 +407,7 @@ fn resolve_thinking_signature(model: &str, text: &[u8], raw: &[u8]) -> Vec<u8> {
         }
         return provider_compatible(target, &carrier.signature, block_kind(carrier.marked, &carrier.target));
     }
-    // Owner ruling 66: an unsigned block for a Claude model gets no cached signature.
+    // Owner ruling 68: an unsigned block for a Claude model gets no cached signature.
     // CLIProxyAPI and OmniRoute both drop unsigned and invalid blocks.
     if target == Provider::Claude {
         return provider_compatible(target, raw, BlockKind::Unknown);
