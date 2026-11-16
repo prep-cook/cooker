@@ -518,7 +518,7 @@ impl CodexExecutor {
     }
 
     /// The URL an Alpha Search posts to; `None` for an API key without a base URL.
-    fn alpha_search_url_for(&self, view: &View<'_>) -> Option<String> {
+    pub(crate) fn alpha_search_url_for(&self, view: &View<'_>) -> Option<String> {
         if !view.api_key {
             return Some(format!("{}/alpha/search", self.alpha_base_url));
         }
@@ -526,38 +526,18 @@ impl CodexExecutor {
         (!base.is_empty()).then(|| format!("{}/alpha/search", base.trim_end_matches('/')))
     }
 
-    /// The standalone Codex Alpha Search call (`Server.codexAlphaSearch` minus selection):
-    /// already in Codex search format, never translated. The upstream status and body are
-    /// returned as is, with only its Content-Type.
-    ///
-    /// `upstream_model` is the credential-resolved model; it replaces `model` for API keys.
-    /// `capture` records the attempt as Go's route does (`server_routes.go`).
-    pub async fn alpha_search(
+    /// The upstream call of one Alpha Search: URL, headers and body, with every refusal that
+    /// needs no network (API key base URL, Sign in with ChatGPT token) decided here.
+    pub(crate) fn alpha_call(
         &self,
-        credential: &Credential,
+        view: &View<'_>,
         body: &[u8],
         client: &HeaderMap,
         upstream_model: &str,
-        cfg: &Config,
-        capture: &ck_core::exec::CaptureSink,
-    ) -> Result<ExecResponse, ExecError> {
-        // Go selects with `X-Session-ID` set from the body's `id`; the request context then
-        // carries that explicit session for `$CPA-SESSION-ID`.
-        let mut selection_headers = client.clone();
-        let id = gjson::get(&String::from_utf8_lossy(body), "id").str().trim().to_owned();
-        if !id.is_empty()
-            && let Ok(value) = http::HeaderValue::from_str(&id)
-        {
-            selection_headers.insert("x-session-id", value);
-        }
-        let session = ck_wire::session::cpa_session_id(Some(&ck_wire::session::extract_session_id(
-            &selection_headers,
-            body,
-            &Default::default(),
-        )));
-        let view = View::for_request(credential, cfg).with_session(session);
+    ) -> Result<AlphaCall, ExecError> {
+        let credential = view.credential;
         let mut body = sanitize_alpha_search(body);
-        let Some(url) = self.alpha_search_url_for(&view) else {
+        let Some(url) = self.alpha_search_url_for(view) else {
             return Err(ExecError::local(
                 503,
                 FailureScope::Credential,
@@ -591,7 +571,7 @@ impl CodexExecutor {
         if !view.token.trim().is_empty() {
             set("authorization", &format!("Bearer {}", view.token));
         }
-        for (name, value) in request::custom_headers(&view, client) {
+        for (name, value) in request::custom_headers(view, client) {
             if let (Ok(name), Ok(value)) = (
                 http::HeaderName::try_from(name.as_str()),
                 http::HeaderValue::from_str(&value),
@@ -602,6 +582,40 @@ impl CodexExecutor {
         if view.api_key {
             headers.insert(http::header::USER_AGENT, http::HeaderValue::from_static("cooker"));
         }
+        Ok(AlphaCall { url, headers, body })
+    }
+
+    /// The standalone Codex Alpha Search call (`Server.codexAlphaSearch` minus selection):
+    /// already in Codex search format, never translated. The upstream status and body are
+    /// returned as is, with only its Content-Type.
+    ///
+    /// `upstream_model` is the credential-resolved model; it replaces `model` for API keys.
+    /// `capture` records the attempt as Go's route does (`server_routes.go`).
+    pub async fn alpha_search(
+        &self,
+        credential: &Credential,
+        body: &[u8],
+        client: &HeaderMap,
+        upstream_model: &str,
+        cfg: &Config,
+        capture: &ck_core::exec::CaptureSink,
+    ) -> Result<ExecResponse, ExecError> {
+        // Go selects with `X-Session-ID` set from the body's `id`; the request context then
+        // carries that explicit session for `$CPA-SESSION-ID`.
+        let mut selection_headers = client.clone();
+        let id = gjson::get(&String::from_utf8_lossy(body), "id").str().trim().to_owned();
+        if !id.is_empty()
+            && let Ok(value) = http::HeaderValue::from_str(&id)
+        {
+            selection_headers.insert("x-session-id", value);
+        }
+        let session = ck_wire::session::cpa_session_id(Some(&ck_wire::session::extract_session_id(
+            &selection_headers,
+            body,
+            &Default::default(),
+        )));
+        let view = View::for_request(credential, cfg).with_session(session);
+        let AlphaCall { url, headers, body } = self.alpha_call(&view, body, client, upstream_model)?;
         let wire = Wire::new(capture, credential);
         wire.request(&url, &headers, &body);
         let upstream = match self.post(&view, &url, &headers, Bytes::from(body), None).await {
@@ -744,8 +758,15 @@ pub(crate) fn count_tokens_body(req: &ExecRequest, cfg: &Config, model: &str) ->
     .apply(cfg, req, body))
 }
 
+/// What an Alpha Search sends upstream.
+pub(crate) struct AlphaCall {
+    pub url: String,
+    pub headers: HeaderMap,
+    pub body: Vec<u8>,
+}
+
 /// Go reads at most 32 MiB of an Alpha Search response, whatever its status.
-const ALPHA_SEARCH_MAX_RESPONSE: usize = 32 << 20;
+pub(crate) const ALPHA_SEARCH_MAX_RESPONSE: usize = 32 << 20;
 
 /// Go's compact policy (`isResponsesCompactRequestFaultError`,
 /// `isResponsesCompactAvailabilityNeutralError`): an upstream without compact support must

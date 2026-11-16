@@ -4,6 +4,8 @@
 
 mod support;
 
+#[path = "exec_codex/alpha.rs"]
+mod alpha;
 #[path = "exec_codex/common.rs"]
 mod common;
 #[path = "exec_codex/count.rs"]

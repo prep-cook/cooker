@@ -34,6 +34,7 @@ pub mod antigravity_version;
 pub mod claude;
 pub mod claude_login;
 pub mod codex;
+mod codex_alpha;
 mod codex_capture;
 mod codex_client;
 mod codex_events;

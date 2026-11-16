@@ -15,9 +15,11 @@ use std::sync::Arc;
 
 use ck_core::exec::{ExecError, FailureScope, UsageSink};
 use ck_core::format::Format;
-use ck_stream::ScratchLease;
+use ck_stream::{ScratchLease, Writer};
 use ck_translate::codec::document::{Document, Value};
-use ck_translate::codec::{self, BodyMode, Capability, Operation, RequestEgress, RequestFence, RequestView};
+use ck_translate::codec::{
+    self, BodyMode, Capability, Operation, RequestEgress, RequestFence, RequestView, ResponseIngress,
+};
 use ck_translate::responses::request::{CodexCapability as CodexRequests, Egress};
 use ck_translate::responses::response::Ingress;
 
@@ -33,12 +35,20 @@ use crate::types::{Attempt, Counted, Execute, Request, Streams, Upstream};
 /// The capability key of Codex credentials.
 pub const DESTINATION: &str = "codex";
 
-/// Responses generation, its token count, and the Responses native compact.
-pub struct CodexCapability;
+/// Responses generation, its token count, and the Responses native compact; Alpha Search
+/// for a credential that may serve it (`CodexExecutor::alpha_allowed`).
+#[derive(Clone, Copy, Default)]
+pub struct CodexCapability {
+    alpha: bool,
+}
 
 impl Capability for CodexCapability {
     fn destination(&self) -> &'static str {
         DESTINATION
+    }
+
+    fn admits(&self, operation: Operation) -> bool {
+        operation.is_text() || (self.alpha && operation == Operation::AlphaSearch)
     }
 
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
@@ -49,17 +59,20 @@ impl Capability for CodexCapability {
                 operation: Operation::Generate,
                 ..view
             }),
-            Operation::Media(_) | Operation::AlphaSearch => Err(codec::Error::Unsupported),
+            Operation::AlphaSearch => ck_translate::search::check_request(view.document),
+            Operation::Media(_) => Err(codec::Error::Unsupported),
         }
     }
 }
 
 impl Execute for CodexExecutor {
     type Capability = CodexCapability;
-    type Ingress = Ingress;
+    type Ingress = CodexIngress;
 
-    fn capability(&self, _attempt: &Attempt<'_>) -> CodexCapability {
-        CodexCapability
+    fn capability(&self, attempt: &Attempt<'_>) -> CodexCapability {
+        CodexCapability {
+            alpha: self.alpha_allowed(attempt.credential, attempt.cfg),
+        }
     }
 
     async fn execute(
@@ -67,7 +80,10 @@ impl Execute for CodexExecutor {
         attempt: &Attempt<'_>,
         request: &Request<'_>,
         streams: Streams<'_>,
-    ) -> Result<Upstream<Ingress>, ExecError> {
+    ) -> Result<Upstream<CodexIngress>, ExecError> {
+        if request.validated.view().operation == Operation::AlphaSearch {
+            return self.alpha(attempt, request, streams).await;
+        }
         crate::codex_siwc::require_token(attempt.credential)?;
         let stream = streaming(request.validated.view().document).map_err(encoding)?;
         let upload = encode(&request.validated, streams.request, true)?;
@@ -100,7 +116,7 @@ impl Execute for CodexExecutor {
             status: upstream.status,
             headers: upstream.headers,
             body: events::body(upstream.body, rules),
-            ingress,
+            ingress: CodexIngress::Responses(Box::new(ingress)),
         })
     }
 
@@ -109,12 +125,14 @@ impl Execute for CodexExecutor {
         attempt: &Attempt<'_>,
         request: &Request<'_>,
         streams: Streams<'_>,
-    ) -> Result<Counted<Ingress>, ExecError> {
+    ) -> Result<Counted<CodexIngress>, ExecError> {
         let view = RequestView {
             operation: Operation::Generate,
             ..request.validated.view()
         };
-        let generate = RequestFence::default().end(view, &CodexCapability).map_err(encoding)?;
+        let generate = RequestFence::default()
+            .end(view, &CodexCapability::default())
+            .map_err(encoding)?;
         let upload = encode(&generate, streams.request, false)?;
         let body = Shape::new(attempt, request, &upload)?.count()?;
         let model = request::base_model(attempt.model);
@@ -136,7 +154,7 @@ impl Execute for CodexExecutor {
         attempt: &Attempt<'_>,
         request: &Request<'_>,
         streams: Streams<'_>,
-    ) -> Result<Upstream<Ingress>, ExecError> {
+    ) -> Result<Upstream<CodexIngress>, ExecError> {
         crate::codex_siwc::require_token(attempt.credential)?;
         let upload = encode(&request.validated, streams.request, false)?;
         let shaped = Shape::new(attempt, request, &upload)?;
@@ -162,7 +180,7 @@ impl Execute for CodexExecutor {
                 restored,
                 crate::codex::compact_error,
             )),
-            ingress,
+            ingress: CodexIngress::Responses(Box::new(ingress)),
         })
     }
 }
@@ -214,6 +232,50 @@ impl CodexExecutor {
             .await?;
         upstream.body = observed(upstream.body, usage.clone(), wire);
         Ok(upstream)
+    }
+}
+
+/// The response decoder of the operation the attempt ran. Boxed: the producer task moves it
+/// once, and the variants differ in size.
+pub enum CodexIngress {
+    Responses(Box<Ingress>),
+    Alpha(Box<ck_translate::search::Ingress>),
+}
+
+impl ResponseIngress for CodexIngress {
+    fn flush_deadline(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::Responses(ingress) => ingress.flush_deadline(),
+            Self::Alpha(ingress) => ingress.flush_deadline(),
+        }
+    }
+
+    fn flush(&mut self, owner: &mut Writer) -> codec::Result<()> {
+        match self {
+            Self::Responses(ingress) => ingress.flush(owner),
+            Self::Alpha(ingress) => ingress.flush(owner),
+        }
+    }
+
+    fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> codec::Result<()> {
+        match self {
+            Self::Responses(ingress) => ingress.advance(owner, bytes),
+            Self::Alpha(ingress) => ingress.advance(owner, bytes),
+        }
+    }
+
+    fn finish(&mut self, owner: &mut Writer) -> codec::Result<()> {
+        match self {
+            Self::Responses(ingress) => ingress.finish(owner),
+            Self::Alpha(ingress) => ingress.finish(owner),
+        }
+    }
+
+    fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> codec::Result<()> {
+        match self {
+            Self::Responses(ingress) => ingress.fail(owner, status, scope),
+            Self::Alpha(ingress) => ingress.fail(owner, status, scope),
+        }
     }
 }
 
@@ -471,7 +533,7 @@ fn report(usage: &UsageSink, generate: bool, body: &str) {
 }
 
 /// `body` marking its first byte for `usage` and captured as it arrives.
-fn observed(body: crate::types::Body, usage: UsageSink, wire: Wire) -> crate::types::Body {
+pub(crate) fn observed(body: crate::types::Body, usage: UsageSink, wire: Wire) -> crate::types::Body {
     let logs = usage.capture().logs_responses();
     let mut first = true;
     Box::pin(futures_util::StreamExt::inspect(body, move |chunk| {
