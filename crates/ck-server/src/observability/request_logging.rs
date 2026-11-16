@@ -2482,17 +2482,15 @@ mod tests {
         let response = app.call(request.body(Body::empty()).unwrap()).await.unwrap();
         let received = response.headers().clone();
         axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let mut content = Vec::new();
-        for _ in 0..500 {
-            if let [log] = &logs(&dir)[..] {
-                content = std::fs::read(log).unwrap();
-                if content.trim_ascii_end().ends_with(b"\ndone") {
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(content.trim_ascii_end().ends_with(b"\ndone"), "no complete log");
+        // Shutdown joins the finalization task, which writes the log and then drops the
+        // record, so the spool files are gone when it returns; no timer decides how long
+        // a slow disk may take.
+        state.shutdown().await;
+        let [log] = &logs(&dir)[..] else {
+            panic!("no complete log");
+        };
+        let content = std::fs::read(log).unwrap();
+        assert!(content.trim_ascii_end().ends_with(b"\ndone"), "incomplete log");
         drop(app);
         drop(state);
         // Spools have no name in the log directory.

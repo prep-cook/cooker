@@ -3,6 +3,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::time::Duration;
 
 use super::replay::{ENC, TURN};
 use super::*;
@@ -11,6 +12,12 @@ use super::*;
 const LARGE: usize = 64 * 1024;
 /// The most one replay entry keeps (`replay::MAX_BYTES_PER_ENTRY`).
 const ENTRY: usize = 8 << 20;
+/// Body bytes the upstream writes and flushes per chunk. The line buffer that joins a
+/// 9.6 MB event grows with the sizes of the reads that feed it and each growth counts its
+/// new size, so the total of one run moves by tens of megabytes with how the body is cut
+/// (measured: 86 MB to 126 MB for the same turn). The two runs compared below must see
+/// the same cut, so the upstream fixes it instead of leaving it to one big write.
+const CHUNK: usize = 256 << 10;
 
 thread_local! {
     static BYTES: Cell<usize> = const { Cell::new(0) };
@@ -53,7 +60,7 @@ static ALLOCATOR: Counting = Counting;
 async fn allocated(principal: &str, body: &str) -> usize {
     // Room for a 9.6 MB event and what the ingress makes of it.
     let streams = Streams::with_frames(1024);
-    let upstream = StreamUpstream::start([Reply::sse(body.to_owned())]).await;
+    let upstream = StreamUpstream::start([Reply::sse(body.to_owned()).throttle(CHUNK, Duration::ZERO)]).await;
     let mut exchange = exchange(&upstream);
     exchange.caller.principal = principal.into();
     let before = BYTES.with(Cell::get);
