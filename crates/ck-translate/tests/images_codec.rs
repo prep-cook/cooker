@@ -839,48 +839,179 @@ fn image_responses_become_one_canonical_stream_and_return_in_the_clients_form() 
             }
         }
     }
-    // §3.1: the source's SSE `id`, `retry` and comment ride on the `image.result` they came with
-    // (the event name is the grammar's own); the client has no place for them, which is reported.
-    let wire = b"id: 42\nretry: 7\n: keep\nevent: image_generation.completed\n\
-        data: {\"type\":\"image_generation.completed\",\"b64_json\":\"AAEC\"}\n\n";
-    let result = run(
-        Wire::OpenAi,
-        BodyMode::Streaming,
-        wire,
-        3,
-        Format::Json,
-        Delivery::Base64,
-    );
-    result.ingress.as_ref().unwrap();
-    result.egress.as_ref().unwrap();
-    let operation = records(&result.canonical)
-        .into_iter()
-        .find(|(name, _)| name == "x_ck.operation")
-        .unwrap()
-        .1;
-    let fields: Vec<(&str, &str, bool)> = operation["x_ck"]["source"]["sse"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| {
-            (
-                f["name"].as_str().unwrap(),
-                f["value"].as_str().unwrap(),
-                f["comment"].as_bool().unwrap(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        fields,
-        [
-            ("id", "42", false),
-            ("retry", "7", false),
-            ("", "keep", true),
-            ("event", "image_generation.completed", false)
-        ]
-    );
-    assert_eq!(operation["x_ck"]["source"]["protocol"], "openai-images");
-    assert_eq!(result.dropped, vec!["SSE id, retry and comment fields"]);
+    // Source metadata and opaque members stay attached to the image occurrence, even when
+    // Codex delays results until the usage-bearing completion event.
+    for (label, wire, events, expected) in [
+        (
+            "OpenAI result",
+            Wire::OpenAi,
+            vec![(
+                "42",
+                json!({"type":"image_generation.completed","b64_json":"AAEC","future":1}),
+            )],
+            vec![(
+                "x_ck.operation",
+                "42",
+                "image_generation.completed",
+                json!([{"protocol":"openai-images","pointer":"/future","value":1}]),
+            )],
+        ),
+        (
+            "Codex delayed results",
+            Wire::Codex,
+            vec![
+                (
+                    "42",
+                    json!({"type":"response.output_item.done","future":{"nested":[1,null]},
+                    "item":{"type":"image_generation_call","result":"AAEC","item/extra~":{"v":2}}}),
+                ),
+                (
+                    "43",
+                    json!({"type":"response.output_item.done","future":3,
+                    "item":{"type":"image_generation_call","result":"QUJD","item_extra":4}}),
+                ),
+                ("99", json!({"type":"response.completed","response":{}})),
+            ],
+            vec![
+                (
+                    "x_ck.operation",
+                    "42",
+                    "response.output_item.done",
+                    json!([
+                        {"protocol":"codex","pointer":"/future","value":{"nested":[1,null]}},
+                        {"protocol":"codex","pointer":"/item/item~1extra~0","value":{"v":2}}
+                    ]),
+                ),
+                (
+                    "x_ck.operation",
+                    "43",
+                    "response.output_item.done",
+                    json!([
+                        {"protocol":"codex","pointer":"/future","value":3},
+                        {"protocol":"codex","pointer":"/item/item_extra","value":4}
+                    ]),
+                ),
+            ],
+        ),
+        (
+            "Codex preview",
+            Wire::Codex,
+            vec![
+                (
+                    "9",
+                    json!({"type":"response.image_generation_call.partial_image",
+                    "partial_image_b64":"QUJD","future":{"nested":[1,null]}}),
+                ),
+                (
+                    "42",
+                    json!({"type":"response.output_item.done",
+                    "item":{"type":"image_generation_call","result":"AAEC"}}),
+                ),
+                ("99", json!({"type":"response.completed","response":{}})),
+            ],
+            vec![
+                (
+                    "x_ck.media.start",
+                    "9",
+                    "response.image_generation_call.partial_image",
+                    json!([
+                        {"protocol":"codex","pointer":"/future","value":{"nested":[1,null]}}
+                    ]),
+                ),
+                ("x_ck.operation", "42", "response.output_item.done", Value::Null),
+            ],
+        ),
+        (
+            "Codex completion output",
+            Wire::Codex,
+            vec![(
+                "99",
+                json!({"type":"response.completed","response":{"output":[
+                    {"type":"message"},
+                    {"type":"image_generation_call","result":"AAEC","item_extra":{"v":2}}
+                ]}}),
+            )],
+            vec![(
+                "x_ck.operation",
+                "99",
+                "response.completed",
+                json!([
+                    {"protocol":"codex","pointer":"/response/output/1/item_extra","value":{"v":2}}
+                ]),
+            )],
+        ),
+        (
+            "Codex completion shares source fields across many images",
+            Wire::Codex,
+            vec![(
+                "99",
+                json!({"type":"response.completed","response":{"output":
+                    vec![json!({"type":"image_generation_call","result":"AAEC"}); 50]
+                }}),
+            )],
+            std::iter::once(("x_ck.operation", "99", "response.completed", Value::Null))
+                .chain(std::iter::repeat_n(("x_ck.operation", "", "", Value::Null), 49))
+                .collect(),
+        ),
+    ] {
+        let comment = "keep".repeat(4_000);
+        let mut body = Vec::new();
+        for (id, event) in events {
+            body.extend_from_slice(format!("id: {id}\nretry: 7\n: {comment}\n").as_bytes());
+            body.extend(sse(&[event]));
+        }
+        for chunk in [body.len(), 1] {
+            let result = run(wire, BodyMode::Streaming, &body, chunk, Format::Json, Delivery::Base64);
+            result.ingress.as_ref().unwrap_or_else(|e| panic!("{label}: {e}"));
+            result.egress.as_ref().unwrap_or_else(|e| panic!("{label}: {e}"));
+            let actual: Vec<_> = records(&result.canonical)
+                .into_iter()
+                .filter(|(name, value)| {
+                    name == "x_ck.operation"
+                        || (name == "x_ck.media.start" && !value["attributes"]["partial_image_index"].is_null())
+                })
+                .map(|(name, value)| (name, value["x_ck"]["source"].clone(), value["x_ck"]["original"].clone()))
+                .collect();
+            let protocol = if wire == Wire::Codex { "codex" } else { "openai-images" };
+            let expected_records: Vec<_> = expected
+                .iter()
+                .map(|(name, id, event, original)| {
+                    (
+                        name.to_string(),
+                        if id.is_empty() {
+                            Value::Null
+                        } else {
+                            json!({"protocol":protocol,"sse":[
+                                {"name":"id","value":id,"comment":false},
+                                {"name":"retry","value":"7","comment":false},
+                                {"name":"","value":comment,"comment":true},
+                                {"name":"event","value":event,"comment":false}
+                            ]})
+                        },
+                        original.clone(),
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected_records, "{label}, chunk {chunk}");
+            let expected_drops: Vec<_> = expected
+                .iter()
+                .flat_map(|(_, id, _, original)| {
+                    (!id.is_empty())
+                        .then_some("SSE id, retry and comment fields")
+                        .into_iter()
+                        .chain(std::iter::repeat_n(
+                            "members of another protocol",
+                            if wire == Wire::Codex {
+                                original.as_array().map_or(0, Vec::len)
+                            } else {
+                                0
+                            },
+                        ))
+                })
+                .collect();
+            assert_eq!(result.dropped, expected_drops, "{label}, chunk {chunk}");
+        }
+    }
     // A preview has no `image.result`: its media carries the SSE record. A bare event name is the
     // grammar's own and reports nothing, an `id` alone does.
     for (wire, dropped) in [
