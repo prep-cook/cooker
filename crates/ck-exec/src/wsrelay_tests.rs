@@ -52,7 +52,7 @@ fn messages_encode_like_go_write_json() {
 }
 
 /// A frame the route would write, decoded.
-async fn next(frames: &mut mpsc::Receiver<String>) -> Message {
+async fn next(frames: &mut Frames) -> Message {
     let frame = tokio::time::timeout(Duration::from_secs(5), frames.recv())
         .await
         .unwrap()
@@ -328,18 +328,36 @@ async fn dropping_a_stream_receiver_frees_its_request() {
 
 #[tokio::test]
 async fn a_browser_that_stops_reading_refuses_new_requests() {
-    let relay = Arc::new(Relay::default());
-    let (session, mut frames) = relay.connect_as("aistudio-a".into());
-    let mut open = Vec::new();
-    for _ in 0..OUT_BUFFER {
-        open.push(relay.stream("aistudio-a", &HttpRequest::default()).await.unwrap());
+    // (request body bytes, requests the queue takes before refusing)
+    let rows: [(usize, usize); 2] = [
+        // Small frames stop at the frame cap.
+        (0, OUT_BUFFER),
+        // 64 bodies of 1 MiB stop at the byte budget first.
+        (1 << 20, 63),
+    ];
+    for (size, taken) in rows {
+        let relay = Arc::new(Relay::default());
+        let (session, mut frames) = relay.connect_as("aistudio-a".into());
+        let request = HttpRequest {
+            body: Bytes::from(vec![b'a'; size]),
+            ..HttpRequest::default()
+        };
+        let mut open = Vec::new();
+        for _ in 0..taken {
+            open.push(relay.stream("aistudio-a", &request).await.unwrap());
+        }
+        // The next request fails at once, before anything reaches the browser, and leaves
+        // no pending entry.
+        let error = relay.stream("aistudio-a", &request).await.unwrap_err();
+        assert_eq!(error, "wsrelay: browser is not reading", "{size}");
+        assert_eq!(lock(&session.pending).len(), taken, "{size}");
+        // What waits for the browser stays within the byte budget.
+        let mut queued = 0;
+        for _ in 0..taken {
+            queued += frames.recv().await.unwrap().len();
+        }
+        assert!(queued <= OUT_BYTES, "{size}: {queued} bytes queued");
+        // Once the browser reads, requests are accepted again.
+        open.push(relay.stream("aistudio-a", &request).await.unwrap());
     }
-    // The frames the browser has not taken are bounded: the next request fails at once,
-    // before anything reaches the browser, and leaves no pending entry.
-    let error = relay.stream("aistudio-a", &HttpRequest::default()).await.unwrap_err();
-    assert_eq!(error, "wsrelay: browser is not reading");
-    assert_eq!(lock(&session.pending).len(), OUT_BUFFER);
-    // Once the browser reads a frame, requests are accepted again.
-    frames.recv().await.unwrap();
-    open.push(relay.stream("aistudio-a", &HttpRequest::default()).await.unwrap());
 }
