@@ -92,7 +92,7 @@ const LEFT_OUT: &[(&str, &str)] = &[
 
 /// Members the Responses egress always writes, which Go passed on only when the upstream did,
 /// and the response id: the client sees the exchange's own id where Go passed on the upstream's.
-fn egress_defaults(got: &mut Value, want: &Value) {
+fn egress_defaults(got: &mut Value, want: &mut Value) {
     if got["id"] == "resp_test" {
         match want.get("id") {
             Some(id) => got["id"] = id.clone(),
@@ -111,6 +111,19 @@ fn egress_defaults(got: &mut Value, want: &Value) {
         && let Some(details) = got.pointer_mut(details).and_then(Value::as_object_mut)
     {
         details.remove("cache_write_tokens");
+    }
+    // F23 requires these members even when the native response omitted them. Extend the
+    // expectation, not the output: missing members, wrong defaults and other additions fail.
+    for (name, default) in [
+        ("access_programs", Value::Null),
+        ("error", Value::Null),
+        ("incomplete_details", Value::Null),
+        ("instructions", Value::Null),
+        ("metadata", Value::Null),
+        ("temperature", json!(1.0)),
+        ("top_p", json!(1.0)),
+    ] {
+        want.as_object_mut().unwrap().entry(name).or_insert(default);
     }
 }
 
@@ -180,9 +193,9 @@ async fn run_scenario(
 fn response_difference(name: &str, s: &Value, outcome: &Result<Value, ExecError>) -> Option<String> {
     match (outcome, s.get("output"), s.get("error")) {
         (Ok(out), Some(want), _) if s["op"] == "execute" => {
-            let want: Value = serde_json::from_str(want.as_str().unwrap()).unwrap();
+            let mut want: Value = serde_json::from_str(want.as_str().unwrap()).unwrap();
             let mut out = out.clone();
-            egress_defaults(&mut out, &want);
+            egress_defaults(&mut out, &mut want);
             (out != want).then(|| format!("{name}:\n  got  {out}\n  want {want}"))
         }
         (Err(error), _, Some(want)) if want["status"] != error.status => {

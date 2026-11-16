@@ -43,6 +43,8 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     /// `response.created` is owed: it waits for the source's own creation snapshot, or for the
     /// first event that needs a created response before it.
     owed: bool,
+    /// Sources without native Responses lifecycle events need a synthesized progress event.
+    synthesize_progress: bool,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     /// The egress for one exchange, live or resumed alike. `id` is the exchange's response id,
@@ -89,6 +91,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             audio: Table::new(owner)?,
             pending: None,
             owed: false,
+            synthesize_progress: false,
         })
     }
     /// The account whose opaque items this response carries.
@@ -415,6 +418,24 @@ fn write_response(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
             e.bytes(b"]")?;
         } else {
             doc.write(field, e)?;
+        }
+    }
+    if !is(doc, doc.root(), "object", "response.compaction")? {
+        for (field, default) in [
+            ("access_programs", b"null".as_slice()),
+            ("error", b"null"),
+            ("incomplete_details", b"null"),
+            ("instructions", b"null"),
+            ("metadata", b"null"),
+            ("temperature", b"1.0"),
+            ("top_p", b"1.0"),
+        ] {
+            if doc.member(doc.root(), field)?.is_none() {
+                e.bytes(b",")?;
+                e.string(field)?;
+                e.bytes(b":")?;
+                e.bytes(default)?;
+            }
         }
     }
     e.bytes(b"}")

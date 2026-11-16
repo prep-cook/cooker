@@ -43,9 +43,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         )
     }
 
-    /// Repeats the request's `tools`, `tool_choice` and `parallel_tool_calls` in a generation's
-    /// response, as the Responses API does; a source without them, such as a Chat upstream,
-    /// otherwise leaves the API defaults. A Responses source's own values replace these by merge.
+    /// Repeats request-derived response fields when the source does not supply them.
+    /// A Responses source's own values replace these by merge.
     /// Call it before the first record: `Closed` once any output was written.
     pub fn echo(&mut self, owner: &mut Writer, request: codec::RequestView<'_>) -> Result<()> {
         crate::boundary::enter(self.owner, owner, self.terminal || self.owed || self.sequence > 0)?;
@@ -59,6 +58,11 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     /// `created` publishes it. Fields the source did not supply keep the response's own values,
     /// and the exchange id stays.
     pub(super) fn response_start(&mut self, incoming: Document) -> Result<()> {
+        let x = incoming.required(incoming.root(), "x_ck")?;
+        self.synthesize_progress = match incoming.member(x, "source")? {
+            Some(source) => !is(&incoming, source, "protocol", "responses")?,
+            None => true,
+        };
         let doc = &mut self.document;
         let target = doc.root();
         let node = doc.absorb(incoming)?;
@@ -103,15 +107,21 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         }
         self.owed = false;
         let response = encode::scratch(owner, |e| write_response(&self.document, e))?;
-        self.emit(
-            owner,
-            "response.created",
-            |e| {
-                e.bytes(b",\"response\":")?;
-                write_lease(&response, e)
-            },
-            output,
-        )
+        for name in ["response.created", "response.in_progress"] {
+            if name == "response.in_progress" && !self.synthesize_progress {
+                break;
+            }
+            self.emit(
+                owner,
+                name,
+                |e| {
+                    e.bytes(b",\"response\":")?;
+                    write_lease(&response, e)
+                },
+                output,
+            )?;
+        }
+        Ok(())
     }
 
     /// Closes the response: buffered mode writes the body, streaming the terminal event.

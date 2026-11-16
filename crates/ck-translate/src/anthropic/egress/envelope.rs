@@ -276,7 +276,7 @@ impl Egress {
 
 fn stop_reason(owner: &mut Writer, doc: &Document, reason: usize) -> Result<Document> {
     let x = doc.required(doc.root(), "x_ck")?;
-    mapped(owner, |e| {
+    let mut finish = mapped(owner, |e| {
         e.bytes(b"{\"stop_reason\":")?;
         let native = doc.member(x, "native_finish_reason")?;
         let anthropic = match doc.member(x, "source")? {
@@ -304,5 +304,9 @@ fn stop_reason(owner: &mut Writer, doc: &Document, reason: usize) -> Result<Docu
             original_members(doc, x, e)?;
         }
         e.bytes(b"}")
-    })
+    })?;
+    if finish.member(finish.root(), "stop_sequence")?.is_none() {
+        finish.set(finish.root(), "stop_sequence", Value::Null)?;
+    }
+    Ok(finish)
 }

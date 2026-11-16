@@ -2,6 +2,15 @@ use super::*;
 
 /// Runs Chat `input` through Chat ingress and Responses egress; returns the client bytes.
 pub(super) fn chat_to_responses(input: &[u8], mode: BodyMode, downstream: BodyMode) -> Vec<u8> {
+    chat_to_responses_with_request(input, mode, downstream, None)
+}
+
+pub(super) fn chat_to_responses_with_request(
+    input: &[u8],
+    mode: BodyMode,
+    downstream: BodyMode,
+    request: Option<&Value>,
+) -> Vec<u8> {
     let mut m = Mapped::new();
     let mut ingress = codec::chat::response::Ingress::new(
         &mut m.writer,
@@ -14,6 +23,26 @@ pub(super) fn chat_to_responses(input: &[u8], mode: BodyMode, downstream: BodyMo
     .unwrap();
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
     let mut egress = crate::client_egress(&mut m.writer, Operation::Generate, downstream).unwrap();
+    if let Some(request) = request {
+        let mut source = Mapped::new();
+        let mut request_ingress = responses::request::Ingress::new(
+            &mut source.writer,
+            &source.store,
+            identity(Direction::Request),
+            Operation::Generate,
+            1_000_000,
+        )
+        .unwrap();
+        request_ingress
+            .advance(&mut source.writer, &serde_json::to_vec(request).unwrap())
+            .unwrap();
+        let ready = request_ingress
+            .finish(&mut source.writer, &responses::request::ResponsesCapability)
+            .unwrap();
+        egress
+            .echo(&mut m.writer, ready.for_destination("responses").unwrap())
+            .unwrap();
+    }
     for fragment in input.chunks(37) {
         if ingress.advance(&mut m.writer, fragment).is_err() {
             break;

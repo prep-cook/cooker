@@ -565,14 +565,46 @@ async fn a_continuation_fails_over_with_the_stored_turn_under_one_id() {
 /// A completed turn is found at once, whether the usage reader is still busy or the client read
 /// the completion through a resume while the index publication was held.
 #[tokio::test]
-async fn a_turn_is_found_as_soon_as_its_client_sees_it_complete() {
-    for ask in [Ask::new("hi"), Ask::new("hi").buffered()] {
-        let fixture = fixture(|_| {});
-        let fake = Fake::new();
-        fixture.rt.streams().holds.usage.close();
-        let first = turn(&fixture, &fake, ask).await;
-        turn(&fixture, &fake, Ask::new("more").after(&first)).await;
-        fixture.rt.streams().holds.usage.open();
+async fn completed_turns_keep_request_fields_and_are_available_for_continuation() {
+    for (fields, expected) in [
+        (
+            json!({}),
+            json!({"instructions": null, "metadata": null, "temperature": 1.0, "top_p": 1.0}),
+        ),
+        (
+            json!({"instructions": "Be brief", "metadata": {"tag": "one"}, "temperature": 0.25, "top_p": 0.8}),
+            json!({"instructions": "Be brief", "metadata": {"tag": "one"}, "temperature": 0.25, "top_p": 0.8}),
+        ),
+    ] {
+        for mut ask in [Ask::new("hi"), Ask::new("hi").buffered()] {
+            ask.body
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let fixture = fixture(|_| {});
+            let fake = Fake::new();
+            fixture.rt.streams().holds.usage.close();
+            let framing = ask.framing;
+            let text = read(committed(send(&fixture, &fake, ask).await)).await;
+            let responses: Vec<Value> = if framing == Framing::Sse {
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|data| serde_json::from_str::<Value>(data).unwrap())
+                    .filter_map(|mut event| event.as_object_mut().unwrap().remove("response"))
+                    .collect()
+            } else {
+                vec![serde_json::from_str(&text).unwrap()]
+            };
+            assert!(!responses.is_empty(), "{text}");
+            for response in responses {
+                for (name, value) in expected.as_object().unwrap() {
+                    assert_eq!(response.get(name), Some(value), "{framing:?} {name}: {text}");
+                }
+            }
+            let first = response_id(&text);
+            turn(&fixture, &fake, Ask::new("more").after(&first)).await;
+            fixture.rt.streams().holds.usage.open();
+        }
     }
 
     let fixture = fixture(|_| {});

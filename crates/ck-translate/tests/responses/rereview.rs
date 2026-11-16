@@ -207,7 +207,8 @@ fn failed_responses_publish_only_their_identity_and_usage() {
                 assert_eq!(response[name], failed[name], "{name} {input}");
             }
             assert_eq!(response["usage"], super::sdk::official_usage(&failed["usage"]));
-            assert!(response.get("message").is_none() && response.get("metadata").is_none());
+            assert!(response.get("message").is_none());
+            assert_eq!(response.get("metadata"), Some(&Value::Null));
         }
     }
 }
@@ -309,7 +310,10 @@ fn response_created_carries_its_own_snapshot() {
     );
     let (out, _) = egress_of(&[start, (Kind::Done, Scope::default(), "")], BodyMode::Streaming);
     let types: Vec<_> = client_events(&out).iter().map(|e| e["type"].clone()).collect();
-    assert_eq!(types, ["response.created", "response.completed"]);
+    assert_eq!(
+        types,
+        ["response.created", "response.in_progress", "response.completed"]
+    );
 }
 
 #[test]

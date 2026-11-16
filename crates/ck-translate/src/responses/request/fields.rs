@@ -26,26 +26,39 @@ pub(super) fn write_field(doc: &Document, field: usize, e: &mut Encoder<'_, '_>)
     write_member(doc, field, e)
 }
 
-/// Writes the request members a Responses `Response` repeats (`tools`, `tool_choice` and
-/// `parallel_tool_calls`) as one object, in their Responses shapes; members the request lacks
-/// are absent.
+/// Writes required request-derived Response members in their Responses shapes.
 pub(in crate::responses) fn write_echo(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     // Native declarations are copied as they are, which is the Responses shape only for a
     // Responses request; another protocol's, such as Anthropic web search, has none.
     if !natives(doc)?.is_empty() && !is(doc, doc.required(doc.root(), "x_ck")?, "original_protocol", "responses")? {
         return Err(Error::Unsupported);
     }
-    e.bytes(b"{")?;
-    let mut first = true;
+    e.bytes(b"{\"instructions\":")?;
+    let mut instructions = None;
+    for message in doc.children(doc.required(doc.root(), "messages")?)? {
+        if super::instructions(doc, message)? {
+            instructions = Some(doc.required(message, "content")?);
+        }
+    }
+    match instructions {
+        Some(value) => doc.write(value, e)?,
+        None => e.bytes(b"null")?,
+    }
     for field in doc.children(doc.root())? {
         let name = doc.node(field)?.name.ok_or(Error::Schema)?;
         let mut echoed = false;
-        for repeated in ["tools", "tool_choice", "parallel_tool_calls"] {
+        for repeated in [
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "temperature",
+            "top_p",
+            "metadata",
+        ] {
             echoed |= doc.name_is(name, repeated)?;
         }
         if echoed {
-            e.bytes(if first { b"" } else { b"," })?;
-            first = false;
+            e.bytes(b",")?;
             write_member(doc, field, e)?;
         }
     }

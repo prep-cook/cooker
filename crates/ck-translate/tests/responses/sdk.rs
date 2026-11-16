@@ -74,41 +74,84 @@ fn foreign_opaque_events_and_carriers_never_reach_responses_clients() {
 fn foreign_responses_carry_the_members_the_schema_requires() {
     let usage = json!({"prompt_tokens":5,"completion_tokens":1,"prompt_tokens_details":{"cache_write_tokens":3}});
     let input = json!({"id":"c","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":usage});
-    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
-        let output =
-            super::cross::chat_to_responses(&serde_json::to_vec(&input).unwrap(), BodyMode::Buffered, downstream);
-        let mut responses = vec![super::cross::final_response(&output, downstream)];
-        if downstream == BodyMode::Streaming {
-            let events = super::cross::client_events(&output);
-            responses.push(events[0]["response"].clone());
-            let delta = events
-                .iter()
-                .find(|e| e["type"] == "response.output_text.delta")
-                .unwrap();
-            assert_eq!(delta["logprobs"], json!([]));
-            let done = events
-                .iter()
-                .find(|e| e["type"] == "response.output_text.done")
-                .unwrap();
-            assert_eq!(done["logprobs"], json!([]));
+    let streamed = super::cross::sse(&[
+        json!({"id":"c","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"x"},"finish_reason":null}]}),
+        json!({"id":"c","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":usage}),
+    ]);
+    let defaults = json!({"access_programs":null,"error":null,"incomplete_details":null,"instructions":null,
+        "metadata":null,"temperature":1.0,"top_p":1.0,"parallel_tool_calls":true,"tool_choice":"auto","tools":[]});
+    let cases = [
+        (None, defaults.clone()),
+        (
+            Some(
+                json!({"model":"m","input":"q","instructions":"Be brief","metadata":{"tag":"one"},
+            "temperature":0.25,"top_p":0.8,"parallel_tool_calls":false,"tool_choice":"none"}),
+            ),
+            json!({"instructions":"Be brief","metadata":{"tag":"one"},"temperature":0.25,"top_p":0.8,
+                "parallel_tool_calls":false,"tool_choice":"none"}),
+        ),
+        (
+            Some(json!({"model":"m","input":"q","instructions":null,"metadata":null,"temperature":null,"top_p":null})),
+            json!({"instructions":null,"metadata":null,"temperature":null,"top_p":null}),
+        ),
+    ];
+    for (request, expected) in cases {
+        for (upstream, input) in [
+            (BodyMode::Buffered, serde_json::to_vec(&input).unwrap()),
+            (BodyMode::Streaming, streamed.as_bytes().to_vec()),
+        ] {
+            for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+                let output =
+                    super::cross::chat_to_responses_with_request(&input, upstream, downstream, request.as_ref());
+                let out = super::cross::final_response(&output, downstream);
+                let mut snapshots = vec![out.clone()];
+                if downstream == BodyMode::Streaming {
+                    let events = super::cross::client_events(&output);
+                    assert_eq!(events[0]["type"], "response.created");
+                    assert_eq!(events[1]["type"], "response.in_progress");
+                    assert_eq!(events.iter().filter(|e| e["type"] == "response.in_progress").count(), 1);
+                    for (sequence, event) in events.iter().enumerate() {
+                        assert_eq!(event["sequence_number"], sequence);
+                    }
+                    snapshots.extend(events.iter().filter_map(|e| e.get("response")).cloned());
+                    for kind in ["response.output_text.delta", "response.output_text.done"] {
+                        let event = events.iter().find(|e| e["type"] == kind).unwrap();
+                        assert_eq!(event["logprobs"], json!([]));
+                    }
+                }
+                for snapshot in snapshots {
+                    for (field, default) in defaults.as_object().unwrap() {
+                        let value = expected.get(field).unwrap_or(default);
+                        assert_eq!(
+                            snapshot.get(field),
+                            Some(value),
+                            "{field}, {upstream:?} -> {downstream:?}"
+                        );
+                    }
+                }
+                assert_eq!(out["output"][0]["content"][0]["text"], "x");
+                assert_eq!(
+                    out["usage"]["input_tokens_details"],
+                    json!({"cache_write_tokens":3,"cached_tokens":0})
+                );
+                assert!(out["usage"].get("cache_write_tokens").is_none());
+            }
         }
-        for response in responses {
-            assert_eq!(response["parallel_tool_calls"], true);
-            assert_eq!(response["tool_choice"], "auto");
-            assert_eq!(response["tools"], json!([]));
-        }
-        let out = super::cross::final_response(&output, downstream);
-        assert_eq!(
-            out["usage"]["input_tokens_details"],
-            json!({"cache_write_tokens":3,"cached_tokens":0})
-        );
-        assert!(out["usage"].get("cache_write_tokens").is_none());
     }
 }
 
 #[test]
 fn native_tool_settings_and_buffered_text_survive_the_defaults() {
     let body = json!({"id":"r","model":"m","created_at":1,"status":"completed","parallel_tool_calls":false,"tool_choice":"none","tools":[{"type":"function","name":"f","parameters":{}}],"output":[{"id":"i","type":"message","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}]});
+    let mut body = body;
+    body.as_object_mut().unwrap().extend(
+        json!({"access_programs":{"cyber":"standard"},"error":null,
+        "incomplete_details":null,"instructions":"Native instructions","metadata":{"tag":"native"},
+        "temperature":0.4,"top_p":0.7})
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
     for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
         let (output, _) = response(
             &serde_json::to_vec(&body).unwrap(),
@@ -117,7 +160,18 @@ fn native_tool_settings_and_buffered_text_survive_the_defaults() {
             Operation::Generate,
         );
         let out = super::cross::final_response(&output, downstream);
-        for name in ["parallel_tool_calls", "tool_choice", "tools"] {
+        for name in [
+            "parallel_tool_calls",
+            "tool_choice",
+            "tools",
+            "access_programs",
+            "error",
+            "incomplete_details",
+            "instructions",
+            "metadata",
+            "temperature",
+            "top_p",
+        ] {
             assert_eq!(out[name], body[name]);
         }
         if downstream == BodyMode::Streaming {

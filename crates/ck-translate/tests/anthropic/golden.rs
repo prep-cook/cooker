@@ -129,6 +129,11 @@ fn recorded_complete_native_messages_preserve_blocks_and_usage() {
             if expected.get("role").is_none() {
                 expected["role"] = json!("assistant");
             }
+            expected
+                .as_object_mut()
+                .unwrap()
+                .entry("stop_sequence")
+                .or_insert(Value::Null);
             let (output, canonical) = response(
                 &raw,
                 BodyMode::Buffered,
