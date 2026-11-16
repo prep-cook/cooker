@@ -466,9 +466,11 @@ struct FirstReport;
 impl ck_translate::video::Ledger for FirstReport {
     fn accepted(&mut self, _: &str) {}
 
-    fn charge(&mut self, _: &str) -> bool {
-        true
+    fn charge(
+        &mut self,
+        _: &str,
+        publish: &mut dyn FnMut() -> ck_translate::codec::Result<()>,
+    ) -> ck_translate::codec::Result<bool> {
+        publish().map(|()| true)
     }
-
-    fn release(&mut self, _: &str) {}
 }

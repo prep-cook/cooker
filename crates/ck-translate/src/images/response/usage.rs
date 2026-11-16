@@ -11,7 +11,7 @@ use crate::{
         Error, Result,
         document::{Document, Value},
         encode::Encoder,
-        event::{Kind, Scope},
+        event::{Emitter, Kind, Scope},
     },
 };
 
@@ -39,7 +39,21 @@ impl State {
             return Ok(());
         }
         self.usage = true;
-        self.snapshot(owner, doc, node, None)
+        let protocol = self.wire.protocol();
+        let Some(job) = self.job.as_mut() else {
+            return snapshot(&mut self.emitter, protocol, owner, doc, node, None, None);
+        };
+        // A deferred job's usage is the job's (E-Q13): a poll's report is published only when it
+        // reports a count and the job table charges the job with it; any other publishes nothing.
+        let id = job.id.clone().ok_or(Error::Schema)?;
+        if !reports(doc, node)? {
+            return Ok(());
+        }
+        let emitter = &mut self.emitter;
+        job.ledger.charge(&id, &mut || {
+            snapshot(emitter, protocol, owner, doc, node, None, Some(&id))
+        })?;
+        Ok(())
     }
 
     /// The image tool's usage, apart from the model's, under the `tool:<model>` scope.
@@ -53,47 +67,68 @@ impl State {
         if matches!(doc.node(node)?.value, Value::Null) {
             return Ok(());
         }
-        self.snapshot(owner, doc, node, Some(model))
-    }
-
-    fn snapshot(&mut self, owner: &mut Writer, doc: &Document, node: usize, tool: Option<Option<usize>>) -> Result<()> {
-        if !matches!(doc.node(node)?.value, Value::Object) {
-            return Err(Error::Schema);
-        }
-        let protocol = self.wire.protocol();
-        self.emitter.emit(
+        snapshot(
+            &mut self.emitter,
+            self.wire.protocol(),
             owner,
-            Kind::Usage,
-            Scope::default(),
-            |e| {
-                if let Some(model) = tool {
-                    e.bytes(b",\"scope\":\"tool:")?;
-                    match model {
-                        Some(model) => doc.write_contents(model, e)?,
-                        None => e.bytes(b"image_generation")?,
-                    }
-                    e.bytes(b"\"")?;
-                }
-                e.bytes(b",\"usage\":{\"native\":{\"protocol\":")?;
-                e.string(protocol)?;
-                e.bytes(b",\"value\":")?;
-                doc.write(node, e)?;
-                e.bytes(b"},\"final\":true")?;
-                for (name, path) in COUNTS {
-                    if let Some(count) = count(doc, node, path)? {
-                        e.bytes(b",")?;
-                        e.string(name)?;
-                        e.bytes(b":")?;
-                        doc.write(count, e)?;
-                    }
-                }
-                details(doc, node, e)?;
-                e.bytes(b"}")
-            },
-            |_| Ok(()),
-        )?;
-        Ok(())
+            doc,
+            node,
+            Some(model),
+            None,
+        )
     }
+}
+
+/// One snapshot: the response's own, the image tool's (`tool`) or a deferred job's (`job`).
+fn snapshot(
+    emitter: &mut Emitter,
+    protocol: &'static str,
+    owner: &mut Writer,
+    doc: &Document,
+    node: usize,
+    tool: Option<Option<usize>>,
+    job: Option<&str>,
+) -> Result<()> {
+    if !matches!(doc.node(node)?.value, Value::Object) {
+        return Err(Error::Schema);
+    }
+    emitter.emit(
+        owner,
+        Kind::Usage,
+        Scope::default(),
+        |e| {
+            if let Some(model) = tool {
+                e.bytes(b",\"scope\":\"tool:")?;
+                match model {
+                    Some(model) => doc.write_contents(model, e)?,
+                    None => e.bytes(b"image_generation")?,
+                }
+                e.bytes(b"\"")?;
+            }
+            if let Some(job) = job {
+                e.bytes(b",\"scope\":\"job:")?;
+                e.escaped(job)?;
+                e.bytes(b"\"")?;
+            }
+            e.bytes(b",\"usage\":{\"native\":{\"protocol\":")?;
+            e.string(protocol)?;
+            e.bytes(b",\"value\":")?;
+            doc.write(node, e)?;
+            e.bytes(b"},\"final\":true")?;
+            for (name, path) in COUNTS {
+                if let Some(count) = count(doc, node, path)? {
+                    e.bytes(b",")?;
+                    e.string(name)?;
+                    e.bytes(b":")?;
+                    doc.write(count, e)?;
+                }
+            }
+            details(doc, node, e)?;
+            e.bytes(b"}")
+        },
+        |_| Ok(()),
+    )?;
+    Ok(())
 }
 
 fn details(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
@@ -111,6 +146,20 @@ fn details(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
         e.bytes(b"}")?;
     }
     Ok(())
+}
+
+/// Whether a usage object reports a billed value: xAI's `cost_in_usd_ticks` or a canonical count.
+/// An empty usage reports nothing, so it does not spend a job's charge.
+fn reports(doc: &Document, node: usize) -> Result<bool> {
+    if !matches!(doc.node(node)?.value, Value::Object) {
+        return Err(Error::Schema);
+    }
+    for (_, path) in COUNTS {
+        if count(doc, node, path)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(count(doc, node, &["cost_in_usd_ticks"])?.is_some())
 }
 
 /// The unsigned count at `path`, when the native usage reports one: null and absent counts stay

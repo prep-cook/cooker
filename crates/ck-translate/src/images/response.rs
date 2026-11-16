@@ -20,6 +20,7 @@ use crate::{
         sse,
         table::Table,
     },
+    video::Ledger,
 };
 
 /// Which upstream dialect a response body speaks. `OpenAi` and `Xai` share the Images JSON
@@ -40,6 +41,24 @@ impl Wire {
             Self::Codex => "codex",
         }
     }
+}
+
+/// What a deferred xAI image answer is to its job (X16): the create's acknowledgement naming the
+/// job, a poll the upstream answered 202 while the job runs, or a poll's 200, which holds the
+/// images or the job's `error`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Deferred {
+    Accepted,
+    Pending,
+    Polled,
+}
+
+/// A deferred answer's job: the job a poll asked for, and the table its usage is charged against
+/// once (E-Q13).
+struct Job {
+    phase: Deferred,
+    id: Option<String>,
+    ledger: Box<dyn Ledger>,
 }
 
 /// Members of an Images response that map to canonical records.
@@ -168,6 +187,8 @@ struct State {
     /// Codex `output_item.done` documents and provenance, held until `response.completed`
     /// brings the usage that precedes their media.
     calls: Table<(Document, ScratchLease)>,
+    /// Set for a deferred xAI answer.
+    job: Option<Job>,
 }
 
 /// One image response: buffered JSON, or SSE events. `finish` means complete framing.
@@ -214,10 +235,36 @@ impl Ingress {
                 completed: false,
                 terminal: false,
                 calls: Table::new(owner)?,
+                job: None,
             },
             limit,
             closed: false,
         })
+    }
+
+    /// A deferred xAI answer (buffered JSON): `job` is the job a poll asked for, and none for the
+    /// create, whose answer names it. The answer becomes one `image.job` operation, or for a
+    /// finished poll the images with the job's usage, which `ledger` charges once.
+    pub fn deferred(
+        owner: &mut Writer,
+        identity: Identity,
+        phase: Deferred,
+        job: Option<&str>,
+        limit: u64,
+        ledger: Box<dyn Ledger>,
+    ) -> Result<Self> {
+        match (phase, job) {
+            (Deferred::Accepted, None) => {}
+            (Deferred::Pending | Deferred::Polled, Some(id)) if !id.is_empty() => {}
+            _ => return Err(Error::Schema),
+        }
+        let mut ingress = Self::new(owner, identity, Wire::Xai, BodyMode::Buffered, limit)?;
+        ingress.state.job = Some(Job {
+            phase,
+            id: job.map(str::to_owned),
+            ledger,
+        });
+        Ok(ingress)
     }
 
     fn report(&mut self, owner: &mut Writer, result: Result<()>) -> Result<()> {
@@ -257,8 +304,18 @@ impl ResponseIngress for Ingress {
         let result = (|| {
             if let Some(mut scanner) = self.json.take() {
                 let source = self.input.take().ok_or(Error::Closed)?;
-                scanner.finish(&source)?;
-                let doc = Document::from_scanned(owner, source, scanner)?;
+                let pending = self
+                    .state
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| job.phase == Deferred::Pending);
+                // xAI may answer a running job's poll with 202 and no body; the polled job is known.
+                let doc = if pending && source.is_empty() {
+                    boundary::mapped(owner, |e| e.bytes(b"{}"))?
+                } else {
+                    scanner.finish(&source)?;
+                    Document::from_scanned(owner, source, scanner)?
+                };
                 self.state.buffered(owner, &doc)?;
             } else {
                 let scanner = self.sse.as_mut().ok_or(Error::Closed)?;
@@ -485,8 +542,16 @@ impl State {
     /// A buffered Images response: `created`, `data[]`, one `usage` and shared image settings.
     fn buffered(&mut self, owner: &mut Writer, doc: &Document) -> Result<()> {
         let root = doc.root();
-        if !matches!(doc.node(root)?.value, Value::Object) || present(doc, root, "error")?.is_some() {
+        if !matches!(doc.node(root)?.value, Value::Object) {
             return Err(Error::Schema);
+        }
+        let failed = present(doc, root, "error")?.is_some();
+        match self.job.as_ref().map(|job| job.phase) {
+            Some(Deferred::Accepted) => return self.job(owner, doc, "queued"),
+            Some(Deferred::Pending) => return self.job(owner, doc, "running"),
+            Some(Deferred::Polled) if failed => return self.job(owner, doc, "failed"),
+            _ if failed => return Err(Error::Schema),
+            _ => {}
         }
         let data = doc.required(root, "data")?;
         if !matches!(doc.node(data)?.value, Value::Array) || doc.children(data)?.next().is_none() {
@@ -526,6 +591,74 @@ impl State {
         if self.images == 0 {
             return Err(Error::Schema);
         }
+        Ok(())
+    }
+
+    /// A deferred job's answer as one `image.job` operation, as a video job is one `video.job`:
+    /// `job_id` (the answer's `request_id`, else the polled job, marked `id_implied`), `status`
+    /// (`queued` once created, `running` while a poll answers 202, `failed` for an `error` body)
+    /// and a failed job's `error` object. Every other member stays in `X.original`.
+    fn job(&mut self, owner: &mut Writer, doc: &Document, status: &str) -> Result<()> {
+        let root = doc.root();
+        let job = self.job.as_mut().ok_or(Error::Schema)?;
+        let wire = present(doc, root, "request_id")?;
+        if let Some(node) = wire {
+            nonempty(doc, node)?;
+        }
+        let error = if status == "failed" {
+            let node = doc.required(root, "error")?;
+            if !matches!(doc.node(node)?.value, Value::Object) {
+                return Err(Error::Schema);
+            }
+            Some(node)
+        } else {
+            None
+        };
+        let id = match (wire, &job.id) {
+            (Some(node), _) => {
+                let mut id = String::new();
+                let mut chars = doc.chars(node)?;
+                while let Some(c) = chars.next_scalar()? {
+                    id.push(c);
+                }
+                id
+            }
+            // The create's answer must name its job.
+            (None, None) => return Err(Error::Schema),
+            (None, Some(id)) => id.clone(),
+        };
+        if job.phase == Deferred::Accepted {
+            job.ledger.accepted(&id);
+        }
+        let known: &[&str] = if error.is_some() {
+            &["request_id", "error"]
+        } else {
+            &["request_id"]
+        };
+        self.start(owner, None, None)?;
+        let protocol = self.wire.protocol();
+        self.emitter.emit(
+            owner,
+            Kind::Operation,
+            Scope::default(),
+            |e| {
+                e.bytes(b",\"kind\":\"image.job\",\"value\":{\"job_id\":")?;
+                e.string(&id)?;
+                e.bytes(b",\"status\":")?;
+                e.string(status)?;
+                if let Some(error) = error {
+                    e.bytes(b",\"error\":")?;
+                    doc.write(error, e)?;
+                }
+                e.bytes(b"}")
+            },
+            |e| {
+                if wire.is_none() {
+                    e.bytes(b",\"id_implied\":true")?;
+                }
+                boundary::original(doc, protocol, &[(root, "", known)], e)
+            },
+        )?;
         Ok(())
     }
 

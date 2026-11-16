@@ -98,8 +98,8 @@ impl XaiExecutor {
             None => (wreq::Method::POST, VIDEOS_GENERATIONS.to_owned()),
         };
         let job = if method == wreq::Method::GET {
-            let Some(admission) = self.jobs.admit(&req.caller, &request_id) else {
-                return Err(unknown_job(&request_id));
+            let Some(admission) = self.jobs.admit(&req.caller, JobKind::Video, &request_id) else {
+                return Err(unknown_job(JobKind::Video, &request_id));
             };
             VideoJob::Poll(admission)
         } else {
@@ -107,7 +107,11 @@ impl XaiExecutor {
                 credential: credential.id.clone(),
                 model: req.model.trim().to_owned(),
             };
-            VideoJob::Create(self.jobs.reserve(&req.caller, binding).ok_or_else(jobs_full)?)
+            VideoJob::Create(
+                self.jobs
+                    .reserve(&req.caller, JobKind::Video, binding)
+                    .ok_or_else(|| jobs_full(JobKind::Video))?,
+            )
         };
         self.media(credential, &req, cfg.as_ref(), method, &path, payload, Some(job))
             .await
@@ -232,6 +236,22 @@ fn owner(caller: &Caller) -> String {
     format!("{}\u{0}{}", caller.provider, caller.principal)
 }
 
+/// What a job makes: a poll of one kind never finds a job of the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    Image,
+    Video,
+}
+
+impl JobKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Video => "video",
+        }
+    }
+}
+
 /// The credential and the model a job was created on, which every poll of it is pinned to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobBinding {
@@ -247,6 +267,7 @@ fn live(now: Instant, record: &Job) -> bool {
 /// One job's record: whether it was charged, when it was created or last polled, how many
 /// requests hold an [`Admission`] to it, and where its polls go.
 struct Job {
+    kind: JobKind,
     charged: bool,
     at: Instant,
     in_flight: usize,
@@ -261,7 +282,8 @@ struct Table {
     pending: usize,
 }
 
-/// The video jobs this process created (E-Q5, E-Q13). A job id belongs to the caller that
+/// The video and deferred image jobs this process created (E-Q5, E-Q13), in one table and one
+/// capacity. A job id belongs to the caller that
 /// created it; any other caller, an expired id or one this process never issued is not found.
 /// A job is charged at the first poll that reports usage and never again. A job missing here
 /// may already have been charged by an earlier process, so its poll is refused rather than risk
@@ -298,9 +320,9 @@ impl VideoJobs {
         self.table.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A slot for a create `caller` is about to send on `binding`, or `None` when the table is
-    /// full of live jobs and pending creates.
-    pub(crate) fn reserve(&self, caller: &Caller, binding: JobBinding) -> Option<Slot> {
+    /// A slot for a create of a `kind` job `caller` is about to send on `binding`, or `None` when
+    /// the table is full of live jobs and pending creates.
+    pub(crate) fn reserve(&self, caller: &Caller, kind: JobKind, binding: JobBinding) -> Option<Slot> {
         let now = (self.clock)();
         let mut table = self.lock();
         if table.jobs.len() + table.pending >= self.capacity {
@@ -313,23 +335,24 @@ impl VideoJobs {
         Some(Slot {
             jobs: self.clone(),
             owner: owner(caller),
+            kind,
             binding: Some(binding),
         })
     }
 
-    /// Where `caller`'s live job `job` is polled, or `None` when it is not theirs, expired or
-    /// unknown.
-    pub fn binding(&self, caller: &Caller, job: &str) -> Option<JobBinding> {
+    /// Where `caller`'s live `kind` job `job` is polled, or `None` when it is not theirs, of the
+    /// other kind, expired or unknown.
+    pub fn binding(&self, caller: &Caller, kind: JobKind, job: &str) -> Option<JobBinding> {
         let now = (self.clock)();
         let key = (owner(caller), job.trim().to_owned());
         let table = self.lock();
         let record = table.jobs.get(&key)?;
-        live(now, record).then(|| record.binding.clone())
+        (record.kind == kind && live(now, record)).then(|| record.binding.clone())
     }
 
-    /// A poll's admission to `caller`'s live job, which restarts its expiry; `None` when the job
-    /// is not theirs, expired or unknown.
-    pub(crate) fn admit(&self, caller: &Caller, job: &str) -> Option<Admission> {
+    /// A poll's admission to `caller`'s live `kind` job, which restarts its expiry; `None` when
+    /// the job is not theirs, of the other kind, expired or unknown.
+    pub(crate) fn admit(&self, caller: &Caller, kind: JobKind, job: &str) -> Option<Admission> {
         let job = job.trim();
         if job.is_empty() {
             return None;
@@ -337,7 +360,10 @@ impl VideoJobs {
         let now = (self.clock)();
         let key = (owner(caller), job.to_owned());
         let mut table = self.lock();
-        let record = table.jobs.get_mut(&key).filter(|record| live(now, record))?;
+        let record = table
+            .jobs
+            .get_mut(&key)
+            .filter(|record| record.kind == kind && live(now, record))?;
         record.at = now;
         record.in_flight += 1;
         Some(Admission {
@@ -356,7 +382,7 @@ impl VideoJobs {
             credential: String::new(),
             model: String::new(),
         };
-        self.reserve(caller, binding)?.created(job)
+        self.reserve(caller, JobKind::Video, binding)?.created(job)
     }
 }
 
@@ -365,6 +391,7 @@ impl VideoJobs {
 pub(crate) struct Slot {
     jobs: VideoJobs,
     owner: String,
+    kind: JobKind,
     /// Taken when the slot becomes a job.
     binding: Option<JobBinding>,
 }
@@ -384,6 +411,7 @@ impl Slot {
         table.pending = table.pending.saturating_sub(1);
         // A job id the upstream repeats keeps the charge it already has.
         let record = table.jobs.entry(key.clone()).or_insert(Job {
+            kind: self.kind,
             charged: false,
             at: now,
             in_flight: 0,
@@ -416,26 +444,29 @@ pub(crate) struct Admission {
 }
 
 impl Admission {
-    /// Claims the job's charge: true only for the first settlement that finds the job uncharged,
-    /// which marks it charged.
+    /// Claims the job's charge for a report recorded where nothing can fail: true only for the
+    /// first settlement that finds the job uncharged, which marks it charged.
     pub(crate) fn settle(&self) -> bool {
+        self.settle_with(|| Ok::<_, std::convert::Infallible>(()))
+            .unwrap_or_else(|never| match never {})
+    }
+
+    /// Charges the job with `publish`: when the job is uncharged, `publish` runs under the table
+    /// lock and its success marks the job charged. A concurrent settlement waits for that
+    /// outcome, so it charges the job itself when `publish` fails rather than having skipped a
+    /// charge nobody makes.
+    pub(crate) fn settle_with<E>(&self, publish: impl FnOnce() -> Result<(), E>) -> Result<bool, E> {
         let mut table = self.jobs.lock();
         // The admission keeps the record; a missing one charges nothing.
         let Some(record) = table.jobs.get_mut(&self.key) else {
-            return false;
+            return Ok(false);
         };
         if record.charged {
-            return false;
+            return Ok(false);
         }
+        publish()?;
         record.charged = true;
-        true
-    }
-
-    /// Undoes this admission's [`Admission::settle`]: the job is uncharged again.
-    pub(crate) fn release(&self) {
-        if let Some(record) = self.jobs.lock().jobs.get_mut(&self.key) {
-            record.charged = false;
-        }
+        Ok(true)
     }
 }
 
@@ -447,9 +478,9 @@ impl Drop for Admission {
     }
 }
 
-/// The job table as a video response's [`video::Ledger`]: an accepted job takes the create's
-/// reserved slot, and a reported usage is the job's charge only when its admission settles it
-/// first. Both routes settle against the same [`VideoJobs`], so one job is charged once whichever
+/// The job table as a video or deferred image response's [`video::Ledger`]: an accepted job takes
+/// the create's reserved slot, and a reported usage is the job's charge only when its admission
+/// settles it first. Both routes settle against the same [`VideoJobs`], so one job is charged once whichever
 /// route polls it.
 struct JobLedger {
     /// A create's reserved slot, until the response names the job.
@@ -464,31 +495,36 @@ impl video::Ledger for JobLedger {
     }
 
     /// The codec binds a poll's answer to the polled job, so the admission is the job's.
-    fn charge(&mut self, _: &str) -> bool {
-        self.admission.as_ref().is_some_and(Admission::settle)
-    }
-
-    /// Called only after this ledger's own [`video::Ledger::charge`] claimed the job.
-    fn release(&mut self, _: &str) {
-        if let Some(admission) = &self.admission {
-            admission.release();
+    fn charge(&mut self, _: &str, publish: &mut dyn FnMut() -> codec::Result<()>) -> codec::Result<bool> {
+        match &self.admission {
+            Some(admission) => admission.settle_with(publish),
+            None => Ok(false),
         }
     }
 }
 
-/// The 404 for a poll of a job [`VideoJobs`] does not know for this caller, in the error shape
-/// OpenAI and xAI give an unknown ID. It is the request's fault: no other credential is tried.
-fn unknown_job(job: &str) -> ExecError {
-    let message = format!("Video job '{job}' does not exist for this API key, or has expired. Create the video again.");
+/// The 404 for a poll of a `kind` job [`VideoJobs`] does not know for this caller, in the error
+/// shape OpenAI and xAI give an unknown ID. It is the request's fault: no other credential is tried.
+fn unknown_job(kind: JobKind, job: &str) -> ExecError {
+    let message = match kind {
+        JobKind::Video => {
+            format!("Video job '{job}' does not exist for this API key, or has expired. Create the video again.")
+        }
+        JobKind::Image => {
+            format!("Image job '{job}' does not exist for this API key, or has expired. Create the image again.")
+        }
+    };
     let body = serde_json::json!({"error": {"message": message, "type": "invalid_request_error", "param": null, "code": null}});
     ExecError::local(404, FailureScope::Request, body.to_string())
 }
 
 /// The 503 for a create while the job table is full (E-Q5): nothing is sent, so no upstream job
 /// exists. It is the request's fault for routing: no other credential is tried or cooled.
-fn jobs_full() -> ExecError {
-    let message = "Too many video jobs are being tracked. Retry after polling or waiting out existing jobs.";
-    let body = serde_json::json!({"error": {"message": message, "type": "server_error", "param": null, "code": "video_jobs_full"}});
+fn jobs_full(kind: JobKind) -> ExecError {
+    let kind = kind.name();
+    let message = format!("Too many {kind} jobs are being tracked. Retry after polling or waiting out existing jobs.");
+    let code = format!("{kind}_jobs_full");
+    let body = serde_json::json!({"error": {"message": message, "type": "server_error", "param": null, "code": code}});
     ExecError::local(503, FailureScope::Request, body.to_string())
 }
 
@@ -683,6 +719,7 @@ pub(crate) const fn admits(media: Media) -> bool {
 pub(crate) fn check(view: RequestView<'_>, media: Media) -> codec::Result<()> {
     match media {
         Media::ImageGenerate | Media::ImageEdit => media_exec::check_images(view, images::Destination::Xai),
+        Media::ImageRetrieve => media_exec::check_image_retrieve(view),
         Media::Speech => media_exec::check_speech(view, audio::Destination::Xai),
         media => match media_exec::video_action(media) {
             Some(action) => video::check_request(view.document, action, video::Dialect::Xai),
@@ -721,6 +758,16 @@ impl XaiExecutor {
                 } else {
                     IMAGES_GENERATIONS
                 };
+                // A deferred create reserves its place in the job table before anything is sent,
+                // as a video create does, so a full table sends nothing (E-Q5).
+                let deferred = media_exec::images_flag(request.validated.view().document, "deferred")
+                    .map_err(xai_exec::encoding)?;
+                let slot = if deferred {
+                    let slot = self.jobs.reserve(request.client.caller, JobKind::Image, call.binding());
+                    Some(slot.ok_or_else(|| jobs_full(JobKind::Image))?)
+                } else {
+                    None
+                };
                 let upstream = self
                     .media_send(
                         &call,
@@ -730,13 +777,26 @@ impl XaiExecutor {
                         false,
                     )
                     .await?;
-                let ingress = images::Ingress::new(
-                    streams.response,
-                    attempt.identity,
-                    images::Wire::Xai,
-                    BodyMode::Buffered,
-                    media_exec::IMAGES_LIMIT,
-                )
+                let ingress = match slot {
+                    Some(slot) => images::Ingress::deferred(
+                        streams.response,
+                        attempt.identity,
+                        images::Deferred::Accepted,
+                        None,
+                        media_exec::IMAGES_LIMIT,
+                        Box::new(JobLedger {
+                            slot: Some(slot),
+                            admission: None,
+                        }),
+                    ),
+                    None => images::Ingress::new(
+                        streams.response,
+                        attempt.identity,
+                        images::Wire::Xai,
+                        BodyMode::Buffered,
+                        media_exec::IMAGES_LIMIT,
+                    ),
+                }
                 .map_err(xai_exec::encoding)?;
                 (
                     upstream.status,
@@ -779,6 +839,7 @@ impl XaiExecutor {
                     MediaIngress::Speech(Box::new(ingress)),
                 )
             }
+            Media::ImageRetrieve => self.image_poll(&call, streams).await?,
             media => self.video(&call, streams, media).await?,
         };
         Ok(Upstream {
@@ -787,6 +848,46 @@ impl XaiExecutor {
             body,
             ingress: XaiIngress::Media(ingress),
         })
+    }
+
+    /// A poll of a deferred image job, admitted against the job table before anything is sent: a
+    /// job this caller did not create through this process, or a video job, is refused. xAI
+    /// answers 202 while the job runs and 200 with its images or its `error`.
+    async fn image_poll(
+        &self,
+        call: &MediaCall<'_>,
+        streams: Streams<'_>,
+    ) -> Result<(u16, HeaderMap, crate::types::Body, MediaIngress), ExecError> {
+        let job = media_exec::image_job(call.request, xai_exec::DESTINATION)?;
+        let admission = self
+            .jobs
+            .admit(call.request.client.caller, JobKind::Image, &job)
+            .ok_or_else(|| unknown_job(JobKind::Image, &job))?;
+        let path = format!("/images/{}", path_escape(&job));
+        let upstream = self.media_send(call, wreq::Method::GET, &path, None, false).await?;
+        let phase = if upstream.status == 202 {
+            images::Deferred::Pending
+        } else {
+            images::Deferred::Polled
+        };
+        let ingress = images::Ingress::deferred(
+            streams.response,
+            call.attempt.identity,
+            phase,
+            Some(&job),
+            media_exec::IMAGES_LIMIT,
+            Box::new(JobLedger {
+                slot: None,
+                admission: Some(admission),
+            }),
+        )
+        .map_err(xai_exec::encoding)?;
+        Ok((
+            upstream.status,
+            upstream.headers,
+            upstream.body,
+            MediaIngress::Images(Box::new(ingress)),
+        ))
     }
 
     /// A video job: create, edit and extend post the request; retrieve polls the job it names.
@@ -808,18 +909,16 @@ impl XaiExecutor {
         let caller = call.request.client.caller;
         let (admission, slot) = match (media, &job) {
             (Media::VideoRetrieve, Some(job)) => (
-                Some(self.jobs.admit(caller, job).ok_or_else(|| unknown_job(job))?),
+                Some(
+                    self.jobs
+                        .admit(caller, JobKind::Video, job)
+                        .ok_or_else(|| unknown_job(JobKind::Video, job))?,
+                ),
                 None,
             ),
             (Media::VideoCreate | Media::VideoEdit | Media::VideoExtend, _) => {
-                let binding = JobBinding {
-                    credential: call.attempt.credential.id.clone(),
-                    model: media_exec::requested_model(call.request.validated.view().document)
-                        .ok()
-                        .filter(|model| !model.is_empty())
-                        .unwrap_or_else(|| call.attempt.model.trim().to_owned()),
-                };
-                (None, Some(self.jobs.reserve(caller, binding).ok_or_else(jobs_full)?))
+                let slot = self.jobs.reserve(caller, JobKind::Video, call.binding());
+                (None, Some(slot.ok_or_else(|| jobs_full(JobKind::Video))?))
             }
             _ => (None, None),
         };
@@ -935,6 +1034,18 @@ struct MediaCall<'r> {
 }
 
 impl MediaCall<'_> {
+    /// Where a job this create makes is polled: the attempt's credential, and the model the
+    /// client named, else the routed one.
+    fn binding(&self) -> JobBinding {
+        JobBinding {
+            credential: self.attempt.credential.id.clone(),
+            model: media_exec::requested_model(self.request.validated.view().document)
+                .ok()
+                .filter(|model| !model.is_empty())
+                .unwrap_or_else(|| self.attempt.model.trim().to_owned()),
+        }
+    }
+
     /// An image or video upload naming the upstream model the route resolved, whether or not the
     /// client named one. Speech has no model member on xAI's wire.
     fn with_model(&self, mut upload: Vec<u8>) -> Vec<u8> {

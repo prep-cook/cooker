@@ -87,6 +87,21 @@ pub(crate) fn check_images(view: RequestView<'_>, target: images::Destination<'_
     images::check(view.document, target)
 }
 
+/// The fence check of a poll of a deferred image job.
+pub(crate) fn check_image_retrieve(view: RequestView<'_>) -> codec::Result<()> {
+    names(view.document, view.operation)?;
+    images::retrieved_job(view.document).map(drop)
+}
+
+/// The job a poll of a deferred image job names, read from `destination`'s fence.
+pub(crate) fn image_job(request: &Request<'_>, destination: &str) -> Result<String, ExecError> {
+    let view = fenced(request, destination)?;
+    let doc = view.document;
+    images::retrieved_job(doc)
+        .and_then(|node| text(doc, node))
+        .map_err(encoding)
+}
+
 /// The fence check of a speech request for `target`.
 pub(crate) fn check_speech(view: RequestView<'_>, target: audio::Destination) -> codec::Result<()> {
     names(view.document, view.operation)?;
@@ -101,7 +116,7 @@ pub(crate) const fn video_action(media: Media) -> Option<video::Action> {
         Media::VideoExtend => Some(video::Action::Extend),
         Media::VideoRetrieve => Some(video::Action::Retrieve),
         Media::VideoContent => Some(video::Action::Content),
-        Media::ImageGenerate | Media::ImageEdit | Media::Speech => None,
+        Media::ImageGenerate | Media::ImageEdit | Media::ImageRetrieve | Media::Speech => None,
     }
 }
 
@@ -152,9 +167,14 @@ pub(crate) fn video_upload(
 
 /// Whether the image request asks for an event stream (`stream: true`).
 pub(crate) fn images_stream(doc: &Document) -> codec::Result<bool> {
+    images_flag(doc, "stream")
+}
+
+/// Whether the image request's boolean control `name` is `true`.
+pub(crate) fn images_flag(doc: &Document, name: &str) -> codec::Result<bool> {
     let x = doc.required(doc.root(), "x_ck")?;
     let controls = doc.required(doc.required(x, "provider_parameters")?, "images")?;
-    Ok(match doc.member(controls, "stream")? {
+    Ok(match doc.member(controls, name)? {
         Some(node) => matches!(doc.node(node)?.value, Value::Bool(true)),
         None => false,
     })

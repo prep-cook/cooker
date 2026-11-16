@@ -64,6 +64,7 @@ fn api(rt: Arc<Runtime>) -> Router {
         .route("/v1/completions", post(openai::completions))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
+        .route("/v1/images/{request_id}", get(images::retrieve))
         .route("/v1/audio/speech", post(speech::speech))
         .route("/v1/tts", post(speech::speech))
         .route("/v1/videos", post(videos::native_post))

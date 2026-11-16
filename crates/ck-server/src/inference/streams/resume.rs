@@ -8,7 +8,7 @@ use std::task::Poll;
 
 use axum::body::Body;
 use axum::extract::{Extension, RawQuery, State};
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use ck_core::exec::Caller;
@@ -110,7 +110,9 @@ async fn start(rt: &Runtime, caller: Caller, query: &str, headers: &HeaderMap) -
 /// and resume answer with the same headers.
 pub(crate) fn delivery(replay: Replay, first: Vec<Bytes>, framing: Framing, id: &StreamId, cursor: Cursor) -> Response {
     let content_type = replay.egress.content_type(framing);
+    let status = StatusCode::from_u16(replay.egress.status()).expect("an HTTP status");
     let mut response = Response::new(body(replay, first));
+    *response.status_mut() = status;
     let set = response.headers_mut();
     set.insert(header::CONTENT_TYPE, content_type);
     set.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
