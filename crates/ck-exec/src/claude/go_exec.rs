@@ -84,8 +84,8 @@ pub(crate) fn without_guessed_max_tokens(source: Format, client: &[u8], go_body:
 }
 
 /// Go tests whose calls with a payload default rule set `max_tokens: 16384`. Go's guess left
-/// the rule nothing to fill; without the guess (Q-H) the rule applies, so Rust must send its
-/// value.
+/// the rule nothing to fill; without the guess (Q-H) and with no configured or registered
+/// limit, the rule applies, so Rust must send its value.
 const PAYLOAD_DEFAULT_MAX_TOKENS: &[&str] =
     &["TestClaudeExecutor_ChatCompletionsDefaultMaxTokensAndPayloadDefaultRule"];
 

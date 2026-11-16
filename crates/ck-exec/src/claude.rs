@@ -1739,7 +1739,15 @@ impl<'a> Ctx<'a> {
             body = strip_attribution_system(&body);
         }
         // 868e137: the payload rules match the fully prepared body and apply once. Only
-        // header extraction, signing and read-only checks follow.
+        // header extraction, signing and read-only checks follow. Their baseline carries the
+        // default `max_tokens` the body got, as the contract path's encoded baseline does, so
+        // a default rule never replaces the configured or registered limit (Settled 49).
+        let baseline = utf8(original_translated);
+        let baseline = if rawjson::get(&baseline, "max_tokens").exists() {
+            baseline
+        } else {
+            std::borrow::Cow::Owned(self.ensure_max_tokens(baseline.into_owned()))
+        };
         let (edited, touched) = ck_wire::payload::apply_tracked(
             &self.payload_rules,
             &ck_wire::payload::Request {
@@ -1749,7 +1757,7 @@ impl<'a> Ctx<'a> {
                 protocol: Format::Claude.as_str(),
                 from_protocol: req.client_format.as_str(),
                 root: "",
-                original: original_translated,
+                original: baseline.as_bytes(),
                 request_path: req.request_path,
                 headers: Some(req.headers),
             },

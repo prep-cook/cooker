@@ -700,18 +700,29 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
     assert_eq!(seen[0].1["model"], MODEL, "alias resolved to the upstream name");
     let reply: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(reply["model"], "friendly", "force-mapping rewrites the response model");
-    // The alias still passes the candidate's fence before the old arm serves it, and nothing
-    // invents a `max_tokens` (Q-H): the catalog default is sent, and without one the only
-    // candidate is refused before any upstream request.
+    // An alias passes the candidate's fence whichever arm serves it, and nothing invents a
+    // `max_tokens` (Q-H): the catalog default is sent, a payload default rule does not replace
+    // it (Settled 49), and without one the only candidate is refused before any upstream request.
     let catalog = format!("model-catalog: [{{match: {MODEL}, overrides: {{default-max-tokens: 777}}}}]\n");
+    let payload = "requests:\n  payload:\n    default:\n      - models: [{name: \"*\", protocol: claude}]\n        params: {max_tokens: 16384}\n";
+    let both = format!("{catalog}{payload}");
     let unlimited = r#"{"model":"team/friendly","messages":[{"role":"user","content":"x"}]}"#;
-    for (config, status, sent) in [(String::new(), 400, None), (catalog, 200, Some(777))] {
-        let p = proxy(&config, vec![key.clone()]).await;
+    // (config, force-mapping, status, sent max_tokens)
+    let rows = [
+        (String::new(), true, 400, None),
+        (catalog, true, 200, Some(777)),
+        (both.clone(), true, 200, Some(777)),
+        (both, false, 200, Some(777)),
+    ];
+    for (config, force, status, sent) in rows {
+        let mut key = key.clone();
+        key.metadata["models"][0]["force-mapping"] = Value::Bool(force);
+        let p = proxy(&config, vec![key]).await;
         let (got, _, text) = post(&p.url, "/v1/chat/completions", unlimited).await;
-        assert_eq!(got, status, "{config}: {text}");
+        assert_eq!(got, status, "{config} force {force}: {text}");
         let seen = p.seen.requests.lock().unwrap().clone();
         let max_tokens = seen.first().map(|request| request.1["max_tokens"].clone());
-        assert_eq!(max_tokens, sent.map(Value::from), "{config}");
+        assert_eq!(max_tokens, sent.map(Value::from), "{config} force {force}");
     }
     // The registry lists the alias and its prefixed copy, not the upstream name.
     let models: Value = wreq::Client::new()

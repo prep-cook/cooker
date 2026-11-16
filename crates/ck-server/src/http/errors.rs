@@ -66,10 +66,30 @@ pub(crate) fn gemini_body(status: u16, text: &str) -> String {
     json!({"error": {"code": status, "message": message, "status": gemini_status(status)}}).to_string()
 }
 
-/// The Interactions API error: `code` is a string, the lower-case form of the status
-/// GenerateContent names, and there is no numeric code or `status` member.
+/// The Interactions API error: a `snake_case` string `code` from its own table, and no numeric
+/// code or `status` member. A status the table does not list falls back to its HTTP reason.
 pub(crate) fn interactions(status: u16, text: &str) -> Response {
-    let code = gemini_status(status).to_ascii_lowercase();
+    let code = match status {
+        400 => "invalid_request".to_owned(),
+        401 => "authentication".to_owned(),
+        402 => "payment_required".to_owned(),
+        403 => "permission_denied".to_owned(),
+        404 => "not_found".to_owned(),
+        409 => "aborted".to_owned(),
+        416 => "out_of_range".to_owned(),
+        429 => "too_many_requests".to_owned(),
+        499 => "cancelled".to_owned(),
+        500 => "api_error".to_owned(),
+        501 => "unimplemented".to_owned(),
+        503 => "service_unavailable".to_owned(),
+        504 => "deadline_exceeded".to_owned(),
+        _ => axum::http::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|s| s.canonical_reason())
+            .unwrap_or("api_error")
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_"),
+    };
     let body = json!({"error": {"code": code, "message": text}}).to_string();
     super::respond::json(status, "application/json", body)
 }
