@@ -71,12 +71,12 @@ pub(super) struct Relay {
 
 impl Relay {
     pub fn new(config: &RelayConfig, limiter: Arc<Limiter>) -> Result<Self, String> {
-        let skipped = ungathered_ice_urls(config);
+        let skipped = ungathered_ice_schemes(config);
         if !skipped.is_empty() {
             // ponytail: webrtc-rs 0.21 gathers relay candidates over UDP TURN only; pion
             // also uses TURN over TCP and TLS. Those servers are skipped with this warning.
             tracing::warn!(
-                urls = ?skipped,
+                schemes = ?skipped,
                 "codex.live-media-relay: TURN over TCP or TLS is not supported by this build; these ICE servers are skipped"
             );
         }
@@ -477,8 +477,9 @@ fn ice_url(url: &str) -> String {
     }
 }
 
-/// URLs webrtc-rs 0.21 accepts but never gathers from: TURN over TCP and TURN over TLS.
-fn ungathered_ice_urls(config: &RelayConfig) -> Vec<String> {
+/// The schemes of the URLs webrtc-rs 0.21 accepts but never gathers from: TURN over TCP and
+/// TURN over TLS. Only the scheme is logged: a URL can carry credentials in its query.
+fn ungathered_ice_schemes(config: &RelayConfig) -> Vec<String> {
     config
         .ice_servers
         .iter()
@@ -488,7 +489,7 @@ fn ungathered_ice_urls(config: &RelayConfig) -> Vec<String> {
             let lower = u.to_ascii_lowercase();
             lower.starts_with("turns:") || (lower.starts_with("turn:") && lower.contains("transport=tcp"))
         })
-        .map(str::to_owned)
+        .filter_map(|u| u.split_once(':').map(|(scheme, _)| scheme.to_owned()))
         .collect()
 }
 

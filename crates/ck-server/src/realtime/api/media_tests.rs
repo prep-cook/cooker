@@ -325,8 +325,16 @@ async fn relays_audio_and_data_channel_between_peers() {
     assert_eq!(ended, Some(Frame::Close(None)));
     assert!(!from_upstream.is_finished());
 
-    // An explicit close frees the slot.
+    // An explicit close frees the slot once both peers closed.
+    let (released, closed) = tokio::sync::oneshot::channel();
+    session.after_close(Box::new(move || {
+        let _ = released.send(());
+    }));
     session.close("test_done");
+    tokio::time::timeout(Duration::from_secs(5), closed)
+        .await
+        .expect("the session finished closing")
+        .unwrap();
     let (second, _) = relay
         .new_session(
             {
@@ -383,16 +391,14 @@ fn ice_urls_get_go_default_ports() {
                 "turns:b.example".into(),
                 "turn:c.example".into(),
                 "stun:d.example".into(),
+                "turns:relay.example?transport=tcp&api_key=sentinel-secret".into(),
             ],
             ..Default::default()
         }],
         ..RelayConfig::default()
     };
-    assert_eq!(
-        ungathered_ice_urls(&config),
-        ["turn:a.example?transport=tcp", "turns:b.example"],
-        "reported, not silently skipped"
-    );
+    // Reported, not silently skipped; by scheme only, so no query value reaches the log.
+    assert_eq!(ungathered_ice_schemes(&config), ["turn", "turns", "turns"]);
 }
 
 /// pion `SetNAT1To1IPs(public-ip, host)`: host candidates advertise the public address;
