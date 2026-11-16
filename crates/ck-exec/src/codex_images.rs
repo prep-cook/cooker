@@ -44,7 +44,7 @@ const DIRECT_MODELS: [&str; 5] = [
     "gpt-image-2.5",
 ];
 /// The Images API's source format name in payload rules and thinking.
-const SOURCE: &str = "openai-image";
+pub(crate) const SOURCE: &str = "openai-image";
 
 /// `codexOpenAIImagePreparedRequest`.
 struct Prepared {
@@ -442,7 +442,13 @@ fn direct_route_model(req: &ExecRequest) -> Option<String> {
     } else {
         String::new()
     };
-    [req.requested_model.trim(), payload_model.as_str(), req.model.as_str()]
+    direct_route([req.requested_model.trim(), payload_model.as_str(), req.model.as_str()])
+}
+
+/// The first of `models` that names a gpt-image-* model the backend serves directly, as its
+/// base model.
+pub(crate) fn direct_route<'a>(models: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    models
         .into_iter()
         .map(image_base_model)
         .find(|m| DIRECT_MODELS.contains(&m.as_str()))
@@ -452,10 +458,15 @@ fn direct_route_model(req: &ExecRequest) -> Option<String> {
 /// the credential's config lists is sent as it is; otherwise a gpt-image-* model loses
 /// its routing prefix and case (51bde0ff).
 fn direct_model(req: &ExecRequest, settings: &Settings) -> Option<String> {
-    let route = direct_route_model(req)?;
-    let model = request::base_model(&req.model).trim().to_owned();
+    Some(resolve_direct(direct_route_model(req)?, &req.model, settings))
+}
+
+/// [`direct_model`] once `route`, the gpt-image-* model a route named, is known; `model` is
+/// the execution model.
+pub(crate) fn resolve_direct(route: String, model: &str, settings: &Settings) -> String {
+    let model = request::base_model(model).trim().to_owned();
     if model.is_empty() {
-        return Some(route);
+        return route;
     }
     let configured = settings.key_models.iter().any(|m| {
         let field = |k: &str| m.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().trim();
@@ -465,18 +476,18 @@ fn direct_model(req: &ExecRequest, settings: &Settings) -> Option<String> {
         request::base_model(name).trim().go_eq_fold(&model)
     });
     if configured {
-        return Some(model);
+        return model;
     }
     let base = image_base_model(&model);
-    Some(if DIRECT_MODELS.contains(&base.as_str()) {
+    if DIRECT_MODELS.contains(&base.as_str()) {
         base
     } else {
         model
-    })
+    }
 }
 
 /// `codexOpenAIImageBaseModel`: no thinking suffix, no `provider/` prefix, lower case.
-fn image_base_model(model: &str) -> String {
+pub(crate) fn image_base_model(model: &str) -> String {
     let base = request::base_model(model);
     let mut base = base.trim();
     if let Some(i) = base.rfind('/')
@@ -499,7 +510,7 @@ fn direct_endpoint(path: &str) -> Option<&'static str> {
 }
 
 /// `resolveGPTImage2BaseModel`.
-fn main_model(configured: &str) -> &str {
+pub(crate) fn main_model(configured: &str) -> &str {
     if !configured.is_empty() && configured.go_lower().starts_with("gpt-") {
         configured
     } else {
@@ -806,7 +817,7 @@ fn url_format(format: &str) -> bool {
 }
 
 /// `codexOpenAIImageToolModel`.
-fn tool_model(request_model: &str, route_model: &str) -> String {
+pub(crate) fn tool_model(request_model: &str, route_model: &str) -> String {
     [request_model.trim(), route_model.trim()]
         .into_iter()
         .find(|m| !m.is_empty())
@@ -854,7 +865,7 @@ fn responses_request(prompt: &str, images: &[String], tool: &str) -> String {
 }
 
 /// `prepareCodexOpenAIImageBody`: thinking, then the Codex request rules.
-fn tool_body(body: &str, main_model: &str, siwc: bool) -> Result<String, ExecError> {
+pub(crate) fn tool_body(body: &str, main_model: &str, siwc: bool) -> Result<String, ExecError> {
     let thought = ck_wire::thinking::apply_thinking_with_source_payload(
         body.as_bytes(),
         body.as_bytes(),

@@ -6,8 +6,10 @@
 //! boundary. Options keep their native names and units (`seconds` is not turned into
 //! `duration`); an option the destination dialect lacks is refused by [`encode`], never
 //! dropped. Unknown fields travel in `x_ck.original` and return only to their own protocol.
+//! [`Ingress`] publishes a job response on a response stream.
 
 pub mod content;
+mod response;
 mod table;
 mod wire;
 
@@ -24,9 +26,10 @@ use crate::{
         source::Source,
     },
 };
+pub use response::Ingress;
 use table::{Shape, WIRE_STATUS, known, shape};
-pub use wire::encode;
 use wire::write_fraction;
+pub use wire::{check_request, encode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Dialect {

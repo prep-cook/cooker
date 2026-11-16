@@ -10,5 +10,5 @@
 mod request;
 mod response;
 
-pub use request::{Decoder, Destination, RequestFailure, encode};
+pub use request::{Decoder, Destination, RequestFailure, check, encode};
 pub use response::{Egress, Ingress};

@@ -151,56 +151,7 @@ pub enum Destination {
 /// independently of the xAI projection.
 pub fn encode(owner: &mut Writer, doc: &Document, destination: Destination) -> Result<ScratchLease, RequestFailure> {
     doc.check_owner(owner)?;
-    let root = doc.root();
-    object(doc, root)?;
-    for name in ["model", "text"] {
-        nonempty(doc, doc.required(root, name)?)?;
-    }
-    let x = doc.required(root, "x_ck")?;
-    if doc.unsigned(doc.required(x, "v")?)? != 1 || !boundary::is(doc, x, "operation", "speech")? {
-        return Err(Error::Schema.into());
-    }
-    let parameters = doc.required(x, "provider_parameters")?;
-    object(doc, parameters)?;
-    for field in doc.children(parameters)? {
-        if !doc.name_is(doc.node(field)?.name.ok_or(Error::Schema)?, "audio")? {
-            return Err(Error::Unsupported.into());
-        }
-    }
-    let audio = doc.required(parameters, "audio")?;
-    object(doc, audio)?;
-    nonempty(doc, doc.required(audio, "voice")?)?;
-    validate_options(doc, audio)?;
-    for field in doc.children(audio)? {
-        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-        if !OPTIONS
-            .iter()
-            .try_fold(false, |found, key| Ok::<_, Error>(found || doc.name_is(name, key)?))?
-        {
-            return Err(Error::Unsupported.into());
-        }
-    }
-    // OpenAI's speech API has no `output_format`; sample rate and codec cannot be expressed there (L16).
-    if destination == Destination::OpenAi && doc.member(audio, "output_format")?.is_some() {
-        return Err(Error::Unsupported.into());
-    }
-    if destination == Destination::Xai {
-        if doc.member(audio, "instructions")?.is_some() {
-            return Err(Error::Unsupported.into());
-        }
-        let format = if let Some(output) = doc.member(audio, "output_format")? {
-            doc.member(output, "codec")?
-        } else {
-            doc.member(audio, "response_format")?
-        };
-        if let Some(format) = format
-            && !["mp3", "wav", "pcm"].iter().try_fold(false, |found, value| {
-                Ok::<_, Error>(found || doc.string_is(format, value)?)
-            })?
-        {
-            return Err(Error::Unsupported.into());
-        }
-    }
+    let (root, x, audio) = canonical(doc, destination)?;
     Ok(encode::scratch(owner, |e| {
         e.bytes(b"{")?;
         if destination == Destination::OpenAi {
@@ -233,6 +184,67 @@ pub fn encode(owner: &mut Writer, doc: &Document, destination: Destination) -> R
         }
         e.bytes(b"}")
     })?)
+}
+
+/// The checks [`encode`] runs before writing, without writing: a destination's capability runs
+/// them at the fence, so a request it cannot express is refused before any attempt sends.
+pub fn check(doc: &Document, destination: Destination) -> Result<()> {
+    canonical(doc, destination).map(drop)
+}
+
+/// The root, `x_ck` and audio parameter nodes of a request `destination` can express.
+fn canonical(doc: &Document, destination: Destination) -> Result<(usize, usize, usize)> {
+    let root = doc.root();
+    object(doc, root)?;
+    for name in ["model", "text"] {
+        nonempty(doc, doc.required(root, name)?)?;
+    }
+    let x = doc.required(root, "x_ck")?;
+    if doc.unsigned(doc.required(x, "v")?)? != 1 || !boundary::is(doc, x, "operation", "speech")? {
+        return Err(Error::Schema);
+    }
+    let parameters = doc.required(x, "provider_parameters")?;
+    object(doc, parameters)?;
+    for field in doc.children(parameters)? {
+        if !doc.name_is(doc.node(field)?.name.ok_or(Error::Schema)?, "audio")? {
+            return Err(Error::Unsupported);
+        }
+    }
+    let audio = doc.required(parameters, "audio")?;
+    object(doc, audio)?;
+    nonempty(doc, doc.required(audio, "voice")?)?;
+    validate_options(doc, audio)?;
+    for field in doc.children(audio)? {
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        if !OPTIONS
+            .iter()
+            .try_fold(false, |found, key| Ok::<_, Error>(found || doc.name_is(name, key)?))?
+        {
+            return Err(Error::Unsupported);
+        }
+    }
+    // OpenAI's speech API has no `output_format`; sample rate and codec cannot be expressed there (L16).
+    if destination == Destination::OpenAi && doc.member(audio, "output_format")?.is_some() {
+        return Err(Error::Unsupported);
+    }
+    if destination == Destination::Xai {
+        if doc.member(audio, "instructions")?.is_some() {
+            return Err(Error::Unsupported);
+        }
+        let format = if let Some(output) = doc.member(audio, "output_format")? {
+            doc.member(output, "codec")?
+        } else {
+            doc.member(audio, "response_format")?
+        };
+        if let Some(format) = format
+            && !["mp3", "wav", "pcm"].iter().try_fold(false, |found, value| {
+                Ok::<_, Error>(found || doc.string_is(format, value)?)
+            })?
+        {
+            return Err(Error::Unsupported);
+        }
+    }
+    Ok((root, x, audio))
 }
 
 fn object(doc: &Document, node: usize) -> Result<()> {

@@ -176,6 +176,21 @@ pub fn encode(owner: &mut Writer, operation: &Document, dialect: Dialect) -> Res
     }
 }
 
+/// Whether `operation` is a `video.request` for `action` that `dialect` can express, without
+/// writing: the check a destination's capability runs at the fence, so an option the dialect
+/// lacks is refused before any attempt sends.
+pub fn check_request(operation: &Document, action: Action, dialect: Dialect) -> Result<()> {
+    let root = operation.root();
+    if !boundary::is(operation, root, "kind", "video.request")? {
+        return Err(Error::Unsupported);
+    }
+    let value = operation.required(root, "value")?;
+    if !boundary::is(operation, value, "action", action.name())? {
+        return Err(Error::Schema);
+    }
+    refuse_unsupported(operation, value, dialect, action)
+}
+
 fn has_extras(doc: &Document, value: usize, dialect: Dialect) -> Result<bool> {
     let mut any = false;
     for_each_original(doc, value, dialect.name(), |_, _| {

@@ -539,6 +539,8 @@ Audio-file response ingress publishes one media lifetime with the supplied conte
 | request_id/id, job status/progress/timestamps/error, model/prompt/options | `operation(kind: video.job)`; X native/original | Preserve cancelled/expired versus failed even if egress collapses status. |
 | video.url/duration/content MIME, completed file bytes | Media references/lifecycle/data | A job response done means that HTTP operation completed, not that the video finished. |
 
+`video::Ingress` reads one job response (a create acknowledgement or a poll) and publishes `response.start`, the job's usage when the body reports any, one `video.job` operation and `done`; a body that is cut or does not validate ends in one `error` with no job and no usage. The usage snapshot has `scope: "job:<job_id>"` at the record's root and is `final` only once the job is no longer queued or running; absent, null or empty usage publishes none. The xAI executor serves create, edit, extend and retrieve through `Execute::execute` (E6); the job table, its once-per-job charge and the content download remain E7.
+
 ### 5.25 Realtime/Live — request, both directions
 
 For live sessions, the §5.25 and §5.26 tables define only the metadata projection and the validation inputs: every message is forwarded as received and never re-encoded, and media fields are never projected (Settled 55).

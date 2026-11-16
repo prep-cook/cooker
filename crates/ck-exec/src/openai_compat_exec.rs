@@ -14,7 +14,7 @@ use ck_stream::{ScratchLease, Writer};
 use ck_translate::codec::chat::request::{ChatCapability, Egress as ChatEgress};
 use ck_translate::codec::chat::response::Ingress as ChatIngress;
 use ck_translate::codec::document::{Document, Value};
-use ck_translate::codec::{self, BodyMode, Capability, Operation, RequestEgress, RequestFence, RequestView};
+use ck_translate::codec::{self, BodyMode, Capability, Media, Operation, RequestEgress, RequestFence, RequestView};
 use ck_translate::responses::request::{Egress as ResponsesEgress, ResponsesCapability};
 use ck_translate::responses::response::Ingress as ResponsesIngress;
 use ck_wire::json as gj;
@@ -35,12 +35,17 @@ pub(crate) const CHAT_PATH: &str = "/chat/completions";
 /// The native compact path under a relay's base URL.
 const COMPACT_PATH: &str = "/responses/compact";
 
-/// Chat generation, its token count, and the Responses native compact.
+/// Chat generation, its token count, the Responses native compact, and image generation and
+/// edits (`openai_compat_media`).
 pub struct RelayCapability;
 
 impl Capability for RelayCapability {
     fn destination(&self) -> &'static str {
         DESTINATION
+    }
+
+    fn admits(&self, operation: Operation) -> bool {
+        operation.is_text() || matches!(operation, Operation::Media(Media::ImageGenerate | Media::ImageEdit))
     }
 
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
@@ -52,6 +57,13 @@ impl Capability for RelayCapability {
                 ..view
             }),
             Operation::Compact => ResponsesCapability.validate(view),
+            Operation::Media(Media::ImageGenerate) => {
+                crate::media_exec::check_images(view, ck_translate::images::Destination::OpenAi)
+            }
+            Operation::Media(Media::ImageEdit) => crate::media_exec::check_images(
+                view,
+                ck_translate::images::Destination::OpenAiForm(crate::openai_compat_media::CHECK_BOUNDARY),
+            ),
             Operation::Media(_) | Operation::AlphaSearch => Err(codec::Error::Unsupported),
         }
     }
@@ -76,6 +88,14 @@ impl Capability for ModelCapability {
         if self.glm { "glm-chat" } else { DESTINATION }
     }
 
+    fn admits(&self, operation: Operation) -> bool {
+        if self.glm {
+            operation.is_text()
+        } else {
+            RelayCapability.admits(operation)
+        }
+    }
+
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
         if self.glm {
             ck_translate::codec::chat::request::GlmCapability.validate(view)
@@ -90,6 +110,7 @@ impl Capability for ModelCapability {
 pub enum RelayIngress {
     Chat(Box<ChatIngress>),
     Responses(Box<ResponsesIngress>),
+    Media(crate::media_exec::MediaIngress),
 }
 
 impl codec::ResponseIngress for RelayIngress {
@@ -97,6 +118,7 @@ impl codec::ResponseIngress for RelayIngress {
         match self {
             Self::Chat(ingress) => ingress.flush_deadline(),
             Self::Responses(ingress) => ingress.flush_deadline(),
+            Self::Media(ingress) => ingress.flush_deadline(),
         }
     }
 
@@ -104,6 +126,7 @@ impl codec::ResponseIngress for RelayIngress {
         match self {
             Self::Chat(ingress) => ingress.flush(owner),
             Self::Responses(ingress) => ingress.flush(owner),
+            Self::Media(ingress) => ingress.flush(owner),
         }
     }
 
@@ -111,6 +134,7 @@ impl codec::ResponseIngress for RelayIngress {
         match self {
             Self::Chat(ingress) => ingress.advance(owner, bytes),
             Self::Responses(ingress) => ingress.advance(owner, bytes),
+            Self::Media(ingress) => ingress.advance(owner, bytes),
         }
     }
 
@@ -118,6 +142,7 @@ impl codec::ResponseIngress for RelayIngress {
         match self {
             Self::Chat(ingress) => ingress.finish(owner),
             Self::Responses(ingress) => ingress.finish(owner),
+            Self::Media(ingress) => ingress.finish(owner),
         }
     }
 
@@ -125,6 +150,7 @@ impl codec::ResponseIngress for RelayIngress {
         match self {
             Self::Chat(ingress) => ingress.fail(owner, status, scope),
             Self::Responses(ingress) => ingress.fail(owner, status, scope),
+            Self::Media(ingress) => ingress.fail(owner, status, scope),
         }
     }
 }
@@ -143,6 +169,9 @@ impl Execute for OpenAICompatExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<RelayIngress>, ExecError> {
+        if let Operation::Media(media) = request.validated.view().operation {
+            return crate::openai_compat_media::images(attempt, request, streams, self.route(attempt)?, media).await;
+        }
         let upstream = chat(attempt, request, streams, self.route(attempt)?).await?;
         Ok(Upstream {
             status: upstream.status,
@@ -185,7 +214,16 @@ impl Execute for OpenAICompatExecutor {
             compat::MAX_LINE as u64,
         )
         .map_err(encoding)?;
-        let upstream = send(&route, attempt, request, COMPACT_PATH, &relay.base_model, body, false).await?;
+        let upstream = send(
+            &route,
+            attempt,
+            request,
+            (COMPACT_PATH, "application/json"),
+            &relay.base_model,
+            body,
+            false,
+        )
+        .await?;
         Ok(Upstream {
             status: upstream.status,
             headers: upstream.headers,
@@ -254,7 +292,16 @@ pub(crate) async fn chat(
     )
     .map_err(encoding)?
     .with_glm(thinking::glm::is_model(&relay.base_model));
-    let upstream = send(&route, attempt, request, CHAT_PATH, &relay.base_model, body, stream).await?;
+    let upstream = send(
+        &route,
+        attempt,
+        request,
+        (CHAT_PATH, "application/json"),
+        &relay.base_model,
+        body,
+        stream,
+    )
+    .await?;
     Ok(Upstream {
         status: upstream.status,
         headers: upstream.headers,
@@ -293,16 +340,16 @@ pub(crate) fn count(attempt: &Attempt<'_>, request: &Request<'_>, streams: Strea
 /// Posts `body` to `path` under the route's base URL with its key and the credential's custom
 /// headers, recording the request-side facts of `model`'s call (contract G4); a non-2xx answer
 /// is the attempt's failure with the upstream's status and body as received.
-async fn send(
+pub(crate) async fn send(
     route: &Route,
     attempt: &Attempt<'_>,
     request: &Request<'_>,
-    path: &str,
+    (path, content_type): (&str, &str),
     model: &str,
     body: Vec<u8>,
     stream: bool,
 ) -> Result<wire::Upstream, ExecError> {
-    let mut headers = crate::openai_compat_headers::base_headers(&route.key, "application/json", route.api_auth);
+    let mut headers = crate::openai_compat_headers::base_headers(&route.key, content_type, route.api_auth);
     let session = ck_wire::session::cpa_session_id(request.client.session);
     for (name, value) in ck_wire::headers::custom_headers(
         &attempt.credential.attributes,
@@ -327,10 +374,10 @@ async fn send(
     }
     let usage = request.client.usage;
     if usage.enabled() {
-        let target = if path == CHAT_PATH {
-            Format::OpenAI
-        } else {
+        let target = if path == COMPACT_PATH {
             Format::OpenAIResponse
+        } else {
+            Format::OpenAI
         };
         usage.request(target, &body);
     }
@@ -566,7 +613,7 @@ fn copy(lease: &ScratchLease) -> Result<Vec<u8>, ExecError> {
 
 /// A failure before anything was sent (contract §9): storage rows by the inner error;
 /// anything else is a gateway defect, since the request passed this destination's fence.
-fn encoding(error: codec::Error) -> ExecError {
+pub(crate) fn encoding(error: codec::Error) -> ExecError {
     match error {
         codec::Error::Storage(ck_stream::Error::StorageExhausted | ck_stream::Error::Io(_)) => {
             ExecError::local(503, FailureScope::Request, "stream.storage_exhausted")

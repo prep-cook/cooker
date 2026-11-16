@@ -19,8 +19,9 @@ use ck_core::format::Format;
 use ck_stream::{ScratchLease, Writer};
 use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::{
-    self, BodyMode, Capability, Operation, RequestEgress, RequestFence, RequestView, ResponseIngress,
+    self, BodyMode, Capability, Media, Operation, RequestEgress, RequestFence, RequestView, ResponseIngress,
 };
+use ck_translate::images;
 use ck_translate::responses::request::{CodexCapability as CodexRequests, Egress};
 use ck_translate::responses::response::Ingress;
 
@@ -37,10 +38,12 @@ use crate::types::{Attempt, Counted, Execute, Request, Streams, Upstream};
 pub const DESTINATION: &str = "codex";
 
 /// Responses generation, its token count, and the Responses native compact; Alpha Search
-/// for a credential that may serve it (`CodexExecutor::alpha_allowed`).
+/// for a credential that may serve it (`CodexExecutor::alpha_allowed`); image generation and
+/// edits (`codex_media`).
 #[derive(Clone, Copy, Default)]
 pub struct CodexCapability {
     alpha: bool,
+    images: crate::codex_media::Route,
 }
 
 impl Capability for CodexCapability {
@@ -49,7 +52,9 @@ impl Capability for CodexCapability {
     }
 
     fn admits(&self, operation: Operation) -> bool {
-        operation.is_text() || (self.alpha && operation == Operation::AlphaSearch)
+        operation.is_text()
+            || (self.alpha && operation == Operation::AlphaSearch)
+            || matches!(operation, Operation::Media(Media::ImageGenerate | Media::ImageEdit))
     }
 
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
@@ -61,6 +66,15 @@ impl Capability for CodexCapability {
                 ..view
             }),
             Operation::AlphaSearch => ck_translate::search::check_request(view.document),
+            Operation::Media(Media::ImageGenerate | Media::ImageEdit) => {
+                // The tool's main model does not change what the body can express.
+                let target = if self.images.direct(view.document)? {
+                    images::Destination::OpenAi
+                } else {
+                    images::Destination::Codex("")
+                };
+                crate::media_exec::check_images(view, target)
+            }
             Operation::Media(_) => Err(codec::Error::Unsupported),
         }
     }
@@ -73,6 +87,7 @@ impl Execute for CodexExecutor {
     fn capability(&self, attempt: &Attempt<'_>) -> CodexCapability {
         CodexCapability {
             alpha: self.alpha_allowed(attempt.credential, attempt.cfg),
+            images: crate::codex_media::Route::of(attempt),
         }
     }
 
@@ -82,8 +97,10 @@ impl Execute for CodexExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<CodexIngress>, ExecError> {
-        if request.validated.view().operation == Operation::AlphaSearch {
-            return self.alpha(attempt, request, streams).await;
+        match request.validated.view().operation {
+            Operation::AlphaSearch => return self.alpha(attempt, request, streams).await,
+            Operation::Media(media) => return self.serve_images(attempt, request, streams, media).await,
+            _ => {}
         }
         crate::codex_siwc::require_token(attempt.credential)?;
         let stream = streaming(request.validated.view().document).map_err(encoding)?;
@@ -234,6 +251,7 @@ impl CodexExecutor {
 pub enum CodexIngress {
     Responses(Box<Ingress>),
     Alpha(Box<ck_translate::search::Ingress>),
+    Images(Box<images::Ingress>),
 }
 
 impl ResponseIngress for CodexIngress {
@@ -241,6 +259,7 @@ impl ResponseIngress for CodexIngress {
         match self {
             Self::Responses(ingress) => ingress.flush_deadline(),
             Self::Alpha(ingress) => ingress.flush_deadline(),
+            Self::Images(ingress) => ingress.flush_deadline(),
         }
     }
 
@@ -248,6 +267,7 @@ impl ResponseIngress for CodexIngress {
         match self {
             Self::Responses(ingress) => ingress.flush(owner),
             Self::Alpha(ingress) => ingress.flush(owner),
+            Self::Images(ingress) => ingress.flush(owner),
         }
     }
 
@@ -255,6 +275,7 @@ impl ResponseIngress for CodexIngress {
         match self {
             Self::Responses(ingress) => ingress.advance(owner, bytes),
             Self::Alpha(ingress) => ingress.advance(owner, bytes),
+            Self::Images(ingress) => ingress.advance(owner, bytes),
         }
     }
 
@@ -262,6 +283,7 @@ impl ResponseIngress for CodexIngress {
         match self {
             Self::Responses(ingress) => ingress.finish(owner),
             Self::Alpha(ingress) => ingress.finish(owner),
+            Self::Images(ingress) => ingress.finish(owner),
         }
     }
 
@@ -269,6 +291,7 @@ impl ResponseIngress for CodexIngress {
         match self {
             Self::Responses(ingress) => ingress.fail(owner, status, scope),
             Self::Alpha(ingress) => ingress.fail(owner, status, scope),
+            Self::Images(ingress) => ingress.fail(owner, status, scope),
         }
     }
 }
