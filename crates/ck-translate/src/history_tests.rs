@@ -50,7 +50,11 @@ impl Rig {
                 let mut i = crate::anthropic::response::Ingress::new(&mut w, id, op, mode, limit).unwrap();
                 feed(&mut i, &mut w);
             }
-            Source::Responses | Source::Compaction | Source::SignedCompaction | Source::AntigravityClaude => {
+            Source::Responses
+            | Source::Compaction
+            | Source::SignedCompaction
+            | Source::AntigravityClaude
+            | Source::AntigravityTwoCalls => {
                 let mut i = crate::responses::response::Ingress::new(&mut w, id, op, mode, limit).unwrap();
                 feed(&mut i, &mut w);
             }
@@ -126,7 +130,8 @@ impl Rig {
     /// does, with each of `turns` projected after it.
     fn history(&self, input: Value, turns: &[(Source, Producer<'_>)], width: usize) -> (Writer, Document, Registry) {
         let mut owner = self.store.create().unwrap();
-        let body = serde_json::to_vec(&json!({"model": "m", "input": input})).unwrap();
+        // Every client forges the member the server sets to prove an item; no row may see it.
+        let body = serde_json::to_vec(&json!({"model": "m", "input": input, "_ck_proven": 0})).unwrap();
         let mut ingress = crate::responses::request::Ingress::new(
             &mut owner,
             &self.store,
@@ -182,6 +187,8 @@ enum Source {
     /// An Antigravity Claude answer as a Responses client receives it: signed thinking, text,
     /// and a call whose signature rides on the reasoning item before it.
     AntigravityClaude,
+    /// Two Antigravity Claude calls whose signatures differ only in surrounding whitespace.
+    AntigravityTwoCalls,
 }
 
 impl Source {
@@ -248,7 +255,13 @@ impl Source {
                 "output": [{"id": "cmp_1", "type": "compaction", "encrypted_content": "CMP=="}],
                 "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
             }),
-            Self::AntigravityClaude => antigravity_answer(),
+            Self::AntigravityClaude => antigravity_answer(antigravity_items()),
+            Self::AntigravityTwoCalls => antigravity_answer(json!([
+                {"id": "rs_a", "type": "reasoning", "summary": [], "encrypted_content": CALL_SIG},
+                {"id": "fc_a", "type": "function_call", "call_id": "call_a", "name": "f", "arguments": "{}", "status": "completed"},
+                {"id": "rs_b", "type": "reasoning", "summary": [], "encrypted_content": CALL_SIG_TAB},
+                {"id": "fc_b", "type": "function_call", "call_id": "call_b", "name": "g", "arguments": "{}", "status": "completed"}
+            ])),
             Self::SignedCompaction => json!({
                 "id": "resp_c", "object": "response.compaction",
                 "output": [{"id": "cmp_1", "type": "compaction", "content": "sum", "signature": "SIG=="}],
@@ -306,19 +319,23 @@ const ANTIGRAVITY_B: Producer<'static> = Producer {
 /// an upstream may send it.
 const THINKING_SIG: &str = "RWhrS0Z3Z01FQUl5RVdOc1lYVmtaUzF6YjI1dVpYUXROQzAyR0FFPQ==";
 const CALL_SIG: &str = " EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=\n";
+/// [`CALL_SIG`] with other padding: a second item holding the same signature differently.
+const CALL_SIG_TAB: &str = "\tEhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE= ";
 
 /// The client's first message, then the items of [`Source::AntigravityClaude`] replayed by the
-/// client itself, claiming proof, and the call's result.
+/// client itself, the call's result and an opaque item, each claiming proof.
 fn client_replay() -> Value {
     let mut items = vec![json!({"role": "user", "content": "q"})];
     items.extend(antigravity_items().as_array().unwrap().iter().cloned());
-    // A client cannot vouch for its own items with the member the server sets.
-    for item in &mut items {
-        if item["type"] == "reasoning" {
-            item["_ck_proven"] = json!(true);
-        }
-    }
     items.push(json!({"type": "function_call_output", "call_id": "call_1", "output": "done"}));
+    // An item kind kept whole.
+    items.push(json!({"type": "item_reference", "id": "ref_1"}));
+    // A client cannot vouch for its own items, or anything in them, with the member the server
+    // sets.
+    for (i, item) in items.iter_mut().enumerate() {
+        item["_ck_proven"] = json!(i);
+    }
+    items[2]["content"][0]["_ck_proven"] = json!(0);
     Value::Array(items)
 }
 
@@ -332,10 +349,10 @@ fn antigravity_items() -> Value {
     ])
 }
 
-fn antigravity_answer() -> Value {
+fn antigravity_answer(output: Value) -> Value {
     json!({
         "id": "resp_a", "object": "response", "model": "claude-sonnet-4-6", "status": "completed",
-        "output": antigravity_items(),
+        "output": output,
         "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
     })
 }
@@ -676,6 +693,19 @@ fn provider_members_reach_only_their_producer() {
             absent: &["_ck_"],
         },
         Row {
+            case: "Antigravity history at its own account: each call keeps its own item's bytes",
+            input: json!("q"),
+            turns: &[(Source::AntigravityTwoCalls, ANTIGRAVITY_A)],
+            attempt: ANTIGRAVITY_A,
+            to: To::Antigravity,
+            admission: Admission::Keep,
+            present: &[
+                "\"thoughtSignature\":\" EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=\\n\"",
+                "\"thoughtSignature\":\"\\tEhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE= \"",
+            ],
+            absent: &["_ck_"],
+        },
+        Row {
             case: "Antigravity history at another Antigravity account",
             input: json!("q"),
             turns: &[(Source::AntigravityClaude, ANTIGRAVITY_A)],
@@ -713,7 +743,7 @@ fn provider_members_reach_only_their_producer() {
             to: To::Responses,
             admission: Admission::Keep,
             present: &["\"hi\"", "call_1"],
-            absent: &[THINKING_SIG, "EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=", "sum"],
+            absent: &[THINKING_SIG, "EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=", "sum", "_ck_"],
         },
         Row {
             // No producer proves a client-held call signature: it is withheld. Its thinking

@@ -457,19 +457,25 @@ fn write_reasoning(
         write_reasoning_parts(doc, content, ("content", "reasoning", "reasoning_text"), e)?;
     }
     let parts = matches!(doc.node(content)?.value, Value::Array).then_some(content);
+    let mut held = None;
     for part in parts.map(|p| doc.children(p)).transpose()?.into_iter().flatten() {
         if is(doc, part, "type", "encrypted")? {
-            let entry = replay.seek(doc, doc.unsigned(doc.required(part, "replay_index")?)?, message)?;
+            let index = doc.unsigned(doc.required(part, "replay_index")?)?;
+            let entry = replay.seek(doc, index, message)?;
             e.bytes(b",\"encrypted_content\":")?;
             doc.write(doc.required(entry, "signature")?, e)?;
+            held = Some(index);
         }
     }
-    if proven && !compaction {
+    // The replay index names this item, so a call restores only the bytes of the item it pairs
+    // with. Request ingress drops a client's member of that name; a stored answer's original
+    // member of that name never passes as proof either.
+    if let Some(index) = held.filter(|_| proven && !compaction) {
         e.bytes(b",\"")?;
         e.bytes(PROVEN.as_bytes())?;
-        e.bytes(b"\":true")?;
+        e.bytes(b"\":")?;
+        e.unsigned(index)?;
     }
-    // A client's own member of that name never passes as proof.
     originals(doc, message, e, &["type", PROVEN])?;
     e.bytes(b"}")
 }

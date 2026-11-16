@@ -4,6 +4,8 @@
 //! web-search request), and the Gemini Responses response converters on the unwrapped
 //! envelope.
 
+use std::collections::HashMap;
+
 use ck_core::registry::{self, ModelInfo};
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, GoValue, Kind};
@@ -311,34 +313,40 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
 
 /// Owner ruling P7b-1 where provenance allows it: a Claude model's function call takes the
 /// signature of the proven reasoning item the Gemini Responses pairing binds to it, with the
-/// bytes the item holds. The envelope removed every function-call signature before, as
-/// CLIProxyAPI does; an unproven one stays removed, since Anthropic mints the same form.
+/// bytes that item holds. The item is found by the `_ck_proven` identity the egress gave it,
+/// so two items holding the same signature differently each keep their own bytes. The
+/// envelope removed every function-call signature before, as CLIProxyAPI does; an unproven
+/// one stays removed, since Anthropic mints the same form.
 fn restore_proven_call_signatures(model: &str, raw: &[u8], mut out: Vec<u8>) -> Vec<u8> {
     if provider_from_model_name(model) != Provider::Claude {
         return out;
     }
     let input = gj::get(raw, "input");
     let items = input.array();
-    let proven: Vec<Vec<u8>> = items
+    let held: HashMap<Vec<u8>, Vec<u8>> = items
         .iter()
-        .filter(|item| item.get("type").bytes().as_ref() == b"reasoning" && item.get(PROVEN).bool())
-        .map(|item| item.get("encrypted_content").bytes().into_owned())
+        .filter(|item| item.get("type").bytes().as_ref() == b"reasoning")
+        .filter_map(|item| {
+            let proven = item.get(PROVEN);
+            proven
+                .exists()
+                .then(|| (proven.raw.to_vec(), item.get("encrypted_content").bytes().into_owned()))
+        })
         .collect();
-    if proven.is_empty() {
+    if held.is_empty() {
         return out;
     }
-    let calls = crate::gemini_responses::paired_call_signatures(&items);
+    let calls = crate::gemini_responses::paired_call_items(&items);
     let contents = gj::get(&out, "request.contents").into_owned();
     for (ci, content) in contents.array().iter().enumerate() {
         for (pi, part) in content.get("parts").array().iter().enumerate() {
-            let Some(paired) = calls.get(part.get("functionCall.id").bytes().as_ref()) else {
+            let Some(bytes) = calls
+                .get(part.get("functionCall.id").bytes().as_ref())
+                .and_then(|id| held.get(id))
+            else {
                 continue;
             };
-            // The pairing trims; the proven item keeps the bytes the upstream sent.
-            let Some(held) = proven.iter().find(|p| trim_space(p) == paired.as_slice()) else {
-                continue;
-            };
-            let signature = provider_compatible(Provider::Claude, held, BlockKind::Unknown);
+            let signature = provider_compatible(Provider::Claude, bytes, BlockKind::Unknown);
             if !signature.is_empty() {
                 gj::set_str(
                     &mut out,

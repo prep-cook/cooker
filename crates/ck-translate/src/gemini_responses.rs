@@ -21,6 +21,7 @@ use crate::common::{
 use crate::gemini_chat_request::{content_node as content, text_part};
 use crate::gemini_gemini::{set_function_response_raw, set_function_response_result};
 use crate::gemini_web_search as ws;
+use crate::responses::request::PROVEN;
 use crate::responses_tools::{
     client_tool_search_name, gemini_function_declarations, is_client_tool_search_item, map_tool_name,
     tool_choice_to_gemini,
@@ -586,22 +587,33 @@ fn with_field(item: &Res<'_>, path: &str, value: &[u8]) -> Res<'static> {
     owned(&raw)
 }
 
-/// The signature [`pair_reasoning_with_function_calls`] binds to each tool call, by call ID.
-pub(crate) fn paired_call_signatures(items: &[Res<'_>]) -> HashMap<Vec<u8>, Vec<u8>> {
+/// By call ID, the `_ck_proven` identity of the reasoning item whose signature
+/// [`pair_reasoning_with_function_calls`] binds to each tool call.
+pub(crate) fn paired_call_items(items: &[Res<'_>]) -> HashMap<Vec<u8>, Vec<u8>> {
     pair_reasoning_with_function_calls(items)
         .iter()
-        .filter(|item| is_tool_call(item))
+        .filter(|item| is_tool_call(item) && !trimmed(item, SIGNATURE_FIELD).is_empty())
         .filter_map(|item| {
-            let signature = trimmed(item, SIGNATURE_FIELD);
-            (!signature.is_empty()).then(|| (extract_call_id(item), signature))
+            let proven = item.get(PROVEN);
+            proven.exists().then(|| (extract_call_id(item), proven.raw.to_vec()))
         })
         .collect()
+}
+
+/// `call` with the `_ck_proven` identity of `reasoning`, the item its signature comes from.
+fn with_source(mut call: Vec<u8>, reasoning: &Res<'_>) -> Vec<u8> {
+    let proven = reasoning.get(PROVEN);
+    if proven.exists() {
+        gj::set_raw(&mut call, PROVEN, &proven.raw);
+    }
+    call
 }
 
 /// pairOpenAIResponsesReasoningWithFunctionCalls: moves reasoning signatures onto the
 /// function calls they belong to (`_cpa_reasoning_signature`, `_cpa_reasoning_summary`).
 fn pair_reasoning_with_function_calls<'a>(items: &[Res<'a>]) -> Vec<Res<'a>> {
-    let mut post_call_signature: HashMap<usize, Vec<u8>> = HashMap::new();
+    // A call's index, to the index of the carrier after it whose signature it takes.
+    let mut post_call_signature: HashMap<usize, usize> = HashMap::new();
     let mut post_call_carrier: HashSet<usize> = HashSet::new();
     let mut consumed_post_call_carrier: HashSet<usize> = HashSet::new();
     let mut group_start = 0;
@@ -648,7 +660,7 @@ fn pair_reasoning_with_function_calls<'a>(items: &[Res<'a>]) -> Vec<Res<'a>> {
                     continue;
                 }
                 if (group_end..output_end).any(|o| extract_call_id(&items[o]) == call_id) {
-                    post_call_signature.insert(call_index, trimmed(&items[call_index + 1], "encrypted_content"));
+                    post_call_signature.insert(call_index, call_index + 1);
                     consumed_post_call_carrier.insert(call_index + 1);
                 }
             }
@@ -660,10 +672,15 @@ fn pair_reasoning_with_function_calls<'a>(items: &[Res<'a>]) -> Vec<Res<'a>> {
     let mut index = 0;
     while index < items.len() {
         let item = &items[index];
-        if let Some(signature) = post_call_signature.get(&index).filter(|s| !s.is_empty()) {
-            paired.push(with_field(item, SIGNATURE_FIELD, signature));
-            index += 1;
-            continue;
+        if let Some(carrier) = post_call_signature.get(&index).map(|&c| &items[c]) {
+            let signature = trimmed(carrier, "encrypted_content");
+            if !signature.is_empty() {
+                let mut call = item.raw.to_vec();
+                gj::set_str(&mut call, SIGNATURE_FIELD, &signature);
+                paired.push(owned(&with_source(call, carrier)));
+                index += 1;
+                continue;
+            }
         }
         if consumed_post_call_carrier.contains(&index) {
             index += 1;
@@ -686,7 +703,7 @@ fn pair_reasoning_with_function_calls<'a>(items: &[Res<'a>]) -> Vec<Res<'a>> {
                 if !summary.is_empty() {
                     gj::set_str(&mut call, SUMMARY_FIELD, &summary);
                 }
-                paired.push(owned(&call));
+                paired.push(owned(&with_source(call, item)));
                 index += 2;
                 continue;
             }
@@ -2263,6 +2280,45 @@ fn convert_items(
 
 #[cfg(test)]
 mod tests {
+    /// A call paired with a reasoning item names that item's `_ck_proven` identity, whether the
+    /// item comes before the call or rides after it as a carrier; an unproven item names none.
+    #[test]
+    fn a_paired_call_names_the_item_its_signature_comes_from() {
+        let call = |id: &str| format!(r#"{{"type":"function_call","call_id":"{id}","name":"f","arguments":"{{}}"}}"#);
+        let output = |id: &str| format!(r#"{{"type":"function_call_output","call_id":"{id}","output":"ok"}}"#);
+        let reasoning =
+            |proof: &str| format!(r#"{{"type":"reasoning","summary":[],"encrypted_content":" S\n"{proof}}}"#);
+        // (case, items, call ID to identity)
+        let rows = [
+            (
+                "reasoning before each call",
+                vec![
+                    reasoning(r#","_ck_proven":3"#),
+                    call("a"),
+                    reasoning(r#","_ck_proven":5"#),
+                    call("b"),
+                ],
+                vec![("a", "3"), ("b", "5")],
+            ),
+            (
+                "a carrier after the call",
+                vec![call("a"), reasoning(r#","_ck_proven":7"#), output("a")],
+                vec![("a", "7")],
+            ),
+            ("an unproven item", vec![reasoning(""), call("a")], vec![]),
+        ];
+        for (case, items, want) in rows {
+            let raw = format!("[{}]", items.join(","));
+            let parsed = ck_wire::json::get(raw.as_bytes(), "@this");
+            let got = super::paired_call_items(&parsed.array());
+            let want: std::collections::HashMap<Vec<u8>, Vec<u8>> = want
+                .iter()
+                .map(|(id, proof)| (id.as_bytes().to_vec(), proof.as_bytes().to_vec()))
+                .collect();
+            assert_eq!(got, want, "{case}");
+        }
+    }
+
     /// openAIResponsesDiscoveredToolNames: a replayed tool_search_output lists each
     /// discovered tool once, by its Gemini name, in first-seen order (a namespace child and
     /// the same qualified name declared directly are one tool).

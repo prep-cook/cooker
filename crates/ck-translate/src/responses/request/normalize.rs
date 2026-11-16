@@ -1,4 +1,5 @@
 use super::super::{is, move_field, string};
+use super::PROVEN;
 use crate::codec::{
     Error, Operation, Result,
     document::{Document, Name, Value},
@@ -419,6 +420,8 @@ fn normalize_opaque(doc: &mut Document, item: usize, messages: usize, original: 
         None => Value::Null,
     };
     mark(doc, original, message, "type", kind)?;
+    // An item kept whole loses only the server's proof member, as `preserve` drops it elsewhere.
+    doc.remove(item, PROVEN)?;
     doc.set(message, "role", Value::Text("assistant"))?;
     let content = doc.set(message, "content", Value::Array)?;
     let part = doc.add(None, Value::Object)?;
@@ -503,7 +506,11 @@ fn mark(doc: &mut Document, original: usize, target: usize, name: &'static str, 
 /// Keeps the detached member `value` of `target` in `x_ck.original` under its own name, which
 /// [`pointers`] turns into the entry's pointer once normalization is done.
 fn preserve(doc: &mut Document, original: usize, target: usize, value: usize) -> Result<()> {
-    doc.node(value)?.name.ok_or(Error::Schema)?;
+    let name = doc.node(value)?.name.ok_or(Error::Schema)?;
+    // The server's proof that it produced an item: a client's member of that name is dropped.
+    if doc.name_is(name, PROVEN)? {
+        return Ok(());
+    }
     let entry = doc.add(None, Value::Object)?;
     doc.append(original, entry)?;
     doc.set(entry, "protocol", Value::Text("responses"))?;
