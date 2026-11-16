@@ -28,6 +28,8 @@ enum Provider {
     Codex,
     /// A Codex ChatGPT login with cloaking off, so the client's headers reach the header rules.
     CodexLogin,
+    /// A Sign in with ChatGPT credential, which has no direct Images endpoint.
+    CodexSiwc,
     Compat,
     Xai,
 }
@@ -37,6 +39,7 @@ impl Provider {
     fn token(self) -> &'static str {
         match self {
             Self::CodexLogin => "oauth-token",
+            Self::CodexSiwc => "siwc-at",
             _ => "sk-up",
         }
     }
@@ -91,8 +94,14 @@ fn exchange(provider: Provider, upstream: &StreamUpstream, model: &str) -> Excha
         }
         return Exchange::new(login, model, "/v1/images/generations");
     }
+    if provider == Provider::CodexSiwc {
+        let mut siwc = credential("codex", &upstream.url(), "sk-up");
+        siwc.metadata.insert("use_siwc".into(), true.into());
+        siwc.metadata.insert("siwc".into(), json!({"access_token": "siwc-at"}));
+        return Exchange::new(siwc, model, "/v1/images/generations");
+    }
     let (name, base) = match provider {
-        Provider::Codex | Provider::CodexLogin => ("codex", upstream.url()),
+        Provider::Codex | Provider::CodexLogin | Provider::CodexSiwc => ("codex", upstream.url()),
         Provider::Compat => ("openai-compatibility", format!("{}/v1", upstream.url())),
         Provider::Xai => ("xai", upstream.url()),
     };
@@ -157,7 +166,7 @@ async fn run_as(
 ) -> Outcome {
     let op = Operation::Media(ask.claimed.unwrap_or(ask.op));
     match provider {
-        Provider::Codex | Provider::CodexLogin => {
+        Provider::Codex | Provider::CodexLogin | Provider::CodexSiwc => {
             let codex = CodexExecutor::with_client(wreq::Client::new(), CodexOAuth::new(wreq::Client::new()));
             run_on(&codex, streams, exchange, held, op, client_only).await
         }
@@ -358,6 +367,28 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
             &[],
         ),
         (
+            "Codex image tool without a request model runs on the execution model",
+            Provider::CodexSiwc,
+            "gpt-image-1.5",
+            ask(Media::ImageGenerate, r#"{"prompt":"a cat"}"#),
+            Reply::sse(codex_tool_events()),
+            "POST",
+            "/responses",
+            json!({"model":"gpt-5.4-mini","tools":[{"type":"image_generation","action":"generate","model":"gpt-image-1.5"}]}),
+            &[],
+        ),
+        (
+            "Codex image tool with a blank request model runs on the execution model",
+            Provider::CodexSiwc,
+            "gpt-image-1.5",
+            ask(Media::ImageGenerate, r#"{"model":" ","prompt":"a cat"}"#),
+            Reply::sse(codex_tool_events()),
+            "POST",
+            "/responses",
+            json!({"model":"gpt-5.4-mini","tools":[{"type":"image_generation","action":"generate","model":"gpt-image-1.5"}]}),
+            &[],
+        ),
+        (
             "Codex login sends its own User-Agent to the Images endpoint",
             Provider::CodexLogin,
             "gpt-image-2",
@@ -469,7 +500,7 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
         for (key, value) in members.as_object().unwrap() {
             assert_eq!(&body[key], value, "{name}: member {key}");
         }
-        if matches!(provider, Provider::Codex | Provider::CodexLogin) {
+        if matches!(provider, Provider::Codex | Provider::CodexLogin | Provider::CodexSiwc) {
             assert!(body["prompt_cache_key"].is_string(), "{name}: the session's cache key");
         }
     }

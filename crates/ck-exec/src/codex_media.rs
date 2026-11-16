@@ -16,7 +16,7 @@ use ck_translate::images;
 use crate::codex::{CodexExecutor, ErrorBody};
 use crate::codex_capture::Wire;
 use crate::codex_exec::{CodexIngress, DESTINATION, encoding, observed};
-use crate::codex_images::{SOURCE, direct_route, main_model, resolve_direct, tool_body};
+use crate::codex_images::{SOURCE, direct_route, main_model, resolve_direct, tool_body, tool_model};
 use crate::codex_json::set_str_if_different;
 use crate::codex_replay::Scope;
 use crate::codex_request::{self as request, Settings, View};
@@ -48,14 +48,26 @@ impl Route {
         Ok(!self.siwc && (self.execution || direct_route([requested.as_str()]).is_some()))
     }
 
-    /// The gpt-image-* model a direct attempt for `doc` routes by; `None` for the tool path.
-    fn model(self, doc: &Document, execution: &str) -> ck_translate::codec::Result<Option<String>> {
-        if !self.direct(doc)? {
-            return Ok(None);
-        }
+    /// Where the attempt for `doc` goes, from the request's model, else the execution model
+    /// (`codexDirectOpenAIImageRouteModel`, `codexOpenAIImageToolModel`): direct by the first that
+    /// names a gpt-image-* model, otherwise the tool on the first that is not blank.
+    fn target(self, doc: &Document, execution: &str) -> ck_translate::codec::Result<Target> {
         let requested = media_exec::requested_model(doc)?;
-        Ok(direct_route([requested.as_str(), execution]))
+        let models = [requested.as_str(), execution];
+        // `direct` is the fence's decision; `execution` is the attempt model it was made from.
+        Ok(match direct_route(models) {
+            Some(route) if self.direct(doc)? => Target::Direct(route),
+            _ => Target::Tool(tool_model(models[0], models[1])),
+        })
     }
+}
+
+/// An image attempt's endpoint and the model that names it there.
+enum Target {
+    /// The backend's own Images endpoint, routed by this gpt-image-* model.
+    Direct(String),
+    /// The `image_generation` tool on Responses, with this tool model.
+    Tool(String),
 }
 
 /// One upstream call: where it goes, what it sends, and how its answer reads.
@@ -91,9 +103,9 @@ impl CodexExecutor {
             cache: crate::codex_shape::sessions_uuid(request.client.execution_session, request.client.derived_session),
         };
         let document = request.validated.view().document;
-        let call = match Route::of(attempt).model(document, attempt.model).map_err(encoding)? {
-            Some(route) => shape.direct(streams.request, media, route)?,
-            None => shape.tool(streams.request)?,
+        let call = match Route::of(attempt).target(document, attempt.model).map_err(encoding)? {
+            Target::Direct(route) => shape.direct(streams.request, media, route)?,
+            Target::Tool(model) => shape.tool(streams.request, &model)?,
         };
         let usage = request.client.usage;
         let wire = Wire::new(usage.capture(), attempt.credential);
@@ -188,7 +200,7 @@ impl Shape<'_> {
 
     /// The Responses request forcing the `image_generation` tool on the images main model,
     /// always streamed, as the backend requires.
-    fn tool(&self, owner: &mut ck_stream::Writer) -> Result<ImageCall, ExecError> {
+    fn tool(&self, owner: &mut ck_stream::Writer, tool: &str) -> Result<ImageCall, ExecError> {
         let main = main_model(&self.settings.image_base_model);
         let upload = utf8(media_exec::images_upload(
             self.request,
@@ -197,6 +209,8 @@ impl Shape<'_> {
             owner,
         )?)?;
         let mut body = tool_body(&upload, main, self.view.siwc)?;
+        // The tool model, not the Responses model, which stays the images main model.
+        body = set_str_if_different(body, "tools.0.model", tool);
         if let Some(id) = &self.cache {
             body = set_str_if_different(body, "prompt_cache_key", id);
         }

@@ -817,7 +817,7 @@ fn url_format(format: &str) -> bool {
 }
 
 /// `codexOpenAIImageToolModel`.
-fn tool_model(request_model: &str, route_model: &str) -> String {
+pub(crate) fn tool_model(request_model: &str, route_model: &str) -> String {
     [request_model.trim(), route_model.trim()]
         .into_iter()
         .find(|m| !m.is_empty())
