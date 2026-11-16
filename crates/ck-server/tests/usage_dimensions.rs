@@ -469,4 +469,6 @@ impl ck_translate::video::Ledger for FirstReport {
     fn charge(&mut self, _: &str) -> bool {
         true
     }
+
+    fn release(&mut self, _: &str) {}
 }

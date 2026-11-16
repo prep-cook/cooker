@@ -962,6 +962,9 @@ enum Route {
     Buffered,
     /// The execution contract: canonical records through the video codec.
     Contract,
+    /// The execution contract onto a stream whose event limit cannot hold the usage record, so
+    /// the attempt fails without publishing it.
+    ContractNoRoom,
 }
 
 /// One video request through `route`: a create answered with `job` when `body` is `None`, else a
@@ -974,8 +977,11 @@ async fn video_step(
     body: Option<&str>,
 ) -> bool {
     match route {
-        Route::Contract => {
-            let streams = Streams::new();
+        Route::Contract | Route::ContractNoRoom => {
+            let streams = match route {
+                Route::ContractNoRoom => Streams::with_event_bytes(400),
+                _ => Streams::new(),
+            };
             let exchange = exchange(Provider::Xai, upstream, "grok-imagine-video");
             let ask = match body {
                 None => ask(Media::VideoCreate, VIDEO),
@@ -986,7 +992,10 @@ async fn video_step(
             let (outcome, records, ..) = run_on(xai, &streams, &exchange, &mut held, operation, false)
                 .await
                 .unwrap();
-            outcome.unwrap_or_else(|e| panic!("{route:?} {job}: {e:?}"));
+            match route {
+                Route::ContractNoRoom => assert!(outcome.is_err(), "{job}: the usage record did not fit"),
+                _ => outcome.unwrap_or_else(|e| panic!("{route:?} {job}: {e:?}")),
+            }
             usages(&records)
                 .iter()
                 .any(|record| record["scope"] == format!("job:{job}"))
@@ -1035,9 +1044,10 @@ async fn video_step(
 /// carries its create and its polls (E-Q13): both settle against the executor's one job table.
 #[tokio::test]
 async fn video_job_usage_is_charged_once_whichever_route_polls_it() {
-    use Route::{Buffered, Contract};
+    use Route::{Buffered, Contract, ContractNoRoom};
     let done = r#"{"status":"done","usage":{"cost_in_usd_ticks":7}}"#;
     let pending = r#"{"status":"pending","usage":{"cost_in_usd_ticks":7}}"#;
+    let large = r#"{"status":"done","usage":{"cost_in_usd_ticks":7,"input_tokens":1000000000000000000,"output_tokens":1000000000000000000,"total_tokens":2000000000000000000}}"#;
     // (label, steps as (route, job, poll answer; `None` for the job's create), charged per step)
     type Case = (
         &'static str,
@@ -1082,6 +1092,16 @@ async fn video_job_usage_is_charged_once_whichever_route_polls_it() {
                 (Contract, "vid_4", Some(done)),
             ],
             vec![false, true, false],
+        ),
+        (
+            "a report whose publication failed leaves the charge to the next poll",
+            vec![
+                (Contract, "vid_5", None),
+                (ContractNoRoom, "vid_5", Some(large)),
+                (Contract, "vid_5", Some(large)),
+                (Contract, "vid_5", Some(large)),
+            ],
+            vec![false, false, true, false],
         ),
     ];
     for (label, steps, expected) in cases {

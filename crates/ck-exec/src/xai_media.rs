@@ -322,6 +322,13 @@ impl Admission {
         record.at = now;
         true
     }
+
+    /// Undoes this admission's [`Admission::settle`]: the job is uncharged again.
+    pub(crate) fn release(&self) {
+        if let Some(record) = self.jobs.lock().get_mut(&self.job) {
+            record.charged = false;
+        }
+    }
 }
 
 impl Drop for Admission {
@@ -349,6 +356,13 @@ impl video::Ledger for JobLedger {
     /// The codec binds a poll's answer to the polled job, so the admission is the job's.
     fn charge(&mut self, _: &str) -> bool {
         self.admission.as_ref().is_some_and(Admission::settle)
+    }
+
+    /// Called only after this ledger's own [`video::Ledger::charge`] claimed the job.
+    fn release(&mut self, _: &str) {
+        if let Some(admission) = &self.admission {
+            admission.release();
+        }
     }
 }
 

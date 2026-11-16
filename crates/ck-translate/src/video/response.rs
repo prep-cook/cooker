@@ -29,8 +29,12 @@ use crate::{
 pub trait Ledger: Send {
     /// A create, edit or extension was accepted as `job`.
     fn accepted(&mut self, job: &str);
-    /// Whether this report of `job`'s usage is its charge: true only for the job's first.
+    /// Whether this report of `job`'s usage is its charge: true only for the job's first. The
+    /// claim excludes every other report until it is published or released.
     fn charge(&mut self, job: &str) -> bool;
+    /// The usage this ledger claimed for `job` was not published, so the job is uncharged again
+    /// and a later report charges it.
+    fn release(&mut self, job: &str);
 }
 
 pub struct Ingress {
@@ -87,12 +91,12 @@ impl Ingress {
         if self.phase == Phase::Accepted {
             self.ledger.accepted(&id);
         }
+        let pending = ["queued", "running"].iter().try_fold(false, |found, status| {
+            Ok::<_, Error>(found || boundary::is(operation, value, "status", status)?)
+        })?;
         if let Some(usage) = usage.filter(|_| self.ledger.charge(&id)) {
-            let pending = ["queued", "running"].iter().try_fold(false, |found, status| {
-                Ok::<_, Error>(found || boundary::is(operation, value, "status", status)?)
-            })?;
             let protocol = self.dialect.name();
-            self.emitter.emit(
+            let published = self.emitter.emit(
                 owner,
                 Kind::Usage,
                 Scope::default(),
@@ -109,7 +113,12 @@ impl Ingress {
                     e.bytes(b"}")
                 },
                 |_| Ok(()),
-            )?;
+            );
+            // A snapshot that never reached the stream charged nothing.
+            if let Err(error) = published {
+                self.ledger.release(&id);
+                return Err(error);
+            }
         }
         let x = operation.required(root, "x_ck")?;
         self.emitter.emit(
