@@ -540,6 +540,7 @@ impl Facts {
             derived_session: client.derived_session,
             execution_session: client.execution_session,
             stream,
+            compaction: ck_translate::anthropic::compaction::requested(request.validated.view()).unwrap_or(false),
         }
     }
 }

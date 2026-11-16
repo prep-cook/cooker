@@ -31,7 +31,8 @@ pub(super) fn replay_from(doc: &Document) -> Result<Option<u64>> {
 }
 
 /// Whether the fenced request asks Anthropic for compaction or carries a compaction block; both
-/// need the compaction beta, and both run on the execution contract (`ck-exec`, Claude).
+/// need the compaction beta, which the Claude executor sends from this answer, and both run on
+/// the execution contract (`ck-exec`, Claude).
 pub fn requested(view: RequestView<'_>) -> Result<bool> {
     Ok(view.operation == Operation::Compact || replay_from(view.document)?.is_some())
 }
@@ -81,7 +82,10 @@ pub(super) fn write_request(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> R
     Ok(())
 }
 
-/// Whether `part` is an Anthropic compaction block kept as an opaque Anthropic part.
+/// Whether `part` is an Anthropic compaction block kept as an opaque Anthropic part: the one test
+/// for a block, which the placement check, the replay trim and, through [`requested`], the
+/// executor's beta all use, so they cannot disagree. It reads the decoded `type`, so a block whose
+/// type the client spelled with a JSON escape is the same block.
 fn block(doc: &Document, part: usize) -> Result<bool> {
     if !is(doc, part, "type", "opaque")? || !is(doc, part, "protocol", "anthropic")? {
         return Ok(false);

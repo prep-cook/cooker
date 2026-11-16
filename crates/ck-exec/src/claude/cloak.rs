@@ -295,7 +295,7 @@ pub(crate) fn prepend_reminders(body: &str, blocks: &[Forwarded], explicit: bool
         }
         let at = blocks
             .iter()
-            .take_while(|b| b.get("type").str() == "tool_result")
+            .take_while(|b| compaction::stays_first(b.get("type").str()))
             .count();
         let mut raw: Vec<String> = blocks.iter().map(|b| b.json().to_owned()).collect();
         raw.splice(at..at, new_blocks);
@@ -470,7 +470,7 @@ pub(crate) fn inject_current_date(body: &str, date: &str, explicit: bool) -> Str
     }
     let at = raw
         .iter()
-        .take_while(|b| rawjson::get(b, "type").str() == "tool_result")
+        .take_while(|b| compaction::stays_first(rawjson::get(b, "type").str()))
         .count();
     raw.insert(at, date_block);
     rawjson::set_raw(body, &path, &format!("[{}]", raw.join(",")))

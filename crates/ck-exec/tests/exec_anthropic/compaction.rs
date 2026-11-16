@@ -140,16 +140,16 @@ async fn compact(fixture: &Fixture, upstream: &StreamUpstream, attempt: &Attempt
 
 /// Sends `block`'s continuation on `attempt`; returns the upstream body and whether it carried
 /// the compaction beta.
-async fn replay(
-    fixture: &Fixture,
-    upstream: &StreamUpstream,
-    attempt: &Attempt<'_>,
-    block: &Value,
-    ask: bool,
-) -> Value {
+async fn replay(fixture: &Fixture, upstream: &StreamUpstream, attempt: &Attempt<'_>, block: &Value, row: Row) -> Value {
     let mut request = fixture.streams.request();
     let mut ingress = anthropic_ingress(fixture, &mut request);
-    let body = continuation(block, ask);
+    let mut body = continuation(block, row.ask);
+    if row.escaped {
+        body = String::from_utf8(body)
+            .unwrap()
+            .replacen(r#""type":"compaction""#, r#""type":"\u0063ompaction""#, 1)
+            .into_bytes();
+    }
     let (started, _) = run(fixture, attempt, &mut ingress, &mut request, &body).await.unwrap();
     started.unwrap().producer.await.unwrap().unwrap();
     let (sent, captured) = sent(upstream);
@@ -160,12 +160,27 @@ async fn replay(
     sent
 }
 
+/// How a replay is sent: the next question after the block, and the block's `type` spelled
+/// with a JSON escape, which is the same block.
+#[derive(Clone, Copy)]
+struct Row {
+    ask: bool,
+    escaped: bool,
+}
+
 /// Compact, then replay on the same credential: an API key, and one thinking replay serves,
 /// whose compaction and continuation both take the contract path. The rolling cache marker
-/// never lands inside the signed block, even when the block ends the conversation.
+/// never lands inside the signed block, even when the block ends the conversation, and the
+/// compaction beta goes with the block however its type is spelled.
 #[tokio::test]
 async fn compact_then_replay_sends_the_block_first_and_unchanged() {
-    for (replay_key, ask) in [(false, true), (true, true), (false, false)] {
+    let rows = [
+        (false, true, false),
+        (true, true, false),
+        (false, false, false),
+        (false, true, true),
+    ];
+    for (replay_key, ask, escaped) in rows {
         let reply = Reply::json(compacted()).byte_at_a_time();
         let upstream = StreamUpstream::start([reply, Reply::json(MESSAGE)]).await;
         let fixture = Fixture::new(&upstream, SONNET);
@@ -180,7 +195,7 @@ async fn compact_then_replay_sends_the_block_first_and_unchanged() {
             item,
             json!({"type": "opaque", "protocol": "anthropic", "value": native["content"][0]})
         );
-        let sent = replay(&fixture, &upstream, &attempt, &item["value"], ask).await;
+        let sent = replay(&fixture, &upstream, &attempt, &item["value"], Row { ask, escaped }).await;
         let messages = sent["messages"].as_array().unwrap();
         assert_eq!(
             messages[0],

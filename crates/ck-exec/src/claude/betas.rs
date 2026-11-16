@@ -362,12 +362,11 @@ pub(crate) fn with_extended_ttl(betas: &str) -> String {
 
 /// The documented betas `body` needs on every path, custom headers included, added to `betas`;
 /// `None` when it needs none, so the header stays as built: thinking binding for
-/// `thinking.block_binding`, and compaction for a body that asks for one (`"compaction"`) or
-/// carries a compaction block in any message. A body the cloak shapes keeps the block where
-/// the client placed it (contract G5).
+/// `thinking.block_binding`, and compaction for a body that asks for one (`"compaction"`). A
+/// body carrying a compaction block gets its beta from the fence ([`with_compaction`]).
 pub(crate) fn documented(betas: &str, body: &str) -> Option<String> {
     let binding = rawjson::get(body, "thinking.block_binding").exists();
-    let compaction = rawjson::get(body, "compaction").exists() || carries_compaction(body);
+    let compaction = rawjson::get(body, "compaction").exists();
     let mut betas = (binding || compaction).then(|| dedup(betas, ""))?;
     for (needed, beta) in [(binding, THINKING_BINDING), (compaction, COMPACTION)] {
         if needed && !betas.iter().any(|b| b == beta) {
@@ -377,23 +376,19 @@ pub(crate) fn documented(betas: &str, body: &str) -> Option<String> {
     Some(betas.join(","))
 }
 
-// ponytail: the walk below allocates per message and block, which every Claude request would pay
-// (`alloc.1900k`, `alloc.cloak.1900k` in bench/budgets.txt), so only a body naming `"compaction"`
-// is walked. A block whose type the client escaped (`\u0063ompaction`) gets no beta, and Anthropic
-// refuses it; an allocation-free walk would cover it.
-fn carries_compaction(body: &str) -> bool {
-    if !body.contains("\"compaction\"") {
-        return false;
+/// Adds the compaction beta to the built header when `carries`: the fenced request holds an
+/// Anthropic compaction block by `ck_translate::anthropic::compaction::requested`, the one
+/// test the fence's placement check also uses, and Anthropic reads a replayed block only with
+/// the beta, whatever path built the header or wherever the client placed the block.
+pub(crate) fn with_compaction(h: &mut super::headers::GoHeader, carries: bool) {
+    if !carries {
+        return;
     }
-    let mut found = false;
-    rawjson::get(body, "messages").each(|_, message| {
-        message.get("content").each(|_, block| {
-            found = block.get("type").str() == "compaction";
-            !found
-        });
-        !found
-    });
-    found
+    let mut betas = dedup(h.get("Anthropic-Beta"), "");
+    if !betas.iter().any(|b| b == COMPACTION) {
+        betas.push(COMPACTION.into());
+    }
+    h.set("Anthropic-Beta", betas.join(","));
 }
 
 /// Removes the recovery beta when the executor performs client-side recovery instead.

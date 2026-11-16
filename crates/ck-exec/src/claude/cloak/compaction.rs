@@ -24,3 +24,10 @@ pub(crate) fn refuse_context(body: String) -> Result<String, ExecError> {
     }
     Ok(body)
 }
+
+/// Whether a block the cloak inserts into a user turn goes behind a block of `kind`: tool
+/// results open a turn that answers tool calls, and Anthropic reads a compaction block only as
+/// the first content block of the first message.
+pub(super) fn stays_first(kind: &str) -> bool {
+    matches!(kind, "tool_result" | "compaction")
+}

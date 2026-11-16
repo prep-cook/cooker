@@ -491,23 +491,36 @@ async fn a_buffered_cloaked_body_over_the_stream_quota_fails_visibly() {
 }
 
 /// A compaction on an OAuth credential is prepared like any cloaked request and still asks
-/// for native compaction; it, and a cloaked request replaying a compaction block where the
-/// client placed it, carry the compaction beta (D2 plan §2.7). Anthropic refuses `compaction`
-/// with `context_management`, so the cloak adds none to it, even with thinking on through the
+/// for native compaction; it, an Anthropic client asking for one itself, and a cloaked request
+/// replaying a compaction block carry the compaction beta (D2 plan §2.7). A cloaked replay goes upstream as the client sent it
+/// (Settled 72), so the block keeps its place, escaped or not, and the cloak's own insertions
+/// go behind a block that opens the first user turn. Anthropic refuses `compaction` with
+/// `context_management`, so the cloak adds none to it, even with thinking on through the
 /// model's thinking suffix. One a payload rule adds is refused in words that name neither the
 /// upstream nor the operator's setting.
 #[tokio::test]
 async fn cloaked_compactions_carry_the_beta_without_context_management() {
     let compact =
         br#"{"model":"m","max_output_tokens":16000,"input":[{"role":"user","content":"Explain lifetimes."}]}"#;
-    let carried = json!({"role": "assistant", "content": [
-        {"type": "compaction", "content": "Café — done.", "signature": "EqQBCkgIBxABGAIq"}]});
-    let replay = serde_json::to_vec(&json!({"model": SONNET, "max_tokens": 64, "messages": [
+    let block = json!({"type": "compaction", "content": "Café — done.", "signature": "EqQBCkgIBxABGAIq"});
+    let replay = |messages: Value| {
+        serde_json::to_vec(&json!({"model": SONNET, "max_tokens": 64, "messages": messages})).unwrap()
+    };
+    let summarized = replay(json!([
         {"role": "user", "content": "Explain lifetimes."},
         {"role": "assistant", "content": "They bound references."},
-        carried,
+        {"role": "assistant", "content": [&block]},
         {"role": "user", "content": "And now?"},
-    ]}))
+    ]));
+    let escaped = String::from_utf8(summarized.clone())
+        .unwrap()
+        .replacen(r#""type":"compaction""#, r#""type":"\u0063ompaction""#, 1)
+        .into_bytes();
+    let user_first = replay(json!([{"role": "user", "content": [&block, {"type": "text", "text": "And now?"}]}]));
+    let asks = serde_json::to_vec(
+        &json!({"model": SONNET, "max_tokens": 64, "compaction": {"type": "summarize"},
+        "messages": [{"role": "user", "content": "Explain lifetimes."}]}),
+    )
     .unwrap();
     let thinking = format!("{SONNET}(8192)");
     let rule = format!(
@@ -517,7 +530,10 @@ async fn cloaked_compactions_carry_the_beta_without_context_management() {
         (&compact[..], Operation::Compact, SONNET, None, false),
         (&compact[..], Operation::Compact, thinking.as_str(), None, false),
         (&compact[..], Operation::Compact, SONNET, Some(&rule), true),
-        (&replay[..], Operation::Generate, SONNET, None, false),
+        (&summarized[..], Operation::Generate, SONNET, None, false),
+        (&escaped[..], Operation::Generate, SONNET, None, false),
+        (&user_first[..], Operation::Generate, SONNET, None, false),
+        (&asks[..], Operation::Generate, SONNET, None, false),
     ] {
         let (mut fixture, recorder) = at(ORIGIN, &oauth(), model, &[]);
         if let Some(rules) = rules {
@@ -544,12 +560,14 @@ async fn cloaked_compactions_carry_the_beta_without_context_management() {
         }
         let wire = wire.expect("the upstream request");
         let sent: Value = serde_json::from_str(&wire.body).unwrap();
-        if operation == Operation::Compact {
+        if sent.get("compaction").is_some() {
             assert_eq!(sent["compaction"], json!({"type": "summarize"}));
-            assert_eq!(sent["stream"], false);
         } else {
             let messages = sent["messages"].as_array().unwrap();
-            assert!(messages.contains(&carried), "{sent}");
+            assert!(messages.iter().any(|m| m["content"][0] == block), "{sent}");
+        }
+        if operation == Operation::Compact {
+            assert_eq!(sent["stream"], false);
         }
         assert!(sent.get("context_management").is_none(), "{sent}");
         assert_eq!(sent.get("thinking").is_some(), model != SONNET, "{sent}");

@@ -920,6 +920,8 @@ struct Input<'a> {
     derived_session: Option<&'a str>,
     execution_session: Option<&'a str>,
     stream: bool,
+    /// The fence found an Anthropic compaction block ([`betas::with_compaction`]).
+    compaction: bool,
 }
 
 impl<'a> Input<'a> {
@@ -940,6 +942,7 @@ impl<'a> Input<'a> {
             derived_session: req.derived_session.as_deref(),
             execution_session: req.execution_session.as_deref(),
             stream: req.stream,
+            compaction: false,
         }
     }
 }
@@ -1949,7 +1952,7 @@ impl<'a> Ctx<'a> {
         } else {
             String::new()
         };
-        let h = headers::build(&headers::Plan {
+        let mut h = headers::build(&headers::Plan {
             api_key: &self.api_key,
             bearer: self.bearer,
             first_party: self.first_party,
@@ -1970,6 +1973,7 @@ impl<'a> Ctx<'a> {
             cached_session_id: &cached_session_id,
             official: self.contract,
         });
+        betas::with_compaction(&mut h, req.compaction);
         Ok(headers::wire(h, self.first_party, count_tokens))
     }
 

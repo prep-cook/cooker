@@ -117,63 +117,148 @@ fn every_iteration_is_billed() {
     );
 }
 
+/// Fences an Anthropic client's `body` and encodes it for Anthropic; returns whether the request
+/// carries a compaction block, as the Claude executor reads it for the beta, and the upload.
+fn fenced(body: &str) -> codec::Result<(bool, Vec<u8>)> {
+    let mut mapped = Mapped::new();
+    let mut ingress = anthropic::request::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        1024 * 1024,
+    )?;
+    ingress.advance(&mut mapped.writer, body.as_bytes())?;
+    let ready = ingress.finish(&mut mapped.writer, &anthropic::request::AnthropicCapability::default())?;
+    let carries = anthropic::compaction::requested(ready.view())?;
+    let egress = anthropic::request::Egress {
+        destination: "anthropic",
+        upstream_stream: true,
+        default_max_tokens: None,
+    };
+    let output = egress.encode(&ready, &mut mapped.writer)?;
+    Ok((carries, bytes(&output)))
+}
+
+/// Every placement and shape of a replayed block that Anthropic's on-demand compaction page
+/// (https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand) accepts: "Put
+/// the block first in `messages`, either as an `assistant` message of its own or as the first
+/// content block of the first message, whether that is a `user` or `assistant` message";
+/// "`cache_control` on the block places a breakpoint after the summary"; "Send exactly one
+/// `compaction` block ..., the newest". A JSON-escaped `type` is the same block. Each is a
+/// block to the one test that both the placement check and the executor's beta use, and goes
+/// upstream first, unchanged, with the turns before it left out (Settled 71). A block anywhere
+/// else is refused, escaped or not.
 #[test]
-fn a_replayed_block_goes_first_and_unchanged_and_earlier_turns_stay_behind() {
-    let body = format!(
-        r#"{{"model":"m","max_tokens":64,"system":"Be brief.","messages":[{{"role":"user","content":"Explain lifetimes."}},{{"role":"assistant","content":"They bound references."}},{{"role":"assistant","content":[{}]}},{{"role":"user","content":"And now?"}}]}}"#,
-        block()
-    );
-    let (sent, _) = request(body.as_bytes(), Operation::Generate);
+fn a_compaction_block_is_accepted_only_where_anthropic_reads_it_and_replays_first() {
     let native: Value = serde_json::from_str(&block()).unwrap();
-    assert_eq!(
-        sent["messages"],
-        json!([{"role": "assistant", "content": [native]}, {"role": "user", "content": "And now?"}])
-    );
-    assert_eq!(sent["system"], "Be brief.");
-    // Anthropic accepts a block only at the head of a conversation message: one behind another
-    // block or a tool call is misplaced, and one in the system prompt would be sent as system
-    // text. Tool calls may follow the block in its message.
+    let mut cached = native.clone();
+    cached["cache_control"] = json!({"type": "ephemeral"});
+    let newer = json!({"type": "compaction", "content": "Newer.", "signature": "c2ln"});
     let call = json!({"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}});
     let result =
         json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]});
-    let go = json!({"role": "user", "content": "go"});
+    let next = json!({"role": "user", "content": "And now?"});
     let text = json!({"type": "text", "text": "x"});
-    for (body, accepted) in [
-        (
-            json!({"messages": [{"role": "assistant", "content": [&text, &native]}, &go]}),
-            false,
-        ),
-        (json!({"system": [&native], "messages": [&go]}), false),
-        (
-            json!({"messages": [{"role": "assistant", "content": [&call, &native]}, &result]}),
-            false,
-        ),
-        (
-            json!({"messages": [{"role": "assistant", "content": [&native, &call]}, &result]}),
-            true,
-        ),
-    ] {
+    let own = json!({"role": "assistant", "content": [&native]});
+    let request = |body: Value| {
         let mut body = body;
         body["model"] = json!("m");
         body["max_tokens"] = json!(64);
-        let body = body.to_string();
-        if accepted {
-            let (sent, _) = request(body.as_bytes(), Operation::Generate);
-            assert_eq!(sent["messages"][0]["content"], json!([&native, &call]), "{sent}");
+        body.to_string()
+    };
+    let escape = |body: Value| request(body).replacen(r#""type":"compaction""#, r#""type":"\u0063ompaction""#, 1);
+    let user_first = json!({"role": "user", "content": [&native, {"type": "text", "text": "And now?"}]});
+    let assistant_first = json!({"role": "assistant", "content": [&native, &text]});
+    let called = json!({"role": "assistant", "content": [&native, &call]});
+    let earlier = [
+        json!({"role": "user", "content": "Explain lifetimes."}),
+        json!({"role": "assistant", "content": "They bound references."}),
+    ];
+    let rows: Vec<(&str, String, Option<Value>)> = vec![
+        (
+            "an assistant message of its own",
+            request(json!({"messages": [&own, &next]})),
+            Some(own.clone()),
+        ),
+        (
+            "first in the first message, a user one",
+            request(json!({"messages": [&user_first]})),
+            Some(user_first.clone()),
+        ),
+        (
+            "first in the first message, an assistant one",
+            request(json!({"messages": [&assistant_first, &next]})),
+            Some(assistant_first.clone()),
+        ),
+        (
+            "followed by a tool call",
+            request(json!({"messages": [&called, &result]})),
+            Some(called.clone()),
+        ),
+        (
+            "with cache_control",
+            request(json!({"messages": [{"role": "assistant", "content": [&cached]}, &next]})),
+            Some(json!({"role": "assistant", "content": [&cached]})),
+        ),
+        (
+            "with an escaped type",
+            escape(json!({"messages": [&earlier[0], &own, &next]})),
+            Some(own.clone()),
+        ),
+        (
+            "behind the turns it summarized",
+            request(json!({"system": "Be brief.", "messages": [&earlier[0], &earlier[1], &own, &next]})),
+            Some(own.clone()),
+        ),
+        (
+            "an older block before the newest",
+            request(json!({"messages": [&own, &earlier[0], {"role": "assistant", "content": [&newer]}, &next]})),
+            Some(json!({"role": "assistant", "content": [&newer]})),
+        ),
+        (
+            "behind another block",
+            request(json!({"messages": [{"role": "assistant", "content": [&text, &native]}, &next]})),
+            None,
+        ),
+        (
+            "behind another block, escaped",
+            escape(json!({"messages": [{"role": "assistant", "content": [&text, &native]}, &next]})),
+            None,
+        ),
+        (
+            "behind a tool call",
+            request(json!({"messages": [{"role": "assistant", "content": [&call, &native]}, &result]})),
+            None,
+        ),
+        (
+            "in the system prompt",
+            request(json!({"system": [&native], "messages": [&next]})),
+            None,
+        ),
+    ];
+    for (row, body, first) in rows {
+        let outcome = fenced(&body);
+        let Some(first) = first else {
+            assert!(matches!(outcome, Err(codec::Error::Unsupported)), "{row}: {body}");
             continue;
-        }
-        let mut mapped = Mapped::new();
-        let mut ingress = anthropic::request::Ingress::new(
-            &mut mapped.writer,
-            &mapped.store,
-            identity(Direction::Request),
-            Operation::Generate,
-            1024 * 1024,
-        )
-        .unwrap();
-        let fenced = ingress
-            .advance(&mut mapped.writer, body.as_bytes())
-            .and_then(|()| ingress.finish(&mut mapped.writer, &anthropic::request::AnthropicCapability::default()));
-        assert!(matches!(fenced, Err(codec::Error::Unsupported)), "{body}");
+        };
+        let (carries, upload) = outcome.unwrap_or_else(|e| panic!("{row}: {e:?}"));
+        assert!(carries, "{row}");
+        let sent: Value = serde_json::from_slice(&upload).unwrap();
+        assert_eq!(sent["messages"][0], first, "{row}");
+        assert!(
+            sent.get("system").is_none() || sent["system"] == "Be brief.",
+            "{row}: {sent}"
+        );
     }
+    // The block's own bytes, escapes included, are what goes upstream.
+    let body = json!({"model": "m", "max_tokens": 64, "messages": [&own, &next]}).to_string();
+    let body = body.replace(&serde_json::to_string(&native).unwrap(), &block());
+    let (carries, upload) = fenced(&body).unwrap();
+    assert!(carries);
+    assert!(String::from_utf8(upload).unwrap().contains(&block()));
+    // A request without a block carries none.
+    let plain = json!({"model": "m", "max_tokens": 64, "messages": [&next]}).to_string();
+    assert!(!fenced(&plain).unwrap().0);
 }
