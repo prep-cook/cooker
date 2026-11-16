@@ -397,7 +397,7 @@ fn write_base(doc: &Document, later: Option<&Document>, e: &mut Encoder<'_, '_>)
 }
 /// Writes `message_delta.usage` without the `Message.usage`-only members a snapshot merged in.
 fn write_delta_usage(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
-    const MESSAGE_ONLY: [&str; 4] = ["cache_creation", "service_tier", "inference_geo", "speed"];
+    const MESSAGE_ONLY: [&str; 5] = ["cache_creation", "service_tier", "inference_geo", "speed", "x_ck"];
     if let Some(native) = doc.member(doc.root(), "native")?
         && is(doc, native, "protocol", "anthropic")?
     {
@@ -411,7 +411,12 @@ fn write_usage(doc: &Document, complete: bool, e: &mut Encoder<'_, '_>) -> Resul
     if let Some(native) = doc.member(root, "native")?
         && is(doc, native, "protocol", "anthropic")?
     {
-        return doc.write(doc.required(native, "value")?, e);
+        let value = doc.required(native, "value")?;
+        // `x_ck` carries gateway counts Anthropic usage has no member for.
+        return match doc.node(value)?.value {
+            Value::Object => object(doc, value, &["x_ck"], e),
+            _ => doc.write(value, e),
+        };
     }
     e.bytes(b"{")?;
     let mut first = true;

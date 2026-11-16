@@ -420,6 +420,7 @@ struct Sent {
     cached: Option<i64>,
     candidates: Option<i64>,
     thoughts: Option<i64>,
+    total: Option<i64>,
 }
 
 impl Sent {
@@ -438,6 +439,7 @@ impl Sent {
             (&mut self.cached, "cachedContentTokenCount"),
             (&mut self.candidates, "candidatesTokenCount"),
             (&mut self.thoughts, "thoughtsTokenCount"),
+            (&mut self.total, "totalTokenCount"),
         ] {
             let value = usage.get(key);
             if value.exists() {
@@ -447,8 +449,9 @@ impl Sent {
     }
 
     /// The Anthropic usage object of these counts: input leaves the cache out (Go 912a038b)
-    /// and output is candidates plus thoughts. A count the upstream did not send stays out,
-    /// and nothing is derived from the total.
+    /// and output is candidates plus thoughts. The total, which Anthropic usage has no member
+    /// for, goes to the gateway's `x_ck.total_tokens`. A count the upstream did not send stays
+    /// out, and nothing is derived from the total.
     fn usage(&self) -> Vec<u8> {
         let mut usage = b"{}".to_vec();
         if let Some(prompt) = self.prompt {
@@ -461,6 +464,9 @@ impl Sent {
         if self.candidates.is_some() || self.thoughts.is_some() {
             let output = self.candidates.unwrap_or(0).wrapping_add(self.thoughts.unwrap_or(0));
             gj::set_int(&mut usage, "output_tokens", output);
+        }
+        if let Some(total) = self.total {
+            gj::set_int(&mut usage, "x_ck.total_tokens", total);
         }
         usage
     }
