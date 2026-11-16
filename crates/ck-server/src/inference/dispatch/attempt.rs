@@ -116,7 +116,7 @@ impl<'x, X: Arms> Arm<'x, X> {
 
     /// The client's operation.
     pub(super) fn operation(&self) -> codec::Operation {
-        self.view.operation
+        self.operation
     }
 }
 
