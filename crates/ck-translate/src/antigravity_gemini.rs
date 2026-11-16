@@ -576,12 +576,16 @@ fn has_signature_key(value: &Res<'_>) -> bool {
 enum PartFate {
     Keep,
     Drop,
-    /// The re-marshaled part, and whether it counts as a change. A thinking part whose
-    /// signature is already normalized does not: its content keeps its raw bytes unless
-    /// another part changes.
+    /// The re-marshaled part, and whether it differs from the part as sent. An unchanged part
+    /// keeps its raw bytes unless another part of its content changes.
     Rewrite(GoValue, bool),
 }
 
+/// SanitizeAntigravityClaudeGeminiRequestSignatures for one part, except that a valid Claude
+/// signature goes upstream as the client holds it, on a thinking part or a model function call
+/// (Settled 68, P7b-1): only the legacy `<group>#` prefix comes off, and it moves to the part's
+/// own `thoughtSignature`. CLIProxyAPI re-wraps the single-layer form and strips function-call
+/// signatures (`antigravity_gemini_request.go:419-452`).
 fn sanitize_part(part: &Res<'_>, model_turn: bool) -> PartFate {
     // A json.Decoder into map[string]any: anything but an object fails and is kept.
     let Some(Ok(mut map)) = GoValue::parse(&part.raw).map(GoValue::into_object) else {
@@ -589,46 +593,44 @@ fn sanitize_part(part: &Res<'_>, model_turn: bool) -> PartFate {
     };
     let signature = SIGNATURE_PATHS.iter().find_map(|p| string_at(&map, p));
     let has_key = signature.is_some() || has_signature_key(part);
-    let strip = |mut map: GoMap| {
-        for path in SIGNATURE_PATHS {
-            delete_at(&mut map, path);
-        }
-        map
-    };
-    let response = map.contains_key("functionResponse") || map.contains_key("function_response");
-    if response || !model_turn || map.get("thought") != Some(&GoValue::Bool(true)) {
-        return if has_key {
-            PartFate::Rewrite(GoValue::Object(strip(map)), true)
+    let sent = map.clone();
+    for path in SIGNATURE_PATHS {
+        delete_at(&mut map, path);
+    }
+    let stripped = |map: GoMap| {
+        if has_key {
+            PartFate::Rewrite(GoValue::Object(map), true)
         } else {
             PartFate::Keep
-        };
+        }
+    };
+    let response = map.contains_key("functionResponse") || map.contains_key("function_response");
+    let thought = map.get("thought") == Some(&GoValue::Bool(true));
+    if !model_turn || response || !(thought || map.contains_key("functionCall")) {
+        return stripped(map);
     }
-    // Settled 68: a valid Claude signature goes upstream as the client holds it; CLIProxyAPI
-    // re-wraps the single-layer form here.
     let raw = signature.as_deref().unwrap_or_default().as_bytes();
-    let Ok(normalized) = String::from_utf8(provider_compatible(Provider::Claude, raw, BlockKind::Unknown)) else {
-        return PartFate::Drop;
-    };
-    if normalized.is_empty() {
-        return PartFate::Drop;
+    let kept = String::from_utf8(provider_compatible(Provider::Claude, raw, BlockKind::Unknown)).unwrap_or_default();
+    if thought {
+        let text = match map.get("text") {
+            Some(GoValue::String(t)) => t.as_str(),
+            _ => "",
+        };
+        if kept.is_empty() || trim_space(text.as_bytes()).is_empty() {
+            return PartFate::Drop;
+        }
+    } else if kept.is_empty() {
+        return stripped(map);
     }
-    let text = match map.get("text") {
-        Some(GoValue::String(t)) => t.as_str(),
-        _ => "",
-    };
-    if trim_space(text.as_bytes()).is_empty() {
-        return PartFate::Drop;
-    }
-    let changed = Some(&normalized) != signature.as_ref();
-    map = strip(map);
-    map.insert("thoughtSignature".into(), GoValue::String(normalized));
+    map.insert("thoughtSignature".into(), GoValue::String(kept));
+    // A moved signature changes the part even when its value does not.
+    let changed = map != sent;
     PartFate::Rewrite(GoValue::Object(map), changed)
 }
 
-/// SanitizeAntigravityClaudeGeminiRequestSignatures: only model thinking parts with a
-/// Claude-compatible signature and non-empty text keep their signature (without the legacy
-/// `<group>#` prefix); other
-/// signature fields are removed and contents left without parts are dropped.
+/// SanitizeAntigravityClaudeGeminiRequestSignatures: model thinking parts and function calls
+/// keep a valid Claude signature ([`sanitize_part`]); thinking without one, or without text, is
+/// dropped; other signature fields are removed and contents left without parts are dropped.
 pub(crate) fn sanitize_claude_signatures(raw: Vec<u8>) -> Vec<u8> {
     let contents = gj::get(&raw, "request.contents");
     if !contents.is_array() {

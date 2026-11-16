@@ -586,6 +586,18 @@ fn with_field(item: &Res<'_>, path: &str, value: &[u8]) -> Res<'static> {
     owned(&raw)
 }
 
+/// The signature [`pair_reasoning_with_function_calls`] binds to each tool call, by call ID.
+pub(crate) fn paired_call_signatures(items: &[Res<'_>]) -> HashMap<Vec<u8>, Vec<u8>> {
+    pair_reasoning_with_function_calls(items)
+        .iter()
+        .filter(|item| is_tool_call(item))
+        .filter_map(|item| {
+            let signature = trimmed(item, SIGNATURE_FIELD);
+            (!signature.is_empty()).then(|| (extract_call_id(item), signature))
+        })
+        .collect()
+}
+
 /// pairOpenAIResponsesReasoningWithFunctionCalls: moves reasoning signatures onto the
 /// function calls they belong to (`_cpa_reasoning_signature`, `_cpa_reasoning_summary`).
 fn pair_reasoning_with_function_calls<'a>(items: &[Res<'a>]) -> Vec<Res<'a>> {

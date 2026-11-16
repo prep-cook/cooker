@@ -467,9 +467,11 @@ const RULED: &[(&str, &[&str], &str)] = &[
             "gemini-antigravity/claude/parts/claude-sonnet-4-6",
             "gemini-antigravity/claude/parts/Claude-Opus-4-6-Thinking",
             "TestConvertGeminiRequestToAntigravity_ClaudeModelNormalizesStrictClaudeThoughtSignature:127",
+            "TestConvertGeminiRequestToAntigravity_ClaudeModelStripsUnneededFunctionCallSignature:214",
         ],
-        "Settled 68 (docs/OPEN-QUESTIONS.md): a Claude model's thought signature goes upstream as the \
-         client holds it, without the double-layer rewrite",
+        "Settled 68 and owner ruling P7b-1 (2026-11-16): a Claude model's thinking and function-call \
+         signatures go upstream as the client holds them, without the double-layer rewrite or the \
+         function-call strip",
     ),
     (
         "openai-response->antigravity",

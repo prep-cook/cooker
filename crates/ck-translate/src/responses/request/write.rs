@@ -1,4 +1,5 @@
 use super::super::{is, member};
+use super::ANTIGRAVITY;
 use super::native::{item_type, native, typed};
 use super::reasoning::write_reasoning_options;
 use crate::codec::{
@@ -6,6 +7,7 @@ use crate::codec::{
     document::{Document, Value},
     encode::Encoder,
 };
+use ck_wire::signature;
 pub(in crate::responses) use fields::write_echo;
 use fields::write_field;
 use results::write_results;
@@ -69,7 +71,7 @@ pub(super) fn write_request(
     };
     for message in doc.children(doc.required(root, "messages")?)? {
         if !instructions(doc, message)? {
-            write_message(view, message, &mut replay, &mut first, e)?;
+            write_message(view, message, &mut replay, destination, &mut first, e)?;
         }
     }
     e.bytes(b"]")?;
@@ -183,6 +185,7 @@ fn write_message(
     view: RequestView<'_>,
     message: usize,
     replay: &mut Replay,
+    destination: &str,
     first: &mut bool,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
@@ -205,7 +208,8 @@ fn write_message(
         }
         let results = write_results(view, content, first, e)?;
         let reasoning = native || any_part(doc, content, true)?;
-        if reasoning {
+        // Settled 62: only Antigravity reads Antigravity's reasoning; elsewhere the item is left out.
+        if reasoning && (destination == ANTIGRAVITY || !antigravity_only(doc, message, content, replay)?) {
             separate(first, e)?;
             write_reasoning(doc, message, content, replay, e)?;
         }
@@ -226,6 +230,51 @@ fn write_message(
         }
     }
     Ok(())
+}
+/// Whether an encrypted part of `message` holds reasoning only the Antigravity steps read.
+fn antigravity_only(doc: &Document, message: usize, content: usize, replay: &mut Replay) -> Result<bool> {
+    if !matches!(doc.node(content)?.value, Value::Array) {
+        return Ok(false);
+    }
+    for part in doc.children(content)? {
+        if is(doc, part, "type", "encrypted")? {
+            let entry = replay.seek(doc, doc.unsigned(doc.required(part, "replay_index")?)?, message)?;
+            if antigravity_reasoning(doc, doc.required(entry, "signature")?)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether string `value` is Antigravity reasoning: a Claude thinking signature, which reaches a
+/// Responses client only from Antigravity, or one of CLIProxyAPI's Antigravity carriers and
+/// compaction capsules. Only a value that can be a Claude signature is copied out to be checked.
+fn antigravity_reasoning(doc: &Document, value: usize) -> Result<bool> {
+    const PREFIXES: [&str; 3] = [
+        "cpa-gemini-responses-carrier-v1:",
+        "cpa-gemini-carrier-v1:",
+        "cpa-ag-compact-v1:",
+    ];
+    let mut chars = doc.chars(value)?;
+    let mut text = String::new();
+    while text.trim_start().len() < PREFIXES[0].len() {
+        match chars.next_scalar()? {
+            Some(c) => text.push(c),
+            None => break,
+        }
+    }
+    let head = text.trim_start();
+    if PREFIXES.iter().any(|p| head.starts_with(p)) {
+        return Ok(true);
+    }
+    if !head.starts_with("claude#") && !head.starts_with(['C', 'E', 'Q', 'R']) {
+        return Ok(false);
+    }
+    while let Some(c) = chars.next_scalar()? {
+        text.push(c);
+    }
+    Ok(signature::detect_provider(&text) == signature::Provider::Claude)
 }
 /// True when array `content` has a reasoning part (`reasoning`) or a message part.
 fn any_part(doc: &Document, content: usize, reasoning: bool) -> Result<bool> {

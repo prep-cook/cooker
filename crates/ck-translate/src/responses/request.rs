@@ -202,6 +202,21 @@ impl Capability for ResponsesCapability {
     }
 }
 
+/// Responses semantics for the Antigravity steps, the only destination that reads Antigravity's
+/// encrypted reasoning (Settled 62).
+pub struct AntigravityCapability;
+impl Capability for AntigravityCapability {
+    fn destination(&self) -> &'static str {
+        ANTIGRAVITY
+    }
+    fn validate(&self, request: RequestView<'_>) -> Result<()> {
+        validate(request, ANTIGRAVITY)
+    }
+}
+
+/// [`AntigravityCapability`]'s destination key.
+pub(crate) const ANTIGRAVITY: &str = "antigravity";
+
 /// Responses semantics with the isolated Codex request controls enabled.
 pub struct CodexCapability;
 impl Capability for CodexCapability {

@@ -466,9 +466,19 @@ pub fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
 /// carrier.
 fn encrypted_content(model: &str, signature: &[u8], direction: &str, target: &str) -> Vec<u8> {
     if provider_from_model_name(model) == Provider::Claude {
-        return trim_space(signature).to_vec();
+        return upstream_signature(model, signature);
     }
     encode_carrier(signature, direction, target)
+}
+
+/// An upstream thought signature, or empty when it is blank. A Claude model's keeps the bytes
+/// the upstream sent (Settled 68); CLIProxyAPI trims every signature.
+fn upstream_signature(model: &str, raw: &[u8]) -> Vec<u8> {
+    let trimmed = trim_space(raw);
+    if trimmed.is_empty() || provider_from_model_name(model) != Provider::Claude {
+        return trimmed.to_vec();
+    }
+    raw.to_vec()
 }
 
 fn grounding_exists(grounding: &Option<Vec<u8>>) -> bool {
@@ -843,7 +853,7 @@ impl State {
     }
 
     fn emit_detached_reasoning(&mut self, signature: &[u8], direction: &str, target: &str, out: &mut Vec<Vec<u8>>) {
-        let signature = trim_space(signature).to_vec();
+        let signature = upstream_signature(&self.model, signature);
         if signature.is_empty() || self.seen_reasoning_signatures.contains(&signature) {
             return;
         }
@@ -885,7 +895,7 @@ impl State {
     fn emit_trailing_detached_reasoning(&mut self, signature: &[u8], out: &mut Vec<Vec<u8>>) {
         match self.last_semantic_kind {
             TEXT => {
-                let signature = trim_space(signature).to_vec();
+                let signature = upstream_signature(&self.model, signature);
                 if signature.is_empty() || self.seen_reasoning_signatures.contains(&signature) {
                     return;
                 }
@@ -991,9 +1001,9 @@ impl State {
             .into_iter()
             .find(Res::exists)
             .map_or(-1, |p| p.int());
-        let mut signature = trim_space(&part.get("thoughtSignature").bytes()).to_vec();
+        let mut signature = upstream_signature(&self.model, &part.get("thoughtSignature").bytes());
         if signature.is_empty() {
-            signature = trim_space(&part.get("thought_signature").bytes()).to_vec();
+            signature = upstream_signature(&self.model, &part.get("thought_signature").bytes());
         }
         let function_call = part.get("functionCall");
         let text = part.get("text");
@@ -1824,9 +1834,9 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
         for (key, p) in parts.array().iter().enumerate() {
             let explicit = [p.get("partIndex"), p.get("index")].into_iter().find(Res::exists);
             let part_index = explicit.as_ref().map_or(key as i64, Res::int);
-            let mut signature = trim_space(&p.get("thoughtSignature").bytes()).to_vec();
+            let mut signature = upstream_signature(ctx.model, &p.get("thoughtSignature").bytes());
             if signature.is_empty() {
-                signature = trim_space(&p.get("thought_signature").bytes()).to_vec();
+                signature = upstream_signature(ctx.model, &p.get("thought_signature").bytes());
             }
             if p.get("thought").bool() {
                 flush_message!();

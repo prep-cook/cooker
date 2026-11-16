@@ -738,6 +738,48 @@ fn responses_history(signature: Option<&str>) -> Value {
     })
 }
 
+/// A Responses history whose assistant turn called a tool under `signature`, carried by the
+/// reasoning item a Responses client received just before the call.
+fn responses_tool_history(signature: &str) -> Value {
+    serde_json::json!({
+        "model": "claude-sonnet-4-6", "stream": true,
+        "tools": [{"type": "function", "name": "Read", "parameters": {"type": "object"}}],
+        "input": [
+            {"role": "user", "content": "q"},
+            {"type": "reasoning", "id": "rs_r_detached_before_0", "summary": [], "encrypted_content": signature},
+            {"type": "function_call", "call_id": "t1", "name": "Read", "arguments": "{\"a\":1}"},
+            {"type": "function_call_output", "call_id": "t1", "output": "done"}
+        ]
+    })
+}
+
+/// A Gemini history whose model turn holds `part`.
+fn gemini_history(part: Value) -> Value {
+    serde_json::json!({
+        "tools": [{"functionDeclarations": [{"name": "Read", "parameters": {"type": "object"}}]}],
+        "contents": [
+            {"role": "user", "parts": [{"text": "q"}]},
+            {"role": "model", "parts": [part]},
+            {"role": "user", "parts": [{"text": "more"}]}
+        ]
+    })
+}
+
+/// A Gemini thinking part signed with `signature` in Gemini's OpenAI-compatible nested field.
+fn gemini_nested_thinking(signature: &str) -> Value {
+    gemini_history(serde_json::json!({
+        "thought": true, "text": "Let me think",
+        "extra_content": {"google": {"thought_signature": signature}}
+    }))
+}
+
+/// A Gemini function call signed with `signature`.
+fn gemini_tool_call(signature: &str) -> Value {
+    gemini_history(serde_json::json!({
+        "functionCall": {"name": "Read", "args": {"a": 1}}, "thoughtSignature": signature
+    }))
+}
+
 /// An Anthropic history whose assistant turn called a tool under `signature`.
 fn tool_history(signature: &str) -> Value {
     serde_json::json!({
@@ -768,14 +810,14 @@ async fn sent_signatures(source: &str, payload: &Value) -> Vec<String> {
     strings(&body, &["thoughtSignature"])
 }
 
-/// Ruling 68: signed thinking and tool calls go back upstream exactly as the client holds
-/// them; CLIProxyAPI would wrap the single-layer form. Only CLIProxyAPI's legacy `<group>#`
+/// Ruling 68 and P7b-1: signed thinking and tool calls go back upstream exactly as the client
+/// holds them, on every client protocol that carries them (Chat carries none); CLIProxyAPI would wrap the single-layer form. Only CLIProxyAPI's legacy `<group>#`
 /// prefix comes off. Thinking without a Claude signature is dropped, as CLIProxyAPI and
 /// OmniRoute both drop it, and no cached signature fills the gap.
 #[tokio::test]
 async fn signed_thinking_goes_upstream_as_the_client_holds_it() {
     let prefixed = format!("claude#{SINGLE_LAYER}");
-    let rows: [(&str, Value, &[&str]); 13] = [
+    let rows: Vec<(&str, Value, &[&str])> = vec![
         ("claude", anthropic_history(Some(DOUBLE_LAYER)), &[DOUBLE_LAYER]),
         ("claude", anthropic_history(Some(SINGLE_LAYER)), &[SINGLE_LAYER]),
         ("claude", anthropic_history(Some(&prefixed)), &[SINGLE_LAYER]),
@@ -797,6 +839,16 @@ async fn signed_thinking_goes_upstream_as_the_client_holds_it() {
         ("openai-response", responses_history(Some(&prefixed)), &[SINGLE_LAYER]),
         ("openai-response", responses_history(Some("opaque-signature")), &[]),
         ("openai-response", responses_history(None), &[]),
+        ("openai-response", responses_tool_history(DOUBLE_LAYER), &[DOUBLE_LAYER]),
+        ("openai-response", responses_tool_history(SINGLE_LAYER), &[SINGLE_LAYER]),
+        ("openai-response", responses_tool_history(&prefixed), &[SINGLE_LAYER]),
+        ("openai-response", responses_tool_history("opaque-signature"), &[]),
+        ("gemini", gemini_nested_thinking(DOUBLE_LAYER), &[DOUBLE_LAYER]),
+        ("gemini", gemini_nested_thinking(SINGLE_LAYER), &[SINGLE_LAYER]),
+        ("gemini", gemini_tool_call(DOUBLE_LAYER), &[DOUBLE_LAYER]),
+        ("gemini", gemini_tool_call(SINGLE_LAYER), &[SINGLE_LAYER]),
+        ("gemini", gemini_tool_call(&prefixed), &[SINGLE_LAYER]),
+        ("gemini", gemini_tool_call("opaque-signature"), &[]),
     ];
     for (source, payload, want) in rows {
         assert_eq!(sent_signatures(source, &payload).await, want, "{source}: {payload}");
@@ -844,12 +896,20 @@ async fn upstream_signatures_reach_the_client_unchanged_and_no_cache_restores_th
 /// them unchanged on the next turn.
 #[tokio::test]
 async fn a_responses_client_receives_the_upstream_signatures_as_sent() {
-    for stream in [false, true] {
+    // The second signature keeps the whitespace the upstream sent around it.
+    let padded = format!(" \n{DOUBLE_LAYER}\r\n");
+    for (stream, call_signature) in [
+        (false, DOUBLE_LAYER),
+        (true, DOUBLE_LAYER),
+        (false, padded.as_str()),
+        (true, padded.as_str()),
+    ] {
         let mut s = scenario("claude_stream_claude_model");
         s["source"] = "openai-response".into();
+        let escaped = serde_json::to_string(call_signature).unwrap();
         let body = s["upstream"]["body"].as_str().unwrap().replace(
             r#"{"functionCall":{"id":"toolu_01""#,
-            &format!(r#"{{"thoughtSignature":"{DOUBLE_LAYER}","functionCall":{{"id":"toolu_01""#),
+            &format!(r#"{{"thoughtSignature":{escaped},"functionCall":{{"id":"toolu_01""#),
         );
         s["upstream"]["body"] = body.into();
         let mut payload = serde_json::json!({
@@ -877,7 +937,11 @@ async fn a_responses_client_receives_the_upstream_signatures_as_sent() {
         // A streamed item repeats its value in the added, done and completed events.
         let mut seen = std::collections::HashSet::new();
         got.retain(|v| seen.insert(v.clone()));
-        assert_eq!(got, [UPSTREAM_SIGNATURE, DOUBLE_LAYER], "stream {stream}: {delivered}");
+        assert_eq!(
+            got,
+            [UPSTREAM_SIGNATURE, call_signature],
+            "stream {stream}: {delivered}"
+        );
     }
 }
 

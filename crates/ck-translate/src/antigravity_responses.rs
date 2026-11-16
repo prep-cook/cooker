@@ -203,8 +203,10 @@ fn enable_thinking_summary(raw: &[u8], out: Vec<u8>) -> Vec<u8> {
 /// rewriteOpenAIResponsesReasoningForAntigravityClaude: for Claude models, the n-th
 /// thought part takes the n-th reasoning item's valid Claude signature as the client holds it
 /// (Settled 68: no double-layer rewrite, only the legacy `<group>#` prefix comes off); thought
-/// parts without one, or without text, are dropped. A change re-marshals the whole document
-/// the way `json.Unmarshal` into `map[string]any` and `json.Marshal` do.
+/// parts without one, or without text, are dropped. A function call takes the valid Claude
+/// signature of the reasoning item bound to it (P7b-1; CLIProxyAPI's envelope strips it). A
+/// change re-marshals the whole document the way `json.Unmarshal` into `map[string]any` and
+/// `json.Marshal` do.
 fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8> {
     if provider_from_model_name(model) != Provider::Claude {
         return gemini;
@@ -229,6 +231,7 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
     if signatures.is_empty() {
         return gemini;
     }
+    let calls = crate::gemini_responses::paired_call_signatures(&input.array());
     let Some(Ok(mut root)) = GoValue::parse_f64(&gemini).map(GoValue::into_object) else {
         return gemini;
     };
@@ -267,6 +270,10 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
                 }
             };
             if map.get("thought") != Some(&GoValue::Bool(true)) {
+                if let Some(signature) = call_signature(&map, &calls) {
+                    changed |= map.get("thoughtSignature") != Some(&signature);
+                    map.insert("thoughtSignature".into(), signature);
+                }
                 kept.push(GoValue::Object(map));
                 continue;
             }
@@ -304,6 +311,21 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
     }
     root.insert("contents".into(), GoValue::Array(kept_contents));
     GoValue::Object(root).marshal()
+}
+
+/// The valid Claude signature bound to function-call part `map`, by its call ID.
+fn call_signature(
+    map: &std::collections::BTreeMap<String, GoValue>,
+    calls: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+) -> Option<GoValue> {
+    let Some(GoValue::Object(call)) = map.get("functionCall") else {
+        return None;
+    };
+    let Some(GoValue::String(id)) = call.get("id") else {
+        return None;
+    };
+    let signature = provider_compatible(Provider::Claude, calls.get(id.as_bytes())?, BlockKind::Unknown);
+    (!signature.is_empty()).then(|| GoValue::String(String::from_utf8_lossy(&signature).into_owned()))
 }
 
 // ---------------------------------------------------------------------------------------

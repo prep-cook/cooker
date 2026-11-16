@@ -25,7 +25,7 @@ use ck_translate::codec::{
     self, BodyMode, Capability, Operation, RequestEgress, RequestFence, RequestView, ResponseIngress,
 };
 use ck_translate::gemini::request::GeminiCapability;
-use ck_translate::responses::request::ResponsesCapability;
+use ck_translate::responses::request::AntigravityCapability as AntigravityResponses;
 use ck_translate::{anthropic, codec::chat, gemini as gemini_codec, responses};
 use futures_util::StreamExt;
 
@@ -49,7 +49,7 @@ impl Capability for AntigravityCapability {
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
         match Protocol::of(view.document)? {
             Protocol::Chat => ChatCapability.validate(view),
-            Protocol::Responses => ResponsesCapability.validate(view),
+            Protocol::Responses => AntigravityResponses.validate(view),
             Protocol::Anthropic => ANTHROPIC.validate(view),
             Protocol::Gemini => GeminiCapability.validate(view),
         }
@@ -100,10 +100,10 @@ impl Protocol {
             }
             .encode(&RequestFence::default().end(view, &ChatCapability)?, owner),
             Self::Responses => responses::request::Egress {
-                destination: ResponsesCapability.destination(),
+                destination: AntigravityResponses.destination(),
                 upstream_stream: stream,
             }
-            .encode(&RequestFence::default().end(view, &ResponsesCapability)?, owner),
+            .encode(&RequestFence::default().end(view, &AntigravityResponses)?, owner),
             Self::Anthropic => anthropic::request::Egress {
                 destination: ANTHROPIC.destination(),
                 upstream_stream: stream,
