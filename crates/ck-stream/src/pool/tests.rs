@@ -145,7 +145,7 @@ fn decay_preserves_a_leased_neighbor_and_prefaults_reuse() {
         reused.push(frame);
     }
     assert_eq!(bytes, &[0x5a; FRAME_BYTES]);
-    assert!(lock(&pool.slow.0).cold.is_empty());
+    assert_eq!(lock(&pool.slow.0).cold.len(), 0);
     drop(pool);
     assert_eq!(bytes, &[0x5a; FRAME_BYTES]);
     for frame in reused {
@@ -238,6 +238,28 @@ fn cold_frames_prefault_only_the_pages_a_record_needs() {
     pool.decay().unwrap();
     // Punching forgets the populated prefix, so reuse populates again.
     assert_eq!(pool.states[frame as usize].ready.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_reservation_populates_its_cold_frames_in_one_call() {
+    // (frames the reservation takes, cold frames populated): its own frames, at most COLD_RUN.
+    for (run, warmed) in [(1, 1), (13, 13), (40, COLD_RUN as usize)] {
+        let directory = Directory::new();
+        let pool = Pool::open(&directory.0, EXTENT, 1, 1, 0).unwrap();
+        pool.decay().unwrap();
+        pool.decay().unwrap();
+        let warm: Vec<_> = (0..WARM).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
+        let cold = pool.cold_frames();
+        let frame = pool.allocate_run(FRAME_BYTES, run).unwrap();
+        assert_eq!(cold - pool.cold_frames(), warmed, "run {run}");
+        // The populated neighbours wait, ready, for the reservation's next frames.
+        let rest: Vec<_> = (1..warmed).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
+        assert_eq!(cold - pool.cold_frames(), warmed, "run {run}");
+        assert!(rest.iter().all(|&next| pool.is_ready(next, FRAME_BYTES)));
+        for frame in warm.into_iter().chain(rest).chain([frame]) {
+            pool.release(frame);
+        }
+    }
 }
 
 #[test]

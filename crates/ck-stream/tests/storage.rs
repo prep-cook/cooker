@@ -70,21 +70,44 @@ fn incomplete_commit_keeps_the_reservation_writable() {
 /// for text events.
 const DATA: u32 = 10;
 
+/// Which pool frames a record takes.
+#[derive(Clone, Copy, Debug)]
+enum Taken {
+    Fresh,
+    /// Frames a scratch lease just released in rising order, which come back falling.
+    Released,
+    /// Not neighbours: another stream took the frame after the record's first.
+    Interleaved,
+}
+
 #[test]
 fn records_span_frames() {
-    // (bytes before the record, record length, kind): text and data records start at the
-    // published end, whatever frame offset that is, and read back byte for byte.
+    // (bytes before the record, record length, kind, frames taken): text and data records
+    // start at the published end, whatever frame offset that is, and read back byte for byte
+    // from whichever pool frames hold them.
     let rows = [
-        (FRAME_BYTES - 3, 9, 1),
-        (FRAME_BYTES - 3, 9, DATA),
-        (FRAME_BYTES - 1, 2 * FRAME_BYTES + 5, DATA),
-        (FRAME_BYTES, FRAME_BYTES, DATA),
-        (17, 3 * FRAME_BYTES, 1),
+        (FRAME_BYTES - 3, 9, 1, Taken::Fresh),
+        (FRAME_BYTES - 3, 9, DATA, Taken::Fresh),
+        (FRAME_BYTES - 1, 2 * FRAME_BYTES + 5, DATA, Taken::Fresh),
+        (FRAME_BYTES, FRAME_BYTES, DATA, Taken::Fresh),
+        (17, 3 * FRAME_BYTES, 1, Taken::Fresh),
+        (FRAME_BYTES, 3 * FRAME_BYTES, DATA, Taken::Released),
+        (17, 2 * FRAME_BYTES, DATA, Taken::Interleaved),
     ];
-    for (before, len, kind) in rows {
+    for (before, len, kind, taken) in rows {
         let (_dir, store, _) = store(8);
         let mut writer = store.create().unwrap();
         writer.append(&vec![b'a'; before]).unwrap();
+        let mut other = store.create().unwrap();
+        match taken {
+            Taken::Fresh => {}
+            Taken::Released => {
+                let mut scratch = writer.begin_scratch(3 * FRAME_BYTES).unwrap();
+                scratch.write(&[b'c'; 3 * FRAME_BYTES]).unwrap();
+                drop(scratch.complete().unwrap());
+            }
+            Taken::Interleaved => drop(other.append(b"b").unwrap()),
+        }
         let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         let mut record = writer.begin_record(len, kind, 7).unwrap();
         let (head, tail) = bytes.split_at(len / 3);
@@ -96,13 +119,22 @@ fn records_span_frames() {
         assert_eq!(
             (start.frame as usize, start.offset as usize),
             (before / FRAME_BYTES, before % FRAME_BYTES),
-            "{before} {len} {kind}"
+            "{before} {len} {kind} {taken:?}"
         );
         let mut reader = store.reader(writer.id(), 1).unwrap();
         let read = lease(&mut reader);
         let mut actual = Vec::new();
         read.visit(|span| actual.extend_from_slice(span)).unwrap();
-        assert_eq!(actual, bytes, "{before} {len} {kind}");
+        assert_eq!(actual, bytes, "{before} {len} {kind} {taken:?}");
+        let mut chunked = Vec::new();
+        let mut position = start;
+        while chunked.len() < len {
+            let chunk = read.chunk(position).unwrap();
+            chunked.extend_from_slice(chunk);
+            position.frame += 1;
+            position.offset = 0;
+        }
+        assert_eq!(chunked, bytes, "{before} {len} {kind} {taken:?}");
         assert_eq!((read.record().kind, read.record().correlation), (kind, 7));
         let mut stale = read.record().start;
         stale.generation += 1;

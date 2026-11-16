@@ -81,8 +81,8 @@ impl Route for Writer {
 
 /// One live session's projector and validator; one value per session.
 pub trait Projector {
-    /// The most bytes [`Self::finish`]'s record can take, at most `ck_stream::FRAME_BYTES`. The
-    /// session runtime holds a prefaulted pool frame of this size from the session's start
+    /// The most bytes [`Self::finish`]'s record can take, at most the stream's event limit. The
+    /// session runtime holds prefaulted pool frames of this size from the session's start
     /// (`Writer::reserve_final`), so the final counters are never refused for space.
     const FINAL_RECORD_BYTES: usize;
 

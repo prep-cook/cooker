@@ -61,7 +61,7 @@ pub(super) fn fits(rounds: usize, budget: usize) -> bool {
 /// accounting change and must then be re-measured against the previous behaviour.
 #[test]
 fn tool_history_metadata_need() {
-    const NEED: usize = 722_216;
+    const NEED: usize = 721_784;
     assert!(fits(30, NEED), "30 rounds no longer fit in {NEED} bytes");
     assert!(!fits(30, NEED - 1), "30 rounds now fit in less than {NEED} bytes");
 }

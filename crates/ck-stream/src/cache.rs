@@ -293,7 +293,7 @@ impl Inner {
         }
         let mut evicted_for_tmpfs = false;
         loop {
-            match self.pool.allocate(needed) {
+            match self.pool.allocate_run(needed, remaining) {
                 Ok(frame) => return Ok(frame),
                 Err(error) if error.kind() == io::ErrorKind::OutOfMemory && error.raw_os_error().is_none() => {
                     if !self.evict(Some(exclude), remaining, Stream::reclaimable) {

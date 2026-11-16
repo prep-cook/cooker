@@ -22,14 +22,17 @@ use wakeup::Wakeup;
 pub use writer::{Reservation, Writer};
 
 pub(crate) const READER_BYTES: usize = std::mem::size_of::<Reader>();
-/// Table room the final record takes: a frame entry and a run index entry.
-pub(crate) const FINAL_METADATA: usize = std::mem::size_of::<Frame>() + std::mem::size_of::<Index>();
+/// Table room a final record over `frames` frames takes: their frame entries and a run index
+/// entry.
+pub(crate) const fn final_metadata(frames: usize) -> usize {
+    frames * std::mem::size_of::<Frame>() + std::mem::size_of::<Index>()
+}
 
-/// A pool frame held for the producer's final record (`Writer::reserve_final`), charged to the
-/// exchange quota with [`FINAL_METADATA`], and prefaulted for its first `len` bytes.
-#[derive(Clone, Copy)]
+/// Consecutive record frames held for the producer's final record (`Writer::reserve_final`),
+/// charged to the exchange quota with [`final_metadata`], and prefaulted for its first `len`
+/// bytes.
 pub(crate) struct FinalRoom {
-    pub(crate) frame: u32,
+    pub(crate) frames: Box<[u32]>,
     pub(crate) len: usize,
 }
 
@@ -402,14 +405,6 @@ impl Stream {
     fn pin(&self, state: &mut State, record: Record) -> Result<Pinned, Terminal> {
         let first = (record.start.frame - state.base_frame) as usize;
         let last = (last_frame(record) - state.base_frame) as usize;
-        if first == last {
-            let index = state.frames[first].pool.ok_or(Terminal::Gone)?;
-            if self.pool.saturated(index) {
-                return Err(Terminal::StorageExhausted);
-            }
-            self.pool.retain(index);
-            return Ok(Pinned::One(index));
-        }
         let frames = (first..=last).map(|index| state.frames[index].pool);
         for frame in frames.clone() {
             match frame {
@@ -418,12 +413,24 @@ impl Stream {
                 Some(_) => {}
             }
         }
-        // The lease's frame list outlives its reader, so it is charged until the lease frees it.
+        // The stream's own references keep every frame allocated while these are added.
+        let (low, high) = (state.frames[first].pool, state.frames[last].pool);
+        if let (Some(low), Some(high)) = (low, high)
+            && low.abs_diff(high) as usize == last - first
+            && frames
+                .clone()
+                .flatten()
+                .zip(Pinned::Run { first: low, last: high }.iter())
+                .all(|(a, b)| a == b)
+        {
+            frames.flatten().for_each(|index| self.pool.retain(index));
+            return Ok(Pinned::Run { first: low, last: high });
+        }
+        // A scattered list outlives its reader, so it is charged until the lease frees it.
         let bytes = (last - first + 1) * std::mem::size_of::<u32>();
         if self.charge_metadata(bytes).is_err() {
             return Err(Terminal::StorageExhausted);
         }
-        // The stream's own references keep every frame allocated while these are added.
         let frames: Box<[u32]> = frames.flatten().collect();
         frames.iter().for_each(|&index| self.pool.retain(index));
         state.external_metadata += bytes;
@@ -519,13 +526,15 @@ impl Stream {
         }
     }
 
-    /// Returns the final room's frame to the pool and its charges to the exchange quota.
+    /// Returns the final room's frames to the pool and their charges to the exchange quota.
     pub(crate) fn free_final(&self, state: &mut State) {
         state.final_next = false;
         if let Some(room) = state.final_room.take() {
-            self.pool.release(room.frame);
-            self.release_frames(1);
-            self.release_metadata(FINAL_METADATA);
+            for &frame in &room.frames {
+                self.pool.release(frame);
+            }
+            self.release_frames(room.frames.len());
+            self.release_metadata(final_metadata(room.frames.len()));
         }
     }
 

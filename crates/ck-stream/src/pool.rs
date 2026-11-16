@@ -1,14 +1,16 @@
 //! Process-private frame storage. Publication and lease ownership belong to streams.
 
 use crate::FRAME_BYTES;
+use cold::ColdList;
 use std::cell::Cell;
 use std::io;
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Range};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Mutex, MutexGuard};
 
+mod cold;
 mod os;
 #[cfg(test)]
 mod tests;
@@ -16,6 +18,8 @@ mod tests;
 /// Frames backed at open and per growth step: 1 MiB, close to the 21 × 50,000-byte extent
 /// it replaces (owner W0-1, 2026-11-16: initial frames 256).
 const EXTENT: u32 = 256;
+/// Most cold frames populated in one call for one reservation: 64 KiB, a 50,000-byte record.
+const COLD_RUN: u32 = 16;
 /// Idle free frames decay keeps per worker list: the 400,000-byte budget of 8 × 50,000-byte
 /// frames rounded up to whole 4,096-byte frames (INTERNAL-STREAM §6.5) until measured.
 const WARM: usize = 98;
@@ -114,8 +118,7 @@ impl Drop for ShardGuard<'_> {
 
 struct Slow {
     backed: u32,
-    cold: Vec<u32>,
-    candidates: Vec<u32>,
+    cold: ColdList,
 }
 
 struct Mapping {
@@ -338,8 +341,7 @@ impl Pool {
             shards: shards.into_boxed_slice(),
             slow: Padded(Mutex::new(Slow {
                 backed: initial,
-                cold: Vec::new(),
-                candidates: Vec::new(),
+                cold: ColdList::default(),
             })),
             used: Padded(AtomicU32::new(0)),
             backed: Padded(AtomicU32::new(initial)),
@@ -372,11 +374,19 @@ impl Pool {
     }
 
     /// Take a free frame whose first `needed` bytes are populated.
+    #[cfg(test)]
     pub(crate) fn allocate(&self, needed: usize) -> io::Result<u32> {
+        self.allocate_run(needed, 1)
+    }
+
+    /// Take a free frame whose first `needed` bytes are populated, for a reservation that
+    /// takes `run` frames from this one on. A cold frame is populated together with up to
+    /// `run - 1` cold neighbours, which become resident for the frames that follow.
+    pub(crate) fn allocate_run(&self, needed: usize, run: usize) -> io::Result<u32> {
         let local = self.shard();
         let frame = match self.resident(local, false) {
             Some(frame) => frame,
-            None => self.reclaim(local)?,
+            None => self.reclaim(local, run)?,
         };
         // Populate outside every lock: the frame is this caller's alone. A cold frame is not
         // populated; on refusal it joins the cold list, and eviction may free better ones.
@@ -392,10 +402,12 @@ impl Pool {
     /// A frame for an allocation that found no resident one: cold, resident after all, or
     /// grown. The reclaimer holds this lock until every candidate is on the cold list and
     /// its punch completes, so allocation cannot see missing capacity.
-    fn reclaim(&self, local: usize) -> io::Result<u32> {
+    fn reclaim(&self, local: usize, run: usize) -> io::Result<u32> {
         let mut slow = lock(&self.slow.0);
-        if let Some(frame) = slow.cold.pop() {
-            return Ok(frame);
+        let run = u32::try_from(run).unwrap_or(u32::MAX).clamp(1, COLD_RUN);
+        if let Some(frames) = slow.cold.take(run) {
+            drop(slow);
+            return Ok(self.warm_cold_run(local, frames));
         }
         if let Some(frame) = self.resident(local, true) {
             return Ok(frame);
@@ -421,6 +433,32 @@ impl Pool {
         self.backed.0.store(new, Ordering::Release);
         self.shards[local].0.lock().frames.extend((old + 1..new).rev());
         Ok(old)
+    }
+
+    /// Populate consecutive cold `frames`, which the caller took off the cold list, in one
+    /// call: one call per reservation rather than per frame, made outside the cold-list lock.
+    /// All but the lowest become resident on this worker's list, and the lowest is returned.
+    /// A refusal returns the others to the cold list and returns the top frame unpopulated,
+    /// so the caller populates only what it needs.
+    fn warm_cold_run(&self, local: usize, frames: Range<u32>) -> u32 {
+        let (low, frame) = (frames.start, frames.end - 1);
+        if low == frame {
+            return frame;
+        }
+        let start = self.frame_start(low) / self.page * self.page;
+        let populated = round_up(self.frame_start(frame) + FRAME_BYTES, self.page)
+            .and_then(|end| os::populate(self.address(start), end - start));
+        if populated.is_err() {
+            lock(&self.slow.0).cold.push_run(low..frame);
+            return frame;
+        }
+        for warmed in low..=frame {
+            self.states[warmed as usize]
+                .ready
+                .store(FRAME_BYTES as u32, Ordering::Relaxed);
+        }
+        self.shards[local].0.lock().frames.extend((low + 1..=frame).rev());
+        low
     }
 
     /// Whether the first `needed` bytes of a frame the caller owns are populated.
@@ -542,8 +580,7 @@ impl Pool {
     /// Called once per externally scheduled second. Returns reclamation failures.
     pub(crate) fn decay(&self) -> io::Result<()> {
         let mut slow = lock(&self.slow.0);
-        let Slow { cold, candidates, .. } = &mut *slow;
-        candidates.clear();
+        let mut candidates = Vec::new();
         // The warm budget is pool-wide: frames freed on one thread stay warm for any thread,
         // which steals resident frames before taking cold ones.
         let mut warm = WARM * self.shards.len();
@@ -555,33 +592,35 @@ impl Pool {
             let count = idle - kept;
             // The startup prefix stays backed even while free; punch only the excess.
             candidates.extend(free.frames.extract_if(..count, |frame| *frame >= self.reserve_frames));
+            // A burst grows a list to one entry per frame it freed; keep room for the warm
+            // budget only, so the burst's list does not stay resident after it.
+            let keep = free.frames.len().max(WARM);
+            free.frames.shrink_to(keep);
             free.low_water = free.frames.len();
         }
         for &frame in candidates.iter() {
             self.states[frame as usize].ready.store(0, Ordering::Relaxed);
         }
         candidates.sort_unstable();
+        let runs: Vec<Range<u32>> = candidates
+            .chunk_by(|low, high| low + 1 == *high)
+            .map(|run| run[0]..run[run.len() - 1] + 1)
+            .collect();
         // Publish cold ownership before any destructive syscall, even if a later
         // run fails. Conservative prefault also covers partially successful punches.
-        cold.extend_from_slice(candidates);
+        for run in &runs {
+            slow.cold.push_run(run.clone());
+        }
         let mut first_error = None;
-        let mut cursor = 0;
-        while cursor < candidates.len() {
-            let first = candidates[cursor];
-            let mut last = first;
-            cursor += 1;
-            while cursor < candidates.len() && candidates[cursor] == last + 1 {
-                last = candidates[cursor];
-                cursor += 1;
-            }
-            let start = round_up(self.frame_start(first), self.page)?;
-            let end = (self.frame_start(last) + FRAME_BYTES) / self.page * self.page;
+        for run in runs {
+            let start = round_up(self.frame_start(run.start), self.page)?;
+            let end = (self.frame_start(run.end - 1) + FRAME_BYTES) / self.page * self.page;
             if end > start
                 && let Err(error) = self.file.punch(start, end - start)
             {
                 first_error.get_or_insert(error);
             }
-            if let Err(error) = self.states.discard(first, last, self.page) {
+            if let Err(error) = self.states.discard(run.start, run.end - 1, self.page) {
                 first_error.get_or_insert(error);
             }
         }

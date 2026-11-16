@@ -104,22 +104,65 @@ fn an_allocation_failure_after_the_terminal_keeps_the_terminal() {
 /// terminal frees room the stream never used.
 #[test]
 fn room_held_for_a_final_record_survives_a_full_quota_and_pool() {
-    // (room held, pool frames, frames another exchange pins, record bytes, records before the
-    // refusal, final record stored, terminal)
+    // (room held in bytes, final record bytes, pool frames, frames another exchange pins,
+    // record bytes, records before the refusal, final record stored, terminal)
+    let counters = b"counters".len();
+    let two = FRAME_BYTES + 1;
     let cases = [
-        (true, 16, 0, FRAME_BYTES / 2, 6, true, Terminal::Shutdown),
-        (false, 16, 0, FRAME_BYTES / 2, 8, false, Terminal::StorageExhausted),
+        (
+            Some(counters),
+            counters,
+            16,
+            0,
+            FRAME_BYTES / 2,
+            6,
+            true,
+            Terminal::Shutdown,
+        ),
+        (
+            None,
+            counters,
+            16,
+            0,
+            FRAME_BYTES / 2,
+            8,
+            false,
+            Terminal::StorageExhausted,
+        ),
         // The other exchange pins every frame the producer does not hold.
-        (true, 4, 3, FRAME_BYTES / 2, 0, true, Terminal::Shutdown),
+        (
+            Some(counters),
+            counters,
+            4,
+            3,
+            FRAME_BYTES / 2,
+            0,
+            true,
+            Terminal::Shutdown,
+        ),
         // The final record would fit the last frame's unpopulated tail; it still goes into the room.
-        (true, 16, 0, FRAME_BYTES * 2 / 3, 4, true, Terminal::Shutdown),
+        (
+            Some(counters),
+            counters,
+            16,
+            0,
+            FRAME_BYTES * 2 / 3,
+            4,
+            true,
+            Terminal::Shutdown,
+        ),
+        // A room over two frames holds both, also against the other exchange.
+        (Some(two), two, 16, 0, FRAME_BYTES / 2, 4, true, Terminal::Shutdown),
+        (Some(two), two, 4, 2, FRAME_BYTES / 2, 0, true, Terminal::Shutdown),
+        // A final record shorter than its room returns the frame it does not use.
+        (Some(two), counters, 16, 0, FRAME_BYTES / 2, 4, true, Terminal::Shutdown),
     ];
-    for (held, pool, pinned, bytes, records, stored, terminal) in cases {
-        let label = format!("held={held} pool={pool} pinned={pinned} bytes={bytes}");
+    for (room, last_bytes, pool, pinned, bytes, records, stored, terminal) in cases {
+        let label = format!("room={room:?} final={last_bytes} pool={pool} pinned={pinned} bytes={bytes}");
         let (_dir, store) = store(pool, 4);
         let mut producer = store.create().unwrap();
-        if held {
-            producer.reserve_final(b"counters".len()).unwrap();
+        if let Some(room) = room {
+            producer.reserve_final(room).unwrap();
         }
         let mut other = store.create().unwrap();
         let _pinned = (pinned > 0).then(|| other.begin_scratch(pinned * FRAME_BYTES).unwrap());
@@ -133,7 +176,8 @@ fn room_held_for_a_final_record_survives_a_full_quota_and_pool() {
         assert!(matches!(refused, Error::StorageExhausted), "{label}: {refused:?}");
         assert_eq!(appended, records, "{label}: half-frame records before the refusal");
         producer.release_final();
-        assert_eq!(producer.append(b"counters").is_ok(), stored, "{label}");
+        let final_record = vec![7; last_bytes];
+        assert_eq!(producer.append(&final_record).is_ok(), stored, "{label}");
         producer.finish(Terminal::Shutdown);
         let mut reader = store.reader(producer.id(), 0).unwrap();
         let mut last = None;
@@ -148,7 +192,7 @@ fn room_held_for_a_final_record_survives_a_full_quota_and_pool() {
                 other => panic!("{label}: no terminal: {}", other.is_pending()),
             }
         };
-        assert_eq!(last.as_deref() == Some(&b"counters"[..]), stored, "{label}");
+        assert_eq!(last.as_deref() == Some(&final_record[..]), stored, "{label}");
         assert_eq!(ended, terminal, "{label}");
     }
     // Room a stream never used returns to the pool at its terminal, including `Gone`, which
