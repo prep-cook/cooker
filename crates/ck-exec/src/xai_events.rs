@@ -14,7 +14,9 @@
 //!   completion caches nothing, nor one after an upstream failure, whose input the ingress
 //!   ignores. Replay copies no event into the response stream, so it cannot cost the
 //!   response its storage.
-//! - The body ending before the completion boundary fails with Go's 408.
+//! - The body ending before the completion boundary fails with Go's 408, and an upstream
+//!   failure with its own status; either one cutting off an apply_patch call fails as the
+//!   bridge's 502.
 //!
 //! One SSE event goes out per upstream event, in order; the ingress decodes the result. A
 //! line that is not UTF-8 passes unchanged, so the ingress refuses it.
@@ -87,7 +89,7 @@ impl ResponseIngress for XaiIngress {
 
     fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> codec::Result<()> {
         match self {
-            Self::Generate(events) => events.inner.fail(owner, status, scope),
+            Self::Generate(events) => events.fail(owner, status, scope),
             Self::Compact(compact) => compact.ingress.fail(owner, status, scope),
         }
     }
@@ -171,9 +173,16 @@ impl Events {
         {
             return Ok(());
         }
+        self.fail(owner, 408, "upstream")
+    }
+
+    /// The upstream failed, or its body ended, before the completion: an apply_patch call
+    /// still open fails as the bridge's 502, as Go reports a cut patch, and any other cut as
+    /// `status`.
+    fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> codec::Result<()> {
         let (_, refused) = self.bridge.finish_stream();
-        let status = if refused.is_some() { 502 } else { 408 };
-        self.inner.fail(owner, status, "upstream")
+        let status = if refused.is_some() { 502 } else { status };
+        self.inner.fail(owner, status, scope)
     }
 
     /// One upstream line (Go's scanner loop); false once a failure ended the response.

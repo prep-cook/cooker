@@ -3,11 +3,14 @@
 //! when the credential sets `websockets`.
 //!
 //! - The turn is an ordinary attempt. Its request carries the expanded history, so the frame
-//!   is the upload HTTP generation would send (shaped without `previous_response_id`) as one
-//!   `response.create`. Nothing about earlier turns is kept: no transcript and no response-id
-//!   map. A `compaction_trigger` input item reaches xAI as received; xAI compacts.
+//!   is the upload HTTP generation would send (shaped without `previous_response_id`, with
+//!   `store: false`) as one `response.create`. The connection keeps no transcript and no
+//!   response-id map; the reasoning replay cache applies exactly as for HTTP generation. A
+//!   `compaction_trigger` input item reaches xAI as received; xAI compacts.
 //! - Every upstream text frame goes to the attempt's ingress unchanged as one SSE `data:`
-//!   event, through the same xAI line rules (`xai_events`) as HTTP generation.
+//!   event, through the same xAI line rules (`xai_events`) as HTTP generation. The one
+//!   exception is the WebSocket mode's own terminal, `response.done`, which goes in as the
+//!   `response.completed` the ingress ends a response on.
 //! - A lost socket is the attempt's failure. xAI ends every connection after 59 minutes; a
 //!   close or drop during a turn ends its body with a transport-scope error, which fails over
 //!   before the client commit and is an error after it. The transport never dials or sends
@@ -127,15 +130,16 @@ fn ws_url(http_url: &str) -> Result<String, ExecError> {
     Ok(crate::xai_url::string(&parsed))
 }
 
-/// `buildXAIWebsocketRequestBody`: every turn is a stored `response.create`; the payload
-/// rules (`rules`) see the WebSocket fields, then the type is fixed again.
+/// `buildXAIWebsocketRequestBody`: every turn is a `response.create`; the payload rules
+/// (`rules`) see the WebSocket fields, then the type is fixed again. The shaped body's
+/// `store: false` stays (owner ruling E9c-1, 2026-11-16): no turn continues from a response
+/// stored at xAI, so Go's `store: true` would only keep the turn's data there.
 fn request_frame(body: Vec<u8>, rules: impl FnOnce(Vec<u8>) -> Vec<u8>) -> Vec<u8> {
     let mut out = body;
     gj::set_str(&mut out, "type", "response.create");
     for key in ["stream", "stream_options", "background"] {
         gj::delete(&mut out, key);
     }
-    gj::set_bool(&mut out, "store", true);
     let mut out = rules(out);
     gj::set_str(&mut out, "type", "response.create");
     out
@@ -476,8 +480,17 @@ impl Frames {
                 self.done = true;
                 return Some(Err(error));
             }
-            if self.warmup && text(&gj::get(payload, "type")) == "response.created" {
+            let kind = text(&gj::get(payload, "type"));
+            if self.warmup && kind == "response.created" {
                 self.pending = Some(event(&warmup_completed(payload)));
+            }
+            if kind == "response.done" {
+                // xAI's WebSocket mode may end a response with `response.done` alone, which
+                // HTTP streams never send and the Responses ingress does not know. As the
+                // completion, its `response.status` still decides how the response ends.
+                let mut completed = payload.to_vec();
+                gj::set_str(&mut completed, "type", "response.completed");
+                return Some(Ok(event(&completed)));
             }
             return Some(Ok(event(payload)));
         }
@@ -565,7 +578,9 @@ impl Turns for XaiExecutor {
         let session = self.ws.pool.session(session_id);
         let guard = session.turn.clone().lock_owned().await;
         capture.request();
-        let (conn, handshake) = self.socket(&session, &target, &headers, &call, &capture).await?;
+        let (conn, handshake) = self
+            .socket(&session, (&target, &headers), (credential, &call.cfg), &capture)
+            .await?;
         if let Some(handshake) = &handshake {
             capture.handshake(handshake);
         }
@@ -619,9 +634,8 @@ impl XaiExecutor {
     async fn socket(
         &self,
         session: &Arc<Session>,
-        target: &Target,
-        headers: &HeaderMap,
-        call: &Call<'_>,
+        (target, headers): (&Target, &HeaderMap),
+        (credential, cfg): (&Credential, &ck_core::config::Config),
         capture: &WsCapture,
     ) -> Result<(Arc<Upstream>, Option<HeaderMap>), ExecError> {
         if let Some(current) = session.current() {
@@ -636,7 +650,7 @@ impl XaiExecutor {
             drop(slot);
             current.shutdown();
         }
-        let client = self.clients.for_credential(call.attempt.credential, &call.cfg);
+        let client = self.clients.for_credential(credential, cfg);
         let (socket, handshake) = dial(&client, target, headers, capture).await?;
         let (sink, stream) = socket.split();
         let conn = Upstream::new(target.clone(), sink, self.ws.pool.write);

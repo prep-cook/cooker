@@ -108,9 +108,9 @@ fn pool_failures_read_as_xai_failures() {
     );
 }
 
-/// TestBuildXAIWebsocketRequestBodySetsStoreAndKeepsPromptCacheKey, and the payload rules
-/// (868e137) running on the frame after its WebSocket fields, with only the type set after
-/// them.
+/// TestBuildXAIWebsocketRequestBodySetsStoreAndKeepsPromptCacheKey without its `store: true`
+/// (owner ruling E9c-1), and the payload rules (868e137) running on the frame after its
+/// WebSocket fields, with only the type set after them.
 #[test]
 fn request_frame_sets_its_fields_then_runs_the_rules() {
     let body = br#"{"model":"grok-4.3","stream":true,"stream_options":{"include_usage":true},"background":true,"prompt_cache_key":"cache-1","input":[{"content":"first"},{"content":"second"}]}"#;
@@ -120,16 +120,19 @@ fn request_frame_sets_its_fields_then_runs_the_rules() {
         assert!(!gj::get(&frame, absent).exists(), "{absent}");
     }
     assert_eq!(gj::get(&frame, "prompt_cache_key").str(), "cache-1");
-    assert!(gj::get(&frame, "store").bool());
+    assert!(
+        !gj::get(&frame, "store").exists(),
+        "the frame keeps the shaped body's store"
+    );
 
     let ruled = request_frame(body.to_vec(), |mut b| {
-        assert!(gj::get(&b, "store").bool(), "the rules see store=true");
-        gj::set_bool(&mut b, "store", false);
+        assert!(!gj::get(&b, "stream").exists(), "the rules see the WebSocket fields");
+        gj::set_bool(&mut b, "store", true);
         gj::delete(&mut b, "type");
         gj::delete(&mut b, "input.0");
         b
     });
-    assert!(!gj::get(&ruled, "store").bool());
+    assert!(gj::get(&ruled, "store").bool(), "a configured rule still wins");
     assert_eq!(gj::get(&ruled, "input.#").int(), 1);
     assert_eq!(gj::get(&ruled, "type").str(), "response.create");
 }
@@ -150,4 +153,48 @@ fn disabled_capture_keeps_no_frame() {
     let usage = UsageSink::default().with_capture(CaptureSink::new(Arc::new(Ignore)));
     let enabled = WsCapture::new(&usage, &c, url, &headers, frame);
     assert_eq!(enabled.frame, frame);
+}
+
+/// TestXAIWebsockets_PingHandlerDoesNotBlockOnWriteMu: an upstream ping is answered while
+/// the pooled socket's writer is held, because the reader sends the pong.
+#[tokio::test]
+async fn a_ping_is_answered_while_the_writer_is_held() {
+    use axum::extract::ws::{Message, WebSocketUpgrade};
+    let (pong_tx, mut pong_rx) = mpsc::channel::<Vec<u8>>(1);
+    let app = axum::Router::new().fallback(move |upgrade: WebSocketUpgrade| {
+        let pong_tx = pong_tx.clone();
+        async move {
+            upgrade.on_upgrade(move |mut socket| async move {
+                // Ping once the test holds the writer.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = socket.send(Message::Ping(b"xai-keepalive-ping".to_vec().into())).await;
+                while let Some(Ok(message)) = socket.recv().await {
+                    if let Message::Pong(data) = message {
+                        let _ = pong_tx.send(data.to_vec()).await;
+                    }
+                }
+            })
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let credential = credential(serde_json::json!({"api_key": "xai-key"}));
+    let cfg = Config::default();
+    let target = Target::new(&credential, format!("ws://{addr}/v1/responses"), &cfg);
+    let executor = XaiExecutor::with_client(wreq::Client::new());
+    let session = executor.ws.pool.session("keepalive");
+    let headers = HeaderMap::new();
+    let capture = WsCapture::new(&UsageSink::default(), &credential, &target.url, &headers, b"");
+    let (conn, _) = executor
+        .socket(&session, (&target, &headers), (&credential, &cfg), &capture)
+        .await
+        .expect("the socket opens");
+    let _writer = conn.sink.lock().await;
+    let pong = tokio::time::timeout(Duration::from_secs(2), pong_rx.recv())
+        .await
+        .expect("pong starved by the held writer");
+    assert_eq!(pong.as_deref(), Some(&b"xai-keepalive-ping"[..]));
+    executor.ws.close("keepalive");
+    server.abort();
 }
