@@ -35,6 +35,8 @@ pub struct Reply {
     cadence: Option<(usize, Duration)>,
     /// Close after this many body bytes, without the terminating chunk.
     cut_after: Option<usize>,
+    /// Declare this body length with `content-length` instead of chunking the body.
+    length: Option<usize>,
     /// Close after reading the request, before any response byte.
     reset: bool,
     /// Request body bytes per read and the pause after each read.
@@ -67,6 +69,7 @@ impl Reply {
             first_byte_delay: Duration::ZERO,
             cadence: None,
             cut_after: None,
+            length: None,
             reset: false,
             slow_read: None,
         }
@@ -109,6 +112,14 @@ impl Reply {
     pub fn cut_after(mut self, bytes: usize) -> Self {
         assert!(bytes < self.body.len(), "a cut ends before the body does");
         self.cut_after = Some(bytes);
+        self
+    }
+
+    /// Declares `missing` bytes beyond the body with `content-length`, sends the body and
+    /// closes: a body the upstream ended before its length.
+    pub fn short_by(mut self, missing: usize) -> Self {
+        assert!(missing > 0, "a short body misses at least one byte");
+        self.length = Some(self.body.len() + missing);
         self
     }
 
@@ -317,7 +328,10 @@ async fn respond(socket: &mut TcpStream, reply: &Reply, log: &mut Log) -> std::i
     for (name, value) in &reply.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
-    head.push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
+    match reply.length {
+        Some(length) => head.push_str(&format!("content-length: {length}\r\nconnection: close\r\n\r\n")),
+        None => head.push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n"),
+    }
     write(socket, head.as_bytes()).await?;
     log.head = Some(Instant::now());
     tokio::time::sleep(reply.first_byte_delay).await;
@@ -325,16 +339,22 @@ async fn respond(socket: &mut TcpStream, reply: &Reply, log: &mut Log) -> std::i
     let (step, interval) = reply.cadence.unwrap_or((end.max(1), Duration::ZERO));
     while log.written < end {
         let piece = &reply.body[log.written..end.min(log.written + step)];
-        let mut chunk = format!("{:x}\r\n", piece.len()).into_bytes();
-        chunk.extend_from_slice(piece);
-        chunk.extend_from_slice(b"\r\n");
+        let chunk = match reply.length {
+            Some(_) => piece.to_vec(),
+            None => {
+                let mut chunk = format!("{:x}\r\n", piece.len()).into_bytes();
+                chunk.extend_from_slice(piece);
+                chunk.extend_from_slice(b"\r\n");
+                chunk
+            }
+        };
         log.writes.push(Instant::now());
         write(socket, &chunk).await?;
         log.written += piece.len();
         tokio::time::sleep(interval).await;
     }
-    if reply.cut_after.is_some() {
-        return Ok(false);
+    if reply.cut_after.is_some() || reply.length.is_some() {
+        return Ok(reply.length.is_some_and(|length| length == reply.body.len()));
     }
     write(socket, b"0\r\n\r\n").await?;
     Ok(true)

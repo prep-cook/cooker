@@ -46,15 +46,29 @@ impl Client {
     }
 }
 
+/// Every recorded CLIProxyAPI exchange, in recording order: the base set, minus the
+/// scenarios v8.0.35 re-recorded under the same name, then the v8.0.27 and v8.0.35 sets
+/// (the composition `antigravity::tests` replays on the old path).
+fn recorded() -> Vec<Value> {
+    let set = |raw: &str| -> Vec<Value> {
+        let fixture: Value = serde_json::from_str(raw).unwrap();
+        fixture["executor"].as_array().unwrap().clone()
+    };
+    let newer = set(include_str!("fixtures/antigravity_v8_0_35_go.json"));
+    let mut all: Vec<Value> = set(include_str!("fixtures/antigravity_go.json"))
+        .into_iter()
+        .filter(|s| !newer.iter().any(|n| n["name"] == s["name"]))
+        .collect();
+    all.extend(set(include_str!("fixtures/antigravity_v8_0_27_go.json")));
+    all.extend(newer);
+    all
+}
+
 fn scenario(name: &str) -> Value {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/antigravity_go.json")).unwrap();
-    fixture["executor"]
-        .as_array()
-        .unwrap()
-        .iter()
+    recorded()
+        .into_iter()
         .find(|s| s["name"] == name)
         .unwrap_or_else(|| panic!("no recorded scenario {name}"))
-        .clone()
 }
 
 /// The scenario's credential, its `UPSTREAM` placeholders pointing at `addr`.
@@ -100,7 +114,13 @@ fn reply(s: &Value) -> Reply {
         .find(|h| h[0].as_str().unwrap().eq_ignore_ascii_case("content-type"))
         .map_or("application/json", |h| h[1].as_str().unwrap());
     let status = upstream["status"].as_u64().unwrap() as u16;
-    Reply::status(status, content_type, upstream["body"].as_str().unwrap().to_owned())
+    let body = upstream["body"].as_str().unwrap();
+    let reply = Reply::status(status, content_type, body.to_owned());
+    // `missing`: the upstream promised that many more bytes and closed the connection.
+    match upstream["missing"].as_u64() {
+        Some(missing) => reply.short_by(missing as usize),
+        None => reply,
+    }
 }
 
 /// What one recorded exchange produced on the contract path.
@@ -152,13 +172,21 @@ async fn run_on(streams: &Streams, s: &Value, upstream: &StreamUpstream, usage: 
         );
     }
     let mut body: Value = serde_json::from_str(s["payload"].as_str().unwrap()).unwrap();
-    // The compact route takes no `stream`; CLIProxyAPI answers it unstreamed.
+    // The operation, not the body, picks CLIProxyAPI's unstreamed compact; the compact route
+    // takes no `stream`.
     if compact {
         body.as_object_mut().unwrap().remove("stream");
     }
     let body = serde_json::to_vec(&body).unwrap();
-    // A Gemini client states streaming in its route only, so it always streams upstream.
-    let streaming = s["op"] == "stream" || (client == Client::Gemini && operation == Operation::Generate);
+    // A Gemini client states streaming in its route's action.
+    let streaming = s["op"] == "stream";
+    if client == Client::Gemini {
+        exchange.streaming = Some(streaming);
+    }
+    if !compact {
+        exchange.alt = s["alt"].as_str().filter(|a| !a.is_empty()).map(str::to_owned);
+    }
+    exchange.derived_session = s["derived_session"].as_str().map(str::to_owned);
     let (store, id) = (&streams.store, identity(Direction::Request));
     let mut writer = streams.request();
     let response = streams.response(&writer);
@@ -226,6 +254,10 @@ fn normalize(text: &str) -> String {
     let rules = [
         (r#""requestId":"agent-[0-9a-f-]{36}""#, r#""requestId":"agent-<uuid>""#),
         (
+            r#""requestId":"image_gen/[0-9]{13}/[0-9a-f-]{36}/12""#,
+            r#""requestId":"image_gen/<ms>/<uuid>/12""#,
+        ),
+        (
             r"antigravity/hub/[0-9.]+ darwin/arm64",
             "antigravity/hub/<v> darwin/arm64",
         ),
@@ -287,7 +319,7 @@ fn usage(published: &Published) -> Option<Value> {
 
 /// Checks the canonical snapshot against the usage CLIProxyAPI recorded. CLIProxyAPI counts
 /// output without reasoning; the canonical output includes it (`docs/INTERNAL-STREAM.md`
-/// §3.5). A reasoning count is compared where the client protocol reports one.
+/// §3.5). A reasoning count and a total are compared where the client protocol reports one.
 fn assert_usage(name: &str, published: &Published, s: &Value) {
     let want = |key: &str| s["usage"][key].as_u64().unwrap();
     let Some(got) = usage(published) else {
@@ -301,7 +333,11 @@ fn assert_usage(name: &str, published: &Published, s: &Value) {
         want("output_tokens") + want("reasoning_tokens"),
         "{name}: output in {got}"
     );
-    assert_eq!(count("total_tokens"), want("total_tokens"), "{name}: total in {got}");
+    // A protocol without a total (Anthropic) leaves the canonical total derived.
+    let derived = |key: &str| got["derived"].as_array().is_some_and(|d| d.iter().any(|k| k == key));
+    if !derived("total_tokens") {
+        assert_eq!(count("total_tokens"), want("total_tokens"), "{name}: total in {got}");
+    }
     assert_eq!(
         count("cache_read_tokens"),
         want("cached_tokens"),
@@ -431,14 +467,29 @@ fn assert_client_output(name: &str, delivered: &str, s: &Value) {
 }
 
 /// Runs one recorded scenario and compares every observable with the recording.
-async fn replay(name: &str) {
-    let s = scenario(name);
+async fn replay(s: &Value) {
+    let name = s["name"].as_str().unwrap();
     let streams = Streams::new();
-    let run = run(&streams, &s).await;
-    assert_request(name, run.captured.first().expect("one upstream request"), &s);
+    let run = run(&streams, s).await;
+    match s["request"].is_null() {
+        true => assert!(run.captured.is_empty(), "{name}: CLIProxyAPI sent nothing upstream"),
+        false => assert_request(name, run.captured.first().expect("one upstream request"), s),
+    }
     if let Some(want) = s["error"].as_object() {
-        let error = run.started.err().expect("the upstream refusal fails the attempt");
-        assert_eq!(error.status as u64, want["status"].as_u64().unwrap(), "{name}: status");
+        // A refusal before the answer fails the attempt; one after it ends the producer.
+        let error = match run.started {
+            Err(error) => error,
+            Ok(started) => produce(&streams, started)
+                .await
+                .0
+                .expect_err("the upstream failure ends the answer"),
+        };
+        // Go's status 0 is an error without a status code (a scanner error); a Rust error
+        // always carries one, so only the message is compared.
+        let status = want["status"].as_u64().unwrap();
+        if status != 0 {
+            assert_eq!(error.status as u64, status, "{name}: status");
+        }
         assert_eq!(
             normalize(&String::from_utf8_lossy(&error.body)),
             normalize(want["message"].as_str().unwrap()),
@@ -464,61 +515,182 @@ async fn replay(name: &str) {
     outcome.unwrap_or_else(|e| panic!("{name}: {}", String::from_utf8_lossy(&e.body)));
     assert_eq!(published.terminal, Some(Terminal::Done), "{name}");
     if operation == Operation::Generate {
-        assert_usage(name, &published, &s);
+        assert_usage(name, &published, s);
     }
     let delivered = delivered(&streams, &mut owner, client, operation, streaming);
-    assert_client_output(name, &delivered, &s);
+    assert_client_output(name, &delivered, s);
 }
 
-/// Each row is a recorded CLIProxyAPI exchange: a client protocol, an operation and a model
-/// family. Gemini clients appear only streamed, because their route alone says whether
-/// they stream and the contract path always streams them.
+/// Recorded exchanges the contract path answers differently, with the reason. Each must
+/// still differ from its recording, so an entry cannot outlive its difference.
+const DEVIATIONS: &[(&str, &str)] = &[
+    (
+        "gemini_function_response_roles",
+        "the Gemini request codec refuses the request at the fence (Schema); D2 keeps it on the old arm",
+    ),
+    (
+        "gemini_function_response_name_match",
+        "the Gemini request codec refuses the request at the fence (Schema); D2 keeps it on the old arm",
+    ),
+    (
+        "trailing_thought_plain_summary",
+        "the Gemini request codec refuses the request at the fence (Schema); D2 keeps it on the old arm",
+    ),
+    (
+        "trailing_thought_with_call",
+        "the Gemini request codec drops `thought: true` from a function-call part",
+    ),
+    (
+        "image_model_execute",
+        "the canonical stream decodes inline media, and the recorded image data `iVBOR` is not base64",
+    ),
+    (
+        "gemini_stream_alt",
+        "with `alt` on a stream the Antigravity steps answer in JSON framing, which the Gemini \
+         response ingress (SSE) does not read; D2 keeps such requests on the old arm",
+    ),
+    (
+        "go_stream_empty_gemini",
+        "an empty answer ends the attempt at the response ingress; the old server called it \
+         `empty_stream`, and D2 maps it to an attempt failure",
+    ),
+    (
+        "go_stream_empty_openai",
+        "an empty answer ends the attempt at the response ingress; the old server called it \
+         `empty_stream`, and D2 maps it to an attempt failure",
+    ),
+    (
+        "stream_split_payload_gemini",
+        "the Antigravity steps forward the joined payload with its line breaks, which is not one \
+         SSE event for the Gemini response ingress",
+    ),
+    (
+        "replay_after_completed_gemini",
+        "the Gemini response ingress refuses a chunk after the finish reason, which CLIProxyAPI forwards",
+    ),
+    (
+        "replay_apply_patch_failure_at_terminal",
+        "the attempt fails with the same 502, but the Responses ingress reports its own message",
+    ),
+    (
+        "stream_split_payload_claude",
+        "the canonical stream accounts the usage the upstream reported (contract §8); CLIProxyAPI \
+         recorded none",
+    ),
+    (
+        "go_stream_no_finish_reason_gemini",
+        "the canonical stream accounts the usage the upstream reported (contract §8); CLIProxyAPI \
+         recorded none",
+    ),
+    (
+        "stream_client_drop_mid_read",
+        "a client disconnect does not stop the producer (Settled), so the short upstream body \
+         fails the attempt where CLIProxyAPI stopped at the drop",
+    ),
+    (
+        "stream_client_drop_after_terminal",
+        "a client disconnect does not stop the producer (Settled), so the short upstream body \
+         fails the attempt where CLIProxyAPI stopped at the drop",
+    ),
+    (
+        "stream_client_drop_after_terminal_claude",
+        "a client disconnect does not stop the producer (Settled), so the short upstream body \
+         fails the attempt where CLIProxyAPI stopped at the drop",
+    ),
+    (
+        "replay_drop_before_terminal",
+        "a client disconnect does not stop the producer (Settled), so the short upstream body \
+         fails the attempt where CLIProxyAPI stopped at the drop",
+    ),
+    (
+        "replay_drop_after_terminal",
+        "a client disconnect does not stop the producer (Settled), so the short upstream body \
+         fails the attempt where CLIProxyAPI stopped at the drop",
+    ),
+];
+
+/// Recorded exchanges this harness cannot drive, with the old-path test that replays them.
+const NOT_REPLAYED: &[(&str, &str)] = &[
+    (
+        "execute_in_short_cooldown",
+        "needs the cooldown an earlier scenario opened on one executor under a pinned clock \
+         (test-only `cooldown_now`); antigravity::tests::go_reference_scenarios",
+    ),
+    (
+        "credits_flag_without_config",
+        "needs the cooldown an earlier scenario opened on one executor under a pinned clock \
+         (test-only `cooldown_now`); antigravity::tests::go_reference_scenarios",
+    ),
+    (
+        "claude_web_search_grounding",
+        "a scripted multi-request upstream with grounding redirects; \
+         antigravity::tests::web_search_grounding_matches_go",
+    ),
+    (
+        "compaction_alt_stream_rejected",
+        "no contract request expresses a streamed compact: the Responses codec refuses `stream` \
+         on compact at the fence; antigravity::tests::go_reference_scenarios",
+    ),
+    (
+        "count_429",
+        "no contract request expresses a Chat token count: the Chat codec refuses it \
+         (Unsupported); antigravity::tests::go_reference_scenarios",
+    ),
+    (
+        "go_stream_interactions",
+        "the contract has no Interactions ingress, so D2 keeps Interactions on the old arm; \
+         antigravity::tests::go_reference_scenarios",
+    ),
+];
+
+/// The text a panic carried.
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default()
+}
+
+/// Every recorded CLIProxyAPI exchange, run through the selector's Antigravity arm in
+/// recording order: the upstream request, the refusal or the canonical usage, and what the
+/// client receives. This covers every client protocol, credits, refusals, token counts,
+/// compaction (ruling 68) and the replay ledger's turns (ruling 67).
 #[tokio::test]
-async fn every_client_protocol_matches_the_recorded_exchange() {
-    for name in [
-        // Claude models, signed thinking (ruling 66) and the stream merge.
-        "claude_stream_claude_model",
-        "claude_model_execute",
-        "claude_client_claude_model_empty_signature",
-        "claude_stream_gemini_model",
-        // Credits: the injected flag and the exhausted balance.
-        "credits_claude_execute",
-        "credits_balance_exhausted",
-        // Chat and Responses clients, streamed and unstreamed.
-        "openai_stream",
-        "openai_execute_tools_schema",
-        "responses_stream",
-        "responses_execute_reasoning",
-        "gemini_stream",
-        // Refusals before the answer.
-        "stream_429",
-        "execute_400",
-        // Token counts.
-        "gemini_count",
-    ] {
-        replay(name).await;
+async fn every_recorded_exchange_matches_cliproxyapi() {
+    let (mut failures, mut deviated) = (Vec::new(), 0);
+    for s in recorded() {
+        let name = s["name"].as_str().unwrap().to_owned();
+        if NOT_REPLAYED.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(replay(&s)))
+            .await
+            .map_err(panic_text);
+        match (DEVIATIONS.iter().any(|(n, _)| *n == name), outcome) {
+            (false, Ok(())) => {}
+            (false, Err(e)) => failures.push(format!("{name}: {e}")),
+            (true, Ok(())) => failures.push(format!("{name}: matches its recording; remove it from DEVIATIONS")),
+            (true, Err(_)) => deviated += 1,
+        }
     }
-}
-
-/// Ruling 68: `/responses/compact`, a compaction trigger and an earlier compaction item are
-/// served from a local summary turn, as CLIProxyAPI serves them.
-#[tokio::test]
-async fn compaction_is_served_locally_as_recorded() {
-    for name in [
-        "compaction_alt_compact",
-        "compaction_trigger_stream",
-        "compaction_item_expands",
-    ] {
-        replay(name).await;
-    }
-}
-
-/// Ruling 67: the reasoning replay ledger a Claude client's first turn fills, keyed by model
-/// and client session, restores the native call on its second turn.
-#[tokio::test]
-async fn the_replay_ledger_carries_a_session_to_its_next_turn() {
-    for name in ["replay_claude_turn1", "replay_claude_turn2_provenance"] {
-        replay(name).await;
+    assert!(
+        failures.is_empty(),
+        "{} exchanges differ:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    assert_eq!(
+        deviated,
+        DEVIATIONS.len(),
+        "every DEVIATIONS entry names a recorded exchange"
+    );
+    let names: Vec<Value> = recorded().into_iter().map(|s| s["name"].clone()).collect();
+    for (name, _) in NOT_REPLAYED {
+        assert!(
+            names.contains(&Value::from(*name)),
+            "NOT_REPLAYED names no recorded exchange: {name}"
+        );
     }
 }
 
@@ -545,6 +717,21 @@ fn anthropic_history(signature: Option<&str>) -> Value {
     })
 }
 
+/// An Anthropic history whose assistant turn called a tool under `signature`.
+fn tool_history(signature: &str) -> Value {
+    serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 1024, "stream": true,
+        "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"a": 1}, "signature": signature}
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "done"}]}
+        ]
+    })
+}
+
 /// Sends `payload` from `source` to a Claude model and returns the thought signatures of the
 /// upload, in order.
 async fn sent_signatures(source: &str, payload: &Value) -> Vec<String> {
@@ -560,16 +747,22 @@ async fn sent_signatures(source: &str, payload: &Value) -> Vec<String> {
     strings(&body, &["thoughtSignature"])
 }
 
-/// Ruling 66: signed thinking goes back upstream exactly as the client holds it; CLIProxyAPI
-/// would wrap the single-layer form. Thinking without a Claude signature is dropped, as
-/// CLIProxyAPI and OmniRoute both drop it, and no cached signature fills the gap.
+/// Ruling 66: signed thinking and tool calls go back upstream exactly as the client holds
+/// them; CLIProxyAPI would wrap the single-layer form. Only CLIProxyAPI's legacy `<group>#`
+/// prefix comes off. Thinking without a Claude signature is dropped, as CLIProxyAPI and
+/// OmniRoute both drop it, and no cached signature fills the gap.
 #[tokio::test]
 async fn signed_thinking_goes_upstream_as_the_client_holds_it() {
-    let rows: [(&str, Value, &[&str]); 4] = [
+    let prefixed = format!("claude#{SINGLE_LAYER}");
+    let rows: [(&str, Value, &[&str]); 8] = [
         ("claude", anthropic_history(Some(DOUBLE_LAYER)), &[DOUBLE_LAYER]),
         ("claude", anthropic_history(Some(SINGLE_LAYER)), &[SINGLE_LAYER]),
+        ("claude", anthropic_history(Some(&prefixed)), &[SINGLE_LAYER]),
         ("claude", anthropic_history(Some("opaque-signature")), &[]),
         ("claude", anthropic_history(None), &[]),
+        ("claude", tool_history(DOUBLE_LAYER), &[DOUBLE_LAYER]),
+        ("claude", tool_history(SINGLE_LAYER), &[SINGLE_LAYER]),
+        ("claude", tool_history(&prefixed), &[SINGLE_LAYER]),
     ];
     for (source, payload, want) in rows {
         assert_eq!(sent_signatures(source, &payload).await, want, "{source}: {payload}");

@@ -236,12 +236,18 @@ impl AntigravityExecutor {
         let view = request.validated.view();
         let operation = view.operation;
         let protocol = Protocol::of(view.document).map_err(encoding)?;
-        // Compact is answered unstreamed, as CLIProxyAPI answers its route.
-        let stream = operation == Operation::Generate && streaming(view.document).map_err(encoding)?;
+        let client = &request.client;
+        // Compact is answered unstreamed, as CLIProxyAPI answers its route. A Gemini route
+        // names its stream choice in its action: CLIProxyAPI sends `:generateContent` upstream
+        // for `:generateContent` (`gemini_handlers.go:167-171`, `antigravity_executor_execute.go:129`).
+        let stream = operation == Operation::Generate
+            && match client.streaming {
+                Some(stream) => stream,
+                None => streaming(view.document).map_err(encoding)?,
+            };
         let body = Bytes::from(copy(
             &protocol.encode(view, stream, streams.request).map_err(encoding)?,
         )?);
-        let client = &request.client;
         let exec = ExecRequest {
             operation: match operation {
                 Operation::CountTokens => ExecOperation::CountTokens,
@@ -254,7 +260,12 @@ impl AntigravityExecutor {
             original_body: body.clone(),
             body,
             stream,
-            alt: (operation == Operation::Compact).then(|| COMPACT_ALT.to_owned()),
+            // CLIProxyAPI carries the route's `alt` into the upstream URL as `$alt`
+            // (`antigravity_executor_request.go:36-52`, `antigravity_executor_tokens.go:93-96`).
+            alt: match operation {
+                Operation::Compact => Some(COMPACT_ALT.to_owned()),
+                _ => client.alt.map(str::to_owned),
+            },
             session: client.session.map(str::to_owned),
             execution_session: client.execution_session.map(str::to_owned),
             derived_session: client.derived_session.map(str::to_owned),
