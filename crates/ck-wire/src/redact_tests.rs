@@ -176,6 +176,25 @@ fn words_that_may_hold_a_credential_print_as_the_placeholder() {
         ("go callback?sk-review-secret", "go <redacted url>"),
         ("go https:sk-review-secret", "go <redacted url>"),
         ("go a1:sk-review-secret", "go <redacted url>"),
+        // An escaped quote or backslash is part of the word.
+        (
+            r#"Post "http://127.0.0.1/?code=a\"sk-review-secret": EOF"#,
+            r#"Post "<redacted url>": EOF"#,
+        ),
+        (
+            r#"{"url":"http://127.0.0.1/?code=a\"sk-review-secret"}"#,
+            r#"{"url":"<redacted url>"}"#,
+        ),
+        (r#""http://h/?a=b\\" tail"#, r#""<redacted url>" tail"#),
+        // Inside a string, a redacted word drops the rest of the string.
+        (
+            r#"{"m":"see http://h/?a=b more \"x\" sk-review-secret"} tail"#,
+            r#"{"m":"see <redacted url>"} tail"#,
+        ),
+        (
+            "x\\\"http://h/?code=prefix sk-review-secret\" y\nz",
+            "<redacted url>\" y\nz",
+        ),
         ("go 1-https:sk-review-secret} x", "go <redacted url> x"),
         ("go 0.9+redis:sk-review-secret", "go <redacted url>"),
         ("go 1a,b+c:sk-review-secret", "go <redacted url>"),
@@ -395,6 +414,10 @@ const SHAPES: &[&str] = &[
     // letter, so these start a word.
     " https:S",
     " a1:S",
+    // An escaped quote, and a reference that ends in punctuation before its `@`.
+    "http://h.example/?code=a\\\"S",
+    "//S]@h.example/",
+    "//S\\@h.example/",
     "redis:S@host.example",
     "mailto:S@host.example",
     "https://host.example/r/https://u:S@x.example/a",
@@ -419,6 +442,8 @@ const SPACED: &[&str] = &["http://h.example/?code=prefix S", " //u:S@h.example/a
 /// Quotes first, then the other wrappings.
 const WRAPS: &[(&str, &str)] = &[
     ("\"", "\""),
+    // A quoted URL inside a JSON string.
+    ("\"{\\\"u\\\":\\\"", "\\\"}\""),
     ("'", "'"),
     ("<", ">"),
     ("`", "`"),
@@ -431,8 +456,8 @@ const WRAPS: &[(&str, &str)] = &[
 ];
 
 const SEPARATORS: &[&str] = &[
-    "", " ", "\n", "\t", "\r\n", ",", ";", ":", "=", "\"", "'", "(", ")", "<", ">", "[", "]", "{", "}", "`", "é", "中",
-    "?", "#", "/", "@", "\\", "&", ".", "-",
+    "", " ", "\n", "\t", "\r\n", "\\\"", ",", ";", ":", "=", "\"", "'", "(", ")", "<", ">", "[", "]", "{", "}", "`",
+    "é", "中", "?", "#", "/", "@", "\\", "&", ".", "-",
 ];
 
 /// A random text of words, long tokens, separators and secret-bearing URLs. Secrets are
@@ -443,7 +468,7 @@ fn generated(rng: &mut Rng) -> String {
         match rng.below(5) {
             0 | 1 => {
                 let (shape, (open, close)) = match rng.below(6) {
-                    0 => (rng.pick(SPACED), rng.pick(&WRAPS[..4])),
+                    0 => (rng.pick(SPACED), rng.pick(&WRAPS[..5])),
                     _ => (rng.pick(SHAPES), rng.pick(WRAPS)),
                 };
                 let mut url = String::new();
@@ -509,12 +534,18 @@ fn parts_fail_closed_where_a_credential_may_go_on() {
             &["x <http://h.example/?code=a", " sk-review-secret> y\nz"],
             "x <redacted url>||\nz",
         ),
-        // So does a word that ends in a byte a URL can hold.
+        // So does any word a part ends in, whatever its last byte.
         (&["total 12", "x y"], "total <redacted url>|| y"),
-        // JSON messages and words that end with their part stay.
-        (&[r#"{"input":[]}"#, r#"{"type":"x"}"#], r#"{"input":[]}||{"type":"x"}"#),
-        (&["total 12}", "x"], "total 12}||x"),
+        (&["//sk-review-secret]", "@127.0.0.1/"], "<redacted url>||"),
+        (&["//sk-review-secret\\", "@127.0.0.1/"], "<redacted url>||"),
+        (&["total 12}", "x y"], "total <redacted url>|| y"),
+        (
+            &[r#"{"input":[]}"#, r#"{"type":"x"}"#],
+            r#"{"input"<redacted url>||"type":"x"}"#,
+        ),
+        // A part that ends between words ends nothing.
         (&["see http://h.example/ ", "x"], "see <redacted url> ||x"),
+        (&["a \"b\"", "c"], "a \"b\"||c"),
     ] {
         let parts: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();
         assert_eq!(parted(&parts, scan::HOLD), want.replace("||", HEADER), "{parts:?}");
@@ -530,7 +561,7 @@ fn parts_fail_closed_where_a_credential_may_go_on() {
 #[test]
 fn copying_in_pieces_equals_redacting_whole() {
     const HEADER: &str = "\n\ntimestamp: t\nevent: x\n";
-    let cases = std::env::var("CK_REDACT_CASES").map_or(48, |n| n.parse().unwrap());
+    let cases = std::env::var("CK_REDACT_CASES").map_or(200, |n| n.parse().unwrap());
     let mut rng = Rng(0x5eed_c0de_2026_1116);
     for case in 0..cases {
         let text = generated(&mut rng);
@@ -561,7 +592,15 @@ fn copying_in_pieces_equals_redacting_whole() {
                 !leaks(&parts),
                 "case {case}: {text:?} parted at {cut} printed {parts:?}"
             );
-            if cut == 0 || scan::stop(bytes_text[cut - 1]) {
+            // A byte ends a word where no odd run of `\` escapes it.
+            let escaped = bytes_text[..cut.saturating_sub(1)]
+                .iter()
+                .rev()
+                .take_while(|b| **b == b'\\')
+                .count()
+                % 2
+                == 1;
+            if cut == 0 || (scan::stop(bytes_text[cut - 1]) && !escaped) {
                 assert_eq!(
                     parts.replacen(HEADER, "", 1),
                     whole,

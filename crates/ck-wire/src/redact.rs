@@ -50,13 +50,15 @@ pub fn urls_in(text: &str) -> Cow<'_, str> {
 }
 
 /// `text` (any bytes) redacted word by word, for errors, captures and logs (owner ruling
-/// Settled 60, 2026-11-16). A word is the bytes between whitespace and `"`. A word prints
+/// Settled 60, 2026-11-16). A word is the bytes between whitespace and `"`; a byte after
+/// a `\` belongs to the word, so an escaped quote (`\"`) never ends one. A word prints
 /// as [`UNPRINTABLE`] whole when it holds `://`, an `@`, a `?` or a `#`, or a scheme (a
 /// letter, then letters, digits, `+`, `-` or `.`) and `:` with a byte after them
 /// (`https:key`, `example.com:443`), and when it is longer than 1 MiB. Such
-/// a word may be part of a quoted value with spaces in it, so when it follows a `"` and
-/// ends at whitespace, the text up to the next `"` is dropped; when it holds `'`, a
-/// backtick or `<`, the text up to the next `"` or line break. No URL structure is
+/// a word may be part of a quoted value with spaces in it, so when it is inside a `"`
+/// string or follows a `"`, and ends at whitespace, the text up to the next unescaped `"`
+/// is dropped; when it holds `'`, a backtick, `<` or an escaped `"`, the text up to the
+/// next unescaped `"` or line break. No URL structure is
 /// parsed, so an e-mail address, `user@host`, `mailto:…`, `name:port` and a word such as
 /// `what?` or `C#` print as the placeholder too.
 pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
@@ -89,9 +91,9 @@ pub fn write(text: &[u8], out: &mut dyn std::io::Write) -> std::io::Result<()> {
 /// Redacts a text that reaches a log in pieces with other text between them, such as
 /// the messages of a WebSocket timeline between their event headers. The pieces are
 /// redacted as one text, as [`copy`] redacts it, except at each [`Pieces::cut`]: the
-/// next piece may go on with the word a piece ends in, so that word prints as
-/// [`UNPRINTABLE`] when it is suspect or its last byte can be part of a URL, and the
-/// next piece is dropped up to its end. The text between pieces is redacted on its own,
+/// next piece may go on with the word a piece ends in, whatever its last byte, so that
+/// word prints as [`UNPRINTABLE`] and the next piece is dropped up to the end of its
+/// first word. The text between pieces is redacted on its own,
 /// with [`write`].
 pub struct Pieces {
     words: scan::Words,

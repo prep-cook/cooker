@@ -48,31 +48,39 @@ pub(super) fn write(text: &[u8], out: &mut dyn Write, hold: usize) -> io::Result
     out.write_all(&written)
 }
 
-/// Text split into words at whitespace and `"`, each held until its end. A [`suspect`]
-/// word, and a word longer than `hold`, prints as [`UNPRINTABLE`]. Such a word may start
-/// a quoted value with spaces in it (`"callback?code=a key"`, `<https://h/?q=a key>`).
-/// When the word follows a `"`, with or without whitespace between, and ends at
-/// whitespace, the text is dropped up to the next `"`, line breaks included. When it holds `'`, a backtick or
-/// `<`, and ends at whitespace other than a line break, the text is dropped up to the
-/// next `"` or line break.
+/// Text split into words at whitespace and `"`, each held until its end. A `\` makes
+/// the byte after it part of the word, so an escaped quote or space (`\"`) never ends
+/// one, across reads and cuts too. A [`suspect`] word, and a word longer than `hold`,
+/// prints as [`UNPRINTABLE`]. Such a word may start a quoted value with spaces in it
+/// (`"callback?code=a key"`, `<https://h/?q=a key>`). When the word is inside a `"`
+/// string or follows a `"`, and ends at whitespace, the text is dropped up to the next
+/// unescaped `"`, line breaks included. When it holds `'`, a backtick, `<` or an escaped
+/// `"`, and ends at
+/// whitespace other than a line break, the text is dropped up to the next unescaped `"`
+/// or line break.
 pub(super) struct Words {
     word: Vec<u8>,
     state: State,
     /// The word follows a `"`, with or without whitespace between.
     quoted: bool,
-    /// The word, its dropped part included, holds `'`, a backtick or `<`.
+    /// An odd number of unescaped `"` came before the word: it is inside a string.
+    string: bool,
+    /// The word, its dropped part included, holds `'`, a backtick, `<` or an escaped `"`.
     opens: bool,
+    /// The last byte read is a `\` that escapes the next one.
+    escaped: bool,
     hold: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Word,
-    /// The word passed the hold limit: its placeholder is written and the rest dropped.
+    /// The word passed the hold limit or a cut: its placeholder is written and the rest
+    /// dropped.
     Long,
-    /// Dropped up to the next `"`.
+    /// Dropped up to the next unescaped `"`.
     Quote,
-    /// Dropped up to the next `"` or line break.
+    /// Dropped up to the next unescaped `"` or line break.
     Line,
 }
 
@@ -82,7 +90,9 @@ impl Words {
             word: Vec::new(),
             state: State::Word,
             quoted: false,
+            string: false,
             opens: false,
+            escaped: false,
             hold,
         }
     }
@@ -95,13 +105,13 @@ impl Words {
                 _ => b"",
             };
             if !ends.is_empty() {
-                let Some(n) = bytes.iter().position(|b| ends.contains(b)) else {
+                let Some(n) = self.find(bytes, |b| ends.contains(&b)) else {
                     return;
                 };
                 self.state = State::Word;
                 bytes = &bytes[n..];
             }
-            match bytes.iter().position(|b| stop(*b)) {
+            match self.find(bytes, stop) {
                 Some(n) => {
                     self.extend(&bytes[..n], out);
                     self.end(Some(bytes[n]), out);
@@ -115,8 +125,25 @@ impl Words {
         }
     }
 
+    /// The first byte of `bytes` that `end` accepts and no `\` escapes. The escape state
+    /// goes on past the bytes it passes.
+    fn find(&mut self, bytes: &[u8], end: impl Fn(u8) -> bool) -> Option<usize> {
+        for (i, &b) in bytes.iter().enumerate() {
+            if std::mem::take(&mut self.escaped) {
+                continue;
+            }
+            if b == b'\\' {
+                self.escaped = true;
+            } else if end(b) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     fn extend(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
-        self.opens |= bytes.iter().any(|b| matches!(b, b'\'' | b'`' | b'<'));
+        // A `"` inside a word is escaped.
+        self.opens |= bytes.iter().any(|b| matches!(b, b'\'' | b'`' | b'<' | b'"'));
         if self.state == State::Long || bytes.is_empty() {
             return;
         }
@@ -139,7 +166,7 @@ impl Words {
             out.extend_from_slice(UNPRINTABLE.as_bytes());
         }
         let empty = self.word.is_empty() && !long;
-        let quoted = self.quoted;
+        let quoted = self.quoted || self.string;
         let opens = std::mem::take(&mut self.opens);
         self.word.clear();
         self.state = State::Word;
@@ -151,7 +178,10 @@ impl Words {
         match stop {
             Some(b) if redacted && quoted && b != b'"' => self.state = State::Quote,
             Some(b) if redacted && opens && !matches!(b, b'"' | b'\n') => self.state = State::Line,
-            Some(b) => out.push(b),
+            Some(b) => {
+                self.string ^= b == b'"';
+                out.push(b);
+            }
             None => {}
         }
     }
@@ -163,21 +193,16 @@ impl Words {
     }
 
     /// Ends a piece of a text whose pieces reach the log with other text between them
-    /// ([`super::Pieces`]). The next piece may go on with the word this one ends in, so a
-    /// word that is suspect or whose last byte can be part of a URL prints as the
-    /// placeholder, and the next piece is dropped up to that word's end. Any other word
-    /// ends with the piece.
+    /// ([`super::Pieces`]). The next piece may go on with the word this one ends in,
+    /// whatever its last byte, so that word prints as the placeholder and the next piece
+    /// is dropped up to the end of its first word.
     pub(super) fn cut(&mut self, out: &mut Vec<u8>) {
         if self.state != State::Word || self.word.is_empty() {
             return;
         }
-        if suspect(&self.word) || self.word.last().is_some_and(|b| url_byte(*b)) {
-            out.extend_from_slice(UNPRINTABLE.as_bytes());
-            self.state = State::Long;
-        } else {
-            out.extend_from_slice(&self.word);
-        }
+        out.extend_from_slice(UNPRINTABLE.as_bytes());
         self.word.clear();
+        self.state = State::Long;
     }
 }
 
@@ -205,10 +230,4 @@ fn suspect(word: &[u8]) -> bool {
                     .any(|j| word[j].is_ascii_alphabetic() && (j == start || matches!(word[j - 1], b'+' | b'-' | b'.')))
             }
         })
-}
-
-/// Whether `b` can be part of a URL: unreserved, `%`, the delimiters a userinfo, path,
-/// query or fragment hold, or non-ASCII text.
-fn url_byte(b: u8) -> bool {
-    b >= 0x80 || b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=%:@/?#".contains(&b)
 }

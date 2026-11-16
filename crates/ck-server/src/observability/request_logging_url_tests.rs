@@ -277,6 +277,9 @@ fn urls_split_across_timeline_messages_are_redacted() {
         "x <http://h.example/?code=a QXKEY> y",
         "{\"u\":\"x//user:QXKEY@h.example\"}",
         "callback?code=QXKEY#QXKEY",
+        "//QXKEY]@127.0.0.1/",
+        "//QXKEY\\@127.0.0.1/",
+        r#"{"url":"http://127.0.0.1/?code=a\"QXKEY"}"#,
     ];
     type Event = fn(&mut super::Section, &std::path::Path, &[u8], &[u8]);
     let surfaces: [Event; 2] = [super::upstream_timeline, super::downstream_timeline];
@@ -303,7 +306,7 @@ fn urls_split_across_timeline_messages_are_redacted() {
     // The last message has no next one to go on into.
     for (messages, want) in [
         (["wss://user:", "APIKEY@host/"], "t: 1\n<redacted url>\n\nt: 2\n"),
-        (["{}", "done"], "t: 1\n{}\n\nt: 2\ndone"),
+        (["{}", "a b"], "t: 1\n<redacted url>\n\nt: 2\n b"),
     ] {
         let mut section = super::Section::framed("timeline");
         super::upstream_timeline(&mut section, &dir, b"t: 1\n", messages[0].as_bytes());
