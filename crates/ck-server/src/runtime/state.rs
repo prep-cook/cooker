@@ -102,8 +102,6 @@ pub struct Runtime {
     pool_offsets: Mutex<HashMap<String, usize>>,
     /// Usage records for `GET /observability/usage/queue` (management configures it).
     usage: Arc<crate::observability::usage::UsageQueue>,
-    /// Video jobs whose usage a record already charged (E-Q13).
-    charged_jobs: crate::observability::usage_record::ChargedJobs,
     /// `--local-model`: embedded model catalogs only, no remote catalog refresh.
     local_model: std::sync::atomic::AtomicBool,
     /// Set by test runtime fixtures: executor calls get credentials that
@@ -223,7 +221,6 @@ impl Runtime {
             oauth_sink: RwLock::default(),
             pool_offsets: Mutex::default(),
             usage: Arc::default(),
-            charged_jobs: Default::default(),
             local_model: Default::default(),
             deny_external: Default::default(),
             refresh_done: tokio::sync::watch::Sender::new(()),
@@ -259,11 +256,6 @@ impl Runtime {
     /// `queuedUsageDetail` per upstream request when `accepts()` (additive API).
     pub fn usage_queue(&self) -> &crate::observability::usage::UsageQueue {
         &self.usage
-    }
-
-    /// The video jobs whose usage was already charged.
-    pub(crate) fn charged_jobs(&self) -> &crate::observability::usage_record::ChargedJobs {
-        &self.charged_jobs
     }
 
     /// Records `--local-model` (Go `modelCatalogUpdaterPlan`'s `localModel`): remote

@@ -241,27 +241,24 @@ pub struct ResponseFacts {
     pub service_tier: Option<String>,
 }
 
-/// The most scopes one attempt accounts. A codec opens one per upstream response, tool model or
-/// video job it reports, so a real attempt stays far below this.
-pub const MAX_SCOPES: usize = 64;
-
 /// One attempt's usage by scope (E-Q13): the attempt's own, and one per upstream response, tool
 /// model or video job a codec reported apart from it (`scope` beside `usage`, such as
 /// `tool:<model>` or `job:<id>`). A snapshot replaces only its own scope's; scopes are never
-/// summed or merged.
+/// summed or merged. Every published scope is kept: each needs its own usage record in the
+/// attempt's stream, so the stream's storage limit bounds the map, and no reported usage is
+/// dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Usage {
     /// `(scope, last snapshot)` in first-reported order; `None` is the attempt's own scope.
     scopes: Vec<(Option<String>, CanonicalUsage)>,
+    /// Each scope's slot in `scopes`.
+    slots: std::collections::HashMap<Option<String>, usize>,
 }
 
 impl Usage {
     /// The attempt's own last snapshot.
     pub fn attempt(&self) -> Option<&CanonicalUsage> {
-        self.scopes
-            .iter()
-            .find(|(scope, _)| scope.is_none())
-            .map(|(_, usage)| usage)
+        self.slots.get(&None).map(|&slot| &self.scopes[slot].1)
     }
 
     /// The last snapshot of every named scope, in first-reported order.
@@ -271,17 +268,14 @@ impl Usage {
             .filter_map(|(scope, usage)| scope.as_deref().map(|scope| (scope, usage)))
     }
 
-    /// Replaces `scope`'s snapshot, or opens the scope while fewer than [`MAX_SCOPES`] are open.
+    /// Replaces `scope`'s snapshot, or opens the scope.
     pub(crate) fn replace(&mut self, scope: Option<String>, usage: CanonicalUsage) {
-        if let Some(slot) = self.scopes.iter_mut().find(|(open, _)| *open == scope) {
-            slot.1 = usage;
-        } else if self.scopes.len() < MAX_SCOPES {
-            self.scopes.push((scope, usage));
-        } else {
-            tracing::warn!(
-                scopes = MAX_SCOPES,
-                "usage scope limit reached; a further scope is not accounted"
-            );
+        match self.slots.get(&scope) {
+            Some(&slot) => self.scopes[slot].1 = usage,
+            None => {
+                self.slots.insert(scope.clone(), self.scopes.len());
+                self.scopes.push((scope, usage));
+            }
         }
     }
 }

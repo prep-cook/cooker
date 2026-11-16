@@ -2532,13 +2532,9 @@ impl Tracker {
         if queue.accepts() {
             queue.enqueue(queued(&record, client));
         }
-        // One record per named scope beside the attempt's (E-Q13). A video job's is charged by
-        // the first attempt that reports it, whichever poll that is; later polls record none.
+        // One record per named scope beside the attempt's (E-Q13). A video job's scope is published
+        // only by the poll its job table charged (`ck_exec` `VideoJobs`), so it is recorded as is.
         for (scope, detail) in std::mem::take(&mut self.scoped) {
-            let job = scope.strip_prefix("job:");
-            if job.is_some_and(|job| !rt.charged_jobs().claim(&record.provider, job)) {
-                continue;
-            }
             let scoped = Record {
                 detail,
                 usage_scope: scope,
@@ -2550,28 +2546,6 @@ impl Tracker {
             }
         }
         warn_model_substitution(&record, &reported.upstream_model, &self.auth_id);
-    }
-}
-
-/// How long a charged job is remembered: well past the binding TTL a client polls within.
-const CHARGED_JOB_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
-
-/// The video jobs whose usage a record already charged, by provider and job id (E-Q13). The claim
-/// is atomic, so concurrent polls of one job charge it once.
-// ponytail: process memory, so a poll after a restart can charge a job again. A durable job ledger
-// (F06-1) lifts this; its store awaits an owner decision.
-#[derive(Default)]
-pub(crate) struct ChargedJobs {
-    jobs: std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>,
-}
-
-impl ChargedJobs {
-    /// Marks `job` of `provider` charged: true only for the first claim within [`CHARGED_JOB_TTL`].
-    pub(crate) fn claim(&self, provider: &str, job: &str) -> bool {
-        let now = std::time::Instant::now();
-        let mut jobs = self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        jobs.retain(|_, at| now.saturating_duration_since(*at) < CHARGED_JOB_TTL);
-        jobs.insert((provider.to_owned(), job.to_owned()), now).is_none()
     }
 }
 
@@ -3027,10 +3001,11 @@ mod tests {
     }
 
     /// One record per usage scope (E-Q13): the attempt's, and one per tool model, upstream
-    /// response or video job beside it. A snapshot replaces only its own scope's, and a job is
-    /// charged by the first poll that reports it, never by a later one.
+    /// response or video job beside it. A snapshot replaces only its own scope's, and every
+    /// published scope is recorded: whether a job's report is its charge is the executor's job
+    /// table's decision, made before the scope is published.
     #[test]
-    fn usage_is_recorded_once_per_scope_and_a_job_once_however_often_polled() {
+    fn usage_is_recorded_once_per_scope() {
         // (label, each attempt's snapshots in stream order as (scope, input tokens), expected
         // records as (usage_scope, input tokens)).
         type Case = (
@@ -3055,27 +3030,21 @@ mod tests {
                 vec![("", Some(3)), ("tool:a", Some(4))],
             ),
             (
-                "ten polls charge once",
-                vec![vec![(Some("job:vid_1"), 7)]; 10],
-                std::iter::once(("", None))
-                    .chain(std::iter::once(("job:vid_1", Some(7))))
-                    .chain(std::iter::repeat_n(("", None), 9))
-                    .collect(),
+                "a published job scope is its own record and the poll's has no usage",
+                vec![vec![(Some("job:vid_1"), 7)], vec![]],
+                vec![("", None), ("job:vid_1", Some(7)), ("", None)],
             ),
             (
-                "each job is charged once",
+                "65 response scopes and the attempt's are all recorded",
                 vec![
-                    vec![(Some("job:a"), 1)],
-                    vec![(Some("job:b"), 2)],
-                    vec![(Some("job:a"), 1)],
+                    (0..=64)
+                        .map(|n| (Some(&*format!("response:{n}").leak()), n + 1))
+                        .chain(std::iter::once((None, 1000)))
+                        .collect(),
                 ],
-                vec![
-                    ("", None),
-                    ("job:a", Some(1)),
-                    ("", None),
-                    ("job:b", Some(2)),
-                    ("", None),
-                ],
+                std::iter::once(("", Some(1000)))
+                    .chain((0..=64).map(|n| (&*format!("response:{n}").leak(), Some(n + 1))))
+                    .collect(),
             ),
         ];
         for (label, attempts, expected) in cases {

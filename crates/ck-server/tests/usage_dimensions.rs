@@ -335,13 +335,14 @@ fn snapshots<'a>(rows: &'a [(Option<&'a str>, u64)]) -> impl FnOnce(&mut Writer,
 }
 
 /// Usage is read per scope (E-Q13): a snapshot replaces only its own scope's, scopes are never
-/// summed, the attempt's own scope stays apart from the named ones, and the scope map is bounded.
+/// summed, the attempt's own scope stays apart from the named ones, and no published scope is
+/// dropped, however many the stream holds.
 #[tokio::test]
 async fn usage_is_read_per_scope() {
-    let many: Vec<(Option<String>, u64)> = (0..=usage_snapshot::MAX_SCOPES as u64)
-        .map(|n| (Some(format!("tool:m{n}")), n))
-        .collect();
-    let many: Vec<(Option<&str>, u64)> = many.iter().map(|(s, n)| (s.as_deref(), *n)).collect();
+    // 65 upstream responses, then the attempt's own usage.
+    let names: Vec<String> = (0..=64).map(|n| format!("response:{n}")).collect();
+    let mut many: Vec<(Option<&str>, u64)> = names.iter().zip(1..).map(|(s, n)| (Some(s.as_str()), n)).collect();
+    many.push((None, 1000));
     // (label, snapshots in stream order, expected attempt input, expected named scopes)
     type Case<'a> = (&'a str, Vec<(Option<&'a str>, u64)>, Option<u64>, Vec<(String, u64)>);
     let cases: Vec<Case> = vec![
@@ -371,12 +372,10 @@ async fn usage_is_read_per_scope() {
             vec![("job:v".into(), 7)],
         ),
         (
-            "at most MAX_SCOPES scopes",
+            "every published scope is kept",
             many,
-            None,
-            (0..usage_snapshot::MAX_SCOPES as u64)
-                .map(|n| (format!("tool:m{n}"), n))
-                .collect(),
+            Some(1000),
+            names.iter().cloned().zip(1..).collect(),
         ),
     ];
     for (label, rows, attempt, named) in cases {
@@ -444,6 +443,7 @@ data: {"type":"response.completed","response":{"created_at":1,"usage":{"input_to
             ck_translate::video::Phase::Job,
             Some("vid_1"),
             LIMIT,
+            Box::new(FirstReport),
         )
         .unwrap();
         ingest(&mut ingress, writer, poll);
@@ -458,4 +458,15 @@ data: {"type":"response.completed","response":{"created_at":1,"usage":{"input_to
         scoped,
         vec![("job:vid_1".to_owned(), vec![("cost_in_usd_ticks", Dimension::Count(7))])]
     );
+}
+
+/// A job table for which every report is the job's first.
+struct FirstReport;
+
+impl ck_translate::video::Ledger for FirstReport {
+    fn accepted(&mut self, _: &str) {}
+
+    fn charge(&mut self, _: &str) -> bool {
+        true
+    }
 }

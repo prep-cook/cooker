@@ -46,13 +46,15 @@ impl Provider {
 }
 
 /// One client request: its operation, body, and the job a non-create video action names.
-/// `claimed` is the operation the request view states when it differs from the body's.
+/// `claimed` is the operation the request view states when it differs from the body's. A poll's
+/// job was `created` through the same executor first, unless the poll is of a foreign job.
 #[derive(Clone, Copy)]
 struct Ask {
     op: Media,
     body: &'static str,
     job: Option<&'static str>,
     claimed: Option<Media>,
+    created: bool,
 }
 
 const fn ask(op: Media, body: &'static str) -> Ask {
@@ -61,6 +63,7 @@ const fn ask(op: Media, body: &'static str) -> Ask {
         body,
         job: None,
         claimed: None,
+        created: false,
     }
 }
 
@@ -70,6 +73,15 @@ const fn job(op: Media, body: &'static str, job: &'static str) -> Ask {
         body,
         job: Some(job),
         claimed: None,
+        created: true,
+    }
+}
+
+/// A poll of a job this executor never created.
+const fn foreign(op: Media, job: &'static str) -> Ask {
+    Ask {
+        created: false,
+        ..self::job(op, "", job)
     }
 }
 
@@ -176,6 +188,9 @@ async fn run_as(
         }
         Provider::Xai => {
             let xai = XaiExecutor::with_client(wreq::Client::new());
+            if let (Media::VideoRetrieve, Some(job), true) = (ask.op, ask.job, ask.created) {
+                create_job(&xai, streams, job).await;
+            }
             run_on(&xai, streams, exchange, held, op, client_only).await
         }
     }
@@ -216,6 +231,19 @@ async fn run_on<E: Execute>(
     let outcome = started.producer.await.expect("the producer does not panic");
     let published = streams.read_to_end(id).await;
     Ok((outcome, records(&published.records), published.terminal, started.stream))
+}
+
+/// Creates `job` through `xai` as a client does: a create the upstream answers with the job.
+async fn create_job(xai: &XaiExecutor, streams: &Streams, job: &str) {
+    let upstream = StreamUpstream::start([Reply::json(json!({"request_id": job}).to_string())]).await;
+    let exchange = exchange(Provider::Xai, &upstream, "grok-imagine-video");
+    let create = ask(Media::VideoCreate, VIDEO);
+    let mut held = decoded(streams, create);
+    let operation = Operation::Media(Media::VideoCreate);
+    let (outcome, ..) = run_on(xai, streams, &exchange, &mut held, operation, false)
+        .await
+        .unwrap();
+    outcome.unwrap();
 }
 
 /// Each record as its event name and data.
@@ -860,12 +888,12 @@ async fn media_failures_publish_no_result() {
             Some((FailureScope::Request, true)),
         ),
         (
-            "an unknown video job is refused with an empty stream",
+            "a job this process never created is refused before anything is sent",
             Provider::Xai,
             "grok-imagine-video",
-            job(Media::VideoRetrieve, "", "vid_404"),
+            foreign(Media::VideoRetrieve, "vid_404"),
             Reply::status(404, "application/json", r#"{"error":"not found"}"#),
-            Some((FailureScope::Request, true)),
+            Some((FailureScope::Request, false)),
         ),
         (
             "a cut image body publishes no image",
@@ -907,6 +935,166 @@ async fn media_failures_publish_no_result() {
                 assert_ne!(terminal, Some(Terminal::Done), "{name}");
             }
         }
-        assert_eq!(upstream.requests(), 1, "{name}");
+        // A poll of a job never created here is refused before it is sent.
+        let foreign = ask.job.is_some() && !ask.created;
+        assert_eq!(upstream.requests(), usize::from(!foreign), "{name}");
+    }
+}
+
+/// The bodies a buffered video route reports to its usage record.
+#[derive(Default)]
+struct Reported(std::sync::Mutex<Vec<Value>>);
+
+impl ck_core::exec::UsageObserver for Reported {
+    fn response_body(&self, _: ck_core::format::Format, body: &[u8]) {
+        self.0.lock().unwrap().push(serde_json::from_slice(body).unwrap());
+    }
+
+    fn response_line(&self, _: ck_core::format::Format, _: &[u8]) {}
+
+    fn request(&self, _: ck_core::format::Format, _: &[u8]) {}
+}
+
+/// The route a video request takes through the xAI executor.
+#[derive(Clone, Copy, Debug)]
+enum Route {
+    /// `XaiExecutor::videos`: the whole body, reported to the usage record.
+    Buffered,
+    /// The execution contract: canonical records through the video codec.
+    Contract,
+}
+
+/// One video request through `route`: a create answered with `job` when `body` is `None`, else a
+/// poll of `job` answered with `body`. Whether its usage was the job's charge.
+async fn video_step(
+    xai: &XaiExecutor,
+    upstream: &StreamUpstream,
+    route: Route,
+    job: &'static str,
+    body: Option<&str>,
+) -> bool {
+    match route {
+        Route::Contract => {
+            let streams = Streams::new();
+            let exchange = exchange(Provider::Xai, upstream, "grok-imagine-video");
+            let ask = match body {
+                None => ask(Media::VideoCreate, VIDEO),
+                Some(_) => foreign(Media::VideoRetrieve, job),
+            };
+            let mut held = decoded(&streams, ask);
+            let operation = Operation::Media(ask.op);
+            let (outcome, records, ..) = run_on(xai, &streams, &exchange, &mut held, operation, false)
+                .await
+                .unwrap();
+            outcome.unwrap_or_else(|e| panic!("{route:?} {job}: {e:?}"));
+            usages(&records)
+                .iter()
+                .any(|record| record["scope"] == format!("job:{job}"))
+        }
+        Route::Buffered => {
+            let (path, payload) = match body {
+                None => ("/v1/videos/generations".to_owned(), VIDEO.to_owned()),
+                Some(_) => (format!("/v1/videos/{job}"), json!({"request_id": job}).to_string()),
+            };
+            let reported = std::sync::Arc::new(Reported::default());
+            let payload = bytes::Bytes::from(payload);
+            let request = ck_core::exec::ExecRequest {
+                operation: ck_core::exec::Operation::Generate,
+                source_format: ck_core::format::Format::OpenAI,
+                response_format: ck_core::format::Format::OpenAI,
+                model: "grok-imagine-video".into(),
+                requested_model: "client-video".into(),
+                body: payload.clone(),
+                original_body: payload,
+                stream: false,
+                alt: None,
+                session: None,
+                execution_session: None,
+                derived_session: None,
+                request_path: path.clone(),
+                headers: http::HeaderMap::new(),
+                caller: ck_core::exec::Caller {
+                    principal: "sk-client-test".into(),
+                    source: "authorization",
+                    provider: "config-inline".into(),
+                },
+                resolved_model: None,
+                usage: ck_core::exec::UsageSink::new(reported.clone()),
+            };
+            let credential = credential("xai", &upstream.url(), "sk-up");
+            xai.videos(&credential, request, &path, &ck_core::config::Config::default())
+                .await
+                .unwrap_or_else(|e| panic!("{route:?} {job}: {e:?}"));
+            let bodies = reported.0.lock().unwrap();
+            bodies.iter().any(|body| body.get("usage").is_some())
+        }
+    }
+}
+
+/// A video job's usage is charged once, at the first answer that reports it, whichever route
+/// carries its create and its polls (E-Q13): both settle against the executor's one job table.
+#[tokio::test]
+async fn video_job_usage_is_charged_once_whichever_route_polls_it() {
+    use Route::{Buffered, Contract};
+    let done = r#"{"status":"done","usage":{"cost_in_usd_ticks":7}}"#;
+    let pending = r#"{"status":"pending","usage":{"cost_in_usd_ticks":7}}"#;
+    // (label, steps as (route, job, poll answer; `None` for the job's create), charged per step)
+    type Case = (
+        &'static str,
+        Vec<(Route, &'static str, Option<&'static str>)>,
+        Vec<bool>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "ten polls charge once",
+            std::iter::once((Contract, "vid_1", None))
+                .chain(std::iter::repeat_n((Contract, "vid_1", Some(done)), 10))
+                .collect(),
+            std::iter::once(false)
+                .chain(std::iter::once(true))
+                .chain(std::iter::repeat_n(false, 9))
+                .collect(),
+        ),
+        (
+            "a buffered poll's charge holds for the contract's polls",
+            vec![
+                (Buffered, "vid_2", None),
+                (Buffered, "vid_2", Some(done)),
+                (Contract, "vid_2", Some(done)),
+                (Contract, "vid_2", Some(done)),
+            ],
+            vec![false, true, false, false],
+        ),
+        (
+            "a contract poll's charge holds for the buffered route",
+            vec![
+                (Contract, "vid_3", None),
+                (Contract, "vid_3", Some(done)),
+                (Buffered, "vid_3", Some(done)),
+            ],
+            vec![false, true, false],
+        ),
+        (
+            "a pending report is the charge and the finished one is not",
+            vec![
+                (Contract, "vid_4", None),
+                (Contract, "vid_4", Some(pending)),
+                (Contract, "vid_4", Some(done)),
+            ],
+            vec![false, true, false],
+        ),
+    ];
+    for (label, steps, expected) in cases {
+        let replies = steps.iter().map(|(_, job, body)| match body {
+            None => Reply::json(json!({"request_id": job}).to_string()),
+            Some(body) => Reply::json(*body),
+        });
+        let upstream = StreamUpstream::start(replies.collect::<Vec<_>>()).await;
+        let xai = XaiExecutor::with_client(wreq::Client::new());
+        let mut charged = Vec::new();
+        for (route, job, body) in steps {
+            charged.push(video_step(&xai, &upstream, route, job, body).await);
+        }
+        assert_eq!(charged, expected, "{label}");
     }
 }

@@ -26,7 +26,7 @@ use crate::{
         source::Source,
     },
 };
-pub use response::Ingress;
+pub use response::{Ingress, Ledger};
 use table::{Shape, WIRE_STATUS, known, shape};
 use wire::write_fraction;
 pub use wire::{check_request, encode};
@@ -99,9 +99,8 @@ pub struct Decoded {
     pub operation: Document,
     /// What this body reports, whatever the job's status: xAI's `usage` has no status condition
     /// (docs.x.ai `rest-api-reference/inference/videos.md`, GET `/v1/videos/{request_id}`), so a
-    /// pending poll may carry it. E-Q13: a job's usage is charged at the first poll that reports
-    /// it and never again, so a decoder told the job was [`Decoder::usage_charged`] returns `None`.
-    /// Absent, null or empty `usage` is `None`; nothing is invented.
+    /// pending poll may carry it. Whether a report is the job's charge is the job table's
+    /// decision ([`Ledger`]). Absent, null or empty `usage` is `None`; nothing is invented.
     pub usage: Option<Usage>,
 }
 
@@ -125,7 +124,6 @@ pub struct Decoder {
     phase: Phase,
     job_id: Option<String>,
     limit: u64,
-    charged: bool,
     failed: bool,
 }
 
@@ -147,16 +145,8 @@ impl Decoder {
             phase,
             job_id: job_id.map(str::to_owned),
             limit,
-            charged: false,
             failed: false,
         })
-    }
-
-    /// The job table's mark that this job's usage was already recorded (E-Q13, E-PLAN §2.6):
-    /// the body is still validated, but its usage is not reported again.
-    pub fn usage_charged(mut self, charged: bool) -> Self {
-        self.charged = charged;
-        self
     }
 
     pub fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
@@ -191,12 +181,11 @@ impl Decoder {
             Document::from_scanned(owner, self.source, self.scanner)?
         };
         let id = self.job_id.as_deref();
-        let reported = if validate(&native, self.phase, id)? {
+        let usage = if validate(&native, self.phase, id)? {
             usage(&native)?
         } else {
             None
         };
-        let usage = reported.filter(|_| !self.charged);
         let (dialect, phase) = (self.dialect, self.phase);
         let mut operation = boundary::mapped(owner, |e| write_operation(&native, dialect, phase, id, e))?;
         provenance::restore_bindings(&mut operation)?;
