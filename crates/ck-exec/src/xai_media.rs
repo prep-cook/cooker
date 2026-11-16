@@ -154,8 +154,10 @@ impl XaiExecutor {
                 // The top-level usage of an image or video body, read as a Responses body's.
                 req.usage.response_body(Format::Codex, &data);
             } else {
-                // The model only: a line that is not a terminal event carries no usage.
-                req.usage.response_line(Format::Codex, &data);
+                // The body without its usage: the model, and a record with no count.
+                let mut quiet = data.to_vec();
+                gj::delete(&mut quiet, "usage");
+                req.usage.response_body(Format::Codex, &quiet);
             }
         }
         Ok(ExecResponse {

@@ -534,7 +534,8 @@ async fn speech_errors_keep_go_scope() {
 
 /// An image or video body reports its top-level usage as a buffered Responses body, so the
 /// server reads its counts and billed units. A body without a billed value in its usage (absent,
-/// null or empty) reports only its model. A video job is charged at the first poll whose usage
+/// null or empty), or a job's repeated report, is reported without its usage, so the record holds
+/// no count. A video job is charged at the first poll whose usage
 /// reports a value, an explicit zero included, and never again (E-Q13), while another job is
 /// charged on its own. A poll of a job the process neither created nor charged, such as one
 /// created before a restart, is refused with a request-scoped 404 before anything is sent. No
@@ -686,8 +687,19 @@ async fn media_usage_is_charged_once_per_response_or_job() {
             }
             (expected, result) => panic!("{row}: expected {expected:?}, got {:?}", result.map(|_| ())),
         };
-        let want: Vec<String> = if charged_now { vec![body.clone()] } else { Vec::new() };
+        // A charged response reports its body as is; any other answered one reports its body
+        // without `usage`, so the record holds no count; a refusal reports nothing.
+        let want: Vec<String> = match expected {
+            Some(true) => vec![body.clone()],
+            Some(false) => {
+                let mut quiet = body.clone().into_bytes();
+                gj::delete(&mut quiet, "usage");
+                vec![String::from_utf8(quiet).unwrap()]
+            }
+            None => Vec::new(),
+        };
         assert_eq!(bodies, want, "{row}");
+        assert_eq!(charged_now, expected == Some(true), "{row}");
     }
 }
 

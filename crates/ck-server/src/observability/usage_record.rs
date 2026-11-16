@@ -74,6 +74,17 @@ pub struct Unreported {
     pub total: bool,
 }
 
+impl Unreported {
+    pub const ALL: Self = Self {
+        input: true,
+        output: true,
+        reasoning: true,
+        cache_read: true,
+        cache_creation: true,
+        total: true,
+    };
+}
+
 impl Detail {
     /// The record of an attempt's canonical usage. Canonical counts are inclusive, cache
     /// reads and writes inside input and reasoning inside output, so the breakdown is Go's
@@ -631,21 +642,12 @@ fn parse_openai_node(node: &Res<'_>) -> Detail {
     d
 }
 
-/// [`parse_openai_node`] of a Responses usage object, which also carries the `responses`
-/// dimension rows. `dimension_members` lists only the Chat rows' members: a Responses stream
-/// accounts its first terminal usage alone, so no later update merges into it.
-fn parse_responses_node(node: &Res<'_>) -> Detail {
-    let mut d = parse_openai_node(node);
-    d.dimensions.extend(native_dimensions("responses", node));
-    d
-}
-
 /// Go `ParseOpenAIUsage`.
 pub fn parse_openai(body: &[u8]) -> Detail {
     parse_usage(body, parse_openai_node)
 }
 
-/// The paths `parse_openai_node` reads each token count from, first present wins.
+/// The paths each token count is read from, first present wins, as `parse_openai_node` reads them.
 const INPUT: &[&str] = &["prompt_tokens", "input_tokens"];
 const OUTPUT: &[&str] = &["completion_tokens", "output_tokens"];
 const REASONING: &[&str] = &[
@@ -663,46 +665,77 @@ const CACHE_CREATION: &[&str] = &[
     "prompt_tokens_details.cache_write_tokens",
 ];
 
-/// The token counts a usage object does not report as numbers. A total it omits is still
-/// reported when its input and output are, as their sum, as the canonical reader derives it.
-fn unreported_counts(node: &Res<'_>) -> Unreported {
-    let absent = |paths: &[&str]| first(node, paths).kind != Kind::Number;
-    let (input, output) = (absent(INPUT), absent(OUTPUT));
-    Unreported {
-        input,
-        output,
-        reasoning: absent(REASONING),
-        cache_read: absent(CACHED),
-        cache_creation: absent(CACHE_CREATION),
-        total: absent(&["total_tokens"]) && (input || output),
-    }
-}
-
-/// A Responses usage object's counts and billed units, every token count it does not report
-/// as a number left unreported rather than zero: an xAI video's `{"cost_in_usd_ticks":…}`, a
-/// Codex terminal's `{"codex_rollout_budget_units":…}` or a partial count. `None` when it
-/// reports neither a count nor a unit.
+/// A Responses usage object's token counts and billed units. A count exists only when the usage
+/// gives it as an integer number; any other count is unreported rather than zero, and never
+/// enters a derived total or the breakdown. A total the usage omits is the sum of its input and
+/// output, as the canonical reader derives it. Without both, the breakdown classifies nothing.
+/// `None` when the usage has no token member and no billed unit.
 fn responses_usage(node: &Res<'_>, tier: String) -> Option<Detail> {
     if !node.is_object() {
         return None;
     }
-    let mut d = parse_responses_node(node);
-    if !has_openai_token_fields(node) && d.dimensions.is_empty() {
+    let count = |paths: &[&str]| {
+        let value = first(node, paths);
+        (value.kind == Kind::Number)
+            .then(|| std::str::from_utf8(value.raw()).ok()?.parse::<i64>().ok())
+            .flatten()
+    };
+    let mut dimensions = native_dimensions("chat", node);
+    dimensions.extend(native_dimensions("responses", node));
+    if !has_openai_token_fields(node) && dimensions.is_empty() {
         return None;
     }
-    d.unreported = unreported_counts(node);
-    if d.unreported.input || d.unreported.output {
-        d.breakdown = Some(unclassified(if d.unreported.total { 0 } else { d.total }));
-    }
-    d.response_service_tier = tier;
-    Some(d)
+    let (input, output, total) = (count(INPUT), count(OUTPUT), count(&["total_tokens"]));
+    let (reasoning, cached, creation) = (count(REASONING), count(CACHED), count(CACHE_CREATION));
+    let breakdown = match (input, output) {
+        (Some(input), Some(output)) => subset(
+            input,
+            cached.unwrap_or(0),
+            creation.unwrap_or(0),
+            output,
+            reasoning.unwrap_or(0),
+            total.unwrap_or(0),
+        ),
+        _ => unclassified(total.unwrap_or(0)),
+    };
+    let ttl = |name: &str| {
+        uint_at(node, &format!("input_tokens_details.cache_write_tokens_details.{name}"))
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+    };
+    Some(Detail {
+        input: input.unwrap_or(0),
+        output: output.unwrap_or(0),
+        reasoning: reasoning.unwrap_or(0),
+        cached: cached.unwrap_or(0),
+        cache_read: cached.unwrap_or(0),
+        cache_creation: creation.unwrap_or(0),
+        cache_creation_30m: ttl("ttl_30m_tokens"),
+        cache_creation_12h: ttl("ttl_12h_tokens"),
+        total: total.unwrap_or(breakdown.total),
+        breakdown: Some(breakdown),
+        response_service_tier: tier,
+        unreported: Unreported {
+            input: input.is_none(),
+            output: output.is_none(),
+            reasoning: reasoning.is_none(),
+            cache_read: cached.is_none(),
+            cache_creation: creation.is_none(),
+            total: total.is_none() && (input.is_none() || output.is_none()),
+        },
+        dimensions,
+        // A Responses stream accounts its first terminal usage alone: no later update merges.
+        dimension_members: reported_members("chat", node),
+        ..Detail::default()
+    })
 }
 
-/// [`parse_openai`] of a buffered Responses body, through [`responses_usage`].
+/// A buffered Responses body's usage through [`responses_usage`]. A body without a usage that
+/// reports a count or unit, such as a pending video job's, records no count.
 fn parse_responses(body: &[u8]) -> Detail {
     let tier = service_tier(body);
     responses_usage(&gj::parse(body).get("usage"), tier.clone()).unwrap_or(Detail {
         response_service_tier: tier,
+        unreported: Unreported::ALL,
         ..Detail::default()
     })
 }
@@ -2979,9 +3012,9 @@ mod tests {
     /// body, reach the record as their own dimensions in their own units: xAI ticks, nano-USD
     /// and tool counts as integers, Codex rollout budget units as the number the upstream wrote.
     /// A token count is recorded only when the usage reports it as a number: an absent, null or
-    /// non-numeric count is left out, whatever else the usage reports, and without both input
-    /// and output the breakdown classifies nothing. A body without usage keeps the legacy record
-    /// of zero counts.
+    /// non-numeric count is left out and never enters a derived total or the breakdown, and
+    /// without both input and output the breakdown classifies nothing. A body without usage, or
+    /// with an empty one, records no count.
     #[test]
     fn responses_billed_units_reach_the_record() {
         let rt = usage_runtime();
@@ -2998,7 +3031,6 @@ mod tests {
         let body = |usage: &str| format!(r#"{{"data":[{{"b64_json":"AAAA"}}],"usage":{usage}}}"#);
         let ticks = serde_json::json!({"cost_in_usd_ticks":200000000});
         let none = serde_json::json!({});
-        let zeros = serde_json::json!({"input_tokens":0,"output_tokens":0,"reasoning_tokens":0,"cached_tokens":0,"cache_read_tokens":0,"cache_creation_tokens":0,"total_tokens":0});
         for (provider, streamed, upstream, dimensions, tokens, literal) in [
             (
                 "xai",
@@ -3034,7 +3066,8 @@ mod tests {
                 none.clone(),
                 "",
             ),
-            ("xai", false, r#"{"status":"pending"}"#.to_owned(), Value::Null, zeros, ""),
+            ("xai", false, r#"{"status":"pending"}"#.to_owned(), Value::Null, none.clone(), ""),
+            ("xai", false, r#"{"status":"pending","usage":{}}"#.to_owned(), Value::Null, none.clone(), ""),
             (
                 "codex",
                 true,
@@ -3069,7 +3102,24 @@ mod tests {
                 serde_json::json!({"input_tokens":4,"output_tokens":1,"total_tokens":5}),
                 "",
             ),
-            // Partial, null and non-numeric token counts: only the numbers are recorded.
+            // Partial, null and non-numeric token counts: only the numbers are recorded, and only
+            // they enter a derived total or the breakdown.
+            (
+                "xai",
+                false,
+                body(r#"{"input_tokens":3,"output_tokens":2,"total_tokens":"999","cost_in_usd_ticks":100}"#),
+                serde_json::json!({"cost_in_usd_ticks":100}),
+                serde_json::json!({"input_tokens":3,"output_tokens":2,"total_tokens":5}),
+                "",
+            ),
+            (
+                "xai",
+                false,
+                body(r#"{"input_tokens":3,"output_tokens":2,"input_tokens_details":{"cached_tokens":"2"},"cost_in_usd_ticks":100}"#),
+                serde_json::json!({"cost_in_usd_ticks":100}),
+                serde_json::json!({"input_tokens":3,"output_tokens":2,"total_tokens":5}),
+                "",
+            ),
             (
                 "xai",
                 false,
@@ -3122,6 +3172,15 @@ mod tests {
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect();
             assert_eq!(Value::Object(counts), tokens, "{upstream}");
+            // The breakdown holds only recorded counts: its total and cache reads are the
+            // record's, or zero when unreported.
+            let breakdown = &record["token_breakdown"];
+            let recorded = |name: &str| tokens.get(name).cloned().unwrap_or(Value::from(0));
+            assert_eq!(
+                (&breakdown["total_tokens"], &breakdown["input"]["cache_read_tokens"]),
+                (&recorded("total_tokens"), &recorded("cache_read_tokens")),
+                "{upstream}"
+            );
             // Without both input and output the breakdown classifies nothing.
             if tokens.get("input_tokens").is_none() || tokens.get("output_tokens").is_none() {
                 let breakdown = &record["token_breakdown"];
