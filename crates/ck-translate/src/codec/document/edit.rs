@@ -166,26 +166,7 @@ impl Document {
         if old == Some((parent, carrier)) {
             return Ok(());
         }
-        if let Some((old_parent, _)) = old {
-            let mut at = self.nodes[old_parent].origins;
-            let mut previous: Option<usize> = None;
-            while let Some(index) = at {
-                let next = self.nodes[index].origin_next;
-                if index == entry {
-                    if let Some(previous) = previous {
-                        self.nodes[previous].origin_next = next;
-                    } else {
-                        self.nodes[old_parent].origins = next;
-                    }
-                    if self.nodes[old_parent].last_origin == Some(entry) {
-                        self.nodes[old_parent].last_origin = previous;
-                    }
-                    break;
-                }
-                previous = Some(index);
-                at = next;
-            }
-        }
+        self.unlink_origin(entry);
         self.nodes[entry].origin = Some((parent, carrier));
         self.nodes[entry].origin_next = None;
         if let Some(last) = self.nodes[parent].last_origin {
@@ -195,6 +176,42 @@ impl Document {
         }
         self.nodes[parent].last_origin = Some(entry);
         Ok(())
+    }
+
+    /// Ends `entry`'s binding, so its former node no longer lists it among its origins. An
+    /// entry removed from its list must be unbound: egress reads a node's origins, not the list.
+    pub fn unbind_origin(&mut self, entry: usize) -> Result<()> {
+        self.check_live()?;
+        self.node(entry)?;
+        self.unlink_origin(entry);
+        self.nodes[entry].origin = None;
+        self.nodes[entry].origin_next = None;
+        Ok(())
+    }
+
+    /// Removes `entry` from the origins list of the node it is bound to, if any.
+    fn unlink_origin(&mut self, entry: usize) {
+        let Some((parent, _)) = self.nodes[entry].origin else {
+            return;
+        };
+        let mut at = self.nodes[parent].origins;
+        let mut previous: Option<usize> = None;
+        while let Some(index) = at {
+            let next = self.nodes[index].origin_next;
+            if index == entry {
+                if let Some(previous) = previous {
+                    self.nodes[previous].origin_next = next;
+                } else {
+                    self.nodes[parent].origins = next;
+                }
+                if self.nodes[parent].last_origin == Some(entry) {
+                    self.nodes[parent].last_origin = previous;
+                }
+                return;
+            }
+            previous = Some(index);
+            at = next;
+        }
     }
 
     pub(crate) fn clone_tree(&mut self, node: usize) -> Result<usize> {

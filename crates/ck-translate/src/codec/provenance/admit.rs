@@ -1,4 +1,5 @@
-//! Per-attempt admission of tagged opaque items (D2-PLAN §2.4; owner ruling Q-C, 2026-11-16).
+//! Per-attempt admission of tagged opaque items (D2-PLAN §2.4). Refusing another account's
+//! compaction item follows owner ruling Q-C; dropping its reasoning awaits ruling D2-6a-1.
 //!
 //! History projection tags every opaque provider member of a stored response, such as a thinking
 //! signature, encrypted reasoning or a compaction item, with the upstream account that produced
@@ -22,8 +23,8 @@ use crate::codec::{
 use ck_stream::Writer;
 
 /// The upstream account that produced a stored response: the credential's provider and auth
-/// index. A replay entry carries it as `producer: {provider, credential}`, plus
-/// `compaction: true` for a compaction item.
+/// index. A replay entry carries it as `producer: {provider, credential}`; a compaction item's
+/// entry also carries `compaction: true`, whatever protocol produced it.
 #[derive(Clone, Copy, Debug)]
 pub struct Producer<'a> {
     pub provider: &'a str,
@@ -54,7 +55,7 @@ pub fn admit(doc: &Document, producer: Producer<'_>) -> Result<Admission> {
         if own(doc, tag, producer)? {
             continue;
         }
-        if doc.member(tag, "compaction")?.is_some() {
+        if compaction(doc, entry)? {
             return Ok(Admission::Refuse);
         }
         admission = Admission::Drop;
@@ -74,7 +75,7 @@ pub fn drop_foreign(owner: &mut Writer, doc: &mut Document, producer: Producer<'
         if let Some(tag) = doc.member(entry, "producer")?
             && !own(doc, tag, producer)?
         {
-            if doc.member(tag, "compaction")?.is_some() {
+            if compaction(doc, entry)? {
                 return Err(Error::Unsupported);
             }
             foreign.push((index, entry))?;
@@ -155,6 +156,7 @@ pub(crate) fn prune(owner: &mut Writer, doc: &mut Document, removed: impl Fn(usi
                 changed |= gone;
             }
             if gone {
+                doc.unbind_origin(entry)?;
                 doc.detach(list, entry)?;
             } else {
                 kept += 1;
@@ -212,6 +214,14 @@ fn replay(doc: &Document) -> Result<Option<usize>> {
         Some(x) => doc.member(x, "replay"),
         None => Ok(None),
     }
+}
+
+/// Whether replay `entry` is a compaction item: its protocol-neutral `compaction` marker.
+pub(crate) fn compaction(doc: &Document, entry: usize) -> Result<bool> {
+    Ok(match doc.member(entry, "compaction")? {
+        Some(marker) => matches!(doc.node(marker)?.value, Value::Bool(true)),
+        None => false,
+    })
 }
 
 fn own(doc: &Document, tag: usize, producer: Producer<'_>) -> Result<bool> {

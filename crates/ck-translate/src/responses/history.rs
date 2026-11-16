@@ -10,7 +10,6 @@
 //! history that passed through X, Y and Z keeps each entry's own tag.
 //!
 //! [`truncate`] drops the history a compaction item replaces.
-use super::request::native;
 use crate::codec::{
     Error, Result,
     document::{Document, Value},
@@ -131,7 +130,7 @@ pub fn truncate(owner: &mut Writer, doc: &mut Document) -> Result<()> {
     let messages = doc.required(doc.root(), "messages")?;
     let mut last = None;
     for message in doc.children(messages)? {
-        if native::typed(doc, native::item_type(doc, message)?, "compaction")? {
+        if compacts(doc, message)? {
             last = Some(message);
         }
     }
@@ -147,6 +146,32 @@ pub fn truncate(owner: &mut Writer, doc: &mut Document) -> Result<()> {
         }
     }
     provenance::admit::prune(owner, doc, |_| false)
+}
+
+/// Whether `message` is a compaction item: a replay entry marked `compaction` is bound to it or
+/// to one of its parts.
+fn compacts(doc: &Document, message: usize) -> Result<bool> {
+    if marked(doc, message)? {
+        return Ok(true);
+    }
+    if let Some(content) = doc.member(message, "content")? {
+        for part in doc.children(content)? {
+            if marked(doc, part)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn marked(doc: &Document, node: usize) -> Result<bool> {
+    let replay = doc.member(doc.required(doc.root(), "x_ck")?, "replay")?;
+    for entry in doc.origins(node)? {
+        if replay.is_some() && doc.node(entry)?.parent == replay && provenance::admit::compaction(doc, entry)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 struct Reduction {
@@ -367,7 +392,9 @@ impl Reduction {
         let mut copies = [(0, 0); 8];
         let mut count = 0;
         if event.string_is(kind, "compaction")? {
-            let data = event.required(item, "encrypted_content")?;
+            // Anthropic's block (`content` and `signature`, §2.7) gets its canonical form with C2;
+            // its replay entry carries the same `compaction` marker.
+            let data = event.member(item, "encrypted_content")?.ok_or(Error::Unsupported)?;
             let index = self.compact_item("assistant", true)?;
             let fragments = self.staging.add(None, Value::Fragments)?;
             self.push_block(index, Part::Encrypted, Some(("responses_encrypted", fragments)))?;

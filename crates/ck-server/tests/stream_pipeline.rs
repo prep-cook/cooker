@@ -767,6 +767,8 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         cooled: &'static [&'static str],
         /// The call is a `responses/compact` request.
         compact: bool,
+        /// Attempts, on either arm, that went ahead without another account's reasoning.
+        withheld: usize,
     }
     let unsupported = || codec::Error::Unsupported;
     let mut rows = vec![
@@ -783,6 +785,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a usage snapshot before an executor error is kept",
@@ -797,6 +800,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a producer error before commitment fails over",
@@ -811,6 +815,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "every candidate refuses",
@@ -825,6 +830,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "an unsupported request skips to the next candidate",
@@ -839,9 +845,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a missing max_tokens skips only that candidate",
+            history: None,
             scripts: [Script::Refence(|| codec::Error::MaxTokensRequired), Script::Answers],
             request: None,
             ends: Ends::Commits { clean: true },
@@ -852,9 +860,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "every candidate lacking max_tokens answers the client with that",
+            history: None,
             scripts: [
                 Script::Refence(|| codec::Error::MaxTokensRequired),
                 Script::Refence(|| codec::Error::MaxTokensRequired),
@@ -868,6 +878,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a schema refusal skips to the next candidate",
@@ -882,6 +893,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "exhausted storage at the fence stops",
@@ -899,6 +911,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a gone stream at the fence stops",
@@ -916,6 +929,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a codec defect at the fence stops",
@@ -930,6 +944,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a cancelled request stops",
@@ -947,6 +962,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a request ended by shutdown stops",
@@ -964,6 +980,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a request ended by exhausted storage stops",
@@ -981,6 +998,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "an executor resource error stops",
@@ -995,6 +1013,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a failure after commitment does not retry",
@@ -1009,6 +1028,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "an old-arm failure fails over to the contract arm",
@@ -1023,6 +1043,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 1,
             cooled: &["a"],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a producer failure ready with the first output does not commit",
@@ -1037,6 +1058,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a client gone before the first byte still accounts the final usage",
@@ -1051,9 +1073,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a compact the destination refuses sends nothing",
+            history: None,
             scripts: [Script::Refence(unsupported), Script::Refence(unsupported)],
             request: None,
             ends: Ends::Status(400),
@@ -1064,34 +1088,71 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: true,
+            withheld: 0,
         },
     ];
-    rows.push(Row {
-        case: "reasoning another account produced is withheld from that attempt only",
-        history: Some((Opaque::Reasoning, "b")),
-        scripts: [Script::Answers, Script::Answers],
-        request: None,
-        ends: Ends::Commits { clean: true },
-        started: &["a"],
-        settled: &[0],
-        failed: &[false],
-        input_tokens: None,
-        old: 0,
-        cooled: &[],
-    });
-    rows.push(Row {
-        case: "a compaction item another account produced skips the candidate on either arm",
-        history: Some((Opaque::Compaction, "b")),
-        scripts: [Script::Old, Script::Answers],
-        request: None,
-        ends: Ends::Status(400),
-        started: &[],
-        settled: &[],
-        failed: &[],
-        input_tokens: None,
-        old: 0,
-        cooled: &[],
-    });
+    rows.extend([
+        Row {
+            case: "reasoning another account produced is withheld from that attempt only",
+            history: Some((Opaque::Reasoning, "b")),
+            scripts: [Script::Answers, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["a"],
+            settled: &[0],
+            failed: &[false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            withheld: 1,
+        },
+        Row {
+            case: "an old-arm attempt is admitted as a contract-arm one",
+            history: Some((Opaque::Reasoning, "b")),
+            scripts: [Script::Old, Script::Answers],
+            request: None,
+            ends: Ends::Status(503),
+            started: &[],
+            settled: &[],
+            failed: &[true],
+            input_tokens: None,
+            old: 1,
+            cooled: &["a"],
+            compact: false,
+            withheld: 1,
+        },
+        Row {
+            case: "a request cancelled before a withheld attempt ends as cancelled",
+            history: Some((Opaque::Reasoning, "b")),
+            scripts: [Script::Answers, Script::Answers],
+            request: Some(Terminal::Cancelled),
+            ends: Ends::Status(499),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            withheld: 0,
+        },
+        Row {
+            case: "a compaction item another account produced skips the candidate on either arm",
+            history: Some((Opaque::Compaction, "b")),
+            scripts: [Script::Old, Script::Answers],
+            request: None,
+            ends: Ends::Status(400),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            withheld: 0,
+        },
+    ]);
     let (upstream, sends) = refusing_upstream().await;
     let usage = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
     for row in rows {
@@ -1208,6 +1269,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             )
             .count();
         assert_eq!(log.matches("missing_setting=").count(), lacking, "{case}: {log}");
+        assert_eq!(
+            log.matches("reasoning from another account withheld").count(),
+            row.withheld,
+            "{case}: {log}"
+        );
         assert!(
             lacking == 0 || log.contains("missing_setting=\"model-catalog default-max-tokens\""),
             "{case}: {log}"

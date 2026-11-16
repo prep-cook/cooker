@@ -10,7 +10,7 @@ use ck_stream::{ScratchLease, Writer};
 mod input;
 mod meta;
 pub use meta::validate as validate_meta;
-pub(super) mod native;
+mod native;
 mod normalize;
 mod reasoning;
 mod validate;

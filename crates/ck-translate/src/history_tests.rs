@@ -50,11 +50,11 @@ impl Rig {
                 let mut i = crate::anthropic::response::Ingress::new(&mut w, id, op, mode, limit).unwrap();
                 feed(&mut i, &mut w);
             }
-            Source::Responses | Source::Compaction => {
+            Source::Responses | Source::Compaction | Source::SignedCompaction => {
                 let mut i = crate::responses::response::Ingress::new(&mut w, id, op, mode, limit).unwrap();
                 feed(&mut i, &mut w);
             }
-            Source::Gemini => {
+            Source::Gemini | Source::GeminiText => {
                 let mut i = crate::gemini::response::Ingress::new(&mut w, id, op, mode, limit).unwrap();
                 feed(&mut i, &mut w);
             }
@@ -117,13 +117,17 @@ enum Source {
     Responses,
     Gemini,
     Chat,
+    /// A Gemini answer whose signature rides on its text part.
+    GeminiText,
     Compaction,
+    /// A compaction whose item is Anthropic's signed block.
+    SignedCompaction,
 }
 
 impl Source {
     fn operation(self) -> Operation {
         match self {
-            Self::Compaction => Operation::Compact,
+            Self::Compaction | Self::SignedCompaction => Operation::Compact,
             _ => Operation::Generate,
         }
     }
@@ -165,9 +169,20 @@ impl Source {
                 ]}, "finish_reason": "tool_calls"}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
             }),
+            Self::GeminiText => json!({
+                "candidates": [{"content": {"role": "model", "parts": [
+                    {"text": "hi", "thoughtSignature": "TSIG=="}
+                ]}, "finishReason": "STOP"}],
+                "modelVersion": "gemini"
+            }),
             Self::Compaction => json!({
                 "id": "resp_c", "object": "response.compaction",
                 "output": [{"id": "cmp_1", "type": "compaction", "encrypted_content": "CMP=="}],
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+            }),
+            Self::SignedCompaction => json!({
+                "id": "resp_c", "object": "response.compaction",
+                "output": [{"id": "cmp_1", "type": "compaction", "content": "sum", "signature": "SIG=="}],
                 "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
             }),
         };
@@ -202,6 +217,10 @@ const CODEX_B: Producer<'static> = Producer {
 const GEMINI_A: Producer<'static> = Producer {
     provider: "gemini",
     credential: "eeee",
+};
+const GEMINI_B: Producer<'static> = Producer {
+    provider: "gemini",
+    credential: "ffff",
 };
 
 /// The upstream body for the candidate `attempt` after admission, or the admission refusal.
@@ -347,7 +366,7 @@ fn provider_members_reach_only_their_producer() {
         present: &'static [&'static str],
         absent: &'static [&'static str],
     }
-    const ALL: &[&str] = &["SIG/abc+==", "REDACTED==", "GSIG==", "G2==", "ENC==", "CMP=="];
+    const ALL: &[&str] = &["SIG/abc+==", "REDACTED==", "GSIG==", "G2==", "TSIG==", "ENC==", "CMP=="];
     let rows = [
         Row {
             case: "another Claude account",
@@ -385,6 +404,24 @@ fn provider_members_reach_only_their_producer() {
             // The call its signature rode on stays.
             present: &["\"hi\"", "\"name\":\"f\""],
             absent: &["GSIG==", "G2==", "think"],
+        },
+        Row {
+            case: "another Gemini account: thought and call signatures",
+            turns: &[(Source::Gemini, GEMINI_A)],
+            attempt: GEMINI_B,
+            to: To::Gemini,
+            admission: Admission::Drop,
+            present: &["\"hi\"", "\"name\":\"f\""],
+            absent: &["GSIG==", "G2==", "think"],
+        },
+        Row {
+            case: "another Gemini account: a signature on a text part",
+            turns: &[(Source::GeminiText, GEMINI_A)],
+            attempt: GEMINI_B,
+            to: To::Gemini,
+            admission: Admission::Drop,
+            present: &["\"hi\""],
+            absent: &["TSIG=="],
         },
         Row {
             case: "another Codex account",
@@ -498,42 +535,96 @@ fn provider_members_reach_only_their_producer() {
     }
 }
 
-/// A compaction item stands for the history before it: only system messages stay before it,
-/// and the replay entries of dropped messages go with them.
+/// A compaction item stands for the history before it: of the stored turns only system
+/// messages stay before it, the new input after it stays, and the replay entries of dropped
+/// messages go with them. The compaction is found whichever protocol recorded the item type.
 #[test]
 fn compaction_truncates_the_history_before_it() {
+    // (case, protocol recording the item's type, whether the client replayed the item itself)
+    let rows = [
+        ("Responses item type", "responses", false),
+        ("item type another protocol recorded", "anthropic", false),
+        ("compaction item the client replayed", "responses", true),
+    ];
     let rig = Rig::new();
-    let input = json!([
-        {"role": "developer", "content": "be brief"},
-        {"type": "message", "id": "msg_0", "role": "user", "content": "q"}
-    ]);
-    let turns = [(Source::Responses, CODEX_A), (Source::Compaction, CODEX_A)];
-    let (mut owner, mut doc, media) = rig.history(input, &turns, usize::MAX);
-    truncate(&mut owner, &mut doc).unwrap();
-    // No provenance entry outlives the message it described.
-    let x = doc.required(doc.root(), "x_ck").unwrap();
-    for list in crate::codec::provenance::bound_lists(&doc, x)
-        .unwrap()
-        .into_iter()
-        .flatten()
-    {
-        for entry in doc.children(list).unwrap() {
-            if let Some((node, _)) = doc.origin(entry).unwrap() {
-                assert!(
-                    crate::codec::provenance::attached(&doc, node).unwrap(),
-                    "an orphaned entry"
-                );
+    for (case, protocol, replayed) in rows {
+        let mut stored = json!([
+            {"role": "developer", "content": "be brief"},
+            {"type": "message", "id": "msg_0", "role": "user", "content": "old"}
+        ]);
+        let mut turns = vec![(Source::Responses, CODEX_A), (Source::Compaction, CODEX_A)];
+        if replayed {
+            stored
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type": "compaction", "encrypted_content": "CMP=="}));
+            turns.clear();
+        }
+        let (mut owner, mut doc, media) = rig.history(stored, &turns, usize::MAX);
+        recorded_by(&mut doc, protocol);
+        new_input(&mut owner, &mut doc, "new");
+        truncate(&mut owner, &mut doc).unwrap();
+        // No provenance entry outlives the message it described.
+        let x = doc.required(doc.root(), "x_ck").unwrap();
+        for list in crate::codec::provenance::bound_lists(&doc, x)
+            .unwrap()
+            .into_iter()
+            .flatten()
+        {
+            for entry in doc.children(list).unwrap() {
+                if let Some((node, _)) = doc.origin(entry).unwrap() {
+                    assert!(
+                        crate::codec::provenance::attached(&doc, node).unwrap(),
+                        "{case}: an orphaned entry"
+                    );
+                }
             }
         }
+        let out = attempt(&mut owner, &mut doc, &media, CODEX_A, To::Responses).unwrap();
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3, "{case}: {out}");
+        assert_eq!(input[0], json!({"role": "developer", "content": "be brief"}), "{case}");
+        assert_eq!(input[1]["encrypted_content"], json!("CMP=="), "{case}");
+        assert_eq!(input[2]["content"], json!("new"), "{case}");
     }
-    let out = attempt(&mut owner, &mut doc, &media, CODEX_A, To::Responses).unwrap();
-    assert_eq!(
-        out["input"],
-        json!([
-            {"role": "developer", "content": "be brief"},
-            {"type": "compaction", "encrypted_content": "CMP=="}
-        ])
+    // Anthropic's signed compaction block has no canonical form before C2: the projection
+    // refuses it rather than misreading it.
+    let (mut owner, mut doc, _) = rig.history(json!("old"), &[], usize::MAX);
+    let stored = rig.stored(Source::SignedCompaction, usize::MAX);
+    let mut allocator = stored.allocator();
+    let mut reader = rig.store.reader(stored.id(), 0).unwrap();
+    let projected = project(&mut owner, &mut doc, &mut allocator, &mut reader, CODEX_A);
+    assert!(
+        matches!(projected, Err(crate::codec::Error::Unsupported)),
+        "{projected:?}"
     );
+}
+
+/// Moves the compaction item's recorded native type to `protocol`'s provenance.
+fn recorded_by(doc: &mut Document, protocol: &'static str) {
+    let x = doc.required(doc.root(), "x_ck").unwrap();
+    let original = doc.required(x, "original").unwrap();
+    let entries: Vec<usize> = doc.children(original).unwrap().collect();
+    for entry in entries {
+        if doc
+            .member(entry, "value")
+            .unwrap()
+            .is_some_and(|v| doc.string_is(v, "compaction").unwrap())
+        {
+            let field = doc.required(entry, "protocol").unwrap();
+            doc.replace(field, crate::codec::document::Value::Text(protocol))
+                .unwrap();
+        }
+    }
+}
+
+/// Appends the continuation's new input, as expansion puts it after the stored history (§2.3).
+fn new_input(owner: &mut Writer, doc: &mut Document, text: &str) {
+    let message = serde_json::to_vec(&json!({"role": "user", "content": text})).unwrap();
+    let lease = crate::codec::encode::scratch(owner, |e| e.bytes(&message)).unwrap();
+    let node = doc.import_json(owner, lease).unwrap();
+    let messages = doc.required(doc.root(), "messages").unwrap();
+    doc.append(messages, node).unwrap();
 }
 
 /// A client cannot tag a member with a producer: the request ingress builds `x_ck` itself.
@@ -544,7 +635,7 @@ fn a_client_cannot_claim_a_producer() {
     let body = json!({
         "model": "m",
         "input": [{"type": "reasoning", "summary": [], "encrypted_content": "ENC=="}],
-        "x_ck": {"replay": [{"kind": "responses_encrypted", "producer": {"provider": "codex", "credential": "cccc", "compaction": true}}]}
+        "x_ck": {"replay": [{"kind": "responses_encrypted", "compaction": true, "producer": {"provider": "codex", "credential": "cccc"}}]}
     });
     let mut ingress = crate::responses::request::Ingress::new(
         &mut owner,

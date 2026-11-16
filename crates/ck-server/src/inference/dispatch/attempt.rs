@@ -157,7 +157,9 @@ pub(super) async fn run<X: Arms>(
         store: &store,
         identity,
     };
-    // §3.2 step 2 (owner ruling Q-C): the provenance check runs for every candidate, either arm.
+    // §3.2 step 2: one admission for every candidate, either arm. A compaction item another
+    // account produced refuses the candidate (Q-C). Its reasoning and signatures are withheld
+    // from this attempt only (pending owner ruling D2-6a-1).
     let auth_index = ck_core::config::credentials::auth_index(&credential);
     let producer = provenance::Producer {
         provider: &credential.provider,
@@ -169,30 +171,24 @@ pub(super) async fn run<X: Arms>(
     };
     let destination = arm.arms.destination(&attempt);
     if admission == Admission::Refuse {
-        return Ran::Skip(skip(&attempt, trace, destination.unwrap_or("old arm"), Refusal::ForeignCompaction));
+        let destination = destination.unwrap_or("old arm");
+        return Ran::Skip(skip(&attempt, trace, destination, Refusal::ForeignCompaction));
     }
+    let withheld = admission == Admission::Drop;
     let Some(destination) = destination else {
-        return Ran::Old;
+        return old_arm(&attempt, trace, withheld);
     };
-    // Reasoning another account produced is withheld from this attempt only: its view is
-    // rebuilt from the request stream, as resume does, and the exchange's view stays whole.
+    // The withheld view is rebuilt from the request stream, as resume does, so the exchange's
+    // view stays whole for the next attempt.
     let own;
-    let view = if admission == Admission::Drop {
+    let view = if withheld {
         let Some(exchange) = arm.exchange.as_mut() else {
             return Ran::Stop(fault(defect()));
         };
         own = match withhold(&store, exchange, producer) {
             Ok(own) => own,
-            Err(codec::Error::Storage(error)) => return Ran::Stop(fault(stored(&error))),
-            Err(_) => return Ran::Stop(fault(defect())),
+            Err(error) => return stopped(Some(exchange), error).await,
         };
-        tracing::info!(
-            target: "ck_dispatch",
-            request_id = %trace.request_id(),
-            auth_index = %auth_index,
-            provider = %credential.provider,
-            "reasoning from another account withheld"
-        );
         RequestView {
             document: &own.0,
             media: &own.1,
@@ -203,19 +199,15 @@ pub(super) async fn run<X: Arms>(
     };
     let validated = match arm.arms.refence(&attempt, view) {
         Ok(validated) => validated,
-        Err(codec::Error::Destination) => return Ran::Old,
+        Err(codec::Error::Destination) => return old_arm(&attempt, trace, withheld),
         Err(error @ (codec::Error::Unsupported | codec::Error::Schema | codec::Error::MaxTokensRequired)) => {
             return Ran::Skip(skip(&attempt, trace, destination, Refusal::Fence(error)));
         }
-        Err(codec::Error::Storage(ck_stream::Error::Closed)) => {
-            let Some(exchange) = arm.exchange.as_mut() else {
-                return Ran::Stop(fault(defective()));
-            };
-            return Ran::Stop(fault(ended(exchange.request.cancelled().await)));
-        }
-        Err(codec::Error::Storage(error)) => return Ran::Stop(fault(stored(&error))),
-        Err(_) => return Ran::Stop(fault(defect())),
+        Err(error) => return stopped(arm.exchange.as_mut(), error).await,
     };
+    if withheld {
+        log_withheld(&attempt, trace);
+    }
     let Some(mut exchange) = arm.exchange.take() else {
         return Ran::Stop(fault(defect()));
     };
@@ -407,6 +399,38 @@ fn uncommitted_error(
         (_, Ok(Err(error))) => error,
         (Uncommitted::Terminal(terminal), Ok(Ok(()))) => ended(terminal),
         (Uncommitted::Error, Ok(Ok(()))) => defect(),
+    }
+}
+
+/// An old-arm attempt. It sends the client's own body, which never carries a tagged member, so
+/// another account's reasoning is withheld from it as from a contract-arm attempt.
+fn old_arm(attempt: &Attempt<'_>, trace: &Trace, withheld: bool) -> Ran {
+    if withheld {
+        log_withheld(attempt, trace);
+    }
+    Ran::Old
+}
+
+fn log_withheld(attempt: &Attempt<'_>, trace: &Trace) {
+    tracing::info!(
+        target: "ck_dispatch",
+        request_id = %trace.request_id(),
+        auth_index = %ck_core::config::credentials::auth_index(attempt.credential),
+        provider = %attempt.credential.provider,
+        "reasoning from another account withheld"
+    );
+}
+
+/// Contract §9 for a request-side codec failure before anything was sent: a closed request
+/// stream answers with its terminal.
+async fn stopped(exchange: Option<&mut Exchange>, error: codec::Error) -> Ran {
+    match error {
+        codec::Error::Storage(ck_stream::Error::Closed) => match exchange {
+            Some(exchange) => Ran::Stop(fault(ended(exchange.request.cancelled().await))),
+            None => Ran::Stop(fault(defective())),
+        },
+        codec::Error::Storage(error) => Ran::Stop(fault(stored(&error))),
+        _ => Ran::Stop(fault(defect())),
     }
 }
 

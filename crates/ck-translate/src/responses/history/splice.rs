@@ -260,13 +260,13 @@ impl Reduction {
             e.bytes(b",\"signature\":")?;
             self.staging.write(signature, e)?;
         }
+        if messages[entry.message].compaction {
+            e.bytes(b",\"compaction\":true")?;
+        }
         e.bytes(b",\"producer\":{\"provider\":")?;
         e.string(producer.provider)?;
         e.bytes(b",\"credential\":")?;
         e.string(producer.credential)?;
-        if messages[entry.message].compaction {
-            e.bytes(b",\"compaction\":true")?;
-        }
         e.bytes(b"}}")
     }
 
