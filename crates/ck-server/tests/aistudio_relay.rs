@@ -151,7 +151,7 @@ async fn register(addr: &str) -> wreq::ws::WebSocket {
 async fn registration_needs_a_listed_relay_key() {
     let none = "access:\n  api-keys: [client-key]\n";
     let empty = "access:\n  api-keys: [client-key]\noauth:\n  providers:\n    aistudio:\n      relay-keys: []\n";
-    let open = "oauth:\n  providers:\n    aistudio:\n      relay-keys: [relay-key]\n";
+    let no_clients = "oauth:\n  providers:\n    aistudio:\n      relay-keys: [relay-key]\n";
     // (config, Authorization header, expected handshake status)
     let rows: [(&str, Option<&str>, u16); 9] = [
         ("", None, 403),
@@ -161,9 +161,9 @@ async fn registration_needs_a_listed_relay_key() {
         (RELAY_CONFIG, None, 401),
         (RELAY_CONFIG, Some("Bearer client-key"), 401),
         (RELAY_CONFIG, Some("Bearer relay-key"), 101),
-        // Open client access does not open registration.
-        (open, None, 401),
-        (open, Some("Bearer relay-key"), 101),
+        // A gateway without client keys registers no relay, even with a listed key.
+        (no_clients, None, 403),
+        (no_clients, Some("Bearer relay-key"), 403),
     ];
     for (config, authorization, want) in rows {
         let rt = runtime(config);
@@ -290,6 +290,12 @@ async fn sessions_end_on_bad_frames_and_relay_key_changes() {
     relay_credentials(&rt, 1).await;
     // A config publish that keeps the relay keys keeps the session.
     rt.publish_config(Config::parse(&format!("{RELAY_CONFIG}server:\n  port: 1\n")).unwrap());
+    relay_credentials(&rt, 1).await;
+    // Removing every client key ends the sessions.
+    rt.publish_config(Config::parse("oauth:\n  providers:\n    aistudio:\n      relay-keys: [relay-key]\n").unwrap());
+    assert!(relay_credentials(&rt, 0).await.is_empty());
+    rt.publish_config(Config::parse(RELAY_CONFIG).unwrap());
+    let _socket = register(&addr).await;
     relay_credentials(&rt, 1).await;
     // Changing the relay keys ends the sessions they registered.
     rt.publish_config(Config::parse("oauth:\n  providers:\n    aistudio:\n      relay-keys: [other-key]\n").unwrap());

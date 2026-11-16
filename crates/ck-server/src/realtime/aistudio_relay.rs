@@ -5,7 +5,7 @@
 //! the executors' [`Relay`] under a random `aistudio-…` name, and a runtime-only
 //! `aistudio` credential of that name serves requests until the socket closes. Only a key
 //! listed in `oauth.providers.aistudio.relay-keys` registers a browser; client keys do
-//! not, and an empty list refuses every browser.
+//! not. An empty list, or a config without client keys, refuses every browser.
 //!
 //! The transport follows gorilla and session.go: a ping every 30 seconds, a read
 //! deadline of 60 seconds that only a pong extends, 10-second writes, frames up to
@@ -36,8 +36,12 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 /// `maxInboundMessageLen`.
 const MAX_MESSAGE: usize = 64 << 20;
 
-/// `oauth.providers.aistudio.relay-keys`: the keys that may register a browser.
+/// The keys that may register a browser: `oauth.providers.aistudio.relay-keys`, or none
+/// while the config has no client keys (an open gateway registers no relay).
 pub fn relay_keys(cfg: &Config) -> Vec<String> {
+    if cfg.api_keys.is_empty() {
+        return Vec::new();
+    }
     cfg.document
         .get("oauth")
         .and_then(|o| o.get("providers"))
@@ -85,8 +89,8 @@ fn observe(rt: &Weak<Runtime>, provider: &str, cause: Option<&str>) {
     }
 }
 
-/// Registration needs a listed relay key, sent like a client key. An empty list refuses
-/// every browser.
+/// Registration needs a listed relay key, sent like a client key. With no relay keys or
+/// no client keys, every browser is refused.
 async fn require_relay_key(State(rt): State<Arc<Runtime>>, req: Request, next: Next) -> Response {
     let keys = relay_keys(&rt.config());
     if keys.is_empty() {

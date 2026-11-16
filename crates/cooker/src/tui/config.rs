@@ -63,7 +63,6 @@ pub fn parse_config(cfg: &Object) -> Vec<Field> {
             Kind::Bool,
         ),
         ("Routing Strategy", "routing/strategy", Kind::Str),
-        ("WebSocket Auth", "oauth/providers/aistudio/ws-auth", Kind::Bool),
     ];
     fields
         .into_iter()
@@ -103,8 +102,6 @@ fn section(path: &str) -> &'static str {
         t("section_server")
     } else if path.starts_with("observability/") {
         t("section_logging")
-    } else if path == "oauth/providers/aistudio/ws-auth" {
-        t("section_websocket")
     } else {
         t("section_other")
     }
@@ -383,6 +380,22 @@ mod tests {
         assert_eq!(field("routing/force-model-prefix").kind, Kind::Bool);
         assert_eq!(field("routing/force-model-prefix").value, "true");
         assert_eq!(field("routing/strategy").value, "soonest-reset");
+        // Every field the tab writes is a setting the server accepts.
+        for field in &fields {
+            let value = match field.kind {
+                Kind::ReadOnly => continue,
+                Kind::Bool => "true",
+                Kind::Int => "1",
+                _ => "x",
+            };
+            let yaml = field
+                .path
+                .rsplit('/')
+                .fold(value.to_owned(), |inner, key| format!("{{{key}: {inner}}}"));
+            let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+            ck_core::config::validate_config_fields(&doc, true)
+                .unwrap_or_else(|e| panic!("{} is not a setting: {e}", field.path));
+        }
     }
 
     #[test]
