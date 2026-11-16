@@ -26,7 +26,15 @@ pub(super) fn validate(view: RequestView<'_>, destination: &str) -> Result<()> {
     }
     let doc = view.document;
     let root = doc.root();
-    string(doc, doc.required(root, "model")?)?;
+    if let Some(model) = doc.member(root, "model")? {
+        string(doc, model)?;
+    } else {
+        let prompt = super::native::native(doc, root, "prompt")?.ok_or(Error::Schema)?;
+        string(doc, doc.required(prompt, "id")?)?;
+        if !matches!(destination, "responses" | "codex") {
+            return Err(Error::Unsupported);
+        }
+    }
     if view.operation == Operation::Compact
         && doc
             .member(root, "stream")?

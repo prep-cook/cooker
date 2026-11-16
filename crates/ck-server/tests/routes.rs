@@ -150,6 +150,10 @@ async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
             )
                 .into_response()
         }
+        "Bearer fake-prompt" => (
+            [("content-type", "text/event-stream")],
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_prompt\",\"model\":\"stored-model\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n",
+        ).into_response(),
         _ if body["stream"] == Value::Bool(true) => ([("content-type", "text/event-stream")], sse()).into_response(),
         _ => (
             [("content-type", "application/json")],
@@ -802,6 +806,70 @@ async fn compact_sends_nothing_to_providers_without_native_compact() {
         assert_eq!(status, 400, "{provider}: {text}");
         assert!(text.contains("does not support compaction"), "{provider}: {text}");
         assert_eq!(sends(), Vec::<String>::new(), "{provider}");
+    }
+}
+
+#[tokio::test]
+async fn reusable_prompts_route_only_to_native_resolvers_without_a_model() {
+    for (native, disabled, explicit, expected) in [
+        (None, false, false, 400),
+        (Some(false), true, false, 400),
+        (Some(false), false, false, 200),
+        (Some(true), false, false, 200),
+        (None, false, true, 200),
+        (Some(true), false, true, 200),
+    ] {
+        for stream in [false, true] {
+            let mut credentials = vec![oauth("claude.json", "fake-ok", serde_json::json!({}))];
+            if let Some(api_key) = native {
+                let metadata =
+                    serde_json::json!({"type":"codex","access_token":"fake-prompt","expired":"2099-01-01T00:00:00Z"});
+                let mut credential = Credential::from_file(
+                    Path::new("/fake"),
+                    Path::new("/fake/codex.json"),
+                    metadata.as_object().unwrap().clone(),
+                )
+                .unwrap();
+                if api_key {
+                    credential.attributes.insert("api_key".into(), "fake-prompt".into());
+                }
+                credential.disabled = disabled;
+                credentials.push(credential);
+            }
+            let p = proxy("", credentials).await;
+            let mut body = serde_json::json!({"prompt":{"id":"pmpt_test","version":"2","variables":{"name":"Ada"}},"input":"hi","stream":stream});
+            if explicit {
+                body["model"] = MODEL.into();
+            }
+            let (status, _, text) = post(&p.url, "/v1/responses", &body.to_string()).await;
+            assert_eq!(
+                status, expected,
+                "native={native:?} disabled={disabled} explicit={explicit} stream={stream}: {text}"
+            );
+            let sends = p.seen.requests.lock().unwrap();
+            if expected == 400 {
+                let error = assert_openai_error(&text);
+                assert!(
+                    error["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("model is required"),
+                    "{text}"
+                );
+                assert!(sends.is_empty(), "{sends:?}");
+            } else {
+                assert_eq!(sends.len(), 1, "{sends:?}");
+                if explicit {
+                    assert_eq!(sends[0].0, "Bearer fake-ok");
+                    assert_eq!(sends[0].1["model"], MODEL);
+                } else {
+                    assert_eq!(sends[0].0, "Bearer fake-prompt");
+                    assert_eq!(sends[0].1.get("model"), None);
+                    assert_eq!(sends[0].1["prompt"], body["prompt"]);
+                    assert!(text.contains("stored-model"), "{text}");
+                }
+            }
+        }
     }
 }
 
