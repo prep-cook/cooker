@@ -181,13 +181,15 @@ async fn chat_modality_and_prediction_details_reach_accounting() {
     );
 }
 
-/// Meta segmentation bills per image and per video frame (`usage.images_processed`,
-/// `usage.video_frames_processed`). Each count the Responses usage reports reaches accounting
-/// as its own dimension, buffered or streamed; an unreported or malformed one stays absent; the
-/// token counts are the upstream's. A streamed usage repeated on a later event replaces the
-/// earlier one rather than adding to it.
+/// Each billed unit a Responses usage reports reaches accounting as its own dimension in its own
+/// unit, buffered or streamed: Meta's per-image and per-frame counts, xAI's charge in ticks and
+/// in nano-USD and its server-side tool counts, and Codex's rollout budget units as the number
+/// the upstream wrote. An unreported, null or malformed unit stays absent; the token counts are
+/// the upstream's. A streamed usage repeated on a later event replaces the earlier one rather
+/// than adding to it.
 #[tokio::test]
-async fn meta_segmentation_counts_reach_accounting() {
+async fn responses_billed_units_reach_accounting() {
+    let decimal = |n: &str| Dimension::Decimal(n.into());
     let tokens = serde_json::json!({"input_tokens":12,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":15});
     for (counts, expected) in [
         (
@@ -205,9 +207,46 @@ async fn meta_segmentation_counts_reach_accounting() {
                 ("video_frames_processed", Dimension::Count(0)),
             ],
         ),
+        (
+            serde_json::json!({"cost_in_usd_ticks":158100000,"cost_in_nano_usd":15810000,"num_sources_used":3,"num_server_side_tools_used":4,"server_side_tool_usage_details":{"web_search_calls":1,"x_search_calls":1,"x_posts_fetched":7,"x_users_fetched":2,"code_interpreter_calls":0,"file_search_calls":0,"document_search_calls":0,"image_generation_calls":0,"mcp_calls":1}}),
+            vec![
+                ("cost_in_usd_ticks", Dimension::Count(158100000)),
+                ("cost_in_nano_usd", Dimension::Count(15810000)),
+                ("num_sources_used", Dimension::Count(3)),
+                ("num_server_side_tools_used", Dimension::Count(4)),
+                ("web_search_calls", Dimension::Count(1)),
+                ("x_search_calls", Dimension::Count(1)),
+                ("x_posts_fetched", Dimension::Count(7)),
+                ("x_users_fetched", Dimension::Count(2)),
+                ("code_interpreter_calls", Dimension::Count(0)),
+                ("file_search_calls", Dimension::Count(0)),
+                ("document_search_calls", Dimension::Count(0)),
+                ("image_generation_calls", Dimension::Count(0)),
+                ("mcp_calls", Dimension::Count(1)),
+            ],
+        ),
+        (
+            serde_json::json!({"cost_in_usd_ticks":0,"server_side_tool_usage_details":{"x_posts_fetched":5}}),
+            vec![
+                ("cost_in_usd_ticks", Dimension::Count(0)),
+                ("x_posts_fetched", Dimension::Count(5)),
+            ],
+        ),
+        (
+            serde_json::json!({"codex_rollout_budget_units":2.5}),
+            vec![("codex_rollout_budget_units", decimal("2.5"))],
+        ),
+        (
+            serde_json::json!({"codex_rollout_budget_units":3}),
+            vec![("codex_rollout_budget_units", decimal("3"))],
+        ),
         (serde_json::json!({}), Vec::new()),
         (
             serde_json::json!({"images_processed":null,"video_frames_processed":-1}),
+            Vec::new(),
+        ),
+        (
+            serde_json::json!({"cost_in_usd_ticks":"12","cost_in_nano_usd":1.5,"server_side_tool_usage_details":null,"codex_rollout_budget_units":"2.5"}),
             Vec::new(),
         ),
     ] {

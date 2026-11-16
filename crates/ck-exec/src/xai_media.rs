@@ -2,6 +2,10 @@
 //! contract; `images`, `videos` and `speech` are the old routes' entry points until E7 moves
 //! the routes onto it.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::Credential;
@@ -67,12 +71,13 @@ impl XaiExecutor {
             IMAGES_GENERATIONS
         };
         let payload = media_rules(&req, cfg.as_ref(), request::normalize_image_refs(req.body.to_vec()));
-        self.media(credential, &req, cfg.as_ref(), wreq::Method::POST, path, payload, false)
+        self.media(credential, &req, cfg.as_ref(), wreq::Method::POST, path, payload, None)
             .await
     }
 
     /// `executeVideos`: generations, edits and extensions by the inbound route; any other
-    /// route with a `request_id` polls `GET /videos/{request_id}`.
+    /// route with a `request_id` polls `GET /videos/{request_id}`. A poll of a job this process
+    /// neither created nor charged is refused before anything is sent ([`VideoJobs`]).
     pub async fn videos(
         &self,
         credential: &Credential,
@@ -91,7 +96,15 @@ impl XaiExecutor {
             None if !request_id.is_empty() => (wreq::Method::GET, format!("/videos/{}", path_escape(&request_id))),
             None => (wreq::Method::POST, VIDEOS_GENERATIONS.to_owned()),
         };
-        self.media(credential, &req, cfg.as_ref(), method, &path, payload, true)
+        let job = if method == wreq::Method::GET {
+            let Some(admission) = self.jobs.admit(&request_id) else {
+                return Err(unknown_job(&request_id));
+            };
+            VideoJob::Poll(admission)
+        } else {
+            VideoJob::Create
+        };
+        self.media(credential, &req, cfg.as_ref(), method, &path, payload, Some(job))
             .await
     }
 
@@ -107,30 +120,15 @@ impl XaiExecutor {
         method: wreq::Method,
         path: &str,
         payload: Vec<u8>,
-        idempotent: bool,
+        video: Option<VideoJob<'_>>,
     ) -> Result<ExecResponse, ExecError> {
         let logged = payload.as_slice();
         let body = (method == wreq::Method::POST).then(|| payload.clone());
         let (token, _) = creds(credential);
-        let mut headers = plain_headers(credential, &token, false, "", req);
-        if idempotent && method == wreq::Method::POST {
-            let header = |name: &str| {
-                req.headers
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::trim)
-                    .unwrap_or_default()
-                    .to_owned()
-            };
-            // The handler's `Idempotency-Key` metadata, else the client's own header.
-            let mut key = header("Idempotency-Key");
-            if key.is_empty() {
-                key = header("x-idempotency-key");
-            }
-            if !key.is_empty() {
-                headers.set("x-idempotency-key", key);
-            }
-        }
+        let headers = plain_headers(credential, &token, false, "", req);
+        // xAI documents no idempotency key for video creates (https://docs.x.ai/openapi.json,
+        // `POST /v1/videos/generations`, `/edits`, `/extensions`: no header parameters), so
+        // none is sent: a replayed create must not hand back a job a previous process charged.
         let url = self.url(endpoint(&chat_base_url(credential), path));
         let (status, headers, data) = self
             .send_buffered(credential, req, cfg, method, &url, headers, body, logged)
@@ -140,10 +138,33 @@ impl XaiExecutor {
             error.headers = Box::new(headers);
             return Err(error);
         }
-        // Go only observes the response model here (no usage parse): a Codex-format line
-        // that is not a terminal event carries exactly that.
+        // A video is a job: its usage is that of the job, which a poll repeats. A create names
+        // it as the server's `video_id` reads it; a poll settles against the job its admission
+        // holds, so only the first settlement that finds the job uncharged charges it.
+        let admission = match video {
+            None => None,
+            Some(VideoJob::Poll(admission)) => Some(admission),
+            Some(VideoJob::Create) => {
+                let id = text(&gj::get(&data, "request_id"));
+                let job = if id.trim().is_empty() {
+                    text(&gj::get(&data, "id"))
+                } else {
+                    id
+                };
+                self.jobs.created(&job)
+            }
+        };
         if req.usage.enabled() {
-            req.usage.response_line(Format::Codex, &data);
+            // An image, or a create naming no job, has nothing a later report could repeat.
+            if reports_usage(&data) && admission.as_ref().is_none_or(Admission::settle) {
+                // The top-level usage of an image or video body, read as a Responses body's.
+                req.usage.response_body(Format::Codex, &data);
+            } else {
+                // The body without its usage: the model, and a record with no count.
+                let mut quiet = data.to_vec();
+                gj::delete(&mut quiet, "usage");
+                req.usage.response_body(Format::Codex, &quiet);
+            }
         }
         Ok(ExecResponse {
             status: 200,
@@ -151,6 +172,173 @@ impl XaiExecutor {
             body: ResponseBody::Buffered(data),
         })
     }
+}
+
+/// The usage members accounting records from an image or video body: the charge, and every
+/// token count the server's Responses usage reader records (xAI images and videos reference).
+const BILLED: &[&str] = &[
+    "usage.cost_in_usd_ticks",
+    "usage.cost_in_nano_usd",
+    "usage.prompt_tokens",
+    "usage.input_tokens",
+    "usage.completion_tokens",
+    "usage.output_tokens",
+    "usage.total_tokens",
+    "usage.prompt_tokens_details.cached_tokens",
+    "usage.input_tokens_details.cached_tokens",
+    "usage.prompt_tokens_details.cache_write_tokens",
+    "usage.prompt_tokens_details.cache_creation_tokens",
+    "usage.input_tokens_details.cache_write_tokens",
+    "usage.input_tokens_details.cache_creation_tokens",
+    "usage.completion_tokens_details.reasoning_tokens",
+    "usage.output_tokens_details.reasoning_tokens",
+];
+
+/// Whether `body` reports a billed value: an integer, zero included, in one of [`BILLED`]. An
+/// absent, null, non-integer or empty usage reports nothing, so it does not spend a job's charge
+/// (E-Q13).
+fn reports_usage(body: &[u8]) -> bool {
+    BILLED.iter().any(|path| {
+        let value = gj::get(body, path);
+        let raw = std::str::from_utf8(value.raw()).unwrap_or_default();
+        value.kind == gj::Kind::Number && (raw.parse::<u64>().is_ok() || raw.parse::<i64>().is_ok())
+    })
+}
+
+/// How long a job is remembered: well past the binding TTL a client polls within.
+const JOB_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// What a video request is to its job: a create, whose response names the job, or a poll
+/// admitted against it.
+pub(crate) enum VideoJob<'a> {
+    Create,
+    Poll(Admission<'a>),
+}
+
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// One job's record: whether it was charged, when it was created or charged, and how many
+/// requests hold an [`Admission`] to it.
+struct Job {
+    charged: bool,
+    at: Instant,
+    in_flight: usize,
+}
+
+/// The video jobs this process created or charged (E-Q13): a job is charged at the first poll
+/// that reports usage and never again, however often it is polled after. A job missing here may
+/// already have been charged by an earlier process, so its poll is refused rather than risk a
+/// second charge. A record older than [`JOB_TTL`] admits no new poll, but stays while any
+/// admitted request holds it, so expiry can only refuse a poll, never erase a charge another
+/// admitted poll settles against.
+// ponytail: process memory, so a job created before a restart cannot be polled through cooker.
+// No store on this path outlives the process: the usage queue is in memory, and SQLite holds
+// configuration and credentials only. A durable job ledger (F06-1) lifts this; its store awaits
+// an owner decision.
+pub(crate) struct VideoJobs {
+    jobs: Mutex<HashMap<String, Job>>,
+    clock: Clock,
+}
+
+impl Default for VideoJobs {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(Instant::now))
+    }
+}
+
+impl VideoJobs {
+    pub(crate) fn with_clock(clock: Clock) -> Self {
+        Self {
+            jobs: Mutex::default(),
+            clock,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Job>> {
+        self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// An admission to `job`, or `None` for a job without an ID. A create records the job if it
+    /// is new, keeping a charge it already has; a poll needs a record younger than [`JOB_TTL`].
+    fn enter(&self, job: &str, create: bool) -> Option<Admission<'_>> {
+        let job = job.trim();
+        if job.is_empty() {
+            return None;
+        }
+        let now = (self.clock)();
+        let live = |record: &Job| now.saturating_duration_since(record.at) < JOB_TTL;
+        let mut jobs = self.lock();
+        jobs.retain(|_, record| record.in_flight > 0 || live(record));
+        let record = if create {
+            jobs.entry(job.to_owned()).or_insert(Job {
+                charged: false,
+                at: now,
+                in_flight: 0,
+            })
+        } else {
+            jobs.get_mut(job).filter(|record| live(record))?
+        };
+        record.in_flight += 1;
+        Some(Admission {
+            jobs: self,
+            job: job.to_owned(),
+        })
+    }
+
+    /// Records a job this process created; its admission settles a usage the create reported.
+    pub(crate) fn created(&self, job: &str) -> Option<Admission<'_>> {
+        self.enter(job, true)
+    }
+
+    /// A poll's admission, or `None` when this process neither created nor charged the job, or
+    /// its record expired.
+    pub(crate) fn admit(&self, job: &str) -> Option<Admission<'_>> {
+        self.enter(job, false)
+    }
+}
+
+/// One request's hold on a job's record: the record outlives expiry until every admission to it
+/// is dropped.
+pub(crate) struct Admission<'a> {
+    jobs: &'a VideoJobs,
+    job: String,
+}
+
+impl Admission<'_> {
+    /// Claims the job's charge: true only for the first settlement that finds the job uncharged,
+    /// which marks it charged and refreshes its record.
+    pub(crate) fn settle(&self) -> bool {
+        let now = (self.jobs.clock)();
+        let mut jobs = self.jobs.lock();
+        // The admission keeps the record; a missing one charges nothing.
+        let Some(record) = jobs.get_mut(&self.job) else {
+            return false;
+        };
+        if record.charged {
+            return false;
+        }
+        record.charged = true;
+        record.at = now;
+        true
+    }
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        if let Some(record) = self.jobs.lock().get_mut(&self.job) {
+            record.in_flight = record.in_flight.saturating_sub(1);
+        }
+    }
+}
+
+/// The 404 for a poll of a job [`VideoJobs`] does not know, in the error shape OpenAI and xAI
+/// give an unknown ID. It is the request's fault: no other credential is tried.
+fn unknown_job(job: &str) -> ExecError {
+    let message = format!(
+        "Video job '{job}' was not created through this server since it last started, or has expired. Create the video again."
+    );
+    let body = serde_json::json!({"error": {"message": message, "type": "invalid_request_error", "param": null, "code": null}});
+    ExecError::local(404, FailureScope::Request, body.to_string())
 }
 
 impl XaiExecutor {

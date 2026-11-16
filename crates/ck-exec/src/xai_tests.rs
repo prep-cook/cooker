@@ -6,6 +6,7 @@
 //! values come only from Go.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ck_core::exec::Caller;
 use serde_json::Value;
@@ -249,7 +250,15 @@ async fn go_reference_scenarios() {
         let path = s["request_path"].as_str().unwrap_or_default().to_owned();
         let result = match op {
             "images" => executor.images(&cred, req, &path, &cfg).await,
-            "videos" => executor.videos(&cred, req, &path, &cfg).await,
+            "videos" => {
+                // Go polls any ID; cooker polls only a job it created (VideoJobs), as the
+                // recorded poll's job had been here.
+                let polled = gj::get(&req.body, "request_id").str().into_owned();
+                if !path.ends_with("/generations") && !polled.is_empty() {
+                    drop(executor.jobs.created(&polled));
+                }
+                executor.videos(&cred, req, &path, &cfg).await
+            }
             _ => {
                 executor
                     .execute(&cred, req, &cfg, s["websocket"].as_bool() == Some(true))
@@ -521,6 +530,408 @@ async fn speech_errors_keep_go_scope() {
         );
         let request_scoped = error.scope == FailureScope::Request && error.headers.is_empty();
         assert_eq!(request_scoped, scoped, "{status} {body}");
+    }
+}
+
+/// An image or video body reports its top-level usage as a buffered Responses body, so the
+/// server reads its counts and billed units. A body without a billed value in its usage (absent,
+/// null or empty), or a job's repeated report, is reported without its usage, so the record holds
+/// no count. A video job is charged at the first poll whose usage
+/// reports a value, an explicit zero included, and never again (E-Q13), while another job is
+/// charged on its own. A poll of a job the process neither created nor charged, such as one
+/// created before a restart, is refused with a request-scoped 404 before anything is sent. No
+/// idempotency key reaches xAI, so replaying a create cannot bring back a charged job. A poll is
+/// settled by the charge state it was admitted with: a job charged when the poll was admitted is
+/// never charged again, even if its record expires while the poll is in flight, and an expired
+/// job is refused.
+#[tokio::test]
+async fn media_usage_is_charged_once_per_response_or_job() {
+    let cfg = Config::default();
+    let target: Arc<Mutex<String>> = Arc::default();
+    // The jobs' clock: its offset from `base` now, and the offset it moves to when the upstream
+    // request is sent, after admission and before settlement.
+    let base = std::time::Instant::now();
+    let time: Arc<Mutex<(Duration, Option<Duration>)>> = Arc::default();
+    // Two processes in turn: the second starts with none of the first's jobs.
+    let processes: [XaiExecutor; 2] = std::array::from_fn(|_| {
+        let (target, sent) = (target.clone(), time.clone());
+        let mut executor = XaiExecutor::default().with_url_rewrite(move |url| {
+            let mut time = sent.lock().unwrap();
+            if let Some(next) = time.1.take() {
+                time.0 = next;
+            }
+            redirect(url, &target.lock().unwrap())
+        });
+        let now = time.clone();
+        executor.jobs = crate::xai_media::VideoJobs::with_clock(Arc::new(move || base + now.lock().unwrap().0));
+        executor
+    });
+    let charged =
+        r#"{"status":"done","video":{"url":"https://v.example/out.mp4"},"usage":{"cost_in_usd_ticks":5000000000}}"#;
+    let image = r#"{"data":[{"b64_json":"AAAA"}],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3,"cost_in_usd_ticks":200000000}}"#;
+    const CREATE: &str = "/v1/videos/generations";
+    let poll = |id: &str| (format!("/v1/videos/{id}"), format!(r#"{{"request_id":"{id}"}}"#));
+    // (process, op, path, payload, upstream body, expected, clock): `Some(charged)` for a 200
+    // and whether its usage was reported, `None` for a refusal that sends nothing upstream; the
+    // clock's seconds at admission and at the upstream send, when the row sets them.
+    type Row = (
+        usize,
+        &'static str,
+        String,
+        String,
+        String,
+        Option<bool>,
+        Option<(u64, u64)>,
+    );
+    let mut rows: Vec<Row> = vec![
+        (
+            0,
+            "images",
+            "/v1/images/generations".into(),
+            r#"{"prompt":"a"}"#.into(),
+            image.into(),
+            Some(true),
+            None,
+        ),
+        (
+            0,
+            "images",
+            "/v1/images/generations".into(),
+            r#"{"prompt":"a"}"#.into(),
+            image.into(),
+            Some(true),
+            None,
+        ),
+        (
+            0,
+            "images",
+            "/v1/images/generations".into(),
+            r#"{"prompt":"a"}"#.into(),
+            r#"{"data":[{"b64_json":"AAAA"}]}"#.into(),
+            Some(false),
+            None,
+        ),
+        // A cache count without input, output or total is still a reported count.
+        (
+            0,
+            "images",
+            "/v1/images/generations".into(),
+            r#"{"prompt":"a"}"#.into(),
+            r#"{"data":[{"b64_json":"AAAA"}],"usage":{"input_tokens_details":{"cached_tokens":3}}}"#.into(),
+            Some(true),
+            None,
+        ),
+    ];
+    let mut create = |process: usize, body: &str| {
+        rows.push((
+            process,
+            "videos",
+            CREATE.into(),
+            r#"{"prompt":"a"}"#.into(),
+            body.into(),
+            Some(false),
+            None,
+        ));
+    };
+    for id in ["vid_9", "vid_10", "vid_11", "vid_12", "vid_30", "vid_31"] {
+        create(0, &format!(r#"{{"request_id":"{id}"}}"#));
+    }
+    // A create answered with `id` instead of `request_id`.
+    create(0, r#"{"id":"vid_13","status":"in_progress"}"#);
+    create(1, r#"{"request_id":"vid_20"}"#);
+    // A replay of vid_9's create, with its idempotency key, after the restart. The key never
+    // reaches xAI, which documents none, so the upstream answers with a new job.
+    create(1, r#"{"request_id":"vid_21"}"#);
+    const DAY: u64 = 24 * 3600;
+    for (process, id, body, expected, clock) in [
+        (0, "vid_9", r#"{"status":"pending","usage":null}"#, Some(false), None),
+        (0, "vid_9", charged, Some(true), None),
+        (0, "vid_9", charged, Some(false), None),
+        (0, "vid_10", charged, Some(true), None),
+        // A usage without a billed value is not the job's report; its later charge still counts.
+        (0, "vid_11", r#"{"status":"pending","usage":{}}"#, Some(false), None),
+        (
+            0,
+            "vid_11",
+            r#"{"status":"pending","usage":{"input_tokens_details":{},"cost_in_usd_ticks":null}}"#,
+            Some(false),
+            None,
+        ),
+        (0, "vid_11", charged, Some(true), None),
+        // An explicit zero charge is a report.
+        (
+            0,
+            "vid_12",
+            r#"{"status":"done","usage":{"cost_in_usd_ticks":0}}"#,
+            Some(true),
+            None,
+        ),
+        (0, "vid_13", charged, Some(true), None),
+        // Never created through this process.
+        (0, "vid_99", charged, None, None),
+        // After a restart: the charged job is unknown and refused; a new job is charged.
+        (1, "vid_9", charged, None, None),
+        (1, "vid_11", charged, None, None),
+        (1, "vid_20", charged, Some(true), None),
+        (1, "vid_21", charged, Some(true), None),
+        (1, "vid_9", charged, None, None),
+        // A day after creation and charge: vid_30 was charged at second 0. A poll admitted at
+        // 86,399 s and answered at 86,401 s settles as charged; the next poll finds it expired.
+        // vid_31, created at second 0 and never charged, is charged once by such a poll.
+        (0, "vid_30", charged, Some(true), None),
+        (0, "vid_30", charged, Some(false), Some((DAY - 1, DAY + 1))),
+        (0, "vid_31", charged, Some(true), Some((DAY - 1, DAY + 1))),
+        (0, "vid_30", charged, None, Some((DAY + 2, DAY + 2))),
+        (0, "vid_31", charged, Some(false), Some((DAY + 2, DAY + 2))),
+    ] {
+        let (path, payload) = poll(id);
+        rows.push((process, "videos", path, payload, body.into(), expected, clock));
+    }
+    for (process, op, path, payload, body, expected, clock) in rows {
+        if let Some((admitted, sent)) = clock {
+            *time.lock().unwrap() = (Duration::from_secs(admitted), Some(Duration::from_secs(sent)));
+        }
+        let mock = Mock::start(
+            &serde_json::json!({"status": 200, "headers": [["Content-Type", "application/json"]], "body": body}),
+        )
+        .await;
+        *target.lock().unwrap() = mock.addr.clone();
+        let (s, recorder, req) = media_request(op, &path, &payload);
+        let executor = &processes[process];
+        let result = match op {
+            "images" => executor.images(&credential(&s, &cfg), req, &path, &cfg).await,
+            _ => executor.videos(&credential(&s, &cfg), req, &path, &cfg).await,
+        };
+        let row = format!("process {process} {op} {path} {body}");
+        let sent = mock.request().unwrap_or_default().go_lower();
+        assert!(
+            !sent.contains("idempotency"),
+            "{row}: no idempotency key goes upstream:\n{sent}"
+        );
+        let reports = recorder.0.lock().unwrap();
+        let bodies: Vec<String> = reports
+            .iter()
+            .filter_map(|r| match r {
+                crate::openai_compat_usage::Report::Body(Format::Codex, data) => {
+                    Some(String::from_utf8_lossy(data).into_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        let charged_now = match (expected, result) {
+            (Some(charged_now), Ok(_)) => charged_now,
+            (None, Err(error)) => {
+                assert_eq!((error.status, error.scope), (404, FailureScope::Request), "{row}");
+                let message: Value = serde_json::from_slice(&error.body).expect("a JSON error");
+                assert_eq!(message["error"]["type"], "invalid_request_error", "{row}");
+                assert_eq!(mock.request(), None, "{row}: nothing is sent upstream");
+                false
+            }
+            (expected, result) => panic!("{row}: expected {expected:?}, got {:?}", result.map(|_| ())),
+        };
+        // A charged response reports its body as is; any other answered one reports its body
+        // without `usage`, so the record holds no count; a refusal reports nothing.
+        let want: Vec<String> = match expected {
+            Some(true) => vec![body.clone()],
+            Some(false) => {
+                let mut quiet = body.clone().into_bytes();
+                gj::delete(&mut quiet, "usage");
+                vec![String::from_utf8(quiet).unwrap()]
+            }
+            None => Vec::new(),
+        };
+        assert_eq!(bodies, want, "{row}");
+        assert_eq!(charged_now, expected == Some(true), "{row}");
+    }
+    // Two polls of vid_40 admitted before its charge: the first is held upstream while the
+    // second charges. Past the job's expiry a new poll is refused, and the held poll then settles
+    // and charges nothing.
+    let executor = &processes[0];
+    let created = Mock::start(
+        &serde_json::json!({"status": 200, "headers": [["Content-Type", "application/json"]], "body": r#"{"request_id":"vid_40"}"#}),
+    )
+    .await;
+    *target.lock().unwrap() = created.addr.clone();
+    let (s, _, req) = media_request("videos", CREATE, r#"{"prompt":"a"}"#);
+    executor
+        .videos(&credential(&s, &cfg), req, CREATE, &cfg)
+        .await
+        .expect("the create");
+    let (path, payload) = poll("vid_40");
+    let (held, arrived, release) = held_upstream(charged).await;
+    *target.lock().unwrap() = held;
+    let (s, first, req) = media_request("videos", &path, &payload);
+    let held_credential = credential(&s, &cfg);
+    let held_poll = executor.videos(&held_credential, req, &path, &cfg);
+    tokio::pin!(held_poll);
+    tokio::select! {
+        _ = &mut held_poll => panic!("the held poll answered before its release"),
+        _ = arrived => {}
+    }
+    let answered = Mock::start(
+        &serde_json::json!({"status": 200, "headers": [["Content-Type", "application/json"]], "body": charged}),
+    )
+    .await;
+    *target.lock().unwrap() = answered.addr.clone();
+    let (s, second, req) = media_request("videos", &path, &payload);
+    executor
+        .videos(&credential(&s, &cfg), req, &path, &cfg)
+        .await
+        .expect("the second poll");
+    time.lock().unwrap().0 += Duration::from_secs(DAY + 2);
+    let (s, _, req) = media_request("videos", &path, &payload);
+    let refused = executor.videos(&credential(&s, &cfg), req, &path, &cfg).await;
+    assert_eq!(refused.err().map(|e| e.status), Some(404), "vid_40 expired");
+    release.send(()).unwrap();
+    held_poll.await.expect("the held poll");
+    let charges = |recorder: &crate::openai_compat_usage::Recorder| {
+        let reports = recorder.0.lock().unwrap();
+        reports
+            .iter()
+            .filter(
+                |r| matches!(r, crate::openai_compat_usage::Report::Body(_, data) if gj::get(data, "usage").exists()),
+            )
+            .count()
+    };
+    assert_eq!((charges(&second), charges(&first)), (1, 0), "vid_40 is charged once");
+}
+
+/// A media request in the shape the scenarios use; every create carries the same client
+/// idempotency key.
+fn media_request(
+    op: &str,
+    path: &str,
+    payload: &str,
+) -> (Value, Arc<crate::openai_compat_usage::Recorder>, ExecRequest) {
+    let s = serde_json::json!({
+        "config_auth": -1,
+        "attributes": {"api_key": "sk-fake-xai"},
+        "op": op,
+        "source": "openai",
+        "payload": payload,
+        "model": "grok-imagine",
+        "request_path": path,
+        "headers": {"Idempotency-Key": "replay-1", "x-idempotency-key": "replay-1"},
+    });
+    let (recorder, _capture, sink) = crate::openai_compat_usage::sinks();
+    let req = request(&s, sink);
+    (s, recorder, req)
+}
+
+/// An upstream that answers one request with `body` once released, and reports when the request
+/// arrived.
+async fn held_upstream(
+    body: &'static str,
+) -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (read, mut write) = socket.into_split();
+        let mut reader = BufReader::new(read);
+        loop {
+            let mut line = Vec::new();
+            if reader.read_until(b'\n', &mut line).await.unwrap_or(0) == 0 || line == b"\r\n" {
+                break;
+            }
+        }
+        let _ = arrived_tx.send(());
+        let _ = released.await;
+        let out = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = write.write_all(out.as_bytes()).await;
+        let _ = write.shutdown().await;
+    });
+    (addr, arrived, release)
+}
+
+/// A video job's charge is claimed once whatever order its admitted polls settle in. Expiry
+/// refuses new polls only: a record stays while an admitted poll holds it.
+#[test]
+fn video_job_charge_is_claimed_once_across_interleavings() {
+    use crate::xai_media::VideoJobs;
+    enum Step {
+        Clock(u64),
+        Create(&'static str),
+        /// (slot, job, admitted)
+        Admit(usize, &'static str, bool),
+        /// (slot, charged)
+        Settle(usize, bool),
+        Release(usize),
+    }
+    use Step::*;
+    const DAY: u64 = 24 * 3600;
+    let rows = [
+        (
+            "two polls admitted uncharged; one charges, a poll past expiry is refused, the other settles",
+            vec![
+                Create("a"),
+                Admit(0, "a", true),
+                Admit(1, "a", true),
+                Clock(1),
+                Settle(0, true),
+                Release(0),
+                Clock(DAY + 2),
+                Admit(2, "a", false),
+                Settle(1, false),
+                Release(1),
+                Admit(2, "a", false),
+            ],
+        ),
+        (
+            "an expired job admitted before expiry: no new poll, its first settlement charges",
+            vec![
+                Create("b"),
+                Admit(0, "b", true),
+                Clock(DAY + 1),
+                Admit(1, "b", false),
+                Settle(0, true),
+                Release(0),
+                Admit(1, "b", true),
+                Settle(1, false),
+            ],
+        ),
+        (
+            "two first settlements: one charges",
+            vec![
+                Create("c"),
+                Admit(0, "c", true),
+                Admit(1, "c", true),
+                Settle(1, true),
+                Settle(0, false),
+            ],
+        ),
+        ("a job never created", vec![Admit(0, "d", false)]),
+    ];
+    for (name, steps) in rows {
+        let time: Arc<Mutex<Duration>> = Arc::default();
+        let base = std::time::Instant::now();
+        let now = time.clone();
+        let jobs = VideoJobs::with_clock(Arc::new(move || base + *now.lock().unwrap()));
+        let mut held: [Option<crate::xai_media::Admission<'_>>; 3] = [None, None, None];
+        for (i, step) in steps.into_iter().enumerate() {
+            match step {
+                Clock(seconds) => *time.lock().unwrap() = Duration::from_secs(seconds),
+                Create(job) => drop(jobs.created(job)),
+                Admit(slot, job, admitted) => {
+                    held[slot] = jobs.admit(job);
+                    assert_eq!(held[slot].is_some(), admitted, "{name}: step {i}");
+                }
+                Settle(slot, charged) => {
+                    let admission = held[slot].as_ref().expect("an admitted poll");
+                    assert_eq!(admission.settle(), charged, "{name}: step {i}");
+                }
+                Release(slot) => held[slot] = None,
+            }
+        }
     }
 }
 

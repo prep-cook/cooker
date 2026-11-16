@@ -43,91 +43,181 @@ pub struct CanonicalUsage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dimension {
     Count(u64),
+    /// A unit that can be fractional, such as Codex's rollout budget units: the JSON number as
+    /// the upstream spelled it, never rounded or converted to another unit.
+    Decimal(String),
     Text(String),
 }
 
+/// What one [`DIMENSIONS`] row holds, and so which [`Dimension`] it records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unit {
+    /// An unsigned integer: a token, call or tick count.
+    Count,
+    /// Any JSON number ([`Dimension::Decimal`]).
+    Decimal,
+    Text,
+}
+
 /// The billing dimensions accounting records besides the token counts: `(source protocol, path
-/// in its native usage, record name, whether a count)`. Both accounting paths read these rows:
+/// in its native usage, record name, unit)`. Both accounting paths read these rows:
 /// the canonical snapshot's `native` value, which keeps provider fields isolated (Q3), and the
 /// legacy parsers' upstream usage object. A provider unit adds a row for each billed unit its
 /// usage reports.
-const DIMENSIONS: &[(&str, &[&str], &str, bool)] = &[
+const DIMENSIONS: &[(&str, &[&str], &str, Unit)] = &[
     (
         "chat",
         &["prompt_tokens_details", "audio_tokens"],
         "input_audio_tokens",
-        true,
+        Unit::Count,
     ),
     (
         "chat",
         &["prompt_tokens_details", "text_tokens"],
         "input_text_tokens",
-        true,
+        Unit::Count,
     ),
     (
         "chat",
         &["prompt_tokens_details", "image_tokens"],
         "input_image_tokens",
-        true,
+        Unit::Count,
     ),
     (
         "chat",
         &["completion_tokens_details", "audio_tokens"],
         "output_audio_tokens",
-        true,
+        Unit::Count,
     ),
     (
         "chat",
         &["completion_tokens_details", "text_tokens"],
         "output_text_tokens",
-        true,
+        Unit::Count,
     ),
     (
         "chat",
         &["completion_tokens_details", "image_tokens"],
         "output_image_tokens",
-        true,
+        Unit::Count,
     ),
     (
         "chat",
         &["completion_tokens_details", "accepted_prediction_tokens"],
         "accepted_prediction_tokens",
-        true,
+        Unit::Count,
     ),
     (
         "chat",
         &["completion_tokens_details", "rejected_prediction_tokens"],
         "rejected_prediction_tokens",
-        true,
+        Unit::Count,
     ),
-    ("anthropic", &["speed"], "speed", false),
-    ("anthropic", &["inference_geo"], "inference_geo", false),
+    ("anthropic", &["speed"], "speed", Unit::Text),
+    ("anthropic", &["inference_geo"], "inference_geo", Unit::Text),
     (
         "anthropic",
         &["server_tool_use", "web_search_requests"],
         "web_search_requests",
-        true,
+        Unit::Count,
     ),
     (
         "anthropic",
         &["server_tool_use", "web_fetch_requests"],
         "web_fetch_requests",
-        true,
+        Unit::Count,
     ),
     // Meta segmentation: per-image and per-frame billing quantities.
-    ("responses", &["images_processed"], "images_processed", true),
-    ("responses", &["video_frames_processed"], "video_frames_processed", true),
+    ("responses", &["images_processed"], "images_processed", Unit::Count),
+    (
+        "responses",
+        &["video_frames_processed"],
+        "video_frames_processed",
+        Unit::Count,
+    ),
+    // xAI: the charge in its two currency units (10^10 ticks or 10^9 nano-USD per dollar), kept
+    // apart and as reported, and the server-side tool counts billed per call or item.
+    ("responses", &["cost_in_usd_ticks"], "cost_in_usd_ticks", Unit::Count),
+    ("responses", &["cost_in_nano_usd"], "cost_in_nano_usd", Unit::Count),
+    ("responses", &["num_sources_used"], "num_sources_used", Unit::Count),
+    (
+        "responses",
+        &["num_server_side_tools_used"],
+        "num_server_side_tools_used",
+        Unit::Count,
+    ),
+    (
+        "responses",
+        &["server_side_tool_usage_details", "web_search_calls"],
+        "web_search_calls",
+        Unit::Count,
+    ),
+    (
+        "responses",
+        &["server_side_tool_usage_details", "x_search_calls"],
+        "x_search_calls",
+        Unit::Count,
+    ),
+    (
+        "responses",
+        &["server_side_tool_usage_details", "x_posts_fetched"],
+        "x_posts_fetched",
+        Unit::Count,
+    ),
+    (
+        "responses",
+        &["server_side_tool_usage_details", "x_users_fetched"],
+        "x_users_fetched",
+        Unit::Count,
+    ),
+    (
+        "responses",
+        &["server_side_tool_usage_details", "code_interpreter_calls"],
+        "code_interpreter_calls",
+        Unit::Count,
+    ),
+    (
+        "responses",
+        &["server_side_tool_usage_details", "file_search_calls"],
+        "file_search_calls",
+        Unit::Count,
+    ),
+    (
+        "responses",
+        &["server_side_tool_usage_details", "document_search_calls"],
+        "document_search_calls",
+        Unit::Count,
+    ),
+    (
+        "responses",
+        &["server_side_tool_usage_details", "image_generation_calls"],
+        "image_generation_calls",
+        Unit::Count,
+    ),
+    (
+        "responses",
+        &["server_side_tool_usage_details", "mcp_calls"],
+        "mcp_calls",
+        Unit::Count,
+    ),
+    // Codex: rollout budget units, a quota unit that is neither tokens nor currency.
+    (
+        "responses",
+        &["codex_rollout_budget_units"],
+        "codex_rollout_budget_units",
+        Unit::Decimal,
+    ),
 ];
 
 /// The service tier inside a source's native usage: `(protocol, member)`.
 const TIERS: &[(&str, &str)] = &[("anthropic", "service_tier"), ("gemini", "serviceTier")];
 
-/// The [`DIMENSIONS`] rows of one source protocol: `(path, record name, whether a count)`.
-pub(crate) fn dimension_rows(protocol: &str) -> impl Iterator<Item = (&'static [&'static str], &'static str, bool)> {
+/// The [`DIMENSIONS`] rows of one source protocol: `(path, record name, unit)`.
+pub(crate) fn dimension_rows(protocol: &str) -> impl Iterator<Item = (&'static [&'static str], &'static str, Unit)> {
     DIMENSIONS
         .iter()
         .filter(move |row| row.0 == protocol)
-        .map(|&(_, path, name, count)| (path, name, count))
+        .map(|&(_, path, name, unit)| (path, name, unit))
 }
 
 /// The usage member, the first segment of its [`DIMENSIONS`] path, holding the dimension `name`.
@@ -226,17 +316,24 @@ fn at(doc: &Document, mut node: usize, path: &[&str]) -> codec::Result<Option<us
     Ok(Some(node))
 }
 
-/// The value of one dimension: an unsigned count or a string, as its row declares. Null, a
-/// count that is not an unsigned integer and a value of the other kind report nothing the
-/// record can name, so the dimension stays absent.
-fn dimension(doc: &Document, node: usize, count: bool) -> codec::Result<Option<Dimension>> {
-    match doc.node(node)?.value {
-        Value::Unsigned(_) | Value::Number(_) if count => match doc.unsigned(node) {
+/// The value of one dimension in its row's unit. Null, a count that is not an unsigned integer
+/// and a value of another kind report nothing the record can name, so the dimension stays absent.
+fn dimension(doc: &Document, node: usize, unit: Unit) -> codec::Result<Option<Dimension>> {
+    match (doc.node(node)?.value, unit) {
+        (Value::Unsigned(_) | Value::Number(_), Unit::Count) => match doc.unsigned(node) {
             Ok(n) => Ok(Some(Dimension::Count(n))),
             Err(codec::Error::Schema) => Ok(None),
             Err(error) => Err(error),
         },
-        Value::String(_) | Value::Text(_) if !count => string(doc, node).map(|text| Some(Dimension::Text(text))),
+        (Value::Number(number), Unit::Decimal) => {
+            let mut cursor = doc.source(number)?.cursor(number.span)?;
+            let mut text = String::new();
+            while let Some(b) = cursor.next_byte()? {
+                text.push(char::from(b));
+            }
+            Ok(Some(Dimension::Decimal(text)))
+        }
+        (Value::String(_) | Value::Text(_), Unit::Text) => string(doc, node).map(|text| Some(Dimension::Text(text))),
         _ => Ok(None),
     }
 }
@@ -257,9 +354,9 @@ fn native(doc: &Document, usage: usize) -> codec::Result<Option<(usize, String)>
 fn dimensions(doc: &Document, usage: usize) -> codec::Result<Vec<(&'static str, Dimension)>> {
     let mut found = Vec::new();
     if let Some((value, protocol)) = native(doc, usage)? {
-        for (path, name, count) in dimension_rows(&protocol) {
+        for (path, name, unit) in dimension_rows(&protocol) {
             if let Some(node) = at(doc, value, path)?
-                && let Some(value) = dimension(doc, node, count)?
+                && let Some(value) = dimension(doc, node, unit)?
             {
                 found.push((name, value));
             }
@@ -272,7 +369,7 @@ fn native_tier(doc: &Document, usage: usize) -> codec::Result<Option<String>> {
     if let Some((value, protocol)) = native(doc, usage)?
         && let Some(member) = tier_member(&protocol)
         && let Some(node) = at(doc, value, &[member])?
-        && let Some(Dimension::Text(tier)) = dimension(doc, node, false)?
+        && let Some(Dimension::Text(tier)) = dimension(doc, node, Unit::Text)?
     {
         return Ok(Some(tier));
     }
