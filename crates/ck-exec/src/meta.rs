@@ -338,18 +338,23 @@ pub(crate) fn headers(c: &Credential, client: &http::HeaderMap, session: Option<
 /// `wrapMetaUpstreamError`, with Go's cooldown semantics as scopes: a 429 or 404 cools
 /// the model on this credential, a subscription-quota 429 the whole credential.
 pub(crate) fn upstream_error(status: u16, body: &[u8]) -> ExecError {
+    classified(status, body, "error")
+}
+
+/// [`upstream_error`] reading the error object at path `error` of `body`.
+fn classified(status: u16, body: &[u8], error: &str) -> ExecError {
     let mut retry_after = None;
     let scope = match status {
         429 => {
-            retry_after = resets_in(body);
-            if subscription_quota(body) {
+            retry_after = resets_in(body, error);
+            if subscription_quota(body, error) {
                 FailureScope::Credential
             } else {
                 FailureScope::Model
             }
         }
         404 => {
-            retry_after = Some(resets_in(body).unwrap_or(NOT_FOUND_COOLDOWN));
+            retry_after = Some(resets_in(body, error).unwrap_or(NOT_FOUND_COOLDOWN));
             FailureScope::Model
         }
         401 | 402 | 403 | 408 | 500.. => FailureScope::Credential,
@@ -367,9 +372,10 @@ pub(crate) fn upstream_error(status: u16, body: &[u8]) -> ExecError {
     }
 }
 
-/// `parseMetaRetryAfter` for a 429/404 body: time until a future `error.resets_at`.
-fn resets_in(body: &[u8]) -> Option<Duration> {
-    let resets_at = gj::get(body, "error.resets_at").int();
+/// `parseMetaRetryAfter` for a 429/404 body: time until a future `resets_at` of the error
+/// object at path `error`.
+fn resets_in(body: &[u8], error: &str) -> Option<Duration> {
+    let resets_at = gj::get(body, &format!("{error}.resets_at")).int();
     if resets_at <= 0 {
         return None;
     }
@@ -380,33 +386,36 @@ fn resets_in(body: &[u8]) -> Option<Duration> {
 }
 
 /// `isMetaSubscriptionQuota` (status already 429).
-fn subscription_quota(body: &[u8]) -> bool {
+fn subscription_quota(body: &[u8], error: &str) -> bool {
     if body.is_empty() {
         return false;
     }
-    let message = gj::get(body, "error.message").str().go_lower();
-    let code = gj::get(body, "error.code").str().go_lower();
+    let field = |name: &str| gj::get(body, &format!("{error}.{name}"));
+    let message = field("message").str().go_lower();
+    let code = field("code").str().go_lower();
     if message.contains("subscription quota") || message.contains("quota exhausted") {
         return true;
     }
-    (code == "rate_limit_exceeded" || code.contains("quota")) && gj::get(body, "error.resets_at").exists()
+    (code == "rate_limit_exceeded" || code.contains("quota")) && field("resets_at").exists()
 }
 
 /// `metaStreamEventError`: an `error` or `response.failed` event ends the response with its
 /// error code as status when it is an HTTP error code, else 502. A `response.failed` carries its
-/// error in `response.error`; a top-level `error` is read when that has no code.
+/// error object in `response.error`, an `error` event (or a `response.failed` without that
+/// object) in `error`; status, quota scope and reset time all come from that one object.
 pub(crate) fn stream_event_error(event: &[u8]) -> Option<ExecError> {
     let kind = gj::get(event, "type").bytes();
     if &*kind != b"error" && &*kind != b"response.failed" {
         return None;
     }
-    let mut code = gj::get(event, "response.error.code");
-    if &*kind == b"error" || !code.exists() {
-        code = gj::get(event, "error.code");
-    }
-    let code = code.int();
+    let error = if &*kind == b"response.failed" && gj::get(event, "response.error").is_object() {
+        "response.error"
+    } else {
+        "error"
+    };
+    let code = gj::get(event, &format!("{error}.code")).int();
     let status = if (400..=599).contains(&code) { code as u16 } else { 502 };
-    Some(upstream_error(status, event))
+    Some(classified(status, event, error))
 }
 
 /// The Refresh metadata change after a successful mint.

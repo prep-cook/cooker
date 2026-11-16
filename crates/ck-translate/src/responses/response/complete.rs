@@ -76,14 +76,20 @@ impl State {
         Err(Error::Schema)
     }
 
-    /// Publishes what failed response `root` may tell the client: its identity and usage. Every
-    /// other member, its error and any nonstandard diagnostic included, stays upstream; egress
-    /// writes a sanitized error (crates/AGENTS.md, Security).
+    /// Publishes what failed response `root` may tell the client: its identity, usage and
+    /// partial output, reconciled with what was streamed as a completion's is. Every other
+    /// member, its error and any nonstandard diagnostic included, stays upstream; egress writes
+    /// a sanitized error (crates/AGENTS.md, Security).
     pub(super) fn publish_failed(&mut self, owner: &mut Writer, doc: &Document, root: usize) -> Result<()> {
         if !matches!(doc.node(root)?.value, Value::Object) {
             return Err(Error::Schema);
         }
         self.lifecycle(owner, doc, root)?;
+        if self.operation != Operation::Compact
+            && let Some(output) = doc.member(root, "output")?
+        {
+            self.reconcile_output(owner, doc, output)?;
+        }
         self.emitter.emit(
             owner,
             Kind::Opaque,
@@ -152,11 +158,17 @@ impl State {
     }
 
     /// Closes every output item against the snapshot and publishes the finish chunk.
-    fn complete_output(&mut self, owner: &mut Writer, doc: &Document, root: usize, output: usize) -> Result<()> {
+    /// Reconciles every item of terminal `output` with what was published and closes it.
+    fn reconcile_output(&mut self, owner: &mut Writer, doc: &Document, output: usize) -> Result<()> {
         for (index, item) in doc.children(output)?.enumerate() {
             let at = self.find_or_add(owner, doc, item, index as u64)?;
             self.snapshot_item(owner, at, doc, item, true)?;
         }
+        Ok(())
+    }
+
+    fn complete_output(&mut self, owner: &mut Writer, doc: &Document, root: usize, output: usize) -> Result<()> {
+        self.reconcile_output(owner, doc, output)?;
         if self.items.iter().any(|i| !i.closed) || self.items.len() != doc.children(output)?.count() {
             return Err(Error::Truncated);
         }

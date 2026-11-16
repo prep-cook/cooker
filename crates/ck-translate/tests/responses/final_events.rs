@@ -171,16 +171,35 @@ fn closing_parts_reconcile_nested_members() {
 fn failure_and_annotation_events_follow_the_native_schemas() {
     let created =
         json!({"type":"response.created","response":{"id":"r","model":"m","status":"in_progress","output":[]}});
-    let records = [
-        created.clone(),
-        json!({"type":"response.output_item.added","output_index":0,
-            "item":{"id":"i","type":"message","role":"assistant","content":[]}}),
-        json!({"type":"response.content_part.added","output_index":0,"item_id":"i","content_index":0,
-            "part":{"type":"output_text","text":"","annotations":[]}}),
-        json!({"type":"response.output_text.delta","output_index":0,"item_id":"i","content_index":0,"delta":"hi"}),
-        json!({"type":"response.failed","response":{"id":"r","status":"failed"}}),
+    // A failed snapshot's output reconciles what was streamed, as a completed one does; its
+    // error never reaches the client.
+    let snapshot = json!({"response":{"id":"r","model":"m","status":"failed",
+        "output":[{"id":"i","type":"message","status":"incomplete","role":"assistant",
+            "content":[{"type":"output_text","text":"hi there","annotations":[]}]}],
+        "usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9},
+        "error":{"code":429,"message":"private upstream diagnostic"}},"type":"response.failed"});
+    // (failed event, final text, final item status)
+    let rows = [
+        (
+            json!({"type":"response.failed","response":{"id":"r","status":"failed"}}),
+            "hi",
+            None,
+        ),
+        (snapshot, "hi there", Some("incomplete")),
     ];
-    for mode in [BodyMode::Streaming, BodyMode::Buffered] {
+    for ((failed, text, status), mode) in rows
+        .iter()
+        .flat_map(|row| [BodyMode::Streaming, BodyMode::Buffered].map(|mode| (row, mode)))
+    {
+        let records = [
+            created.clone(),
+            json!({"type":"response.output_item.added","output_index":0,
+                "item":{"id":"i","type":"message","status":"in_progress","role":"assistant","content":[]}}),
+            json!({"type":"response.content_part.added","output_index":0,"item_id":"i","content_index":0,
+                "part":{"type":"output_text","text":"","annotations":[]}}),
+            json!({"type":"response.output_text.delta","output_index":0,"item_id":"i","content_index":0,"delta":"hi"}),
+            failed.clone(),
+        ];
         let mut m = Mapped::new();
         let mut ingress = responses::response::Ingress::new(
             &mut m.writer,
@@ -218,6 +237,12 @@ fn failure_and_annotation_events_follow_the_native_schemas() {
         assert_eq!(response["object"], "response");
         assert_eq!(response["status"], "failed");
         assert!(response["error"]["code"].is_string() && response["error"]["message"].is_string());
+        let item = &response["output"][0];
+        assert_eq!(item["content"][0]["text"], *text, "{mode:?}: {response}");
+        if let Some(status) = status {
+            assert_eq!(item["status"], *status, "{mode:?}: {response}");
+        }
+        assert!(!String::from_utf8_lossy(&out).contains("private"), "{mode:?}");
     }
     let citation = |i: u64| json!({"type":"url_citation","url":format!("https://e/{i}"),"title":"t","start_index":0,"end_index":1});
     let text = json!({"id":"r","status":"completed","output":[{"id":"i","type":"message","role":"assistant",
