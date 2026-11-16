@@ -200,6 +200,9 @@ pub(super) async fn run<X: Arms>(
             caller: &call.caller,
             headers: &call.headers,
             route: &call.request_path,
+            alt: call.alt.as_deref(),
+            // A Gemini route names its stream choice in its action; other bodies state it.
+            streaming: (call.entry == ck_core::format::Format::Gemini).then_some(call.stream),
             session: req.session.as_deref(),
             execution_session: req.execution_session.as_deref(),
             derived_session: req.derived_session.as_deref(),

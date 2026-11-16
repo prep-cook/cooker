@@ -346,6 +346,9 @@ struct Begun {
     previous_gone: Option<bool>,
     /// Usage records enqueued before this attempt started.
     records: usize,
+    /// The route facts the attempt's request handle carries: `alt` and the route's stream
+    /// choice.
+    route: (Option<String>, Option<bool>),
 }
 
 /// The contract arm scripted per credential id; `start` runs the real `pipeline::start`.
@@ -422,6 +425,7 @@ impl Arms for Fake {
                 attempt: attempt.identity.attempt,
                 previous_gone: previous.map(|id| matches!(attempt.store.reader(id, 0), Err(ck_stream::Error::Gone))),
                 records,
+                route: (request.client.alt.map(str::to_owned), request.client.streaming),
             });
         }
         let executor = Executor {
@@ -587,6 +591,57 @@ fn call() -> Call {
         peer: None,
         turn: None,
         media: None,
+    }
+}
+
+/// The attempt's request handle carries the route facts the body does not state: the
+/// `alt` query value, and the stream choice a Gemini action names.
+#[tokio::test]
+async fn an_attempt_carries_the_route_facts() {
+    let rows = [
+        (Format::OpenAI, true, None, (None, None)),
+        (Format::OpenAI, true, Some("json"), (Some("json"), None)),
+        (Format::Gemini, false, Some("json"), (Some("json"), Some(false))),
+        (Format::Gemini, true, None, (None, Some(true))),
+    ];
+    let (upstream, _sends) = refusing_upstream().await;
+    for (entry, stream, alt, want) in rows {
+        let fixture = Fixture::with_credentials(vec![credential("a"), credential("b")], &upstream);
+        let (_release, released) = oneshot::channel();
+        let fake = Fake {
+            rt: fixture.rt.clone(),
+            scripts: [("a", Script::Answers), ("b", Script::Answers)],
+            begun: Mutex::default(),
+            records: Mutex::default(),
+            release: Mutex::new(Some(released)),
+        };
+        let mut exchange = exchange(&fixture, owner(KEY), output(Protocol::Chat, Framing::Sse), CLIENT);
+        let (document, media) = request_view(&fixture, &mut exchange);
+        let codec = Codec {
+            exchange,
+            view: RequestView {
+                document: &document,
+                media: &media,
+                operation: Operation::Generate,
+            },
+            request_id: LocalId::new("request").unwrap(),
+        };
+        let mut call = call();
+        (call.entry, call.stream, call.alt) = (entry, stream, alt.map(str::to_owned));
+        let trace = Trace::with_request_id(Some("trace".into()));
+        let served = tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch::run_exchange(&fixture.rt, &fake, call, &trace, codec),
+        )
+        .await
+        .expect("the call finishes");
+        drop(served);
+        let begun = fake.begun.lock().unwrap();
+        let got = begun.first().map(|b| b.route.clone()).expect("an attempt started");
+        let want = (want.0.map(str::to_owned), want.1);
+        assert_eq!(got, want, "{entry:?} stream {stream} alt {alt:?}");
+        drop(begun);
+        drop((document, media));
     }
 }
 
