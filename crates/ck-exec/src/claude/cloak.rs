@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 
 use super::signals;
 use crate::rawjson::{self, js_string};
+pub(crate) mod compaction;
 
 pub(crate) const CLI_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 pub(crate) const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
@@ -294,7 +295,7 @@ pub(crate) fn prepend_reminders(body: &str, blocks: &[Forwarded], explicit: bool
         }
         let at = blocks
             .iter()
-            .take_while(|b| b.get("type").str() == "tool_result")
+            .take_while(|b| compaction::stays_first(b.get("type").str()))
             .count();
         let mut raw: Vec<String> = blocks.iter().map(|b| b.json().to_owned()).collect();
         raw.splice(at..at, new_blocks);
@@ -469,7 +470,7 @@ pub(crate) fn inject_current_date(body: &str, date: &str, explicit: bool) -> Str
     }
     let at = raw
         .iter()
-        .take_while(|b| rawjson::get(b, "type").str() == "tool_result")
+        .take_while(|b| compaction::stays_first(rawjson::get(b, "type").str()))
         .count();
     raw.insert(at, date_block);
     rawjson::set_raw(body, &path, &format!("[{}]", raw.join(",")))
@@ -580,7 +581,7 @@ pub(crate) fn thinking_accepts_clear(body: &str) -> bool {
 
 /// `injectClaudeCodeContextManagement`.
 pub(crate) fn inject_context_management(body: &str) -> Option<String> {
-    (!rawjson::get(body, "context_management").exists() && thinking_accepts_clear(body))
+    (!rawjson::get(body, "context_management").exists() && compaction::accepts_context(body))
         .then(|| rawjson::set_raw(body, "context_management", CONTEXT_MANAGEMENT))
 }
 
@@ -593,7 +594,7 @@ pub(crate) fn reconcile_context_management(body: String, eligible: bool, caller_
         }
         return rawjson::delete(&body, "context_management");
     }
-    if !eligible || caller_owned || current.exists() {
+    if !eligible || caller_owned || current.exists() || !compaction::accepts_context(&body) {
         return body;
     }
     rawjson::set_raw(&body, "context_management", CONTEXT_MANAGEMENT)
@@ -807,12 +808,11 @@ fn eligible_for_rolling_cache(message: &rawjson::Value) -> bool {
     if content.kind() != gjson::Kind::Array || blocks.is_empty() {
         return false;
     }
-    if message.get("role").str() != "assistant" {
-        return true;
-    }
+    let assistant = message.get("role").str() == "assistant";
+    let last = blocks.last().map(|b| b.get("type").str().to_owned());
     !matches!(
-        blocks.last().map(|b| b.get("type").str().to_owned()).as_deref(),
-        Some("thinking" | "redacted_thinking")
+        (assistant, last.as_deref()),
+        (true, Some("thinking" | "redacted_thinking")) | (_, Some("compaction"))
     )
 }
 

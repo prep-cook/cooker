@@ -489,3 +489,95 @@ async fn a_buffered_cloaked_body_over_the_stream_quota_fails_visibly() {
     assert_eq!(published.terminal, Some(Terminal::StorageExhausted));
     assert!(published.records.is_empty(), "nothing of the body is published");
 }
+
+/// A compaction on an OAuth credential is prepared like any cloaked request and still asks
+/// for native compaction; it, an Anthropic client asking for one itself, and a cloaked request
+/// replaying a compaction block carry the compaction beta (D2 plan §2.7). A cloaked replay goes upstream as the client sent it
+/// (Settled 72), so the block keeps its place, escaped or not, and the cloak's own insertions
+/// go behind a block that opens the first user turn. Anthropic refuses `compaction` with
+/// `context_management`, so the cloak adds none to it, even with thinking on through the
+/// model's thinking suffix. One a payload rule adds is refused in words that name neither the
+/// upstream nor the operator's setting.
+#[tokio::test]
+async fn cloaked_compactions_carry_the_beta_without_context_management() {
+    let compact =
+        br#"{"model":"m","max_output_tokens":16000,"input":[{"role":"user","content":"Explain lifetimes."}]}"#;
+    let block = json!({"type": "compaction", "content": "Café — done.", "signature": "EqQBCkgIBxABGAIq"});
+    let replay = |messages: Value| {
+        serde_json::to_vec(&json!({"model": SONNET, "max_tokens": 64, "messages": messages})).unwrap()
+    };
+    let summarized = replay(json!([
+        {"role": "user", "content": "Explain lifetimes."},
+        {"role": "assistant", "content": "They bound references."},
+        {"role": "assistant", "content": [&block]},
+        {"role": "user", "content": "And now?"},
+    ]));
+    let escaped = String::from_utf8(summarized.clone())
+        .unwrap()
+        .replacen(r#""type":"compaction""#, r#""type":"\u0063ompaction""#, 1)
+        .into_bytes();
+    let user_first = replay(json!([{"role": "user", "content": [&block, {"type": "text", "text": "And now?"}]}]));
+    let asks = serde_json::to_vec(
+        &json!({"model": SONNET, "max_tokens": 64, "compaction": {"type": "summarize"},
+        "messages": [{"role": "user", "content": "Explain lifetimes."}]}),
+    )
+    .unwrap();
+    let thinking = format!("{SONNET}(8192)");
+    let rule = format!(
+        "requests:\n  payload:\n    default:\n      - models: [{{name: {SONNET}}}]\n        params: {{context_management: {{edits: []}}}}\n"
+    );
+    for (body, operation, model, rules, refused) in [
+        (&compact[..], Operation::Compact, SONNET, None, false),
+        (&compact[..], Operation::Compact, thinking.as_str(), None, false),
+        (&compact[..], Operation::Compact, SONNET, Some(&rule), true),
+        (&summarized[..], Operation::Generate, SONNET, None, false),
+        (&escaped[..], Operation::Generate, SONNET, None, false),
+        (&user_first[..], Operation::Generate, SONNET, None, false),
+        (&asks[..], Operation::Generate, SONNET, None, false),
+    ] {
+        let (mut fixture, recorder) = at(ORIGIN, &oauth(), model, &[]);
+        if let Some(rules) = rules {
+            fixture.exchange.cfg = ck_core::config::Config::parse(rules).unwrap();
+        }
+        let started = if operation == Operation::Compact {
+            let mut request = fixture.streams.request();
+            let (store, id) = (&fixture.streams.store, identity(Direction::Request));
+            let mut ingress = responses::request::Ingress::new(&mut request, store, id, operation, LIMIT).unwrap();
+            fixture.start(&mut ingress, &mut request, body).await.0
+        } else {
+            fixture.anthropic(body, operation).await.0
+        };
+        let Err(error) = started else {
+            panic!("the proxy refuses every connection")
+        };
+        let wire = recorder.0.lock().unwrap().pop();
+        if refused {
+            assert!(wire.is_none(), "{model}");
+            let text = String::from_utf8_lossy(&error.body);
+            assert!(text.contains("context_management"), "{text}");
+            assert!(!text.contains("Anthropic") && !text.contains("payload"), "{text}");
+            continue;
+        }
+        let wire = wire.expect("the upstream request");
+        let sent: Value = serde_json::from_str(&wire.body).unwrap();
+        if sent.get("compaction").is_some() {
+            assert_eq!(sent["compaction"], json!({"type": "summarize"}));
+        } else {
+            let messages = sent["messages"].as_array().unwrap();
+            assert!(messages.iter().any(|m| m["content"][0] == block), "{sent}");
+        }
+        if operation == Operation::Compact {
+            assert_eq!(sent["stream"], false);
+        }
+        assert!(sent.get("context_management").is_none(), "{sent}");
+        assert_eq!(sent.get("thinking").is_some(), model != SONNET, "{sent}");
+        let betas = wire
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
+            .unwrap();
+        for beta in ["oauth-2025-04-20", "compact-2026-09-04"] {
+            assert!(betas.1.split(',').any(|b| b == beta), "{beta} missing from {}", betas.1);
+        }
+    }
+}

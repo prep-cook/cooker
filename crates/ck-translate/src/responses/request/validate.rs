@@ -308,7 +308,9 @@ fn validate_part(view: RequestView<'_>, part: usize) -> Result<()> {
             .get(doc, doc.required(source, "ref")?)?
             .ok_or(Error::Position)?;
     }
-    if !supported {
+    // Another protocol's opaque block, such as an Anthropic compaction, never goes to Responses
+    // (owner ruling Q3).
+    if !supported || (doc.string_is(kind, "opaque")? && !is(doc, part, "protocol", "responses")?) {
         return Err(Error::Unsupported);
     }
     if doc.string_is(kind, "document")? {

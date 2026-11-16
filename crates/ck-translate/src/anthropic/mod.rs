@@ -1,5 +1,6 @@
 //! Anthropic Messages boundary codecs over the shared canonical stream.
 
+pub mod compaction;
 mod content;
 pub mod egress;
 mod index;

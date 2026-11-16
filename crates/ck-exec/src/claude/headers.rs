@@ -370,8 +370,8 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
         } else if p.stream {
             restore(&mut h);
         }
-        if rawjson::get(p.body, "thinking.block_binding").exists() {
-            h.set("Anthropic-Beta", betas::with_thinking_binding(h.get("Anthropic-Beta")));
+        if let Some(betas) = betas::documented(h.get("Anthropic-Beta"), p.body) {
+            h.set("Anthropic-Beta", betas);
         }
         // This branch excludes cloaked and confirmed Claude Code requests, even on API keys.
         if !p.bearer {
@@ -477,8 +477,8 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
     } else if p.stream {
         transport(&mut h);
     }
-    if rawjson::get(p.body, "thinking.block_binding").exists() {
-        h.set("Anthropic-Beta", betas::with_thinking_binding(h.get("Anthropic-Beta")));
+    if let Some(betas) = betas::documented(h.get("Anthropic-Beta"), p.body) {
+        h.set("Anthropic-Beta", betas);
     }
     h
 }

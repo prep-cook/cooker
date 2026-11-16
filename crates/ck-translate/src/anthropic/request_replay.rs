@@ -1,6 +1,17 @@
 //! Replay signatures of thinking blocks bound for an Anthropic upstream.
 use super::At;
-use crate::codec::{Result, document::Document};
+use crate::codec::{Error, Result, document::Document};
+
+/// Whether some replay entry has no binding: an imported document, whose entries are matched
+/// by position instead.
+pub(super) fn unbound(doc: &Document, x: usize) -> Result<bool> {
+    match doc.member(x, "replay")? {
+        Some(replay) => doc
+            .children(replay)?
+            .try_fold(false, |any, entry| Ok::<_, Error>(any || doc.origin(entry)?.is_none())),
+        None => Ok(false),
+    }
+}
 
 /// The replay signature of a reasoning part: its bound entry's, or for an imported document,
 /// which carries no bindings, the entry's at the part's position.

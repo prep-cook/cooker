@@ -7,9 +7,7 @@ use crate::codec::{
 use std::collections::hash_map::RandomState;
 
 pub(super) fn validate(view: RequestView<'_>, default_max_tokens: Option<u64>) -> Result<()> {
-    if view.operation == Operation::Compact {
-        return Err(Error::Unsupported);
-    }
+    super::compaction::validate(view)?;
     let doc = view.document;
     let root = doc.root();
     let messages = parameters(doc, root, view.operation, default_max_tokens)?;
@@ -64,7 +62,7 @@ fn parameters(doc: &Document, root: usize, operation: Operation, default_max_tok
         .member(root, "max_completion_tokens")?
         .map(|n| doc.unsigned(n))
         .transpose()?;
-    if operation == Operation::Generate {
+    if operation != Operation::CountTokens {
         // Encoding writes `max_completion_tokens` as `max_tokens` unless `max_tokens` is present.
         let max_tokens = match doc.member(root, "max_tokens")? {
             Some(max_tokens) => doc.unsigned(max_tokens)?,

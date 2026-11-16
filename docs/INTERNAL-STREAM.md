@@ -473,7 +473,7 @@ For request destinations unable to express a supplied semantic field in §4's ca
 
 | Wire fields | Internal location | Notes |
 | --- | --- | --- |
-| id/object/created_at/model/output[] including compaction/encrypted items | Response start + ordered `compact` events | Preserve opaque items and item IDs, not a text summary substitute. |
+| id/object/created_at/model/output[] including compaction/encrypted items | Response start + ordered `compact` events | Preserve opaque items and item IDs, not a text summary substitute. An Anthropic `compaction` block is one item `{type: "opaque", protocol: "anthropic", value}` holding the block unchanged; only the Anthropic request egress writes it, first in `messages`. |
 | usage, metadata, status/error | Usage, X original, terminal | Aggregate the compact response only at egress. |
 
 ### 5.19 Images — request, both directions

@@ -583,19 +583,6 @@ async fn api_key_requests_keep_the_clients_values_and_betas() {
     assert_eq!(captured.header("anthropic-beta"), Some(betas));
 }
 
-#[tokio::test]
-async fn compact_is_refused_at_the_fence() {
-    let upstream = StreamUpstream::start([]).await;
-    let fixture = Fixture::new(&upstream, SONNET);
-    let mut request = fixture.streams.request();
-    let store = &fixture.streams.store;
-    let (id, op) = (identity(Direction::Request), Operation::Compact);
-    let mut ingress = responses::request::Ingress::new(&mut request, store, id, op, LIMIT).unwrap();
-    let body = br#"{"model":"m","input":"hi"}"#;
-    assert!(fixture.fence(&mut ingress, &mut request, body).is_err());
-    assert_eq!(upstream.requests(), 0);
-}
-
 /// Every usage and capture call, by name.
 #[derive(Default)]
 struct Observed(Mutex<Vec<String>>);
@@ -655,5 +642,7 @@ async fn request_side_facts_reach_the_usage_sink_and_response_usage_does_not() {
 
 #[path = "exec_anthropic/cloak.rs"]
 mod cloak;
+#[path = "exec_anthropic/compaction.rs"]
+mod compaction;
 #[path = "exec_anthropic/parity.rs"]
 mod parity;

@@ -230,11 +230,16 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         doc.transplant(target, value)
     }
 
-    /// Appends one compact output item.
+    /// Appends one compact output item. Another protocol's item, such as an Anthropic
+    /// compaction block, reaches a Responses client only inside the cooker envelope (D2 plan
+    /// §2.4.1, unit D2-6a); until that exists it is refused, never written as a native item.
     pub(super) fn compact(&mut self, node: usize) -> Result<()> {
         let doc = &mut self.document;
         let output_node = doc.required(doc.root(), "output")?;
         let item = doc.required(node, "item")?;
+        if is(doc, item, "type", "opaque")? {
+            return Err(Error::Unsupported);
+        }
         doc.detach(node, item)?;
         doc.append(output_node, item)?;
         Ok(())
