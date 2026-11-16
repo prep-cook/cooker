@@ -69,18 +69,20 @@ impl Proxy {
 }
 
 /// Speech reaches the client only from its first audio byte: until then nothing is sent, not
-/// even the status line, and an attempt that ends before it fails over to the next credential
-/// with the client none the wiser.
+/// even the status line, and an attempt that ends before it, an empty answer included, fails over
+/// to the next credential with the client none the wiser. When every credential answers empty,
+/// the client gets Go's `empty_stream` failure.
 #[tokio::test]
 async fn speech_commits_at_its_first_audio_byte() {
     let late = Duration::from_millis(400);
-    // (case, upstream replies, upstream requests, earliest response head)
+    // (case, upstream replies, upstream requests, earliest response head, status)
     let cases = [
         (
             "the response head waits for the first audio byte",
             vec![Reply::ok("audio/wav", AUDIO).first_byte_after(late)],
             1,
             late,
+            200,
         ),
         (
             "an answer cut before its first byte fails over",
@@ -90,9 +92,24 @@ async fn speech_commits_at_its_first_audio_byte() {
             ],
             2,
             Duration::ZERO,
+            200,
+        ),
+        (
+            "an empty answer fails over",
+            vec![Reply::ok("audio/wav", ""), Reply::ok("audio/wav", AUDIO)],
+            2,
+            Duration::ZERO,
+            200,
+        ),
+        (
+            "every credential answering empty is an empty stream",
+            vec![Reply::ok("audio/wav", ""), Reply::ok("audio/wav", "")],
+            2,
+            Duration::ZERO,
+            500,
         ),
     ];
-    for (case, replies, sends, earliest) in cases {
+    for (case, replies, sends, earliest, status) in cases {
         let upstream = StreamUpstream::start(replies).await;
         let proxy = proxy(&upstream, 4096).await;
         let started = Instant::now();
@@ -102,11 +119,14 @@ async fn speech_commits_at_its_first_audio_byte() {
             "{case}: head after {:?}",
             started.elapsed()
         );
-        assert_eq!(response.status(), 200, "{case}");
+        assert_eq!(response.status(), status, "{case}");
+        assert_eq!(upstream.requests(), sends, "{case}");
+        if status != 200 {
+            continue;
+        }
         assert_eq!(response.headers()["content-type"], "audio/wav", "{case}");
         assert!(response.headers().contains_key("x-ck-stream-id"), "{case}");
         assert_eq!(&response.bytes().await.unwrap()[..], AUDIO, "{case}");
-        assert_eq!(upstream.requests(), sends, "{case}");
     }
 }
 

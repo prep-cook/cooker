@@ -682,48 +682,66 @@ async fn media_answers_become_canonical_records_with_scoped_usage() {
     }
 }
 
-/// The speech answer reaches the client byte for byte with the upstream's MIME type.
+/// The speech answer reaches the client byte for byte, with the upstream's media type when it
+/// names audio and the requested format's own when it names none.
 #[tokio::test]
 async fn speech_audio_passes_through_byte_exact() {
     let audio_bytes: Vec<u8> = (0..=255u8).cycle().take(120_000).collect();
-    let upstream = StreamUpstream::start([Reply::ok("audio/wav; rate=24000", audio_bytes.clone())]).await;
-    let streams = Streams::new();
-    let exchange = exchange(Provider::Xai, &upstream, "grok-tts");
-    let ask = ask(Media::Speech, SPEECH);
-    let mut held = decoded(&streams, ask);
-    let (outcome, records, _, mut stream) = run(Provider::Xai, &streams, &exchange, &mut held, ask).await.unwrap();
-    outcome.unwrap();
-    assert!(usages(&records).is_empty());
-    let id = stream.id();
-    let mut egress = audio::Egress::new(&stream, Some(identity(Direction::Response)));
-    let mut out = Vec::new();
-    let mut reader = streams.reader(id);
-    while let Some(read) = reader.next().await {
-        if let Read::Record(lease) = read {
-            egress
-                .advance(&mut stream, lease, |bytes| {
-                    let mut at = 0;
-                    while at < bytes.len() {
-                        let chunk = bytes.chunk(at).unwrap();
-                        out.extend_from_slice(chunk);
-                        at += chunk.len();
-                    }
-                    Ok(())
-                })
-                .unwrap();
+    // (upstream Content-Type, request, client media type)
+    let cases = [
+        ("audio/wav; rate=24000", SPEECH, "audio/wav; rate=24000"),
+        (" Application/JSON ; charset=utf-8", SPEECH, "audio/wav"),
+        (
+            "text/plain",
+            r#"{"model":"tts-1","input":"hello","voice":"alloy","response_format":"pcm"}"#,
+            "audio/pcm",
+        ),
+        (
+            "application/octet-stream",
+            r#"{"model":"tts-1","input":"hello","voice":"alloy"}"#,
+            "audio/mpeg",
+        ),
+    ];
+    for (upstream_type, request, expected) in cases {
+        let upstream = StreamUpstream::start([Reply::ok(upstream_type, audio_bytes.clone())]).await;
+        let streams = Streams::new();
+        let exchange = exchange(Provider::Xai, &upstream, "grok-tts");
+        let ask = ask(Media::Speech, request);
+        let mut held = decoded(&streams, ask);
+        let (outcome, records, _, mut stream) = run(Provider::Xai, &streams, &exchange, &mut held, ask).await.unwrap();
+        outcome.unwrap();
+        assert!(usages(&records).is_empty(), "{upstream_type}");
+        let id = stream.id();
+        let mut egress = audio::Egress::new(&stream, Some(identity(Direction::Response)));
+        let mut out = Vec::new();
+        let mut reader = streams.reader(id);
+        while let Some(read) = reader.next().await {
+            if let Read::Record(lease) = read {
+                egress
+                    .advance(&mut stream, lease, |bytes| {
+                        let mut at = 0;
+                        while at < bytes.len() {
+                            let chunk = bytes.chunk(at).unwrap();
+                            out.extend_from_slice(chunk);
+                            at += chunk.len();
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
         }
+        egress.finish().unwrap();
+        assert_eq!(out, audio_bytes, "{upstream_type}");
+        let mime = egress.content_type().unwrap().map(|(doc, node)| {
+            let mut chars = doc.chars(node).unwrap();
+            let mut s = String::new();
+            while let Some(c) = chars.next_scalar().unwrap() {
+                s.push(c);
+            }
+            s
+        });
+        assert_eq!(mime.as_deref(), Some(expected), "{upstream_type}");
     }
-    egress.finish().unwrap();
-    assert_eq!(out, audio_bytes);
-    let mime = egress.content_type().unwrap().map(|(doc, node)| {
-        let mut chars = doc.chars(node).unwrap();
-        let mut s = String::new();
-        while let Some(c) = chars.next_scalar().unwrap() {
-            s.push(c);
-        }
-        s
-    });
-    assert_eq!(mime.as_deref(), Some("audio/wav; rate=24000"));
 }
 
 /// A request the destination cannot express, or a fence that is not this destination's, is
