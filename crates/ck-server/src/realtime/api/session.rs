@@ -13,7 +13,8 @@
 //! - Every session ends with exactly one `live_session_end` log naming its cause.
 //! - Usage: once the session has ended, its stream is read once; each response's and each
 //!   transcription's usage is its own usage record beside the session's (E-Q13). A response
-//!   without `response.done` usage records none.
+//!   without `response.done` usage records none. A call's sideband records no usage: the
+//!   call's own data channel session records it (R-15).
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -387,6 +388,7 @@ async fn settle_and_log(
 ) -> &'static str {
     let Opened {
         rt,
+        events,
         upstream_model,
         credential,
         call_id,
@@ -394,8 +396,9 @@ async fn settle_and_log(
         ..
     } = opened;
     let (cause, initiator) = cause(&ended.end, stop);
+    let record = (events != Events::Sideband).then_some((&facts, &*credential, upstream_model.as_str()));
     let counts = match held {
-        Some(held) => settle(&rt, &facts, &credential, &upstream_model, held).await,
+        Some(held) => settle(&rt, record, held).await,
         None => Counts::default(),
     };
     let close = match &ended.end {
@@ -550,14 +553,9 @@ struct Counts {
 }
 
 /// Reads the ended session's stream once: every usage snapshot by scope, recorded as the
-/// session's usage records, and the final counters for the end log. Drops `held` after.
-async fn settle(
-    rt: &Arc<Runtime>,
-    facts: &Arc<Facts>,
-    credential: &Credential,
-    upstream_model: &str,
-    held: sessions::Held,
-) -> Counts {
+/// session's usage records when `record` names whom to record them for, and the final
+/// counters for the end log. Drops `held` after.
+async fn settle(rt: &Arc<Runtime>, record: Option<(&Arc<Facts>, &Credential, &str)>, held: sessions::Held) -> Counts {
     let mut stream = held.stream();
     let mut usage = Usage::default();
     let mut counts = Counts::default();
@@ -579,6 +577,9 @@ async fn settle(
         Err(error) => tracing::warn!(%error, "live session stream unreadable for usage"),
     }
     drop(held);
+    let Some((facts, credential, upstream_model)) = record else {
+        return counts;
+    };
     if !upstream_model.is_empty() {
         response.model = Some(upstream_model.to_owned());
     }

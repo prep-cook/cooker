@@ -1264,7 +1264,8 @@ async fn live_messages_are_forwarded_byte_for_byte() {
 }
 
 /// Each response's `response.done` usage and each transcription's token usage is its own
-/// usage record beside the session's own; a response without usage records nothing.
+/// usage record beside the session's own; a response without usage records nothing. A call's
+/// sideband records none: the call's data channel session records the call's usage (R-15).
 #[tokio::test]
 async fn live_usage_comes_from_response_done() {
     use axum::extract::ws::Message as Up;
@@ -1281,51 +1282,94 @@ async fn live_usage_comes_from_response_done() {
         r#"{"type":"response.created","response":{"id":"resp_2","status":"in_progress"}}"#,
         r#"{"type":"response.done","response":{"id":"resp_2","status":"cancelled"}}"#,
     ];
-    mock.lock()
-        .unwrap()
-        .script
-        .push_back(replies.iter().map(|r| Up::Text((*r).into())).collect());
-    let mut socket = open_realtime(&proxy).await;
-    socket
-        .send(Message::text(r#"{"type":"response.create"}"#))
-        .await
-        .unwrap();
-    for reply in replies {
-        assert_eq!(next_frame(&mut socket).await, Frame::Text(reply.into()));
-    }
-    socket.send(Message::Close(None)).await.unwrap();
-    upstream_seen(&mock).await;
-    let mut records = Vec::new();
-    for _ in 0..500 {
-        records.extend(rt.usage_queue().pop_oldest(10));
-        if records.len() >= 3 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    let mut got: Vec<(String, Option<u64>, Option<u64>, String)> = records
-        .iter()
-        .map(|record| {
-            let record: Value = serde_json::from_slice(record).unwrap();
-            // The session's own record reports no tokens.
-            (
-                record["usage_scope"].as_str().unwrap_or_default().to_owned(),
-                record["tokens"]["input_tokens"].as_u64(),
-                record["tokens"]["output_tokens"].as_u64(),
-                record["endpoint"].as_str().unwrap().to_owned(),
-            )
-        })
-        .collect();
-    got.sort();
     let endpoint = "GET /v1/realtime".to_owned();
-    assert_eq!(
-        got,
-        [
-            (String::new(), None, None, endpoint.clone()),
-            ("response:resp_1".into(), Some(10), Some(5), endpoint.clone()),
-            ("transcription:item_1".into(), Some(7), Some(2), endpoint),
-        ]
-    );
+    let client = wreq::Client::new();
+    let sideband = format!("ws{}/v1/realtime/calls/call-usage", proxy.trim_start_matches("http"));
+    // (whether the socket is a call's sideband, the usage records expected)
+    let rows = [
+        (true, vec![]),
+        (
+            false,
+            vec![
+                (String::new(), None, None, endpoint.clone()),
+                ("response:resp_1".into(), Some(10), Some(5), endpoint.clone()),
+                ("transcription:item_1".into(), Some(7), Some(2), endpoint),
+            ],
+        ),
+    ];
+    for (is_sideband, expected) in rows {
+        mock.lock()
+            .unwrap()
+            .script
+            .push_back(replies.iter().map(|r| Up::Text((*r).into())).collect());
+        let mut socket = if is_sideband {
+            let created = client
+                .post(format!("{proxy}/v1/live"))
+                .header("authorization", "Bearer owner-key")
+                .header("thread-id", "call-usage")
+                .body(r#"{"sdp":"v=0"}"#)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(created.status().as_u16(), 201);
+            let joined = client
+                .websocket(&sideband)
+                .header("authorization", "Bearer owner-key")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(joined.status().as_u16(), 101);
+            joined.into_websocket().await.unwrap()
+        } else {
+            open_realtime(&proxy).await
+        };
+        socket
+            .send(Message::text(r#"{"type":"response.create"}"#))
+            .await
+            .unwrap();
+        for reply in replies {
+            assert_eq!(next_frame(&mut socket).await, Frame::Text(reply.into()));
+        }
+        socket.send(Message::Close(None)).await.unwrap();
+        upstream_seen(&mock).await;
+        let mut records = Vec::new();
+        for _ in 0..500 {
+            records.extend(rt.usage_queue().pop_oldest(10));
+            let done = if is_sideband {
+                // The sideband settles its usage before it gives up the call; a join gets 409
+                // while it runs and 404 once the call is gone.
+                let join = client
+                    .websocket(&sideband)
+                    .header("authorization", "Bearer owner-key")
+                    .send()
+                    .await
+                    .unwrap();
+                join.status().as_u16() == 404
+            } else {
+                records.len() >= expected.len()
+            };
+            if done {
+                records.extend(rt.usage_queue().pop_oldest(10));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut got: Vec<(String, Option<u64>, Option<u64>, String)> = records
+            .iter()
+            .map(|record| {
+                let record: Value = serde_json::from_slice(record).unwrap();
+                // The session's own record reports no tokens.
+                (
+                    record["usage_scope"].as_str().unwrap_or_default().to_owned(),
+                    record["tokens"]["input_tokens"].as_u64(),
+                    record["tokens"]["output_tokens"].as_u64(),
+                    record["endpoint"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, expected, "sideband: {is_sideband}");
+    }
 }
 
 #[derive(Clone, Default)]
