@@ -51,9 +51,6 @@ impl Ingress {
         operation: Operation,
         limit: u64,
     ) -> Result<Self> {
-        if operation == Operation::CountTokens {
-            return Err(Error::Unsupported);
-        }
         Ok(Self {
             owner: owner.id(),
             input: Some(input::Input::new(owner, limit)?),

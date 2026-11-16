@@ -316,7 +316,7 @@ pub(super) async fn run<X: Arms>(
         Some(sink) => sink.clone().with_capture(req.capture().clone()),
         None => req.usage.clone(),
     };
-    let mut request = Request::owned(
+    let request = Request::owned(
         fenced,
         Client {
             caller: &call.caller,
@@ -334,6 +334,12 @@ pub(super) async fn run<X: Arms>(
             original: &call.body,
         },
     );
+    // Responses `input_tokens` presents the count as the destination's own.
+    let mut request = if responses && arm.operation == codec::Operation::CountTokens {
+        request.upstream_count()
+    } else {
+        request
+    };
     // The client's document: the one this attempt edited is the withheld copy.
     let shown = kept
         .as_ref()
@@ -368,6 +374,9 @@ pub(super) async fn run<X: Arms>(
             arm.exchange = Some(exchange);
             let _ = begun.send(Begun::Refused(error.clone()));
             let _ = settlement.done.await;
+            if ck_exec::pipeline::refused_local_count(&error) {
+                return Ran::Skip(skip(&attempt, trace, destination, Refusal::LocalCount));
+            }
             return failed(error);
         }
     };
@@ -586,6 +595,8 @@ enum Refusal {
     ForeignCompaction,
     /// Only the old arm serves the candidate, and a Responses client needs the contract arm.
     NoContract,
+    /// The destination would only estimate a count the client takes as the destination's own.
+    LocalCount,
 }
 
 /// A destination refusal: logged without content, neutral for the credential, which the
@@ -598,6 +609,7 @@ fn skip(attempt: &Attempt<'_>, trace: &Trace, destination: &str, refusal: Refusa
         Refusal::Fence(_) => "the destination does not support the request",
         Refusal::ForeignCompaction => "another account produced the compaction item",
         Refusal::NoContract => "this account does not serve the Responses API",
+        Refusal::LocalCount => ck_exec::pipeline::LOCAL_COUNT,
     };
     // Only a missing limit names the setting that would have supplied it.
     let missing_setting = matches!(refusal, Refusal::Fence(codec::Error::MaxTokensRequired))

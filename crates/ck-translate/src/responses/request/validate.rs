@@ -22,7 +22,11 @@ struct Calls<'a> {
     ordinal: u64,
 }
 
+/// No Responses destination counts tokens upstream: a count is refused at its fence.
 pub(super) fn validate(view: RequestView<'_>, destination: &str) -> Result<()> {
+    if view.operation == Operation::CountTokens {
+        return Err(Error::Unsupported);
+    }
     check(view, destination, false)
 }
 /// Parses the known Codex controls of a client request. Another protocol's opaque part, such as
@@ -31,9 +35,6 @@ pub(super) fn ingress(view: RequestView<'_>) -> Result<()> {
     check(view, "codex", true)
 }
 fn check(view: RequestView<'_>, destination: &str, foreign_opaque: bool) -> Result<()> {
-    if view.operation == Operation::CountTokens {
-        return Err(Error::Unsupported);
-    }
     let doc = view.document;
     let root = doc.root();
     if let Some(model) = doc.member(root, "model")? {
@@ -45,7 +46,7 @@ fn check(view: RequestView<'_>, destination: &str, foreign_opaque: bool) -> Resu
             return Err(Error::Unsupported);
         }
     }
-    if view.operation == Operation::Compact
+    if view.operation != Operation::Generate
         && doc
             .member(root, "stream")?
             .is_some_and(|n| matches!(doc.node(n).map(|n| n.value), Ok(Value::Bool(true))))

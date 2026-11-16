@@ -379,11 +379,16 @@ enum Answer {
     Failed(u16),
 }
 
-/// Runs `ask` through request ingress, `responses_state::begin` and the contract arm.
-async fn send(fixture: &Fixture, fake: &Fake, ask: Ask) -> Answer {
+/// `ask` through request ingress for `operation` and `responses_state::begin`: the exchange and
+/// the request document, expanded when it continues a stored turn.
+fn begin(
+    fixture: &Fixture,
+    ask: &Ask,
+    operation: Operation,
+) -> Result<(Exchange, codec::document::Document, codec::media::Registry), Refused> {
     let output = Output {
         protocol: Protocol::Responses,
-        operation: Operation::Generate,
+        operation,
         framing: ask.framing,
     };
     let body = serde_json::to_vec(&ask.body).unwrap();
@@ -396,7 +401,7 @@ async fn send(fixture: &Fixture, fake: &Fake, ask: Ask) -> Answer {
                 request,
                 store,
                 identity(Direction::Request),
-                Operation::Generate,
+                operation,
                 1 << 20,
             )
             .unwrap();
@@ -410,17 +415,25 @@ async fn send(fixture: &Fixture, fake: &Fake, ask: Ask) -> Answer {
         .unwrap()
         .unwrap();
     let (document, media) = read_request(&mut exchange.request, &mut records).unwrap();
-    let request_id = LocalId::new("request").unwrap();
     let view = RequestView {
         document: &document,
         media: &media,
-        operation: Operation::Generate,
+        operation,
     };
-    let expanded = match responses_state::begin(streams, &mut exchange, view, request_id, Default::default()) {
-        Ok(expanded) => expanded,
+    let request_id = LocalId::new("request").unwrap();
+    let expanded = responses_state::begin(streams, &mut exchange, view, request_id, Default::default())?;
+    let (document, media) = expanded.unwrap_or((document, media));
+    Ok((exchange, document, media))
+}
+
+/// Runs `ask` through request ingress, `responses_state::begin` and the contract arm.
+async fn send(fixture: &Fixture, fake: &Fake, ask: Ask) -> Answer {
+    let (exchange, document, media) = match begin(fixture, &ask, Operation::Generate) {
+        Ok(begun) => begun,
         Err(refused) => return Answer::Refused(refused),
     };
-    let (document, media) = expanded.unwrap_or((document, media));
+    let body = serde_json::to_vec(&ask.body).unwrap();
+    let request_id = LocalId::new("request").unwrap();
     let codec = Codec {
         exchange,
         request: OwnedRequest {
@@ -804,6 +817,21 @@ async fn an_idle_turn_expires_after_an_hour() {
     fixture.advance(Duration::from_secs(61 * 60));
     let answer = send(&fixture, &fake, Ask::new("again").after(&second)).await;
     assert!(matches!(answer, Answer::Refused(Refused::NotFound)));
+}
+
+/// A token count reads the stored turn its `previous_response_id` names, but is no turn itself:
+/// it issues no response id and stores nothing to continue.
+#[tokio::test]
+async fn a_count_reads_the_stored_turn_and_is_no_turn() {
+    let fixture = fixture(|_| {});
+    let fake = Fake::new();
+    let first = turn(&fixture, &fake, Ask::new("hi")).await;
+    let mut ask = Ask::new("again").after(&first).buffered();
+    ask.body.as_object_mut().unwrap().remove("stream");
+    let (exchange, document, _) = begin(&fixture, &ask, Operation::CountTokens).unwrap();
+    assert!(exchange.turn.is_none(), "a count issues no response id");
+    let messages = document.member(document.root(), "messages").unwrap().unwrap();
+    assert_eq!(document.children(messages).unwrap().count(), 3, "hi, hello, again");
 }
 
 /// With four stream headers, a chain of ten continuations evicts the oldest turns and their

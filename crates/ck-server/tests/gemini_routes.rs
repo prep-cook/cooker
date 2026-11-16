@@ -65,7 +65,7 @@ async fn proxy_to(up: &str) -> String {
 
 fn runtime_to(up: &str) -> Arc<ck_server::Runtime> {
     let config = Config::parse(&format!(
-        "access:\n  api-keys: [client-key]\napi-keys:\n  gemini:\n    - base-url: {up}/\n      headers:\n        X-Session: \"s-$CPA-SESSION-ID\"\n      models:\n        - name: gemini-2.5-flash\n          alias: flash\n      keys:\n        - api-key: AIza-fake-upstream"
+        "access:\n  api-keys: [client-key, other-key]\napi-keys:\n  gemini:\n    - base-url: {up}/\n      headers:\n        X-Session: \"s-$CPA-SESSION-ID\"\n      models:\n        - name: gemini-2.5-flash\n          alias: flash\n      keys:\n        - api-key: AIza-fake-upstream"
     ))
     .unwrap();
     let credentials = ck_core::config::credentials::from_config(&config);
@@ -80,9 +80,13 @@ fn runtime_to(up: &str) -> Arc<ck_server::Runtime> {
 }
 
 async fn post(url: &str, path: &str, body: &str) -> (u16, String, String) {
+    post_as("client-key", url, path, body).await
+}
+
+async fn post_as(key: &str, url: &str, path: &str, body: &str) -> (u16, String, String) {
     let res = wreq::Client::new()
         .post(format!("{url}{path}"))
-        .header("authorization", "Bearer client-key")
+        .header("authorization", format!("Bearer {key}"))
         .header("content-type", "application/json")
         .body(body.to_owned())
         .send()
@@ -180,6 +184,87 @@ async fn count_tokens_reaches_gemini_key() {
     assert_eq!(status, 200, "{text}");
     assert!(text.contains(r#""totalTokens":7"#), "{text}");
     assert_eq!(seen.lock().unwrap()[0].0, "/v1beta/models/gemini-2.5-flash:countTokens");
+}
+
+/// `POST /v1/responses/input_tokens` answers with the destination's own count, over the
+/// stored history a `previous_response_id` names; another caller cannot continue that turn.
+#[tokio::test]
+async fn responses_input_tokens_counts_upstream_over_stored_history() {
+    let (url, seen) = proxy().await;
+    let path = "/v1/responses/input_tokens";
+    let (status, content_type, text) = post(&url, path, r#"{"model":"flash","input":"hi"}"#).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(content_type.starts_with("application/json"), "{content_type}");
+    let count: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        count,
+        serde_json::json!({"object": "response.input_tokens", "input_tokens": 7})
+    );
+    let (count_path, _, _, body, _) = seen.lock().unwrap().remove(0);
+    assert_eq!(count_path, "/v1beta/models/gemini-2.5-flash:countTokens");
+    assert!(body.contains(r#""text":"hi""#), "{body}");
+
+    let (status, _, text) = post(&url, "/v1/responses", r#"{"model":"flash","input":"hi"}"#).await;
+    assert_eq!(status, 200, "{text}");
+    let id = serde_json::from_str::<serde_json::Value>(&text).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    seen.lock().unwrap().clear();
+    let next = format!(r#"{{"model":"flash","input":"again","previous_response_id":"{id}"}}"#);
+    let (status, _, text) = post(&url, path, &next).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains(r#""object":"response.input_tokens""#), "{text}");
+    let (count_path, _, _, body, _) = seen.lock().unwrap().remove(0);
+    assert_eq!(count_path, "/v1beta/models/gemini-2.5-flash:countTokens");
+    // The count covers the stored turn, then the new input.
+    assert_eq!(
+        body,
+        r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"model","parts":[{"text":"ok"}]},{"role":"user","parts":[{"text":"again"}]}]}"#
+    );
+
+    // Another caller does not find this turn.
+    let (status, _, text) = post_as("other-key", &url, path, &next).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("previous_response_not_found"), "{text}");
+    assert!(seen.lock().unwrap().is_empty(), "nothing reaches the upstream");
+}
+
+/// A candidate that would only estimate the count is skipped for the next one, and a streamed
+/// count is refused before any upstream call.
+#[tokio::test]
+async fn responses_input_tokens_skips_an_estimating_candidate() {
+    let seen = Arc::new(Seen::default());
+    let up = serve(axum::Router::new().fallback(upstream).with_state(seen.clone())).await;
+    let config = Config::parse(&format!(
+        "access:\n  api-keys: [client-key]\napi-keys:\n  gemini:\n    - base-url: {up}/\n      models:\n        - name: gemini-2.5-flash\n          alias: flash\n      keys:\n        - api-key: AIza-fake-upstream\n  openai-compatibility:\n    - name: Acme\n      priority: 10\n      base-url: {up}/v1\n      models:\n        - name: up-model\n          alias: flash\n      keys:\n        - api-key: sk-fake-upstream\n"
+    ))
+    .unwrap();
+    let credentials = ck_core::config::credentials::from_config(&config);
+    let executors = Executors {
+        claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+        codex: Default::default(),
+        devices: Default::default(),
+        openai: Default::default(),
+        google: Default::default(),
+    };
+    let url = serve(router(Arc::new(ck_server::testing::runtime(
+        config,
+        credentials,
+        executors,
+    ))))
+    .await;
+    let path = "/v1/responses/input_tokens";
+    // The estimating key has the higher priority, so it is the first candidate.
+    let (status, _, text) = post(&url, path, r#"{"model":"flash","input":"hi"}"#).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(text, r#"{"object":"response.input_tokens","input_tokens":7}"#);
+    let paths: Vec<String> = seen.lock().unwrap().drain(..).map(|s| s.0).collect();
+    assert_eq!(paths, ["/v1beta/models/gemini-2.5-flash:countTokens"]);
+
+    let (status, _, text) = post(&url, path, r#"{"model":"flash","input":"hi","stream":true}"#).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(seen.lock().unwrap().is_empty(), "nothing reaches the upstream");
 }
 
 #[tokio::test]

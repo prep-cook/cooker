@@ -103,6 +103,7 @@ pub async fn start<E: Execute>(
         Operation::Compact => executor.compact(attempt, request, streams).await,
         Operation::CountTokens => match executor.count_tokens(attempt, request, streams).await {
             Ok(Counted::Upstream(upstream)) => Ok(upstream),
+            Ok(Counted::Local { .. }) if request.upstream_count_only() => Err(local_count_refused()),
             Ok(Counted::Local { input_tokens }) => return Ok(local_count(attempt, response, input_tokens)),
             Err(error) => Err(error),
         },
@@ -167,6 +168,18 @@ fn spawn<I: ResponseIngress + Send + 'static>(
         stream: response.allocator(),
         producer: tokio::spawn(produce(upstream.body, upstream.ingress, response, published)),
     }
+}
+
+/// What refuses a local count for a request that takes only the destination's own.
+pub const LOCAL_COUNT: &str = "this account has no token-counting endpoint";
+
+fn local_count_refused() -> ExecError {
+    ExecError::local(400, FailureScope::Request, LOCAL_COUNT)
+}
+
+/// Whether `error` is the refusal of a local count ([`Request::upstream_count`]).
+pub fn refused_local_count(error: &ExecError) -> bool {
+    error.status == 400 && error.scope == FailureScope::Request && error.headers.is_empty() && error.body == LOCAL_COUNT
 }
 
 /// A local count's producer publishes the count as the attempt's response.

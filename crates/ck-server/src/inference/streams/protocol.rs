@@ -14,6 +14,8 @@ pub enum ProtocolEgress {
     Chat(codec::chat::egress::Egress),
     Anthropic(Box<anthropic::egress::Egress>),
     Responses(responses::egress::Egress<fn(&'static str, u64)>),
+    /// Responses `input_tokens`: the `response.input_tokens` object.
+    ResponsesCount(responses::count::CountEgress),
     Gemini(gemini::egress::Egress),
     /// A media file's bytes: speech audio or a finished video.
     Raw(audio::Egress),
@@ -61,6 +63,9 @@ impl ProtocolEgress {
                 mode,
                 |_| {},
             )?)),
+            Protocol::Responses if operation == Operation::CountTokens => {
+                Self::ResponsesCount(responses::count::CountEgress::new(stream, Some(identity)))
+            }
             Protocol::Responses => {
                 // An exchange `responses_state::begin` did not prepare shows an id derived from
                 // its response stream. The producer is a placeholder nothing reads: provenance
@@ -179,6 +184,7 @@ impl ResponseEgress for ProtocolEgress {
             Self::Chat(egress) => egress.advance(owner, input, output),
             Self::Anthropic(egress) => egress.advance(owner, input, output),
             Self::Responses(egress) => egress.advance(owner, input, output),
+            Self::ResponsesCount(egress) => egress.advance(owner, input, output),
             Self::Gemini(egress) => egress.advance(owner, input, output),
             Self::Raw(egress) => egress.advance(owner, input, output),
             Self::Images(egress) => egress.advance(owner, input, output),
@@ -192,6 +198,7 @@ impl ResponseEgress for ProtocolEgress {
             Self::Chat(egress) => egress.finish(),
             Self::Anthropic(egress) => egress.finish(),
             Self::Responses(egress) => egress.finish(),
+            Self::ResponsesCount(egress) => egress.finish(),
             Self::Gemini(egress) => egress.finish(),
             Self::Raw(egress) => egress.finish(),
             Self::Images(egress) => egress.finish(),

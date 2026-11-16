@@ -446,11 +446,14 @@ pub fn begin(
         Ok(None) => true,
         Err(_) => return Err(Refused::Defect),
     };
-    exchange.turn = Some(Turn {
-        id: ResponseId::random(),
-        stored: stored || keep.ignore_store_false,
-        socket: keep.socket,
-    });
+    // A token count is no turn: it shows no response id and stores nothing.
+    if view.operation != codec::Operation::CountTokens {
+        exchange.turn = Some(Turn {
+            id: ResponseId::random(),
+            stored: stored || keep.ignore_store_false,
+            socket: keep.socket,
+        });
+    }
     let Some(previous) = previous(doc, x).map_err(|_| Refused::Defect)? else {
         return Ok(None);
     };
