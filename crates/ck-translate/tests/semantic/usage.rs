@@ -88,8 +88,19 @@ fn choice_and_stream_usage_finalize_separately_in_all_response_modes() {
         (buffered.as_slice(), codec::BodyMode::Buffered),
         (streaming.as_slice(), codec::BodyMode::Streaming),
     ] {
-        for destination in [codec::BodyMode::Buffered, codec::BodyMode::Streaming] {
-            let (output, events) = response(input, source, destination);
+        let mut accounting = None;
+        for (destination, include_usage, aggregate_chunks) in [
+            (codec::BodyMode::Streaming, false, 0),
+            (codec::BodyMode::Streaming, true, 1),
+            (codec::BodyMode::Buffered, false, 0),
+            (codec::BodyMode::Buffered, true, 0),
+        ] {
+            let (output, events) = super::response_with_usage(input, source, destination, 31, include_usage);
+            if let Some(expected) = &accounting {
+                assert_eq!(&events, expected, "{source:?} {destination:?} {include_usage}");
+            } else {
+                accounting = Some(events.clone());
+            }
             let finals: Vec<_> = events.iter().filter(|e| e["usage"]["final"] == true).collect();
             assert_eq!(finals.len(), 3);
             assert_eq!(finals[0]["x_ck"]["choice_index"], 2);
@@ -103,6 +114,35 @@ fn choice_and_stream_usage_finalize_separately_in_all_response_modes() {
                 assert_eq!(output["choices"][0]["usage"]["total_tokens"], 4);
                 assert_eq!(output["choices"][1]["usage"]["total_tokens"], 6);
                 assert_eq!(output["usage"]["total_tokens"], 10);
+            } else {
+                let text = std::str::from_utf8(&output).unwrap();
+                assert!(text.ends_with("data: [DONE]\n\n"));
+                let chunks: Vec<Value> = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect();
+                let aggregate: Vec<_> = chunks.iter().filter(|chunk| chunk.get("usage").is_some()).collect();
+                assert_eq!(aggregate.len(), aggregate_chunks, "{source:?} {include_usage}");
+                if include_usage {
+                    assert_eq!(aggregate[0]["choices"], json!([]));
+                    assert_eq!(aggregate[0]["usage"]["total_tokens"], 10);
+                    assert_eq!(chunks.last().unwrap(), aggregate[0]);
+                }
+                let choices: Vec<_> = chunks
+                    .iter()
+                    .flat_map(|chunk| chunk["choices"].as_array().unwrap())
+                    .filter(|choice| choice.get("usage").is_some())
+                    .collect();
+                assert_eq!(choices.len(), 2, "{source:?} {include_usage}");
+                for (choice, index, prompt, completion) in [(choices[0], 2, 3, 1), (choices[1], 0, 4, 2)] {
+                    assert_eq!(choice["index"], index);
+                    assert_eq!(
+                        choice["usage"],
+                        json!({"prompt_tokens":prompt,"completion_tokens":completion,"total_tokens":prompt + completion})
+                    );
+                }
             }
         }
     }

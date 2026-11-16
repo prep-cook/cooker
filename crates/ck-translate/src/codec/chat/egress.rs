@@ -134,7 +134,9 @@ impl Egress {
             chunk_deliverable(&doc)?
         } else if kind == Kind::Usage {
             let usage = doc.required(root, "usage")?;
-            self.include_usage && matches!(doc.node(doc.required(usage, "final")?)?.value, Value::Bool(true))
+            // The opt-in controls only the aggregate chunk, not provider-native choice usage.
+            (self.include_usage || doc.member(x, "choice_index")?.is_some())
+                && matches!(doc.node(doc.required(usage, "final")?)?.value, Value::Bool(true))
         } else {
             true
         };
