@@ -138,7 +138,9 @@ impl Decoded {
                 ck_translate::gemini::request::Ingress::new(request, store, identity, operation, &call.model, limit)
                     .map(Ingress::Gemini)
             }
-            Protocol::Responses | Protocol::Speech | Protocol::Images(_) => Err(codec::Error::Unsupported),
+            Protocol::Responses | Protocol::Speech | Protocol::Images(_) | Protocol::Search | Protocol::Video(_) => {
+                Err(codec::Error::Unsupported)
+            }
         };
         let mut decoded = Self {
             exchange: Some(exchange),

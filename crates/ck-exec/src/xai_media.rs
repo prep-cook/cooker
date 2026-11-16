@@ -756,7 +756,7 @@ impl XaiExecutor {
             Box::new(JobLedger { slot, admission }),
         )
         .map_err(xai_exec::encoding)?;
-        let request = call.request.validated.view().document;
+        let request = call.request.validated().view().document;
         ingress.echo(streams.response, request).map_err(xai_exec::encoding)?;
         Ok((
             upstream.status,
