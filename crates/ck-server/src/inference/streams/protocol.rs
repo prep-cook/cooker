@@ -4,7 +4,7 @@
 use ck_stream::{Lease, Reader, ScratchLease, Writer};
 use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
-use ck_translate::codec::{self, BodyMode, RequestView, ResponseEgress, internal};
+use ck_translate::codec::{self, BodyMode, Operation, RequestView, ResponseEgress, internal};
 use ck_translate::{anthropic, gemini, responses};
 
 use crate::http::egress::{Framing, Output, Protocol};
@@ -19,8 +19,9 @@ pub enum ProtocolEgress {
 impl ProtocolEgress {
     /// The egress for `output` on the response stream `stream`. `identity` is the attempt's
     /// response identity ([`response_identity`]); `request` is the client's request view,
-    /// whose Chat `stream_options.include_usage` decides the usage chunk. `id` is the response
-    /// id a Responses exchange issued (`responses_state`), the only id its client sees.
+    /// whose Chat `stream_options.include_usage` decides the usage chunk and whose Responses
+    /// fields seed the response echo. `id` is the response id a Responses exchange issued
+    /// (`responses_state`), the only id its client sees.
     pub fn new(
         output: Output,
         stream: &mut Writer,
@@ -68,9 +69,11 @@ impl ProtocolEgress {
                     credential: [0; 32],
                 };
                 let ignore: fn(&'static str, u64) = |_, _| {};
-                Self::Responses(responses::egress::Egress::new(
-                    stream, id, producer, operation, mode, ignore,
-                )?)
+                let mut egress = responses::egress::Egress::new(stream, id, producer, operation, mode, ignore)?;
+                if operation != Operation::Compact {
+                    egress.echo(stream, request)?;
+                }
+                Self::Responses(egress)
             }
             Protocol::Gemini => {
                 let framing = match output.framing {
