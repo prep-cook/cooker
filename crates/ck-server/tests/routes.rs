@@ -154,6 +154,15 @@ async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
             [("content-type", "text/event-stream")],
             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_prompt\",\"model\":\"stored-model\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n",
         ).into_response(),
+        _ if body["compaction"].is_object() => (
+            [("content-type", "application/json")],
+            serde_json::json!({"id":"msg_c","type":"message","role":"assistant","model":body["model"],
+                "content":[{"type":"compaction","content":"summary","signature":"sig-c"}],"stop_reason":"compaction",
+                "stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,
+                "iterations":[{"type":"compaction","input_tokens":9,"output_tokens":3}]}})
+            .to_string(),
+        )
+            .into_response(),
         _ if body["stream"] == Value::Bool(true) => ([("content-type", "text/event-stream")], sse()).into_response(),
         _ => (
             [("content-type", "application/json")],
@@ -523,6 +532,15 @@ async fn codec_routes_decode_before_selection_and_commit_on_the_contract_arm() {
             )
         },
         refused(responses_path(), "{".into(), 400, "invalid_request_error"),
+        // A compaction carrier that does not hold an Anthropic block is malformed.
+        refused(
+            responses_path(),
+            format!(
+                r#"{{"model":"{MODEL}","max_output_tokens":5,"input":[{{"type":"compaction","encrypted_content":"ck.anthropic-compaction.v1.e30"}}]}}"#
+            ),
+            400,
+            "invalid_request_error",
+        ),
         // Q-G: `conversation` is refused; an id cooker never issued is not found.
         refused(
             responses_path(),
@@ -600,46 +618,44 @@ async fn responses_continuation_resends_the_stored_turn_after_failover() {
         ],
     )
     .await;
-    let first = format!(r#"{{"model":"{MODEL}","max_output_tokens":5,"input":"first question"}}"#);
-    let (status, _, text) = post(&p.url, "/v1/responses", &first).await;
-    assert_eq!(status, 200, "{text}");
-    let id = serde_json::from_str::<Value>(&text).unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(
-        id.starts_with("resp_") && id.len() == 37,
-        "a cooker id, not the upstream's: {id}"
-    );
-    p.seen.requests.lock().unwrap().clear();
-
-    for stream in [false, true] {
-        let next = format!(
-            r#"{{"model":"{MODEL}","max_output_tokens":5,"stream":{stream},"previous_response_id":"{id}","input":"second"}}"#
-        );
-        let (status, _, text) = post(&p.url, "/v1/responses", &next).await;
-        assert_eq!(status, 200, "stream {stream}: {text}");
+    // (first turn's model, next turn's model, next turn streamed). `friendly` force-maps to
+    // MODEL on one credential, which still shows the alias, issues local ids and resends.
+    for (first, next, stream) in [
+        (MODEL, MODEL, false),
+        (MODEL, MODEL, true),
+        ("friendly", "friendly", false),
+        (MODEL, "friendly", true),
+    ] {
+        let case = format!("{first} then {next}, stream {stream}");
+        let body = format!(r#"{{"model":"{first}","max_output_tokens":5,"input":"first question"}}"#);
+        let (status, headers, text) = post(&p.url, "/v1/responses", &body).await;
+        assert_eq!(status, 200, "{case}: {text}");
+        assert!(headers.get("x-ck-stream-id").is_some(), "{case}: {headers:?}");
+        let reply: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(reply["model"], first, "{case}");
+        let id = reply["id"].as_str().unwrap().to_owned();
         assert!(
-            !text.contains(&id),
-            "stream {stream}: the new turn has its own id: {text}"
+            id.starts_with("resp_") && id.len() == 37,
+            "{case}: a cooker id, not the upstream's: {id}"
         );
+        p.seen.requests.lock().unwrap().clear();
+
+        let body = format!(
+            r#"{{"model":"{next}","max_output_tokens":5,"stream":{stream},"previous_response_id":"{id}","input":"second"}}"#
+        );
+        let (status, _, text) = post(&p.url, "/v1/responses", &body).await;
+        assert_eq!(status, 200, "{case}: {text}");
+        assert!(!text.contains(&id), "{case}: the new turn has its own id: {text}");
+        assert!(text.contains(&format!(r#""model":"{next}""#)), "{case}: {text}");
         let seen = std::mem::take(&mut *p.seen.requests.lock().unwrap());
         let (token, sent) = seen.last().unwrap();
-        assert_eq!(token, "Bearer fake-ok", "stream {stream}");
+        assert_eq!(token, "Bearer fake-ok", "{case}");
         let sent = sent.to_string();
         for part in ["first question", r#""hi""#, "second"] {
-            assert!(sent.contains(part), "stream {stream}: {part} resent: {sent}");
+            assert!(sent.contains(part), "{case}: {part} resent: {sent}");
         }
-        assert!(!sent.contains("previous_response_id"), "stream {stream}: {sent}");
+        assert!(!sent.contains("previous_response_id"), "{case}: {sent}");
     }
-
-    // A force-mapped alias takes the old arm, which cannot carry the stored turn:
-    // nothing is sent and the client is told to send the full input.
-    let forced = format!(r#"{{"model":"friendly","max_output_tokens":5,"previous_response_id":"{id}","input":"x"}}"#);
-    let (status, _, text) = post(&p.url, "/v1/responses", &forced).await;
-    assert_eq!(status, 400, "{text}");
-    assert!(text.contains("previous_response_id"), "{text}");
-    assert_eq!(p.seen.requests.lock().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -970,8 +986,8 @@ async fn misc_routes_match_go() {
     assert!(error["error"]["message"].as_str().is_some_and(|s| !s.is_empty()));
     let (status, _, text) = post(&p.url, &format!("/v1beta/models/{MODEL}:embed"), "{}").await;
     assert_eq!((status, text.as_str()), (200, ""));
-    // Compact through Claude: Messages has no native compaction, so it is refused before
-    // any upstream call, and no summary stands in for one (owner question 7).
+    // Compact through Claude runs native compaction (C2), which needs a `max_tokens` nothing
+    // here supplies (Q-H): it is refused before any upstream call.
     let (status, _, text) = post(
         &p.url,
         "/v1/responses/compact",
@@ -979,39 +995,44 @@ async fn misc_routes_match_go() {
     )
     .await;
     assert_eq!(status, 400, "{text}");
-    assert!(text.contains("This model does not support compaction"), "{text}");
+    assert!(text.contains("max_tokens is required"), "{text}");
     assert!(p.seen.requests.lock().unwrap().is_empty());
 }
 
-/// Compact runs only where the provider's compact is native and the client can receive it
-/// (D2-PLAN §3.3), on either arm. Antigravity would answer with a local summary; Claude's
-/// native compaction block has no Responses carrier yet. Both are skipped with nothing sent,
-/// and the client hears the refusal.
+/// Settled 71 through the real route: a Claude compact runs Anthropic's native compaction,
+/// the client receives the signed block inside a Responses `compaction` item, and a later
+/// request carrying that item sends the block first and leaves out the messages before it.
 #[tokio::test]
-async fn compact_sends_nothing_to_providers_without_native_compact() {
-    let antigravity = {
-        let metadata = serde_json::json!({"type":"antigravity","access_token":"ya29.fake-compact",
-            "expired":"2099-01-01T00:00:00Z","project_id":"proj-compact"});
-        let (dir, name) = (Path::new("/fake"), "ag.json");
-        Credential::from_file(dir, &dir.join(name), metadata.as_object().unwrap().clone()).unwrap()
-    };
-    // Claude's native compaction would run with a `max_tokens` (C2): the catalog supplies one.
+async fn claude_compaction_reaches_a_responses_client_and_replays_first() {
     let catalog = format!("model-catalog: [{{match: {MODEL}, overrides: {{default-max-tokens: 777}}}}]\n");
-    let claude = oauth("claude.json", "fake-ok", serde_json::json!({}));
-    for (provider, config, credential) in [("claude", catalog.as_str(), claude), ("antigravity", "", antigravity)] {
-        let p = proxy(config, vec![credential]).await;
-        // The capability probe of a registering Antigravity credential is not a send.
-        let sends = || {
-            let mut paths: Vec<String> = p.seen.requests.lock().unwrap().iter().map(|r| r.0.clone()).collect();
-            paths.retain(|path| !path.ends_with(":fetchAvailableModels"));
-            paths
-        };
-        let body = format!(r#"{{"model":"{MODEL}","input":"x"}}"#);
-        let (status, _, text) = post(&p.url, "/v1/responses/compact", &body).await;
-        assert_eq!(status, 400, "{provider}: {text}");
-        assert!(text.contains("does not support compaction"), "{provider}: {text}");
-        assert_eq!(sends(), Vec::<String>::new(), "{provider}");
-    }
+    let p = proxy(&catalog, vec![oauth("claude.json", "fake-ok", serde_json::json!({}))]).await;
+    let body = format!(r#"{{"model":"{MODEL}","input":"x"}}"#);
+    let (status, _, text) = post(&p.url, "/v1/responses/compact", &body).await;
+    assert_eq!(status, 200, "{text}");
+    let reply: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(reply["object"], "response.compaction", "{text}");
+    let item = reply["output"][0].clone();
+    assert_eq!(item["type"], "compaction", "{text}");
+    assert!(item["encrypted_content"].is_string(), "{text}");
+    let sent = std::mem::take(&mut *p.seen.requests.lock().unwrap());
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1["compaction"], serde_json::json!({"type":"summarize"}));
+
+    let body = serde_json::json!({"model":MODEL,"max_output_tokens":5,"input":[
+        {"role":"user","content":"before"},
+        item,
+        {"role":"user","content":"after"},
+    ]});
+    let (status, _, text) = post(&p.url, "/v1/responses", &body.to_string()).await;
+    assert_eq!(status, 200, "{text}");
+    let sent = std::mem::take(&mut *p.seen.requests.lock().unwrap());
+    let messages = &sent[0].1["messages"];
+    assert_eq!(
+        messages[0]["content"][0],
+        serde_json::json!({"type":"compaction","content":"summary","signature":"sig-c"}),
+        "{messages}"
+    );
+    assert!(!messages.to_string().contains("before"), "{messages}");
 }
 
 #[tokio::test]
@@ -1050,7 +1071,9 @@ async fn reusable_prompts_route_only_to_native_resolvers_without_a_model() {
             let p = proxy("", credentials).await;
             let mut body = serde_json::json!({"prompt":prompt,"input":"hi","stream":stream});
             if explicit {
+                // Claude answers it, which needs a `max_tokens` (Q-H).
                 body["model"] = MODEL.into();
+                body["max_output_tokens"] = 5.into();
             }
             if cooling {
                 let (status, _, text) = post(&p.url, "/v1/responses", &body.to_string()).await;
@@ -1068,10 +1091,11 @@ async fn reusable_prompts_route_only_to_native_resolvers_without_a_model() {
             if expected == 400 {
                 let error = assert_openai_error(&text);
                 assert_eq!(error["error"]["type"], "invalid_request_error");
+                // The Responses codec refuses a prompt without a string `id` at ingress.
                 let message = if prompt.get("id").is_some_and(Value::is_string) {
                     "model is required"
                 } else {
-                    "prompt.id must be a string"
+                    "invalid protocol schema"
                 };
                 assert!(error["error"]["message"].as_str().unwrap().contains(message), "{text}");
                 assert!(sends.is_empty(), "{sends:?}");

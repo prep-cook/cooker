@@ -335,6 +335,14 @@ async fn usage_records_match_go() {
                 other => panic!("{name}: no route for {other}"),
             };
             let (status, _, text) = post(&url, path, s["payload"].as_str().unwrap()).await;
+            // Only the old arm serves `gemini-interactions` (Q7), and it cannot answer a
+            // Responses client, so the candidate is skipped before anything is sent.
+            if path == "/v1/responses" {
+                assert_eq!(status, 400, "{name}: {text}");
+                assert!(text.contains("does not serve the Responses API"), "{name}: {text}");
+                ran += 1;
+                continue;
+            }
             // `gemini-interactions` credentials still take the old arm (Q7).
             let codec = matches!(path, "/v1/chat/completions" | "/v1/messages")
                 && s["provider"].as_str() != Some("gemini-interactions");

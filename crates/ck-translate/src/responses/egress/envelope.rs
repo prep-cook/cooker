@@ -27,7 +27,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         doc.set(error, "code", Value::Text("server_error"))?;
         doc.set(error, "message", Value::Text("Response failed"))?;
         order_array(doc, doc.required(root, "output")?, "output_index", owner)?;
-        let response = encode::scratch(owner, |e| write_response(doc, e))?;
+        let response = encode::scratch(owner, |e| write_response(doc, self.model.as_deref(), e))?;
         if self.mode == BodyMode::Buffered {
             return output(response);
         }
@@ -40,6 +40,12 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             },
             output,
         )
+    }
+
+    /// Shows `model` as the response's model whatever the source reports: the alias a
+    /// force-mapped client model names.
+    pub fn show_model(&mut self, model: &str) {
+        self.model = Some(model.to_owned());
     }
 
     /// Repeats request-derived response fields when the source does not supply them.
@@ -105,7 +111,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             return Ok(());
         }
         self.owed = false;
-        let response = encode::scratch(owner, |e| write_response(&self.document, e))?;
+        let response = encode::scratch(owner, |e| write_response(&self.document, self.model.as_deref(), e))?;
         for name in ["response.created", "response.in_progress"] {
             if name == "response.in_progress" && !self.synthesize_progress {
                 break;
@@ -140,7 +146,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             doc.set(root, "status", Value::Text("completed"))?;
         }
         order_array(doc, doc.required(root, "output")?, "output_index", owner)?;
-        let response = encode::scratch(owner, |e| write_response(doc, e))?;
+        let response = encode::scratch(owner, |e| write_response(doc, self.model.as_deref(), e))?;
         if self.mode == BodyMode::Buffered {
             return output(response);
         }
@@ -191,7 +197,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 return Ok(());
             }
             let doc = &self.document;
-            let response = encode::scratch(owner, |e| write_response(doc, e))?;
+            let response = encode::scratch(owner, |e| write_response(doc, self.model.as_deref(), e))?;
             return self.emit(
                 owner,
                 "response.in_progress",
@@ -239,17 +245,37 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         doc.transplant(target, value)
     }
 
-    /// Appends one compact output item. Another protocol's item, such as an Anthropic
-    /// compaction block, reaches a Responses client only inside the cooker envelope (D2 plan
-    /// §2.4.1, unit D2-6a); until that exists it is refused, never written as a native item.
-    pub(super) fn compact(&mut self, node: usize) -> Result<()> {
+    /// Appends one compact output item. An Anthropic compaction block becomes a native
+    /// `compaction` item whose `encrypted_content` carries the block unchanged (Settled 71),
+    /// so the client can send it back; any other protocol's opaque item is refused.
+    pub(super) fn compact(&mut self, owner: &mut Writer, node: usize) -> Result<()> {
         let doc = &mut self.document;
         let output_node = doc.required(doc.root(), "output")?;
-        let item = doc.required(node, "item")?;
+        let mut item = doc.required(node, "item")?;
         if is(doc, item, "type", "opaque")? {
-            return Err(Error::Unsupported);
+            let block = doc.required(item, "value")?;
+            if !is(doc, item, "protocol", "anthropic")? || !is(doc, block, "type", "compaction")? {
+                return Err(Error::Unsupported);
+            }
+            let native = encode::scratch(owner, |e| doc.write(block, e))?;
+            // The item id follows the exchange's response id: `resp_<hex>` shows `cmp_<hex>`.
+            let mut response = String::new();
+            let mut chars = doc.chars(doc.required(doc.root(), "id")?)?;
+            while let Some(c) = chars.next_scalar()? {
+                response.push(c);
+            }
+            let id = format!("cmp_{}", response.strip_prefix("resp_").unwrap_or(&response));
+            let carried = encode::scratch(owner, |e| {
+                e.bytes(b"{\"type\":\"compaction\",\"id\":")?;
+                e.string(&id)?;
+                e.bytes(b",\"encrypted_content\":\"")?;
+                super::super::opaque::write_carrier(&native, e)?;
+                e.bytes(b"\"}")
+            })?;
+            item = doc.import_json(owner, carried)?;
+        } else {
+            doc.detach(node, item)?;
         }
-        doc.detach(node, item)?;
         doc.append(output_node, item)?;
         Ok(())
     }

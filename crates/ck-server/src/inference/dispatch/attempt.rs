@@ -34,7 +34,7 @@ use futures_util::FutureExt;
 use tokio::sync::oneshot;
 
 use super::{Call, Fault, Trace};
-use crate::http::egress::{self, Failed};
+use crate::http::egress::{self, Failed, Protocol};
 use crate::http::respond;
 use crate::inference::responses_state::Publication;
 use crate::inference::streams::{Exchange, Settled, Uncommitted};
@@ -147,7 +147,7 @@ pub(super) async fn run<X: Arms>(
     usage: Option<&Arc<Facts>>,
     lease: &mut Lease,
     upstream: &str,
-    old_only: bool,
+    alias: Option<&str>,
 ) -> Ran {
     let store = match rt.streams().store() {
         Ok(store) => store,
@@ -196,18 +196,18 @@ pub(super) async fn run<X: Arms>(
         Err(_) => return Ran::Stop(fault(defect())),
     };
     let destination = arm.arms.destination(&attempt);
-    // The old arm sends the client's body, which names a stored turn the upstream never saw.
-    // ponytail: a continuation skips every old-arm candidate; this ends when the providers
-    // still on the old arm (force-mapped aliases, Meta `apply_patch`, Claude credentials
-    // eligible for thinking replay) move to the contract arm.
-    let continued = arm
+    // A Responses exchange shows only the response id it issued and resends its stored history
+    // to every candidate (Settled 54); the old arm sends the client's body and shows the
+    // upstream's id, so it serves no Responses candidate.
+    // ponytail: providers with no contract path for a request (Meta's custom `apply_patch`,
+    // Devin, AI Studio) are skipped for Responses clients until their executors move over.
+    let responses = arm
         .exchange
         .as_ref()
-        .and_then(|exchange| exchange.turn)
-        .is_some_and(|turn| turn.continued);
+        .is_some_and(|exchange| exchange.output.protocol == Protocol::Responses);
     let old_arm = |attempt: &Attempt<'_>, trace: &Trace, withheld: bool| {
-        if continued {
-            return Ran::Skip(skip(attempt, trace, "old arm", Refusal::Continuation));
+        if responses {
+            return Ran::Skip(skip(attempt, trace, "old arm", Refusal::NoContract));
         }
         old_arm(attempt, trace, withheld)
     };
@@ -251,7 +251,9 @@ pub(super) async fn run<X: Arms>(
             };
         }
     };
-    if old_only {
+    // ponytail: a force-mapped alias takes the old arm outside Responses, because only the old
+    // arm rewrites those protocols' response model; the Responses egress shows the alias.
+    if alias.is_some() && !responses {
         // The candidate passed admission and its fence; only the old arm serves it.
         arm.request = kept.or_else(|| Some(fenced.into_request()));
         return old_arm(&attempt, trace, withheld);
@@ -262,6 +264,7 @@ pub(super) async fn run<X: Arms>(
     let Some(mut exchange) = arm.exchange.take() else {
         return Ran::Stop(fault(defect()));
     };
+    exchange.model = alias.map(Arc::from);
     let streams = store
         .create_dependent(&exchange.request)
         .and_then(|response| Ok((store.reader(response.id(), 0)?, response)));
@@ -548,8 +551,8 @@ enum Refusal {
     Fence(codec::Error),
     /// The history holds a compaction item another account produced (Q-C).
     ForeignCompaction,
-    /// The old arm cannot carry a Responses continuation's stored turn.
-    Continuation,
+    /// Only the old arm serves the candidate, and a Responses client needs the contract arm.
+    NoContract,
 }
 
 /// A destination refusal: logged without content, neutral for the credential, which the
@@ -561,7 +564,7 @@ fn skip(attempt: &Attempt<'_>, trace: &Trace, destination: &str, refusal: Refusa
         Refusal::Fence(codec::Error::MaxTokensRequired) => "max_tokens is required",
         Refusal::Fence(_) => "the destination does not support the request",
         Refusal::ForeignCompaction => "another account produced the compaction item",
-        Refusal::Continuation => "the old arm cannot carry a stored turn",
+        Refusal::NoContract => "this account does not serve the Responses API",
     };
     // Only a missing limit names the setting that would have supplied it.
     let missing_setting = matches!(refusal, Refusal::Fence(codec::Error::MaxTokensRequired))
@@ -577,39 +580,7 @@ fn skip(attempt: &Attempt<'_>, trace: &Trace, destination: &str, refusal: Refusa
         missing_setting,
         "candidate skipped"
     );
-    // The client is told to send the full input, which the old arm can serve.
-    if matches!(refusal, Refusal::Continuation) {
-        return fault(crate::inference::responses_state::Refused::Unsupported.error());
-    }
     fault(ExecError::local(400, FailureScope::Request, reason))
-}
-
-/// Whether the provider's `responses/compact` is a native upstream call a Responses client
-/// can receive. Every other provider would answer with a local summary, a refusal or an
-/// error, on either arm.
-/// ponytail: Claude's native compaction (C2) is left out because the Responses egress refuses
-/// its block until the cross-format carrier exists (`ck-translate` `responses/egress/envelope.rs`,
-/// `compact`); add `claude` here with that carrier.
-pub(super) fn native_compact(provider: &str) -> bool {
-    provider == "codex" || provider == ck_exec::xai::PROVIDER || ck_exec::openai_compat::handles(provider)
-}
-
-/// The client's wording for a compact no candidate can serve natively.
-const NO_NATIVE_COMPACT: &str = "This model does not support compaction; choose a model that does.";
-
-/// A compact refused before any send: logged without content, neutral for the
-/// credential like a destination refusal.
-pub(super) fn no_native_compact(trace: &Trace, credential: &ck_core::credential::Credential, upstream: &str) -> Fault {
-    tracing::info!(
-        target: "ck_dispatch",
-        request_id = %trace.request_id(),
-        auth_index = %ck_core::config::credentials::auth_index(credential),
-        provider = %credential.provider,
-        upstream_model = %upstream,
-        reason = "no native compact",
-        "candidate skipped"
-    );
-    fault(ExecError::local(400, FailureScope::Request, NO_NATIVE_COMPACT))
 }
 
 fn fault(error: ExecError) -> Fault {

@@ -62,9 +62,6 @@ pub struct Turn {
     pub id: ResponseId,
     /// The client did not send `store: false`: the committed turn is indexed.
     pub stored: bool,
-    /// The request continues a stored turn (`previous_response_id`), so the exchange's
-    /// request stream holds the expanded history rather than the client's body.
-    pub continued: bool,
 }
 
 /// The index of committed turns. Its capacity is the pool's header slots, fixed when the store
@@ -383,13 +380,11 @@ pub fn begin(
         Ok(None) => true,
         Err(_) => return Err(Refused::Defect),
     };
-    let previous = previous(doc, x).map_err(|_| Refused::Defect)?;
     exchange.turn = Some(Turn {
         id: ResponseId::random(),
         stored,
-        continued: previous.is_some(),
     });
-    let Some(previous) = previous else {
+    let Some(previous) = previous(doc, x).map_err(|_| Refused::Defect)? else {
         return Ok(None);
     };
     let found = previous

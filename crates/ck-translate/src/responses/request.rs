@@ -90,14 +90,11 @@ impl Ingress {
         super::content::register(document, owner, &mut self.media)?;
         self.media.relocate_ingress(document, 0)?;
         // Parse the known Codex controls; the destination fence still authorizes them.
-        validate(
-            RequestView {
-                document,
-                media: &self.media,
-                operation: self.operation,
-            },
-            "codex",
-        )?;
+        validate::ingress(RequestView {
+            document,
+            media: &self.media,
+            operation: self.operation,
+        })?;
         bindings(document, owner)?;
         let root = document.root();
         publish_fields(

@@ -290,7 +290,7 @@ fn normalize_item(doc: &mut Document, owner: &mut Writer, item: usize, items: &m
     } else if is(doc, item, "type", "function_call_output")? || is(doc, item, "type", "custom_tool_call_output")? {
         normalize_output(doc, item, messages, original)
     } else if is(doc, item, "type", "reasoning")? || is(doc, item, "type", "compaction")? {
-        normalize_reasoning(doc, item, items)
+        normalize_reasoning(doc, owner, item, items)
     } else if (doc.member(item, "type")?.is_none() && doc.member(item, "role")?.is_some())
         || is(doc, item, "type", "message")?
     {
@@ -365,8 +365,9 @@ fn normalize_output(doc: &mut Document, item: usize, messages: usize, original: 
     Ok(())
 }
 /// Turns a reasoning or compaction item into an assistant message of reasoning parts; its
-/// encrypted content becomes a replay entry.
-fn normalize_reasoning(doc: &mut Document, item: usize, items: &mut Items) -> Result<()> {
+/// encrypted content becomes a replay entry. A compaction item carrying an Anthropic block
+/// becomes that block, as an Anthropic client would send it.
+fn normalize_reasoning(doc: &mut Document, owner: &mut Writer, item: usize, items: &mut Items) -> Result<()> {
     let Items { messages, original, .. } = *items;
     // The item `type`, kept below as an original field, tells request egress which item it was.
     doc.append(messages, item)?;
@@ -391,7 +392,22 @@ fn normalize_reasoning(doc: &mut Document, item: usize, items: &mut Items) -> Re
             preserve_unknown(doc, original, part, &["type", "text"])?;
         }
     }
-    if let Some(data) = doc.remove(item, "encrypted_content")? {
+    let carried = match doc.member(item, "encrypted_content")? {
+        Some(data) if is(doc, item, "type", "compaction")? => {
+            string(doc, data)?;
+            super::super::opaque::read_carrier(doc, owner, data)?
+        }
+        _ => None,
+    };
+    if let Some(block) = carried {
+        doc.remove(item, "encrypted_content")?;
+        let part = doc.add(None, Value::Object)?;
+        doc.append(content, part)?;
+        doc.set(part, "type", Value::Text("opaque"))?;
+        doc.set(part, "protocol", Value::Text("anthropic"))?;
+        doc.rename(block, "value")?;
+        doc.append(part, block)?;
+    } else if let Some(data) = doc.remove(item, "encrypted_content")? {
         replay_encrypted(doc, item, content, data, items)?;
     }
     preserve_unknown(doc, original, item, &["role", "content"])?;
