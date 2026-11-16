@@ -1008,55 +1008,60 @@ fn usage_event(counts: &str, finished: bool) -> String {
 /// An answer that ends before its body does fails the attempt with exactly one error on
 /// every client protocol; a complete one completes. Rows: scenario; end; the events replacing
 /// the scenario's body, as (usage object, finish reason) (`None` keeps the recording); and the
-/// input, output and cache-read counts the canonical stream holds afterwards. After a cut, a
-/// count is present exactly when the upstream sent it in a complete line, zero included, and
-/// holds the latest report of that field, even when a later usage object leaves it out; no
-/// estimate, default or derivation fills the gap. A complete
-/// answer keeps Go's final usage (owner question P7-4-1).
+/// input, output, cache-read and total counts the canonical stream holds afterwards. A count is
+/// present exactly when the upstream sent it in a complete line, zero included, and holds the
+/// latest report of that field, even when a later usage object leaves it out; no estimate or
+/// default fills the gap. A total the upstream did not send is input plus output when both are
+/// known. Cut and complete answers follow the same rule (owner ruling P7-4-1, 2026-11-16).
 #[tokio::test]
 async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
-    type Counts = (Option<u64>, Option<u64>, Option<u64>);
+    type Counts = (Option<u64>, Option<u64>, Option<u64>, Option<u64>);
     type Row = (&'static str, End, Option<&'static [(&'static str, bool)]>, Counts);
-    let rows: [Row; 19] = [
-        ("gemini_stream", End::InLastLine, None, (Some(5), None, None)),
-        ("openai_stream", End::InLastLine, None, (None, None, None)),
-        ("responses_stream", End::InLastLine, None, (None, None, None)),
-        ("claude_stream_claude_model", End::InLastLine, None, (None, None, None)),
+    let rows: [Row; 23] = [
+        ("gemini_stream", End::InLastLine, None, (Some(5), None, None, Some(5))),
+        ("openai_stream", End::InLastLine, None, (None, None, None, None)),
+        ("responses_stream", End::InLastLine, None, (None, None, None, None)),
+        (
+            "claude_stream_claude_model",
+            End::InLastLine,
+            None,
+            (None, None, None, None),
+        ),
         (
             "claude_stream_claude_model",
             End::AfterEvents(1),
             None,
-            (None, None, None),
+            (None, None, None, None),
         ),
         (
             "claude_stream_gemini_model",
             End::InLastLine,
             None,
-            (Some(5), None, None),
+            (Some(5), None, None, Some(5)),
         ),
         (
             "claude_stream_gemini_model",
             End::AfterEvents(1),
             Some(&[(r#"{"promptTokenCount":0,"candidatesTokenCount":3}"#, false)]),
-            (Some(0), Some(3), None),
+            (Some(0), Some(3), None, Some(3)),
         ),
         (
             "claude_stream_gemini_model",
             End::AfterEvents(1),
             Some(&[(r#"{"candidatesTokenCount":0}"#, false)]),
-            (None, Some(0), None),
+            (None, Some(0), None, None),
         ),
         (
             "claude_stream_gemini_model",
             End::AfterEvents(1),
             Some(&[(r#"{"promptTokenCount":5}"#, false)]),
-            (Some(5), None, None),
+            (Some(5), None, None, None),
         ),
         (
             "claude_stream_gemini_model",
             End::AfterEvents(1),
             Some(&[(r#"{"promptTokenCount":5}"#, true)]),
-            (Some(5), None, None),
+            (Some(5), None, None, None),
         ),
         (
             "claude_stream_gemini_model",
@@ -1065,7 +1070,7 @@ async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
                 r#"{"promptTokenCount":5,"candidatesTokenCount":0,"totalTokenCount":9}"#,
                 true,
             )]),
-            (Some(5), Some(0), None),
+            (Some(5), Some(0), None, Some(9)),
         ),
         (
             "claude_stream_gemini_model",
@@ -1074,7 +1079,7 @@ async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
                 ("{}", false),
                 (r#"{"promptTokenCount":5,"candidatesTokenCount":3}"#, false),
             ]),
-            (Some(5), Some(3), None),
+            (Some(5), Some(3), None, Some(8)),
         ),
         (
             "claude_stream_gemini_model",
@@ -1083,7 +1088,7 @@ async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
                 r#"{"promptTokenCount":5,"candidatesTokenCount":3,"cachedContentTokenCount":2}"#,
                 false,
             )]),
-            (Some(5), Some(3), Some(2)),
+            (Some(5), Some(3), Some(2), Some(8)),
         ),
         (
             "claude_stream_gemini_model",
@@ -1092,7 +1097,7 @@ async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
                 (r#"{"promptTokenCount":5,"cachedContentTokenCount":2}"#, false),
                 (r#"{"promptTokenCount":5}"#, true),
             ]),
-            (Some(5), None, Some(2)),
+            (Some(5), None, Some(2), None),
         ),
         (
             "claude_stream_gemini_model",
@@ -1102,7 +1107,7 @@ async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
                 (r#"{"promptTokenCount":5,"candidatesTokenCount":3}"#, false),
                 (r#"{"promptTokenCount":6}"#, true),
             ]),
-            (Some(6), Some(3), None),
+            (Some(6), Some(3), None, Some(9)),
         ),
         (
             "claude_stream_gemini_model",
@@ -1112,15 +1117,44 @@ async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
                 (r#"{"candidatesTokenCount":0}"#, false),
                 (r#"{"promptTokenCount":6}"#, true),
             ]),
-            (Some(6), Some(0), None),
+            (Some(6), Some(0), None, Some(6)),
         ),
-        ("gemini_stream", End::AfterEvents(1), None, (Some(5), None, None)),
-        ("gemini_stream", End::Short, None, (Some(5), None, None)),
+        (
+            "gemini_stream",
+            End::AfterEvents(1),
+            None,
+            (Some(5), None, None, Some(5)),
+        ),
+        ("gemini_stream", End::Short, None, (Some(5), None, None, Some(5))),
         (
             "claude_stream_gemini_model",
             End::Complete,
             Some(&[(r#"{"promptTokenCount":5,"totalTokenCount":9}"#, true)]),
-            (Some(5), Some(4), None),
+            (Some(5), None, None, Some(9)),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::Complete,
+            Some(&[(r#"{"promptTokenCount":5}"#, true)]),
+            (Some(5), None, None, None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::Complete,
+            Some(&[(r#"{"candidatesTokenCount":0}"#, true)]),
+            (None, Some(0), None, None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::Complete,
+            Some(&[(r#"{"cachedContentTokenCount":2}"#, true)]),
+            (None, None, Some(2), None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::Complete,
+            Some(&[(r#"{"totalTokenCount":9}"#, true)]),
+            (None, None, None, Some(9)),
         ),
     ];
     for (name, end, events, want) in rows {
@@ -1174,6 +1208,7 @@ async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
             count("input_tokens"),
             count("output_tokens"),
             count("cache_read_tokens"),
+            count("total_tokens"),
         );
         assert_eq!(got, want, "{row}: published usage");
     }

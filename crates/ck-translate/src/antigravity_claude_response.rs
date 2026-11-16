@@ -420,6 +420,7 @@ struct Sent {
     cached: Option<i64>,
     candidates: Option<i64>,
     thoughts: Option<i64>,
+    total: Option<i64>,
 }
 
 impl Sent {
@@ -438,6 +439,7 @@ impl Sent {
             (&mut self.cached, "cachedContentTokenCount"),
             (&mut self.candidates, "candidatesTokenCount"),
             (&mut self.thoughts, "thoughtsTokenCount"),
+            (&mut self.total, "totalTokenCount"),
         ] {
             let value = usage.get(key);
             if value.exists() {
@@ -447,8 +449,9 @@ impl Sent {
     }
 
     /// The Anthropic usage object of these counts: input leaves the cache out (Go 912a038b)
-    /// and output is candidates plus thoughts. A count the upstream did not send stays out,
-    /// and nothing is derived from the total.
+    /// and output is candidates plus thoughts. The total, which Anthropic usage has no member
+    /// for, goes to the gateway's `x_ck.total_tokens`. A count the upstream did not send stays
+    /// out, and nothing is derived from the total.
     fn usage(&self) -> Vec<u8> {
         let mut usage = b"{}".to_vec();
         if let Some(prompt) = self.prompt {
@@ -462,18 +465,11 @@ impl Sent {
             let output = self.candidates.unwrap_or(0).wrapping_add(self.thoughts.unwrap_or(0));
             gj::set_int(&mut usage, "output_tokens", output);
         }
+        if let Some(total) = self.total {
+            gj::set_int(&mut usage, "x_ck.total_tokens", total);
+        }
         usage
     }
-}
-
-/// The two Anthropic usage objects hold the same token counts, each present in both or neither.
-fn same_counts(a: &[u8], b: &[u8]) -> bool {
-    ["input_tokens", "output_tokens", "cache_read_input_tokens"]
-        .iter()
-        .all(|key| {
-            let (a, b) = (gj::get(a, key), gj::get(b, key));
-            a.exists() == b.exists() && a.int() == b.int()
-        })
 }
 
 /// Params of ConvertAntigravityResponseToClaude.
@@ -488,8 +484,6 @@ struct Stream {
     sent: Sent,
     /// What the last usage event carried, in reported-only mode.
     emitted: Option<Sent>,
-    /// Go's final usage, written after the reported one when a stream completes.
-    derived: Option<Vec<u8>>,
     out: Vec<u8>,
     has_first_response: bool,
     response_type: u8,
@@ -760,9 +754,8 @@ impl Stream {
             gj::set_int(&mut delta, "usage.cache_read_input_tokens", self.cached_tokens);
         }
         if self.reported_usage {
-            // The reported counts go out now; Go's follow once the stream completes, so a
-            // stream cut before that accounts only what the upstream sent.
-            let go = gj::get(&delta, "usage").bytes().into_owned();
+            // Only the counts the upstream sent, whether the stream completes or is cut
+            // (owner ruling P7-4-1, 2026-11-16).
             let mut usage = self.sent.usage();
             if self.web_search_requests > 0 {
                 gj::set_int(
@@ -772,7 +765,6 @@ impl Stream {
                 );
             }
             gj::set_raw(&mut delta, "usage", &usage);
-            self.derived = Some(go);
             self.emitted = Some(self.sent);
         }
         self.event("message_delta", &delta);
@@ -798,12 +790,6 @@ impl Stream {
                 return vec![];
             }
             self.final_events(true);
-            // A completed stream accounts Go's final usage (owner question P7-4-1).
-            if let Some(go) = self.derived.take()
-                && !same_counts(&go, &self.sent.usage())
-            {
-                self.usage_delta(&go);
-            }
             self.event("message_stop", br#"{"type":"message_stop"}"#);
             return vec![std::mem::take(&mut self.out)];
         }

@@ -58,6 +58,10 @@ impl Inner {
                 continue;
             }
             let stream = cache.streams[&key.1].stream.clone();
+            // A kept stream never returns frames, so neither does its unit.
+            if stream.is_kept() {
+                continue;
+            }
             let state = stream.state.lock();
             // Queue timestamps are lower bounds. Once maintenance has observed a stream, the
             // fence holds off new leases, so one requeue at the real value is exact except for

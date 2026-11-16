@@ -112,3 +112,55 @@ fn no_request_egress_encodes_a_client_fenced_request() {
     let capability = gemini::request::GeminiCapability;
     fence_then_refence(&mut m, ingress, &body, &capability, &gemini_egress("gemini"));
 }
+
+#[test]
+fn reusable_prompts_preserve_model_omission_and_overrides() {
+    for (body, accepted) in [
+        (
+            json!({"prompt":{"id":"pmpt_test","version":"2","variables":{"name":"Ada"}}}),
+            true,
+        ),
+        (json!({"model":"override","prompt":{"id":"pmpt_test"}}), true),
+        (json!({"input":"hi"}), false),
+        (json!({"prompt":null}), false),
+        (json!({"prompt":{}}), false),
+        (json!({"prompt":{"id":7}}), false),
+        (json!({"model":7,"prompt":{"id":"pmpt_test"}}), false),
+    ] {
+        let mut m = Mapped::new();
+        let mut ingress =
+            responses::request::Ingress::new(&mut m.writer, &m.store, identity(), Operation::Generate, 1 << 20)
+                .unwrap();
+        ingress
+            .advance(&mut m.writer, &serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        let result = ingress.finish(&mut m.writer, &ClientCapability);
+        assert_eq!(result.is_ok(), accepted, "{body}");
+        if let Ok(client) = result {
+            for (capability, accepted) in [
+                (&responses::request::ResponsesCapability as &dyn Capability, true),
+                (&responses::request::CodexCapability, true),
+                (&gemini::request::GeminiCapability, body.get("model").is_some()),
+                (&responses::request::AntigravityCapability, body.get("model").is_some()),
+            ] {
+                assert_eq!(
+                    capability.validate(client.view()).is_ok(),
+                    accepted,
+                    "{}: {body}",
+                    capability.destination()
+                );
+            }
+            let attempt = RequestFence::default()
+                .end(client.view(), &responses::request::CodexCapability)
+                .unwrap();
+            let upload = responses_egress("codex").encode(&attempt, &mut m.writer).unwrap();
+            let mut bytes = Vec::new();
+            while bytes.len() < upload.len() {
+                bytes.extend_from_slice(upload.chunk(bytes.len()).unwrap());
+            }
+            let encoded: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(encoded.get("model"), body.get("model"));
+            assert_eq!(encoded["prompt"], body["prompt"]);
+        }
+    }
+}

@@ -150,6 +150,10 @@ async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
             )
                 .into_response()
         }
+        "Bearer fake-prompt" => (
+            [("content-type", "text/event-stream")],
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_prompt\",\"model\":\"stored-model\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n",
+        ).into_response(),
         _ if body["stream"] == Value::Bool(true) => ([("content-type", "text/event-stream")], sse()).into_response(),
         _ => (
             [("content-type", "application/json")],
@@ -802,6 +806,89 @@ async fn compact_sends_nothing_to_providers_without_native_compact() {
         assert_eq!(status, 400, "{provider}: {text}");
         assert!(text.contains("does not support compaction"), "{provider}: {text}");
         assert_eq!(sends(), Vec::<String>::new(), "{provider}");
+    }
+}
+
+#[tokio::test]
+async fn reusable_prompts_route_only_to_native_resolvers_without_a_model() {
+    let prompt = serde_json::json!({"id":"pmpt_test","version":"2","variables":{"name":"Ada"}});
+    for (native, disabled, explicit, cooling, prompt, expected) in [
+        (None, false, false, false, prompt.clone(), 400),
+        (Some(false), true, false, false, prompt.clone(), 400),
+        (Some(false), false, false, false, prompt.clone(), 200),
+        (Some(true), false, false, false, prompt.clone(), 200),
+        (None, false, true, false, prompt.clone(), 200),
+        (Some(true), false, true, false, prompt.clone(), 200),
+        (Some(false), false, false, true, prompt, 429),
+        (Some(false), false, false, false, Value::Null, 400),
+        (Some(false), false, false, false, serde_json::json!({}), 400),
+        (Some(false), false, false, false, serde_json::json!({"id":7}), 400),
+    ] {
+        for stream in [false, true] {
+            let mut credentials = vec![oauth("claude.json", "fake-ok", serde_json::json!({}))];
+            if let Some(api_key) = native {
+                let token = if cooling { "fake-quota" } else { "fake-prompt" };
+                let metadata =
+                    serde_json::json!({"type":"codex","access_token":token,"expired":"2099-01-01T00:00:00Z"});
+                let mut credential = Credential::from_file(
+                    Path::new("/fake"),
+                    Path::new("/fake/codex.json"),
+                    metadata.as_object().unwrap().clone(),
+                )
+                .unwrap();
+                if api_key {
+                    credential.attributes.insert("api_key".into(), token.into());
+                }
+                credential.disabled = disabled;
+                credentials.push(credential);
+            }
+            let p = proxy("", credentials).await;
+            let mut body = serde_json::json!({"prompt":prompt,"input":"hi","stream":stream});
+            if explicit {
+                body["model"] = MODEL.into();
+            }
+            if cooling {
+                let (status, _, text) = post(&p.url, "/v1/responses", &body.to_string()).await;
+                assert_eq!(status, 429, "{text}");
+                let mut sends = p.seen.requests.lock().unwrap();
+                assert_eq!(sends.len(), 1, "{sends:?}");
+                sends.clear();
+            }
+            let (status, _, text) = post(&p.url, "/v1/responses", &body.to_string()).await;
+            assert_eq!(
+                status, expected,
+                "native={native:?} disabled={disabled} explicit={explicit} cooling={cooling} stream={stream} prompt={prompt}: {text}"
+            );
+            let sends = p.seen.requests.lock().unwrap();
+            if expected == 400 {
+                let error = assert_openai_error(&text);
+                assert_eq!(error["error"]["type"], "invalid_request_error");
+                let message = if prompt.get("id").is_some_and(Value::is_string) {
+                    "model is required"
+                } else {
+                    "prompt.id must be a string"
+                };
+                assert!(error["error"]["message"].as_str().unwrap().contains(message), "{text}");
+                assert!(sends.is_empty(), "{sends:?}");
+            } else if cooling {
+                let error = assert_openai_error(&text);
+                assert_eq!(error["error"]["type"], "rate_limit_error");
+                assert_eq!(error["error"]["code"], "model_cooldown");
+                assert!(error["error"]["reset_seconds"].as_u64().unwrap() > 0);
+                assert!(sends.is_empty(), "{sends:?}");
+            } else {
+                assert_eq!(sends.len(), 1, "{sends:?}");
+                if explicit {
+                    assert_eq!(sends[0].0, "Bearer fake-ok");
+                    assert_eq!(sends[0].1["model"], MODEL);
+                } else {
+                    assert_eq!(sends[0].0, "Bearer fake-prompt");
+                    assert_eq!(sends[0].1.get("model"), None);
+                    assert_eq!(sends[0].1["prompt"], body["prompt"]);
+                    assert!(text.contains("stored-model"), "{text}");
+                }
+            }
+        }
     }
 }
 

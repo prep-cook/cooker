@@ -310,24 +310,35 @@ fn count_tokens_is_not_generation_usage_and_compact_is_unsupported() {
 }
 #[test]
 fn partial_usage_and_null_never_become_zero_or_additive_deltas() {
-    let mut rows = stream();
-    rows[0]["message"]["usage"] = json!({"input_tokens":4,"output_tokens":0,"cache_read_input_tokens":null});
-    rows.insert(13, json!({"type":"message_delta","delta":{},"usage":{"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":2}}));
-    let (_, canonical) = response(
-        &sse(&rows),
-        BodyMode::Streaming,
-        BodyMode::Buffered,
-        Operation::Generate,
-        11,
-    );
-    let snapshots: Vec<_> = canonical.iter().filter_map(|v| v.get("usage")).collect();
-    // An omitted or null cache count adds 0 to the inclusive input but is never reported as 0.
-    assert_eq!(snapshots[0]["input_tokens"], 4);
-    assert!(snapshots[0].get("cache_read_tokens").is_none());
-    let last = snapshots.last().unwrap();
-    assert_eq!(last["input_tokens"], 6);
-    assert_eq!(last["output_tokens"], 7);
-    assert_eq!(last["total_tokens"], 13);
+    // Rows: the gateway total `x_ck.total_tokens` on `message_start` (absent: derived from
+    // input and output); the client delivery; the final canonical total.
+    for (reported, downstream, total) in [
+        (None, BodyMode::Buffered, 13),
+        (None, BodyMode::Streaming, 13),
+        (Some(20), BodyMode::Buffered, 20),
+        (Some(20), BodyMode::Streaming, 20),
+    ] {
+        let mut rows = stream();
+        rows[0]["message"]["usage"] = json!({"input_tokens":4,"output_tokens":0,"cache_read_input_tokens":null});
+        if let Some(reported) = reported {
+            rows[0]["message"]["usage"]["x_ck"] = json!({"total_tokens":reported});
+        }
+        rows.insert(13, json!({"type":"message_delta","delta":{},"usage":{"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":2}}));
+        let (output, canonical) = response(&sse(&rows), BodyMode::Streaming, downstream, Operation::Generate, 11);
+        let snapshots: Vec<_> = canonical.iter().filter_map(|v| v.get("usage")).collect();
+        // An omitted or null cache count adds 0 to the inclusive input but is never reported as 0.
+        assert_eq!(snapshots[0]["input_tokens"], 4);
+        assert!(snapshots[0].get("cache_read_tokens").is_none());
+        let last = snapshots.last().unwrap();
+        assert_eq!(last["input_tokens"], 6);
+        assert_eq!(last["output_tokens"], 7);
+        assert_eq!(last["total_tokens"], total, "{reported:?} {downstream:?}");
+        let derived = last["derived"].as_array().unwrap();
+        assert_eq!(derived.contains(&json!("total_tokens")), reported.is_none());
+        // The gateway total never reaches an Anthropic client.
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("x_ck"), "{reported:?} {downstream:?}: {output}");
+    }
 }
 #[test]
 fn malformed_truncated_and_post_terminal_responses_never_gain_success() {
