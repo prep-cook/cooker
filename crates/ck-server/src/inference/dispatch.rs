@@ -1534,7 +1534,11 @@ async fn attempt<X: Arms>(
         // the contract arm needs the alias in its response egress first.
         let forced_alias = target.alias.force_mapping && !target.alias.original_alias.is_empty();
         let fault = 'arm: {
+            // D2-PLAN §3.3: a compact runs only where the provider's compact is native;
+            // nothing is sent to any other, on either arm.
+            let native = !target.compact || attempt::native_compact(&lease.credential.provider);
             let ran = match arm.as_deref_mut() {
+                _ if !native => Ran::Skip(attempt::no_native_compact(trace, &lease.credential, upstream)),
                 Some(arm) => loop {
                     let ran = attempt::run(
                         arm,
@@ -1563,17 +1567,6 @@ async fn attempt<X: Arms>(
                     break ran;
                 },
                 None => Ran::Old,
-            };
-            // D2-PLAN §3.3: an old-arm compact runs only where the provider's compact is
-            // native; nothing is sent to any other.
-            // C2 (Claude native compaction) plugs in here: once it lands, a Claude candidate
-            // reaches the new arm and never gets this far; the old arm keeps only the
-            // providers listed in `attempt::native_compact` until D9 deletes it.
-            let ran = match ran {
-                Ran::Old if target.compact && !attempt::native_compact(&lease.credential.provider) => {
-                    Ran::Skip(attempt::no_native_compact(trace, &lease.credential, upstream))
-                }
-                ran => ran,
             };
             match ran {
                 Ran::Old => {}

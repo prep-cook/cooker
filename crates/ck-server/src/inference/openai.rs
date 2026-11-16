@@ -259,10 +259,15 @@ pub async fn responses(
         headers,
         path: dispatch::route_path(matched.as_ref(), &original.0),
     };
-    let keepalive = respond::keepalive(&rt.config());
-    dispatch::serve(
+    let output = Output {
+        protocol: Protocol::Responses,
+        operation: codec::Operation::Generate,
+        framing: if stream { Framing::Sse } else { Framing::Json },
+    };
+    dispatch::exchange::serve(
         &rt,
         call(req, Format::OpenAIResponse, model, body, stream, None),
+        output,
         move |result| async move {
             match result {
                 Err(failure) if stream => {
@@ -297,7 +302,7 @@ pub async fn responses(
                         if framer.data_frames > 0 {
                             let tail = futures_util::StreamExt::boxed(futures_util::stream::iter(next));
                             let finished = framer.stopped();
-                            return respond::sse(respond::resume(ready, finished, tail, framer, keepalive));
+                            return respond::sse(respond::resume(ready, finished, tail, framer, None));
                         }
                         match next {
                             Some(Ok(_)) => unreachable!("handled above"),
@@ -323,7 +328,7 @@ pub async fn responses(
                         }
                     }
                     let finished = framer.stopped();
-                    respond::sse(respond::resume(ready, finished, rest, framer, keepalive))
+                    respond::sse(respond::resume(ready, finished, rest, framer, None))
                 }
             }
         },
@@ -853,7 +858,12 @@ pub async fn compact(
         false,
         Some("responses/compact".into()),
     );
-    dispatch::serve(&rt, call, |result| async move {
+    let output = Output {
+        protocol: Protocol::Responses,
+        operation: codec::Operation::Compact,
+        framing: Framing::Json,
+    };
+    dispatch::exchange::serve(&rt, call, output, |result| async move {
         match result {
             Err(failure) => errors::openai(&failure),
             Ok(Done::Buffered { body, .. }) => respond::json(200, "application/json", body),

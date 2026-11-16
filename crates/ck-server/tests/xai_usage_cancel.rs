@@ -1,8 +1,8 @@
 //! xAI usage records when the client goes away, through the real router, dispatch and
-//! usage tracker, against a loopback mock upstream. Go cancels the request context: the
-//! pending HTTP send or body read fails with `context canceled` and the executor
-//! publishes that failure (`TrackFailure`, the scanner's `PublishFailure`). An attempt
-//! that ended before the client left keeps the record it already settled.
+//! usage tracker, against a loopback mock upstream. A client that leaves while the executor
+//! waits for the upstream's headers cancels the attempt, which records the cancellation.
+//! Once the upstream answered, the attempt runs on its own stream task (execution contract
+//! §5.2): the client leaving neither cancels it nor drops its record or final usage.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,22 +15,30 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_1","object":"response","model":"grok-4.7","status":"in_progress","output":[]}}"#;
+const CREATED: &str = r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","created_at":1,"model":"grok-4.7","status":"in_progress","output":[]}}"#;
+const ITEM: &str = r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","status":"in_progress","role":"assistant","content":[]}}"#;
+const CLOSE: [&str; 3] = [
+    r#"{"type":"response.output_text.done","item_id":"msg_1","output_index":0,"content_index":0,"text":"hi"}"#,
+    r#"{"type":"response.content_part.done","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"hi","annotations":[]}}"#,
+    r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}}"#,
+];
+const PART: &str = r#"{"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}"#;
 const DELTA: &str =
     r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hi"}"#;
-const COMPLETED_USAGE: &str = r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","model":"grok-4.7","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}"#;
-const COMPLETED_BARE: &str = r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","model":"grok-4.7","status":"completed","output":[]}}"#;
+const COMPLETED_USAGE: &str = r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"model":"grok-4.7","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}"#;
+const COMPLETED_BARE: &str = r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"model":"grok-4.7","status":"completed","output":[]}}"#;
 
 /// What the mock upstream does after reading the request.
 #[derive(Clone, Copy)]
 enum Upstream {
     /// Never answers.
     Hang,
-    /// Sends the SSE headers, `response.created` and a text delta, then waits forever.
-    /// (The Responses framer hands a frame to the client once the next line arrives.)
-    Partial,
-    /// Sends what `Partial` sends, then drops the connection mid-body.
+    /// Sends the SSE headers, `response.created`, a message and a text delta, then drops the
+    /// connection mid-body.
     Reset,
+    /// Sends what `Reset` sends, then, once the client has left, the rest of the message
+    /// and `response.completed` with usage.
+    Late,
     /// A complete SSE body ending in `response.completed` with this payload.
     Complete(&'static str),
 }
@@ -81,8 +89,8 @@ async fn mock(behaviour: Upstream) -> (String, mpsc::UnboundedReceiver<()>) {
                 read_request(&mut conn).await;
                 match behaviour {
                     Upstream::Hang => {}
-                    Upstream::Partial | Upstream::Reset => {
-                        let head = format!("{SSE_HEAD}{}{}", sse(CREATED), sse(DELTA));
+                    Upstream::Reset | Upstream::Late => {
+                        let head = format!("{SSE_HEAD}{}{}{}{}", sse(CREATED), sse(ITEM), sse(PART), sse(DELTA));
                         conn.write_all(head.as_bytes()).await.unwrap();
                         conn.flush().await.unwrap();
                     }
@@ -95,6 +103,12 @@ async fn mock(behaviour: Upstream) -> (String, mpsc::UnboundedReceiver<()>) {
                 if let Upstream::Reset = behaviour {
                     drop(conn);
                     return;
+                }
+                if let Upstream::Late = behaviour {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let close: String = CLOSE.iter().map(|event| sse(event)).collect();
+                    let rest = format!("{close}{}0\r\n\r\n", sse(COMPLETED_USAGE));
+                    conn.write_all(rest.as_bytes()).await.unwrap();
                 }
                 // Keep the connection open until the test runtime ends.
                 std::future::pending::<()>().await;
@@ -169,12 +183,14 @@ async fn records(rt: &ck_server::Runtime, want: usize) -> Vec<Value> {
     got.iter().map(|r| serde_json::from_slice(r).unwrap()).collect()
 }
 
-fn outcome(record: &Value) -> (bool, i64, String, i64) {
+/// Whether the record failed, its status and body, and its total tokens; a count the
+/// upstream did not report is absent.
+fn outcome(record: &Value) -> (bool, i64, String, Option<i64>) {
     (
         record["failed"].as_bool().unwrap(),
         record["fail"]["status_code"].as_i64().unwrap(),
         record["fail"]["body"].as_str().unwrap().to_owned(),
-        record["tokens"]["total_tokens"].as_i64().unwrap(),
+        record["tokens"]["total_tokens"].as_i64(),
     )
 }
 
@@ -189,14 +205,14 @@ async fn cancel_while_awaiting_headers_records_the_failure() {
     drop(conn);
     let got = records(&p.rt, 1).await;
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(outcome(&got[0]), (true, 499, "context canceled".into(), 0));
+    assert_eq!(outcome(&got[0]), (true, 499, "stream.cancelled".into(), None));
 }
 
-/// The client leaves while the stream waits for the next upstream line, after the
-/// first event reached it.
+/// The client leaves after the first event reached it; the attempt runs on and records the
+/// upstream's final usage.
 #[tokio::test]
-async fn cancel_while_awaiting_stream_data_records_the_failure() {
-    let mut p = proxy(Upstream::Partial).await;
+async fn leaving_a_stream_keeps_the_final_usage() {
+    let mut p = proxy(Upstream::Late).await;
     let mut conn = request(&p.addr, true).await;
     p.ready.recv().await.unwrap();
     let mut seen = Vec::new();
@@ -212,20 +228,21 @@ async fn cancel_while_awaiting_stream_data_records_the_failure() {
     drop(conn);
     let got = records(&p.rt, 1).await;
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(outcome(&got[0]), (true, 499, "context canceled".into(), 0));
+    assert_eq!(outcome(&got[0]), (false, 200, String::new(), Some(10)));
 }
 
-/// A non-streaming client leaves while the executor reads the upstream body.
+/// A non-streaming client leaves while the executor reads the upstream body; the attempt
+/// runs on and records the upstream's final usage.
 #[tokio::test]
-async fn cancel_while_reading_buffered_body_records_the_failure() {
-    let mut p = proxy(Upstream::Partial).await;
+async fn leaving_a_buffered_answer_keeps_the_final_usage() {
+    let mut p = proxy(Upstream::Late).await;
     let conn = request(&p.addr, false).await;
     p.ready.recv().await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     drop(conn);
     let got = records(&p.rt, 1).await;
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(outcome(&got[0]), (true, 499, "context canceled".into(), 0));
+    assert_eq!(outcome(&got[0]), (false, 200, String::new(), Some(10)));
 }
 
 /// A stream that already failed keeps its own failure when the client then leaves.
@@ -256,12 +273,12 @@ async fn completion_then_drop_keeps_the_usage() {
     drop(conn);
     let got = records(&p.rt, 1).await;
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(outcome(&got[0]), (false, 200, String::new(), 10));
+    assert_eq!(outcome(&got[0]), (false, 200, String::new(), Some(10)));
 }
 
-/// A completed stream without usage still publishes nothing (no `EnsurePublished`).
+/// A completed stream without usage records the attempt with no token counts.
 #[tokio::test]
-async fn usage_less_completion_records_nothing() {
+async fn usage_less_completion_records_no_counts() {
     let mut p = proxy(Upstream::Complete(COMPLETED_BARE)).await;
     let mut conn = request(&p.addr, true).await;
     p.ready.recv().await.unwrap();
@@ -269,6 +286,7 @@ async fn usage_less_completion_records_nothing() {
     conn.read_to_end(&mut out).await.unwrap();
     assert!(String::from_utf8_lossy(&out).contains("response.completed"));
     drop(conn);
-    let got = records(&p.rt, 0).await;
-    assert!(got.is_empty(), "{got:?}");
+    let got = records(&p.rt, 1).await;
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(outcome(&got[0]), (false, 200, String::new(), None));
 }

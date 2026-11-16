@@ -62,6 +62,9 @@ pub struct Turn {
     pub id: ResponseId,
     /// The client did not send `store: false`: the committed turn is indexed.
     pub stored: bool,
+    /// The request continues a stored turn (`previous_response_id`), so the exchange's
+    /// request stream holds the expanded history rather than the client's body.
+    pub continued: bool,
 }
 
 /// The index of committed turns. Its capacity is the pool's header slots, fixed when the store
@@ -297,6 +300,17 @@ pub enum Refused {
 impl Refused {
     /// The client's answer, in the Responses error shape.
     pub fn response(&self) -> Response {
+        let (status, body) = self.parts();
+        crate::http::respond::gin_json(status, body)
+    }
+
+    /// The same answer as a request-scoped error, for the route's error writer.
+    pub fn error(&self) -> ck_core::exec::ExecError {
+        let (status, body) = self.parts();
+        ck_core::exec::ExecError::local(status, ck_core::exec::FailureScope::Request, body)
+    }
+
+    fn parts(&self) -> (u16, String) {
         let (status, message, kind, param, code) = match self {
             Self::Conversation => (
                 400,
@@ -343,7 +357,7 @@ impl Refused {
             detail.str("param", param)
         };
         let detail = detail.str("code", code).finish();
-        crate::http::respond::gin_json(status, crate::http::gojson::Obj::new().raw("error", &detail).finish())
+        (status, crate::http::gojson::Obj::new().raw("error", &detail).finish())
     }
 }
 
@@ -369,11 +383,13 @@ pub fn begin(
         Ok(None) => true,
         Err(_) => return Err(Refused::Defect),
     };
+    let previous = previous(doc, x).map_err(|_| Refused::Defect)?;
     exchange.turn = Some(Turn {
         id: ResponseId::random(),
         stored,
+        continued: previous.is_some(),
     });
-    let Some(previous) = previous(doc, x).map_err(|_| Refused::Defect)? else {
+    let Some(previous) = previous else {
         return Ok(None);
     };
     let found = previous

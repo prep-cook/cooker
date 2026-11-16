@@ -251,18 +251,11 @@ async fn meta_segmentation_counts_reach_the_record() {
             response
         };
         let completed = |counts: &Value| json!({"type":"response.completed","response":response(counts)});
-        let earlier = json!({"images_processed":5,"video_frames_processed":7});
-        let streamed = format!(
-            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-            completed(&earlier),
-            completed(&counts)
-        );
+        let streamed = format!("data: {}\n\ndata: [DONE]\n\n", completed(&counts));
         let usage = &response(&counts)["usage"];
-        // The client's stream ends at its first terminal event, so it receives the earlier counts.
-        for (stream, content_type, answer, delivered) in [
-            (false, JSON, response(&counts).to_string(), &counts),
-            (true, SSE, streamed, &earlier),
-        ] {
+        // Meta's executor streams from the upstream whatever the client asked.
+        for stream in [false, true] {
+            let (content_type, answer, delivered) = (SSE, streamed.clone(), &counts);
             let request = json!({"model":"fast","input":"segment the cat","stream":stream});
             let (record, client) = exchange("meta", "/v1/responses", request, content_type, answer).await;
             let field = |name| record.get(name).cloned().unwrap_or(Value::Null);
