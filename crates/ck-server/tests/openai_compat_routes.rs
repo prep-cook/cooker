@@ -21,13 +21,16 @@ fn assert_local_error(text: &str, kind: &str) {
     assert_eq!(value["error"].get("code"), Some(&serde_json::Value::Null));
 }
 
-/// Requests seen, the compact failure to answer with (`None` answers `{"ok":true}`),
-/// and the SSE body to stream (`None` streams `CHUNK` and `[DONE]`).
+/// Requests seen, the compact answers by arrival order (`(status, body)`; the first key to
+/// send a compact is entry 0, the next entry 1, and a key without an entry answers
+/// `{"ok":true}`; status 0 resets the connection), the SSE body to stream (`None` streams
+/// `CHUNK` and `[DONE]`), and the keys in the order their first compact arrived.
 #[derive(Default)]
 struct Seen(
     Mutex<Vec<(String, Option<String>, String)>>,
-    Mutex<Option<(u16, &'static str)>>,
+    Mutex<Vec<(u16, &'static str)>>,
     Mutex<Option<String>>,
+    Mutex<Vec<String>>,
 );
 
 const CHAT: &str = r#"{"id":"c1","object":"chat.completion","created":1,"model":"up-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
@@ -43,9 +46,27 @@ async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
     let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     let stream = body.contains(r#""include_usage":true"#);
-    seen.0.lock().unwrap().push((path.clone(), auth, body));
+    seen.0.lock().unwrap().push((path.clone(), auth.clone(), body));
     if path.ends_with("/responses/compact") {
-        return match *seen.1.lock().unwrap() {
+        let answer = {
+            let key = auth.clone().unwrap_or_default();
+            let mut roles = seen.3.lock().unwrap();
+            let role = roles.iter().position(|k| *k == key).unwrap_or_else(|| {
+                roles.push(key);
+                roles.len() - 1
+            });
+            seen.1.lock().unwrap().get(role).copied()
+        };
+        return match answer {
+            Some((0, _)) => {
+                let reset =
+                    futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("mock connection reset"))]);
+                (
+                    [("content-type", "application/json")],
+                    axum::body::Body::from_stream(reset),
+                )
+                    .into_response()
+            }
             Some((status, body)) => (
                 axum::http::StatusCode::from_u16(status).unwrap(),
                 [("content-type", "application/json")],
@@ -315,36 +336,117 @@ async fn compact_execute() {
     assert_eq!(seen[0].2, r#"{"model":"up-model","input":"hello"}"#);
 }
 
-/// Go `TestOpenAIResponsesCompactTransientFailureDoesNotCooldownAuthAndPreservesError`:
-/// a 500 on every credential keeps the upstream status and message, and cools nothing.
-#[tokio::test]
-async fn compact_transient_failure_keeps_error_and_cools_nothing() {
-    let (url, seen) = proxy_keys(&["sk-fake-a", "sk-fake-b"]).await;
-    *seen.1.lock().unwrap() = Some((
-        500,
-        r#"{"error":{"message":"compact upstream temporary error","type":"api_error"}}"#,
-    ));
-    let body = br#"{"model":"fast","input":"hello"}"#.to_vec();
-    let (status, text) = send(&url, "/v1/responses/compact", &[], body.clone()).await;
-    assert_eq!(status, 500, "{text}");
-    assert!(text.contains("compact upstream temporary error"), "{text}");
-    assert_eq!(compact_calls(&seen), 2, "a transient fault fails over");
-    let (status, text) = send(&url, "/v1/responses", &[], body).await;
-    assert_eq!(status, 200, "normal traffic is not cooled: {text}");
+/// Compact calls each key received, in the order the keys first sent one.
+fn compact_sends(seen: &Seen) -> Vec<usize> {
+    let roles = seen.3.lock().unwrap().clone();
+    let requests = seen.0.lock().unwrap();
+    let sent = |key: &String| {
+        requests
+            .iter()
+            .filter(|r| r.0.ends_with("/responses/compact") && r.1.as_ref() == Some(key))
+            .count()
+    };
+    roles.iter().map(sent).collect()
 }
 
-/// Go `TestOpenAIResponsesCompactRequestFaultStopsFallbackAndPreservesError`.
+/// A compact failure is routed by its class (D2-PLAN §3.3). The call is the probe: an
+/// unsupported answer is skipped and never remembered, a credential fault or a transient
+/// one fails over and cools the credential, and a client fault stops with nothing sent to
+/// the next credential.
 #[tokio::test]
-async fn compact_request_fault_stops_fallback() {
-    let (url, seen) = proxy_keys(&["sk-fake-a", "sk-fake-b"]).await;
-    *seen.1.lock().unwrap() = Some((404, "404 page not found"));
+async fn compact_failures_are_routed_by_class() {
+    const OK: &str = r#"{"ok":true}"#;
+    let quota = r#"{"error":{"message":"quota","type":"insufficient_quota"}}"#;
+    struct Row {
+        case: &'static str,
+        /// What the credential tried first (`a`) answers (status 0 resets the connection) and
+        /// what the next one (`b`) answers.
+        a: (u16, &'static str),
+        b: (u16, &'static str),
+        /// The first compact's status and its text when it differs from `OK`.
+        status: u16,
+        /// Compact sends to `(a, b)` after the first and after a second compact.
+        first: (usize, usize),
+        second: (usize, usize),
+    }
+    let ok = (200, OK);
+    let mut rows = vec![];
+    for status in [404, 405, 501] {
+        rows.push(Row {
+            case: "an unsupported answer is skipped and tried again by the next compact",
+            a: (status, "no such endpoint"),
+            b: ok,
+            status: 200,
+            first: (1, 1),
+            second: (2, 2),
+        });
+    }
+    rows.push(Row {
+        case: "a transport failure fails over; the scheduler never cools a connection fault",
+        a: (0, ""),
+        b: ok,
+        status: 200,
+        first: (1, 1),
+        second: (2, 2),
+    });
+    for status in [408, 500, 502, 503, 504] {
+        rows.push(Row {
+            case: "a transient answer fails over and cools the credential",
+            a: (status, "boom"),
+            b: ok,
+            status: 200,
+            first: (1, 1),
+            second: (1, 2),
+        });
+    }
+    for status in [402, 403, 429] {
+        rows.push(Row {
+            case: "a credential answer fails over and cools the credential",
+            a: (status, quota),
+            b: ok,
+            status: 200,
+            first: (1, 1),
+            second: (1, 2),
+        });
+    }
+    for status in [400, 409, 413, 422] {
+        rows.push(Row {
+            case: "a client fault stops with nothing sent to the next credential",
+            a: (status, "bad request"),
+            b: ok,
+            status,
+            first: (1, 0),
+            // Round robin moves on; the client's fault cooled nothing.
+            second: (1, 1),
+        });
+    }
+    rows.push(Row {
+        case: "every credential unsupported answers the last one's status",
+        a: (404, "no such endpoint"),
+        b: (404, "no such endpoint"),
+        status: 404,
+        first: (1, 1),
+        second: (2, 2),
+    });
     let body = br#"{"model":"fast","input":"hello"}"#.to_vec();
-    let (status, text) = send(&url, "/v1/responses/compact", &[], body.clone()).await;
-    assert_eq!(status, 404, "{text}");
-    assert!(text.contains("404 page not found"), "{text}");
-    assert_eq!(compact_calls(&seen), 1, "a request fault stops failover");
-    let (status, text) = send(&url, "/v1/responses", &[], body).await;
-    assert_eq!(status, 200, "normal traffic is not cooled: {text}");
+    for row in rows {
+        let (url, seen) = proxy_keys(&["sk-fake-a", "sk-fake-b"]).await;
+        *seen.1.lock().unwrap() = vec![row.a, row.b];
+        let sends = |seen: &Seen| {
+            let mut sends = compact_sends(seen);
+            sends.resize(2, 0);
+            (sends[0], sends[1])
+        };
+        let case = format!("{} ({})", row.case, row.a.0);
+        let (status, text) = send(&url, "/v1/responses/compact", &[], body.clone()).await;
+        assert_eq!(status, row.status, "{case}: {text}");
+        if row.status == 200 {
+            assert_eq!(text, OK, "{case}");
+        }
+        assert_eq!(sends(&seen), row.first, "{case}: first compact");
+        send(&url, "/v1/responses/compact", &[], body.clone()).await;
+        assert_eq!(sends(&seen), row.second, "{case}: second compact");
+    }
 }
 
 /// Go `pickLCP` through dispatch: with session affinity, an authenticated request

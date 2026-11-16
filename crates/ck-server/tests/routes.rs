@@ -777,6 +777,34 @@ async fn misc_routes_match_go() {
     assert!(p.seen.requests.lock().unwrap().is_empty());
 }
 
+/// An old-arm compact runs only where the provider's compact is native (D2-PLAN §3.3).
+/// Claude and Antigravity would answer with a refusal or a local summary, so they are
+/// skipped with nothing sent and the client hears the refusal.
+#[tokio::test]
+async fn compact_sends_nothing_to_providers_without_native_compact() {
+    let antigravity = {
+        let metadata = serde_json::json!({"type":"antigravity","access_token":"ya29.fake-compact",
+            "expired":"2099-01-01T00:00:00Z","project_id":"proj-compact"});
+        let (dir, name) = (Path::new("/fake"), "ag.json");
+        Credential::from_file(dir, &dir.join(name), metadata.as_object().unwrap().clone()).unwrap()
+    };
+    let claude = oauth("claude.json", "fake-ok", serde_json::json!({}));
+    for (provider, credential) in [("claude", claude), ("antigravity", antigravity)] {
+        let p = proxy("", vec![credential]).await;
+        // The capability probe of a registering Antigravity credential is not a send.
+        let sends = || {
+            let mut paths: Vec<String> = p.seen.requests.lock().unwrap().iter().map(|r| r.0.clone()).collect();
+            paths.retain(|path| !path.ends_with(":fetchAvailableModels"));
+            paths
+        };
+        let body = format!(r#"{{"model":"{MODEL}","input":"x"}}"#);
+        let (status, _, text) = post(&p.url, "/v1/responses/compact", &body).await;
+        assert_eq!(status, 400, "{provider}: {text}");
+        assert!(text.contains("does not support compaction"), "{provider}: {text}");
+        assert_eq!(sends(), Vec::<String>::new(), "{provider}");
+    }
+}
+
 #[derive(Default)]
 struct OAuthMock {
     calls: Mutex<Vec<String>>,
