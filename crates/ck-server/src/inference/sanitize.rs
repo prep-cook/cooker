@@ -244,7 +244,7 @@ mod tests {
         for (input, want) in [
             (
                 r#"Post "http://127.0.0.1/v1?beta=sk-review-secret": dial tcp 127.0.0.1:1: i/o timeout"#,
-                r#"Post "<redacted url>": dial tcp <redacted url> i/o timeout"#,
+                r#"Post "<redacted url>": dial tcp 127.0.0.1:1: i/o timeout"#,
             ),
             (
                 r#"Post "http://127.0.0.1/v1#sk-review-secret": EOF"#,

@@ -175,6 +175,10 @@ fn words_that_may_hold_a_credential_print_as_the_placeholder() {
         ("go next#sk-review-secret", "go <redacted url>"),
         ("go callback?sk-review-secret", "go <redacted url>"),
         ("go https:sk-review-secret", "go <redacted url>"),
+        ("go a1:sk-review-secret", "go <redacted url>"),
+        ("go 1-https:sk-review-secret} x", "go <redacted url> x"),
+        ("go 0.9+redis:sk-review-secret", "go <redacted url>"),
+        ("go 1a,b+c:sk-review-secret", "go <redacted url>"),
         ("dial 9://sk-review-secret/x", "dial <redacted url>"),
         ("open https:relay.example//sk-review-secret", "open <redacted url>"),
         ("see x<http://h/>what?yes tail", "see <redacted url>"),
@@ -221,9 +225,8 @@ fn words_that_may_hold_a_credential_print_as_the_placeholder() {
             "and/or what? C# ## heading what?yes",
             "and/or <redacted url> <redacted url> <redacted url> heading <redacted url>",
         ),
-        ("ratio 1:2 at 12:30", "ratio <redacted url> at <redacted url>"),
-        ("listen 127.0.0.1:8080", "listen <redacted url>"),
-        ("Timestamp: 2026-11-16T15:01:52+11:00", "Timestamp: <redacted url>"),
+        ("listen example.com:443", "listen <redacted url>"),
+        ("dsn redis:key", "dsn <redacted url>"),
         ("models/claude@001:rawPredict", "<redacted url>"),
     ] {
         let got = urls_in(text);
@@ -243,6 +246,10 @@ fn words_that_may_hold_a_credential_print_as_the_placeholder() {
         r#"{"type":"x","n":[1,2]}"#,
         "error: EOF a/b//c and path//x",
         "time: 12 :30 1: 2",
+        // A scheme starts with a letter: times and IPv4 `host:port` print.
+        "ratio 1:2 at 12:30",
+        "at 2026-11-16T05:00:00Z and 2026-11-16T15:01:52+11:00",
+        "dial tcp 1.2.3.4:443 and 127.0.0.1:8080",
         r#"{"image":"/9j/4AAQSkZJRgABAQ=="}"#,
         "\u{fffd}\u{fffd} plain",
     ] {
@@ -384,8 +391,10 @@ const SHAPES: &[&str] = &[
     "?code=S",
     "#S",
     "next?S",
-    "https:S",
-    "1:S",
+    // An opaque `scheme:key` is a scheme only where its run of scheme bytes starts with a
+    // letter, so these start a word.
+    " https:S",
+    " a1:S",
     "redis:S@host.example",
     "mailto:S@host.example",
     "https://host.example/r/https://u:S@x.example/a",

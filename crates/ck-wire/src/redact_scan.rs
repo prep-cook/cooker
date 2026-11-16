@@ -186,11 +186,25 @@ pub(super) fn stop(b: u8) -> bool {
 }
 
 /// Whether `word` may hold a credential: it holds an `@`, a `?`, a `#` or `://`, or a
-/// scheme byte and `:` with at least one byte after them (`https:key`, `user:key`).
+/// scheme (a letter, then letters, digits, `+`, `-` or `.`) and `:` with at least one
+/// byte after them (`https:key`, `user:key`, `example.com:443`). The scheme may start
+/// inside the run of scheme bytes before the `:`, at a letter after `+`, `-` or `.`
+/// (`1-https:key`). A letter after a digit does not start one, so times
+/// (`2026-11-16T05:00:00Z`) and IPv4 `host:port` print.
 fn suspect(word: &[u8]) -> bool {
     word.iter().any(|b| matches!(b, b'@' | b'?' | b'#'))
         || word.windows(3).any(|w| w == b"://")
-        || (1..word.len().saturating_sub(1)).any(|i| word[i] == b':' && super::scheme_byte(word[i - 1]))
+        || (1..word.len().saturating_sub(1)).any(|i| {
+            // Each search stops at the previous `:`, so the scan stays linear.
+            word[i] == b':' && {
+                let start = word[..i]
+                    .iter()
+                    .rposition(|b| !super::scheme_byte(*b))
+                    .map_or(0, |p| p + 1);
+                (start..i)
+                    .any(|j| word[j].is_ascii_alphabetic() && (j == start || matches!(word[j - 1], b'+' | b'-' | b'.')))
+            }
+        })
 }
 
 /// Whether `b` can be part of a URL: unreserved, `%`, the delimiters a userinfo, path,

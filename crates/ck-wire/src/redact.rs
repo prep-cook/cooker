@@ -51,14 +51,14 @@ pub fn urls_in(text: &str) -> Cow<'_, str> {
 
 /// `text` (any bytes) redacted word by word, for errors, captures and logs (owner ruling
 /// Settled 60, 2026-11-16). A word is the bytes between whitespace and `"`. A word prints
-/// as [`UNPRINTABLE`] whole when it holds `://`, an `@`, a `?` or a `#`, or a scheme byte
-/// (letter, digit, `+`, `-`, `.`) and `:` with a byte after them (`https:key`, `12:30`),
-/// and when it is longer than 1 MiB. Such
+/// as [`UNPRINTABLE`] whole when it holds `://`, an `@`, a `?` or a `#`, or a scheme (a
+/// letter, then letters, digits, `+`, `-` or `.`) and `:` with a byte after them
+/// (`https:key`, `example.com:443`), and when it is longer than 1 MiB. Such
 /// a word may be part of a quoted value with spaces in it, so when it follows a `"` and
 /// ends at whitespace, the text up to the next `"` is dropped; when it holds `'`, a
 /// backtick or `<`, the text up to the next `"` or line break. No URL structure is
-/// parsed, so an e-mail address, `user@host`, `mailto:…`, a time, `host:port` and a
-/// word such as `what?` or `C#` print as the placeholder too.
+/// parsed, so an e-mail address, `user@host`, `mailto:…`, `name:port` and a word such as
+/// `what?` or `C#` print as the placeholder too.
 pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
     if text.len() <= scan::HOLD && !text.iter().any(|b| matches!(b, b':' | b'@' | b'?' | b'#')) {
         return Cow::Borrowed(text);
