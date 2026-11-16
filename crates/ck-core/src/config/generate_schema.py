@@ -107,6 +107,10 @@ for old, family in re.findall(r'\{"([^"]+)", "([^"]+)"\}', families):
         group["fields"]["keys"] = {"list": key}
     put("api-keys." + family, {"list": group})
 schema["fields"]["config-version"] = "version"
+# Nothing sends bytes before an attempt's first answer byte, so the non-stream keep-alive and
+# stream bootstrap retries are removed (Q-F).
+schema["fields"]["requests"]["fields"].pop("nonstream-keepalive-interval")
+schema["fields"]["requests"]["fields"]["streaming"]["fields"].pop("bootstrap-retries")
 # cooker additions (docs/DIFFERENCES-FROM-GO.md). Go starts with them and ignores
 # them; a config edit through its v8 Management API moves them into comments.
 put("oauth.providers.codex.chatgpt-keep-alive", "bool")

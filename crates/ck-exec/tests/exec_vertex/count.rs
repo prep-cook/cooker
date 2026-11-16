@@ -120,7 +120,9 @@ fn fence_then(
     let mut ingress = gemini::request::Ingress::new(&mut writer, &streams.store, id, operation, MODEL, LIMIT).unwrap();
     ingress.advance(&mut writer, body.as_bytes()).unwrap();
     let executors = executors();
-    let validated = executors.fence(&attempt, &mut ingress, &mut writer)?;
+    let validated = ingress
+        .finish(&mut writer, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| executors.refence(&attempt, fenced.view()))?;
     let Some(next) = next else { return Ok(()) };
     let exchange = Exchange::new(next.clone(), MODEL, "/client");
     executors

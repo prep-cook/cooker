@@ -579,7 +579,10 @@ async fn the_selector_runs_meta_through_the_executor() {
     let mut ingress =
         chat::request::Ingress::new(&mut request, &streams.store, id, Operation::Generate, LIMIT).unwrap();
     ingress.advance(&mut request, CHAT).unwrap();
-    let validated = executors.fence(&attempt, &mut ingress, &mut request).unwrap();
+    let validated = ingress
+        .finish(&mut request, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| executors.refence(&attempt, fenced.view()))
+        .unwrap();
     assert_eq!(
         executors.refence(&attempt, validated.view()).unwrap().destination(),
         DESTINATION

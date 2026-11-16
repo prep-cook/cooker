@@ -2,7 +2,8 @@
 //! `BaseAPIHandler.Execute*WithAuthManager` plus `Manager.Execute*`).
 //!
 //! Model to providers through the registry, credential selection across all of them,
-//! per-credential alias pools, request-scoped rules, retry rounds and stream bootstrap.
+//! per-credential alias pools, request-scoped rules, retry rounds and stream bootstrap
+//! (the first event before committing).
 //! Routes only parse their request and render the [`Done`] or [`Failure`].
 
 use std::sync::Arc;
@@ -529,81 +530,15 @@ fn canonical_model_raw(model: &str) -> &str {
 
 /// Runs `call` and renders the result, adding Go's `X-Ck-Trace-Id` (selection time,
 /// the selected credential's auth index and a request ID) once a credential was picked.
-///
-/// Non-stream generate calls run under Go's `StartNonStreamingKeepAlive`: when
-/// `requests.nonstream-keepalive-interval` is set and no result arrived within one
-/// interval, the response commits as 200 `application/json` and a `\n` goes out every
-/// interval until the call finishes; the rendered body follows. The rendered status and
-/// headers are lost then, as in Go, where they are written after the first keep-alive
-/// flush.
 pub async fn serve<F, Fut>(rt: &Arc<Runtime>, call: Call, render: F) -> axum::response::Response
 where
-    F: FnOnce(Result<Done, Failure>) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
+    F: FnOnce(Result<Done, Failure>) -> Fut,
+    Fut: std::future::Future<Output = axum::response::Response>,
 {
-    let interval = nonstream_keepalive(&call, &rt.config()).filter(|_| !waits_for_kimi_proof(rt, &call));
-    let trace = Arc::new(Trace::with_request_id(crate::observability::api::current_request_id()));
-    let mut run = Box::pin({
-        let (rt, trace) = (rt.clone(), trace.clone());
-        async move {
-            let result = run_with_bootstrap_retries(&rt, call, &trace).await;
-            let cfg = rt.config();
-            let upstream = upstream_headers(&cfg, &result, trace.served_by_kimi(&rt));
-            (result, upstream)
-        }
-    });
-    // Upstream headers and the trace ID go on a rendered response; once a keep-alive
-    // committed the headers they are lost, as in Go.
-    let Some(interval) = interval else {
-        let (result, upstream) = run.await;
-        return traced(rt, &trace, render(result).await, upstream);
-    };
-    tokio::select! {
-        biased;
-        (result, upstream) = &mut run => return traced(rt, &trace, render(result).await, upstream),
-        () = tokio::time::sleep(interval) => {}
-    }
-    // Go's handlers stop the keep-alive as soon as Execute returns: no beats while the
-    // result renders.
-    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    enum Event {
-        Tick,
-        Done(Result<Done, Failure>),
-    }
-    let events = futures_util::stream::unfold(Some((run, ticks)), |state| async move {
-        let (mut run, mut ticks) = state?;
-        tokio::select! {
-            biased;
-            (result, _) = &mut run => Some((Event::Done(result), None)),
-            _ = ticks.tick() => Some((Event::Tick, Some((run, ticks)))),
-        }
-    });
-    let beat = Bytes::from_static(b"\n");
-    let once = |bytes: Bytes| futures_util::stream::iter([Ok::<_, axum::Error>(bytes)]);
-    let first = once(beat.clone());
-    let mut render = Some(render);
-    let body = first.chain(events.flat_map(move |event| match event {
-        Event::Tick => once(beat.clone()).left_stream(),
-        Event::Done(result) => {
-            let render = render.take().expect("the run finishes once");
-            let rendered = futures_util::stream::once(render(result));
-            rendered
-                .flat_map(|response| response.into_body().into_data_stream())
-                .right_stream()
-        }
-    }));
-    let mut response = axum::response::Response::new(axum::body::Body::from_stream(body));
-    response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
-    let headers = response.headers_mut();
-    // Go cpa_trace.go applies the trace ID when the first keep-alive commits headers.
-    if let Some(value) = trace.header() {
-        headers.insert("x-ck-trace-id", value);
-    }
-    response
+    let trace = Trace::with_request_id(crate::observability::api::current_request_id());
+    let result = run_routed_models(rt, call, &trace).await;
+    let upstream = upstream_headers(&rt.config(), &result, trace.served_by_kimi(rt));
+    traced(rt, &trace, render(result).await, upstream)
 }
 
 /// Serves a media request its route decoded into `codec` (E-PLAN §2.3). Nothing reaches the
@@ -702,66 +637,9 @@ fn upstream_headers(cfg: &Config, result: &Result<Done, Failure>, kimi: bool) ->
     }
 }
 
-/// Whether a keep-alive would commit the response headers before a Kimi proof can reach them:
-/// the client sent a nonce (a model router may pick the provider after the first beat), or the
-/// call can reach a Kimi credential carrying a configured nonce.
-fn waits_for_kimi_proof(rt: &Runtime, call: &Call) -> bool {
-    if call.headers.contains_key("x-msh-request-nonce") {
-        return true;
-    }
-    // A configured router can shadow a non-Kimi registry model before selection.
-    let routers = call.forced_provider.is_none()
-        && call.media.is_none()
-        && rt.config().document["model-routers"]
-            .as_sequence()
-            .is_some_and(|r| !r.is_empty());
-    if !routers
-        && let Ok((providers, _)) = route(rt, &rt.registry(), call)
-        && !providers.iter().any(|p| ck_exec::kimi::PROVIDERS.contains(&p.as_str()))
-    {
-        return false;
-    }
-    rt.store().snapshot().iter().any(|credential| {
-        ck_exec::kimi::PROVIDERS.contains(&credential.provider.as_str())
-            && credential
-                .attributes
-                .iter()
-                .any(|(key, value)| key.eq_ignore_ascii_case("header:X-Msh-Request-Nonce") && !value.trim().is_empty())
-    })
-}
-
-/// `requests.nonstream-keepalive-interval` seconds (Go `NonStreamingKeepAliveInterval`;
-/// 0 or below disables it), for the calls whose Go handler starts the keep-alive: only
-/// non-stream generate handlers do; the count-tokens handlers (code_handlers.go,
-/// gemini_handlers.go) and deferred Chat never call `StartNonStreamingKeepAlive`.
-fn nonstream_keepalive(call: &Call, cfg: &Config) -> Option<Duration> {
-    let deferred = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::DeferredChat);
-    if call.stream || call.operation != Operation::Generate || deferred {
-        return None;
-    }
-    let seconds = cfg
-        .document
-        .get("requests")
-        .and_then(|r| r.get("nonstream-keepalive-interval"))
-        .and_then(serde_yaml_ng::Value::as_i64)
-        .unwrap_or(0);
-    (seconds > 0).then(|| Duration::from_secs(seconds as u64))
-}
-
-/// `requests.streaming.bootstrap-retries` (Go `StreamingBootstrapRetries`).
-fn bootstrap_retries(cfg: &Config) -> usize {
-    cfg.document
-        .get("requests")
-        .and_then(|r| r.get("streaming"))
-        .and_then(|s| s.get("bootstrap-retries"))
-        .and_then(serde_yaml_ng::Value::as_i64)
-        .unwrap_or(0)
-        .max(0) as usize
-}
-
-/// Go handlers_stream.go: a stream that failed before its first payload is retried as a
-/// whole request when the status is statusless, auth, quota, timeout or 5xx.
-pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &Trace) -> Result<Done, Failure> {
+/// Runs `call` with the model a model router picks, moving to the router's fallback models
+/// while an attempt fails before any byte reached the client.
+async fn run_routed_models(rt: &Arc<Runtime>, call: Call, trace: &Trace) -> Result<Done, Failure> {
     let mut call = call;
     // A model router (`model-routers`) names the model, for the registry to route.
     let mut picked = None;
@@ -782,7 +660,9 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
             trace.prompt_prefix(call.entry, &call.body);
         }
         let scope = picked.as_ref().map(|p| p.scope.clone());
-        let result = retry_bootstrap(rt, call, trace, &resolved, scope).await;
+        let result = run_routed(rt, call, trace, resolved, scope)
+            .await
+            .map_err(|e| e.failure);
         // A conversation moves to a routed model only once it served.
         if let (Ok(_), Some(picked)) = (&result, &picked) {
             picked.commit(rt);
@@ -804,54 +684,6 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
         call = original;
         call.model = model;
     }
-}
-
-/// The bootstrap retry rounds of one resolved request.
-async fn retry_bootstrap(
-    rt: &Arc<Runtime>,
-    call: Call,
-    trace: &Trace,
-    resolved: &(Vec<String>, String),
-    scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
-) -> Result<Done, Failure> {
-    let max = if call.stream {
-        bootstrap_retries(&rt.config())
-    } else {
-        0
-    };
-    let mut result = run_routed(rt, call.clone(), trace, resolved.clone(), scope.clone()).await;
-    for _ in 0..max {
-        let original = match &result {
-            Err(RunError {
-                failure: Failure::Exec(e),
-                bootstrap: true,
-            }) if bootstrap_eligible(classify::go_status(e)) => e.clone(),
-            _ => break,
-        };
-        result = match run_routed(rt, call.clone(), trace, resolved.clone(), scope.clone()).await {
-            Err(RunError {
-                failure,
-                bootstrap: false,
-            }) if matches!(failure, Failure::Unavailable { .. }) && classify::response_status(&original) >= 500 => {
-                Err(RunError {
-                    failure: Failure::Exec(original),
-                    bootstrap: false,
-                })
-            }
-            Err(RunError {
-                failure,
-                bootstrap: false,
-            }) => {
-                return Err(failure);
-            }
-            other => other,
-        };
-    }
-    result.map_err(|e| e.failure)
-}
-
-fn bootstrap_eligible(status: u16) -> bool {
-    matches!(status, 0 | 401 | 402 | 403 | 408 | 429) || status >= 500
 }
 
 /// The trace ID of the last credential selected for a request.
@@ -972,7 +804,7 @@ impl Trace {
     }
 
     /// The prompt prefix hash of the request's body, from the first body it is asked
-    /// for: the client's body when [`run_with_bootstrap_retries`] asks.
+    /// for: the client's body when [`serve`] asks.
     pub(crate) fn prompt_prefix(&self, format: Format, body: &[u8]) -> String {
         self.4
             .get_or_init(|| crate::observability::usage_record::prompt_prefix(format, body))
@@ -1010,19 +842,14 @@ pub fn request_id() -> String {
     )
 }
 
-/// A terminal failure of [`run`]. `bootstrap` marks a stream that failed before its
-/// first payload (Go `streamBootstrapError`).
+/// A terminal failure of [`run`].
 pub struct RunError {
     pub failure: Failure,
-    pub bootstrap: bool,
 }
 
 impl From<Failure> for RunError {
     fn from(failure: Failure) -> Self {
-        Self {
-            failure,
-            bootstrap: false,
-        }
+        Self { failure }
     }
 }
 
@@ -1039,7 +866,6 @@ impl Fault {
     fn into_run_error(self) -> RunError {
         RunError {
             failure: Failure::Exec(self.error),
-            bootstrap: self.bootstrap.is_some(),
         }
     }
 }
@@ -1736,13 +1562,10 @@ async fn attempt<X: Arms>(
         };
         // A credential-wide quota ends this credential's model pool.
         let last_here = stop || i + 1 == target.models.len() || classify::credential_scoped(error);
-        // Go returns a stopping bootstrap failure as is: an error, not a stream, so the
-        // handler's bootstrap retries never see it. Any other one goes on as a
+        // Go returns a stopping bootstrap failure as is. Any other one goes on as a
         // `streamBootstrapError`, whose `Headers()` are the stream's.
         let mut fault = fault;
-        if stop {
-            fault.bootstrap = None;
-        } else if let Some(headers) = &fault.bootstrap {
+        if !stop && let Some(headers) = &fault.bootstrap {
             fault.error.addon = Some(headers.clone());
         }
         if last_here {
@@ -2117,58 +1940,6 @@ mod tests {
             let record: serde_json::Value = serde_json::from_slice(&records[0]).unwrap();
             assert_eq!(record["upstream_response_bytes"], 42, "{ending}: {record}");
         }
-    }
-
-    /// Go starts the non-stream keep-alive in the non-stream generate handlers only, and
-    /// `NonStreamingKeepAliveInterval` treats 0 and below as off.
-    #[test]
-    fn nonstream_keepalive_only_for_nonstream_generate() {
-        let call = |operation, stream| Call {
-            entry: Format::Claude,
-            response: Format::Claude,
-            operation,
-            model: "m".into(),
-            body: Bytes::new(),
-            stream,
-            alt: None,
-            headers: HeaderMap::new(),
-            caller: Caller {
-                principal: String::new(),
-                source: "",
-                provider: String::new(),
-            },
-            forced_provider: None,
-            selection_model: None,
-            execution_session: None,
-            request_path: String::new(),
-            peer: None,
-            socket: None,
-            media: None,
-        };
-        let cfg = |yaml: &str| Config::parse(yaml).unwrap();
-        let on = cfg("requests:\n  nonstream-keepalive-interval: 3\n");
-        assert_eq!(
-            nonstream_keepalive(&call(Operation::Generate, false), &on),
-            Some(Duration::from_secs(3))
-        );
-        assert_eq!(nonstream_keepalive(&call(Operation::Generate, true), &on), None);
-        assert_eq!(nonstream_keepalive(&call(Operation::CountTokens, false), &on), None);
-        for off in [
-            "{}\n",
-            "requests:\n  nonstream-keepalive-interval: 0\n",
-            "requests:\n  nonstream-keepalive-interval: -5\n",
-        ] {
-            assert_eq!(
-                nonstream_keepalive(&call(Operation::Generate, false), &cfg(off)),
-                None,
-                "{off}"
-            );
-        }
-        let configured = cfg("requests:\n  nonstream-keepalive-interval: 2\n");
-        assert_eq!(
-            nonstream_keepalive(&call(Operation::Generate, false), &configured),
-            Some(Duration::from_secs(2))
-        );
     }
 
     /// Each attempt carries Go's binding for its credential and upstream model; a kept

@@ -762,7 +762,7 @@ async fn deferred_chat_jobs_belong_to_their_caller_and_charge_once() {
         Reply::json(r#"{"error":{"message":"job failed"}}"#),
     ])
     .await;
-    let proxy = proxy_with(&upstream, 1, "requests:\n  nonstream-keepalive-interval: 1\n").await;
+    let proxy = proxy_with(&upstream, 1, "").await;
     let usage = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
     proxy.rt.usage_queue().configure(true, &usage);
     let create = r#"{"model":"grok-4.3","deferred":true,"messages":[{"role":"user","content":"hello"}]}"#;

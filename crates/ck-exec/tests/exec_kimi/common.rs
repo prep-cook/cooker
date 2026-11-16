@@ -139,7 +139,9 @@ async fn attempt<I: RequestIngress>(
     for chunk in body.chunks(step) {
         ingress.advance(request, chunk)?;
     }
-    let fenced = executors.fence(&attempt, ingress, request)?;
+    let fenced = ingress
+        .finish(request, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| executors.refence(&attempt, fenced.view()))?;
     let validated = executors.refence(&attempt, fenced.view())?;
     let mut handle = exchange.request(validated);
     Ok((executors.start(&attempt, &mut handle, request, response).await, id))

@@ -346,13 +346,9 @@ impl Events {
         let output = gjson::get(&payload, "response.output");
         let listed = output.kind() == Kind::Array && !output.array().is_empty();
         if listed || self.items.len() == 0 || self.bridge.is_some() {
-            let payload = if listed {
-                self.hydrate(payload)
-            } else if self.items.len() > 0 {
-                self.inlined(payload)?
-            } else {
-                payload
-            };
+            // A bridged completion keeps its empty output: the Responses ingress answers with
+            // the items the stream announced, which the bridge already converted.
+            let payload = if listed { self.hydrate(payload) } else { payload };
             self.items = Items::default();
             let turn = (!incomplete)
                 .then(|| listed_turn(self.replay.as_ref(), &payload))
@@ -389,23 +385,6 @@ impl Events {
         self.text(&payload.as_bytes()[open + 1..]);
         self.text(b"\n");
         Ok(())
-    }
-
-    /// The completion with the announced items as its output, on the heap: the apply_patch
-    /// bridge converts whole payloads.
-    // ponytail: a bridged completion holds its items on the heap, as the old path did; a
-    // streaming bridge would keep them in their leases.
-    fn inlined(&mut self, payload: String) -> Result<String, ExecError> {
-        let (payload, open) = emptied(&payload)?;
-        let mut inlined = payload.as_bytes()[..=open].to_vec();
-        for (i, item) in self.items.drain().iter().enumerate() {
-            if i > 0 {
-                inlined.push(b',');
-            }
-            inlined.extend(copy(&item.json)?);
-        }
-        inlined.extend_from_slice(&payload.as_bytes()[open + 1..]);
-        String::from_utf8(inlined).map_err(|_| defect("announced item not UTF-8"))
     }
 
     /// Fills missing ids of a listed output from the items announced at the same index.

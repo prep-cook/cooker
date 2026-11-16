@@ -329,9 +329,7 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
         }
         // Undelayed recordings expect no keepalive; host load must not select their mode.
         if !delayed {
-            text = text
-                .replace("nonstream-keepalive-interval: 1", "nonstream-keepalive-interval: 0")
-                .replace("keepalive-seconds: 1", "keepalive-seconds: 0");
+            text = text.replace("keepalive-seconds: 1", "keepalive-seconds: 0");
         }
         Config::parse(&text).expect("config parses")
     };

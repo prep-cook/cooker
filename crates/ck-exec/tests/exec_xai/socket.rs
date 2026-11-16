@@ -213,7 +213,10 @@ async fn fenced<T>(
         ingress.advance(&mut writer, chunk).unwrap();
     }
     let attempt = exchange.attempt(&streams.store);
-    let validated = pipeline::fence(executor, &attempt, &mut ingress, &mut writer).expect("the fence accepts");
+    let validated = ingress
+        .finish(&mut writer, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| pipeline::refence(executor, &attempt, fenced.view()))
+        .expect("the fence accepts");
     let validated = pipeline::refence(executor, &attempt, validated.view()).expect("the re-fence accepts");
     let mut request = exchange.request(validated);
     request.client.execution_session = session;

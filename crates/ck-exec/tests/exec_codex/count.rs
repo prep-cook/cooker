@@ -101,7 +101,12 @@ async fn a_streamed_compact_is_refused() {
     let body = br#"{"model":"client-model","stream":true,"input":"hi"}"#;
     let executors = selector();
     ingress.advance(&mut request, body).unwrap();
-    assert!(executors.fence(&attempt, &mut ingress, &mut request).is_err());
+    assert!(
+        ingress
+            .finish(&mut request, &ck_translate::codec::ClientCapability)
+            .and_then(|fenced| executors.refence(&attempt, fenced.view()))
+            .is_err()
+    );
 }
 
 fn selector() -> ck_exec::Executors {
@@ -129,7 +134,10 @@ async fn the_selector_runs_codex_through_the_executor() {
     for chunk in CHAT.chunks(16) {
         ingress.advance(&mut request, chunk).unwrap();
     }
-    let validated = executors.fence(&attempt, &mut ingress, &mut request).unwrap();
+    let validated = ingress
+        .finish(&mut request, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| executors.refence(&attempt, fenced.view()))
+        .unwrap();
     let refenced = executors.refence(&attempt, validated.view()).unwrap();
     assert_eq!(refenced.destination(), ck_exec::codex_exec::DESTINATION);
     let response = streams.response(&request);

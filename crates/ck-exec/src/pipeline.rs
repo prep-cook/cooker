@@ -26,9 +26,7 @@ use std::time::Duration;
 use ck_core::exec::{ExecError, FailureScope};
 use ck_stream::{Lease, Read, Reader, Terminal, Writer};
 use ck_translate::codec::event::{Emitter, Identity, Kind, Scope};
-use ck_translate::codec::{
-    self, Capability, Operation, RequestFence, RequestIngress, RequestView, ResponseIngress, ValidatedRequest,
-};
+use ck_translate::codec::{self, Capability, Operation, RequestFence, RequestView, ResponseIngress, ValidatedRequest};
 use futures_util::StreamExt;
 use http::HeaderMap;
 use tokio::task::JoinHandle;
@@ -57,16 +55,6 @@ pub struct Started {
 /// The capability key `executor` reaches for `attempt`.
 pub fn destination<E: Execute>(executor: &E, attempt: &Attempt<'_>) -> &'static str {
     executor.capability(attempt).destination()
-}
-
-/// Contract §4 step 1: closes the client fence against the first attempt's destination.
-pub fn fence<'a, E: Execute, I: RequestIngress>(
-    executor: &E,
-    attempt: &Attempt<'_>,
-    ingress: &'a mut I,
-    request: &mut Writer,
-) -> codec::Result<ValidatedRequest<'a>> {
-    ingress.finish(request, &executor.capability(attempt))
 }
 
 /// Contract §4 step 2: re-fences the client view for this attempt's destination.

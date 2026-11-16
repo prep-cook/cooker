@@ -132,11 +132,9 @@
         "proxy-url": "string",
         "tls-handshake-timeout-seconds": "int",
         "passthrough-headers": "bool",
-        "nonstream-keepalive-interval": "int",
         "streaming": {
           "fields": {
             "keepalive-seconds": "int",
-            "bootstrap-retries": "int",
             "send-keepalive-before-ft": "bool"
           }
         },

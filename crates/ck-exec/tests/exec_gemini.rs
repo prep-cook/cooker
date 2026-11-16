@@ -78,8 +78,9 @@ async fn run_with<I: RequestIngress>(
     }
     let executors = executors();
     assert_eq!(executors.destination(&attempt), Some("gemini"));
-    let validated = executors
-        .fence(&attempt, &mut ingress, &mut writer)
+    let validated = ingress
+        .finish(&mut writer, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| executors.refence(&attempt, fenced.view()))
         .expect("the fence accepts");
     let validated = executors
         .refence(&attempt, validated.view())

@@ -315,9 +315,9 @@ async fn a_buffered_generation_the_cloak_may_shape_takes_the_contract_path() {
         for byte in bytes.chunks(1) {
             ingress.advance(&mut request, byte).unwrap();
         }
-        let view = cloak
-            .executors
-            .fence(&attempt, &mut ingress, &mut request)
+        let view = ingress
+            .finish(&mut request, &ck_translate::codec::ClientCapability)
+            .and_then(|fenced| cloak.executors.refence(&attempt, fenced.view()))
             .unwrap()
             .view();
         let validated = cloak.executors.refence(&attempt, view).unwrap();

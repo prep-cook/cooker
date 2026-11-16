@@ -327,7 +327,10 @@ impl Fixture {
         )
         .unwrap();
         ingress.advance(&mut upload, REQUEST).unwrap();
-        let fenced = pipeline::fence(stub, &attempt, &mut ingress, &mut upload).unwrap();
+        let fenced = ingress
+            .finish(&mut upload, &ck_translate::codec::ClientCapability)
+            .and_then(|fenced| pipeline::refence(stub, &attempt, fenced.view()))
+            .unwrap();
         let view = RequestView {
             operation,
             ..fenced.view()

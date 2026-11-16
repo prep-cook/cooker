@@ -307,22 +307,19 @@ async fn chat_completions_translate_and_stream_upstream_for_non_stream_clients()
     assert!(text.contains(r#""content":"hi""#));
 }
 
-/// `requests.nonstream-keepalive-interval` does not apply to the codec routes (D2-PLAN
-/// §5.1, Q-F): nothing reaches the client before commitment, so a slow answer sends no
-/// keep-alive newline and keeps its own status and headers. Which calls still run the
-/// keep-alive is `dispatch::tests::nonstream_keepalive_only_for_nonstream_generate`.
+/// Nothing reaches the client before commitment (D2-PLAN §5.1): a slow answer sends no
+/// keep-alive newline and keeps its own status and headers.
 #[tokio::test]
 async fn codec_routes_send_no_keepalive_before_commitment() {
     let messages = format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"hi"}}]}}"#);
     let responses = format!(r#"{{"model":"{MODEL}","max_output_tokens":5,"input":"hi"}}"#);
-    let every_second = "requests:\n  nonstream-keepalive-interval: 1\n";
     for (token, path, body, status) in [
         ("fake-held-ok", "/v1/chat/completions", &messages, 200),
         ("fake-held-ok", "/v1/messages", &messages, 200),
         ("fake-held-bad", "/v1/messages", &messages, 400),
         ("fake-held-ok", "/v1/responses", &responses, 200),
     ] {
-        let p = proxy(every_second, vec![oauth("a.json", token, serde_json::json!({}))]).await;
+        let p = proxy("", vec![oauth("a.json", token, serde_json::json!({}))]).await;
         let request = wreq::Client::new()
             .post(format!("{}{path}", p.url))
             .header("authorization", "Bearer client-key")
@@ -330,7 +327,7 @@ async fn codec_routes_send_no_keepalive_before_commitment() {
             .send();
         let request = tokio::spawn(request);
         p.seen.arrived.notified().await;
-        // Two keep-alive intervals pass while the upstream holds its answer.
+        // Two seconds pass while the upstream holds its answer.
         tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
         assert!(
             !request.is_finished(),
@@ -1477,9 +1474,8 @@ async fn empty_stream_fails_over_and_reports_empty_stream() {
     assert_eq!(error["error"]["message"], "Bad Gateway");
 }
 
-/// A codec route sends nothing before the first byte of the answer (D2-PLAN §5.1), so
-/// `requests.streaming.bootstrap-retries` does not re-run a stream that broke before it: the
-/// failure moves to the next credential, and with none left it is the answer.
+/// A codec route sends nothing before the first byte of the answer (D2-PLAN §5.1): a stream
+/// that broke before it moves to the next credential, and with none left it is the answer.
 #[tokio::test]
 async fn a_stream_broken_before_its_first_byte_moves_to_the_next_credential() {
     let broken = || -> Reply {
@@ -1499,10 +1495,9 @@ async fn a_stream_broken_before_its_first_byte_moves_to_the_next_credential() {
         })
     };
     let body = format!(r#"{{"model":"{MODEL}","stream":true,"max_output_tokens":5,"input":"x"}}"#);
-    let config = "requests:\n  streaming:\n    bootstrap-retries: 1\n";
     // (credentials, status, upstream calls)
     for (tokens, status, calls) in [(&["fake-a", "fake-b"][..], 200, 2), (&["fake-a"][..], 500, 1)] {
-        let (url, script, _) = scripted_proxy(config, tokens, vec![broken(), sse_reply()]).await;
+        let (url, script, _) = scripted_proxy("", tokens, vec![broken(), sse_reply()]).await;
         let (got, _, text) = post(&url, "/v1/responses", &body).await;
         assert_eq!(got, status, "{tokens:?}: {text}");
         let seen = script.calls.lock().unwrap().clone();
