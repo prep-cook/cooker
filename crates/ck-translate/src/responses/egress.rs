@@ -56,6 +56,8 @@ struct Shown {
     model: Option<String>,
     /// The turn is stored for continuation: `store` is `true`.
     stored: bool,
+    /// cooker runs the turn in the background: `background` is `true`.
+    background: bool,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     /// The egress for one exchange, live or resumed alike. `id` is the exchange's response id,
@@ -423,7 +425,9 @@ fn write_response(doc: &Document, shown: &Shown, e: &mut Encoder<'_, '_>) -> Res
             && doc.name_is(name, "model")?
         {
             e.string(model)?;
-        } else if shown.stored && doc.name_is(name, "store")? {
+        } else if (shown.stored && doc.name_is(name, "store")?)
+            || (shown.background && doc.name_is(name, "background")?)
+        {
             e.bytes(b"true")?;
         } else if doc.name_is(name, "output")? {
             e.bytes(b"[")?;
@@ -458,6 +462,9 @@ fn write_response(doc: &Document, shown: &Shown, e: &mut Encoder<'_, '_>) -> Res
     }
     if shown.stored && doc.member(doc.root(), "store")?.is_none() {
         e.bytes(b",\"store\":true")?;
+    }
+    if shown.background && doc.member(doc.root(), "background")?.is_none() {
+        e.bytes(b",\"background\":true")?;
     }
     e.bytes(b"}")
 }

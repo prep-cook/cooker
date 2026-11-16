@@ -124,6 +124,22 @@ pub(crate) fn delivery(replay: Replay, first: Vec<Bytes>, framing: Framing, id: 
     response
 }
 
+/// The stored Responses turn `attached` as one JSON body (`GET /v1/responses/{id}`), encoded
+/// as a resume encodes it. `None` when its streams expired before they were read.
+pub(crate) async fn render(streams: &Registry, attached: Attached) -> Option<Response> {
+    let replay = match Replay::open(streams, attached, Cursor::start(Framing::Json)).await {
+        Ok(replay) => replay,
+        Err(Failure::Gone) => return None,
+        Err(failure) => return Some(failure.response()),
+    };
+    let content_type = replay.egress.content_type(Framing::Json);
+    let status = StatusCode::from_u16(replay.egress.status()).expect("an HTTP status");
+    let mut response = Response::new(body(replay, Vec::new()));
+    *response.status_mut() = status;
+    response.headers_mut().insert(header::CONTENT_TYPE, content_type);
+    Some(response)
+}
+
 /// The one value of `name`; a repeated header is a client error.
 fn single<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a HeaderValue>, Failure> {
     let mut values = headers.get_all(name).iter();
@@ -201,7 +217,7 @@ impl Replay {
                 &mut response,
                 identity,
                 view,
-                (shown.id, shown.model.as_deref(), shown.stored),
+                (shown.id, shown.model.as_deref(), shown.stored, shown.background),
             )?
         };
         Ok(Self {

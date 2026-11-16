@@ -25,7 +25,7 @@ use crate::inference::responses_state::{Index, Publication, Turn};
 
 pub use cursor::{Cursor, Units};
 pub use protocol::ProtocolEgress;
-pub(crate) use resume::{Replay, delivery};
+pub(crate) use resume::{Replay, delivery, render};
 pub use resume::{Uncommitted, resume};
 
 /// Request and response header carrying a [`StreamId`]. Request capture and logs redact it.
@@ -188,6 +188,7 @@ impl Exchange {
                 id: self.turn.map(|turn| turn.id.text()),
                 model: self.model.clone(),
                 stored: self.turn.is_some_and(|turn| turn.stored),
+                background: self.turn.is_some_and(|turn| turn.background),
                 gate: self.publication.as_ref().map(|publication| publication.gate()),
             },
         }
@@ -239,13 +240,14 @@ pub struct StreamHandle {
 }
 
 /// What every delivery of a committed response shows alike, live or resumed: the Responses id
-/// the exchange issued, the model alias it shows, whether it shows `store: true`, and the index
-/// publication's gate its `done` waits for.
+/// the exchange issued, the model alias it shows, whether it shows `store: true` and
+/// `background: true`, and the index publication's gate its `done` waits for.
 #[derive(Clone, Default)]
 pub(crate) struct Shown {
     pub id: Option<ck_translate::codec::event::LocalId>,
     pub model: Option<Arc<str>>,
     pub stored: bool,
+    pub background: bool,
     pub gate: Option<tokio::sync::watch::Receiver<bool>>,
 }
 

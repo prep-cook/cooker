@@ -92,6 +92,15 @@ fn api(rt: Arc<Runtime>) -> Router {
         .route("/v1/responses", post(openai::responses))
         .route("/v1/responses/compact", post(openai::compact))
         .route("/v1/responses/input_tokens", post(openai::input_tokens))
+        // Local state only: an id is never looked up upstream (`responses_state`).
+        .route(
+            "/v1/responses/{response_id}",
+            get(inference::responses_state::retrieve).delete(inference::responses_state::delete),
+        )
+        .route(
+            "/v1/responses/{response_id}/cancel",
+            post(inference::responses_state::cancel),
+        )
         .route("/backend-api/codex/responses", post(openai::responses))
         .route("/backend-api/codex/responses/compact", post(openai::compact))
         .route("/v1beta/models", get(models::gemini_list))

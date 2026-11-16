@@ -54,6 +54,12 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         self.shown.stored = true;
     }
 
+    /// Shows `background: true` whatever the source reports: cooker runs the turn in the
+    /// background and the upstream serves an ordinary one.
+    pub fn show_background(&mut self) {
+        self.shown.background = true;
+    }
+
     /// Repeats request-derived response fields when the source does not supply them.
     /// A Responses source's own values replace these by merge.
     /// Call it before the first record: `Closed` once any output was written.
