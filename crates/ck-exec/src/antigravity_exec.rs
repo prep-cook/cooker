@@ -237,14 +237,14 @@ impl AntigravityExecutor {
         let operation = view.operation;
         let protocol = Protocol::of(view.document).map_err(encoding)?;
         let client = &request.client;
-        // Compact is answered unstreamed, as CLIProxyAPI answers its route. A Gemini route
-        // names its stream choice in its action: CLIProxyAPI sends `:generateContent` upstream
-        // for `:generateContent` (`gemini_handlers.go:167-171`, `antigravity_executor_execute.go:129`).
-        let stream = operation == Operation::Generate
-            && match client.streaming {
-                Some(stream) => stream,
-                None => streaming(view.document).map_err(encoding)?,
-            };
+        // A Gemini route names its stream choice in its action: CLIProxyAPI sends
+        // `:generateContent` upstream for `:generateContent` (`gemini_handlers.go:167-171`,
+        // `antigravity_executor_execute.go:129`). A compact carries no `stream`, and a count
+        // ignores it.
+        let stream = match client.streaming {
+            Some(stream) => stream,
+            None => streaming(view.document).map_err(encoding)?,
+        };
         let body = Bytes::from(copy(
             &protocol.encode(view, stream, streams.request).map_err(encoding)?,
         )?);
