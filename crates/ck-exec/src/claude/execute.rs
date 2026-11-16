@@ -133,13 +133,7 @@ fn payload_max_tokens(rules: &ck_wire::payload::Rules, model: &str, headers: &ht
 /// registry `thinking` data.
 pub(super) fn capability(attempt: &Attempt<'_>) -> AnthropicCapability {
     let default_max_tokens = default_max_tokens(attempt.cfg, attempt.model, attempt.headers);
-    let model = base_model(attempt.model);
-    let model = model.trim();
-    let thinking = match attempt.resolved_model {
-        Some(resolved) => resolved.info.thinking.clone(),
-        None => ck_core::registry::lookup_model(model, Some("claude")).and_then(|info| info.thinking),
-    };
-    let budget = match thinking {
+    let budget = match thinking(attempt) {
         Some(t) if t.min > 0 || t.max > 0 => Budget::Manual {
             min: u64::try_from(t.min).unwrap_or(0),
         },
@@ -150,6 +144,36 @@ pub(super) fn capability(attempt: &Attempt<'_>) -> AnthropicCapability {
         default_max_tokens,
         budget,
     }
+}
+
+/// The attempt model's thinking support: the dispatch loop's binding, else the registry.
+fn thinking(attempt: &Attempt<'_>) -> Option<ck_core::registry::ThinkingSupport> {
+    match attempt.resolved_model {
+        Some(resolved) => resolved.info.thinking.clone(),
+        None => {
+            let model = base_model(attempt.model);
+            ck_core::registry::lookup_model(model.trim(), Some("claude")).and_then(|info| info.thinking)
+        }
+    }
+}
+
+/// Moves `output_config.effort` to the nearest level the model supports (owner ruling
+/// 2026-11-15, Settled 59): the fence passes any client effort, and Messages refuses one
+/// outside the model's levels.
+fn snap_effort(attempt: &Attempt<'_>, mut body: Vec<u8>) -> Vec<u8> {
+    let effort = ck_wire::json::get(&body, "output_config.effort");
+    if effort.kind != ck_wire::json::Kind::String {
+        return body;
+    }
+    let Some(levels) = thinking(attempt).map(|t| t.levels) else {
+        return body;
+    };
+    let effort = effort.str().into_owned();
+    let snapped = ck_wire::thinking::snap_level(&effort, &levels);
+    if snapped != effort {
+        ck_wire::json::set_str(&mut body, "output_config.effort", snapped);
+    }
+    body
 }
 
 impl ClaudeExecutor {
@@ -188,7 +212,13 @@ impl ClaudeExecutor {
             }
             None => {
                 let default_max_tokens = default_max_tokens(attempt.cfg, attempt.model, attempt.headers);
-                encoded = encode(&request.validated(), streams.request, stream, default_max_tokens)?;
+                encoded = encode(
+                    attempt,
+                    &request.validated(),
+                    streams.request,
+                    stream,
+                    default_max_tokens,
+                )?;
                 (&encoded, &encoded)
             }
         };
@@ -258,11 +288,17 @@ impl ClaudeExecutor {
                 let mut capability = capability(attempt);
                 capability.default_max_tokens = capability.default_max_tokens.or(Some(u64::MAX));
                 let generate = RequestFence::default().end(view, &capability).map_err(encoding)?;
-                encoded = encode(&generate, streams.request, false, capability.default_max_tokens)?;
+                encoded = encode(
+                    attempt,
+                    &generate,
+                    streams.request,
+                    false,
+                    capability.default_max_tokens,
+                )?;
                 (&encoded, &encoded)
             }
             None => {
-                encoded = encode(&request.validated(), streams.request, false, None)?;
+                encoded = encode(attempt, &request.validated(), streams.request, false, None)?;
                 (&encoded, &encoded)
             }
         };
@@ -597,9 +633,10 @@ fn streaming(doc: &Document, client: Format) -> codec::Result<bool> {
     }
 }
 
-/// Encodes `request` into the request stream's scratch and copies it out as the upload; the
-/// pipeline edits the Messages body as text.
+/// Encodes `request` into the request stream's scratch and copies it out as the upload with
+/// its effort snapped; the pipeline edits the Messages body as text.
 fn encode(
+    attempt: &Attempt<'_>,
     request: &ValidatedRequest<'_>,
     owner: &mut Writer,
     upstream_stream: bool,
@@ -610,7 +647,10 @@ fn encode(
         upstream_stream,
         default_max_tokens,
     };
-    copy(&egress.encode(request, owner).map_err(encoding)?)
+    Ok(snap_effort(
+        attempt,
+        copy(&egress.encode(request, owner).map_err(encoding)?)?,
+    ))
 }
 
 fn copy(lease: &ScratchLease) -> Result<Vec<u8>, ExecError> {

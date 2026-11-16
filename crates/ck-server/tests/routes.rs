@@ -462,6 +462,16 @@ async fn codec_routes_decode_before_selection_and_commit_on_the_contract_arm() {
                 r#""text":"hi""#,
             )
         },
+        // An effort the model lacks snaps to its nearest level (Settled 59): Sonnet 4.6 has
+        // `low` to `max`, so `minimal` goes as `low`.
+        Row {
+            upstream: r#""effort":"low""#,
+            ..ok(
+                chat_path(),
+                chat(r#","reasoning_effort":"minimal""#),
+                r#""content":"hi""#,
+            )
+        },
         refused(chat_path(), "{".into(), 400, "invalid_request_error"),
         refused(messages_path(), "{".into(), 400, r#""type":"error""#),
         refused(gemini("generateContent"), "{".into(), 400, "INVALID_ARGUMENT"),
