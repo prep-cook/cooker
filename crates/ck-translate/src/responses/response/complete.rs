@@ -70,10 +70,16 @@ impl State {
         Ok(())
     }
 
-    /// Publishes what failed response `root` may tell the client, its identity and usage, then
-    /// fails the stream. Every other member, its error and any nonstandard diagnostic included,
-    /// stays upstream; egress writes a sanitized error (crates/AGENTS.md, Security).
+    /// Publishes what failed response `root` may tell the client, then fails the stream.
     pub(super) fn fail(&mut self, owner: &mut Writer, doc: &Document, root: usize) -> Result<()> {
+        self.publish_failed(owner, doc, root)?;
+        Err(Error::Schema)
+    }
+
+    /// Publishes what failed response `root` may tell the client: its identity and usage. Every
+    /// other member, its error and any nonstandard diagnostic included, stays upstream; egress
+    /// writes a sanitized error (crates/AGENTS.md, Security).
+    pub(super) fn publish_failed(&mut self, owner: &mut Writer, doc: &Document, root: usize) -> Result<()> {
         if !matches!(doc.node(root)?.value, Value::Object) {
             return Err(Error::Schema);
         }
@@ -100,7 +106,7 @@ impl State {
             },
             |_| Ok(()),
         )?;
-        Err(Error::Schema)
+        Ok(())
     }
 
     /// Ends the stream with the upstream's own `error` event as the canonical upstream failure.

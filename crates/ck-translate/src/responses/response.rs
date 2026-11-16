@@ -75,6 +75,8 @@ impl Ingress {
                 completed: None,
                 xai: false,
                 client_declared_tools: 0,
+                classified: false,
+                held: false,
             },
             failed: false,
         })
@@ -82,6 +84,14 @@ impl Ingress {
     /// Hands the completion that ends this streamed body to `observer`; see [`Completed`].
     pub fn on_completed(&mut self, observer: Completed) {
         self.state.completed = Some(observer);
+    }
+    /// The executor classifies the upstream's failure events and ends the body with that error
+    /// right after one: a failure event publishes the identity and usage of its `response` when
+    /// they decode and ends the response, and its `error` record waits for
+    /// [`codec::ResponseIngress::fail`], which writes the executor's status and scope. A body
+    /// that ends instead gets the default 502.
+    pub fn classified_failures(&mut self) {
+        self.state.classified = true;
     }
     /// xAI's hosted X Search calls must not shadow tools declared by the client.
     pub fn xai(&mut self, request: &[u8]) {
@@ -109,16 +119,21 @@ impl Ingress {
         Ok(())
     }
     fn failure(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> Result<()> {
-        if !self.state.terminal {
+        if !self.state.terminal || self.state.held {
             codec::upstream_failure(&mut self.state.emitter, owner, status, scope)?;
             self.state.terminal = true;
+            self.state.held = false;
         }
         Ok(())
     }
 }
 impl codec::ResponseIngress for Ingress {
     fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> Result<()> {
-        crate::boundary::enter(self.owner, owner, self.failed || self.state.terminal)?;
+        crate::boundary::enter(
+            self.owner,
+            owner,
+            self.failed || (self.state.terminal && !self.state.held),
+        )?;
         self.failed = true;
         self.failure(owner, status, scope)
     }
@@ -164,7 +179,7 @@ impl codec::ResponseIngress for Ingress {
                 let buffered = self.buffered.take().ok_or(Error::Closed)?;
                 buffered.finish(owner, &mut self.state)?;
             }
-            Ok(())
+            if self.state.held { Err(Error::Truncated) } else { Ok(()) }
         })();
         self.handle(owner, result)
     }
@@ -226,6 +241,10 @@ struct State {
     completed: Option<Completed>,
     xai: bool,
     client_declared_tools: u8,
+    /// See [`Ingress::classified_failures`].
+    classified: bool,
+    /// A classified `response.failed` ended the response; its `error` record is not out yet.
+    held: bool,
 }
 impl Item {
     fn scope(&self, block: Option<u64>) -> Scope {

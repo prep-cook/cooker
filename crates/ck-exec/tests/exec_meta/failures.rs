@@ -42,8 +42,9 @@ async fn upstream_refusals_fail_the_attempt_before_commitment() {
 }
 
 /// A failure event after the upstream answered ends the stream with one `error` after the text
-/// already published, with Meta's status (`error.code` when it is an HTTP status, else 502)
-/// and scope.
+/// already published, with Meta's status (`error.code` when it is an HTTP status, read from
+/// `response.error` in `response.failed`, else 502) and scope. A `response.failed` publishes its
+/// usage before the `error`, whatever its member order, and none of its upstream detail.
 #[tokio::test]
 async fn a_failure_event_fails_with_the_meta_classification() {
     let partial = message_events()
@@ -51,25 +52,46 @@ async fn a_failure_event_fails_with_the_meta_classification() {
         .next()
         .unwrap()
         .to_owned();
-    for (failure, status, scope) in [
+    let reordered = r#"{"response":{"output":[{"id":"msg_1","type":"message","status":"incomplete","role":"assistant","content":[{"type":"output_text","text":"hel","annotations":[]}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9},"error":{"code":"server_error","message":"internal https://vendor.invalid/x"},"status":"failed","model":"muse-spark","id":"resp_1","object":"response","created_at":1},"sequence_number":9,"type":"response.failed"}"#;
+    let nested = r#"{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":429,"message":"slow down"},"usage":{"input_tokens":7,"output_tokens":0,"total_tokens":7}}}"#;
+    for (failure, status, scope, usage) in [
         (
             r#"{"type":"error","error":{"code":429,"message":"slow down"}}"#,
             429,
             FailureScope::Model,
+            None,
         ),
         (
             r#"{"type":"response.failed","response":{"id":"resp_1","status":"failed"},"error":{"code":"server_error"}}"#,
             502,
             FailureScope::Credential,
+            None,
         ),
+        (reordered, 502, FailureScope::Credential, Some(r#""input_tokens":7"#)),
+        (nested, 429, FailureScope::Model, Some(r#""input_tokens":7"#)),
     ] {
         let (outcome, terminal, records) = chat_on((partial.clone() + &event("x", failure)).into_bytes()).await;
         let error = outcome.unwrap_err();
-        assert_eq!((error.status, error.scope), (status, scope));
+        assert_eq!((error.status, error.scope), (status, scope), "{failure}");
         assert_eq!(&error.body[..], failure.as_bytes());
         assert_eq!(terminal, Some(Terminal::UpstreamError));
         assert_eq!(errors(&records), 1, "{records:?}");
+        let error_record = records.iter().position(|r| r.contains("event: x_ck.error")).unwrap();
+        assert!(
+            records[error_record].contains(&format!(r#""status":{status}"#)),
+            "{records:?}"
+        );
         assert!(records.iter().any(|r| r.contains("hel")), "{records:?}");
+        assert!(!records.iter().any(|r| r.contains("vendor.invalid")), "{records:?}");
+        let usage_record = records.iter().position(|r| r.contains("event: x_ck.usage"));
+        match usage {
+            Some(count) => {
+                let at = usage_record.unwrap_or_else(|| panic!("no usage: {records:?}"));
+                assert!(records[at].contains(count), "{records:?}");
+                assert!(at < error_record, "{records:?}");
+            }
+            None => assert_eq!(usage_record, None, "{records:?}"),
+        }
     }
 }
 

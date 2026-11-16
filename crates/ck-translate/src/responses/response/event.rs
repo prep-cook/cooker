@@ -246,6 +246,18 @@ impl State {
             return Ok(());
         };
         match class {
+            Class::Failure if self.classified => {
+                // The executor's error ends the response either way; the failed response's
+                // identity and usage are kept when they decode.
+                if let Some(response) = doc.member(root, "response")?
+                    && let Err(Error::Storage(error)) = self.publish_failed(owner, &doc, response)
+                {
+                    return Err(Error::Storage(error));
+                }
+                self.terminal = true;
+                self.held = true;
+                Ok(())
+            }
             Class::Failure => match doc.member(root, "response")? {
                 Some(response) => self.fail(owner, &doc, response),
                 None => self.upstream_error(owner),

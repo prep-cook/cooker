@@ -50,31 +50,51 @@ async fn upstream_refusals_fail_the_attempt_before_commitment() {
 
 /// A failure event after the upstream answered ends the stream with one `error` carrying Go's
 /// status, and the attempt fails with Go's scope: an in-stream usage limit is the credential's
-/// 429, not a gateway 502.
+/// 429, not a gateway 502. A `response.failed` publishes its usage before the `error`, whatever
+/// its member order, and none of its upstream detail.
 #[tokio::test]
 async fn a_failure_event_fails_with_the_codex_classification() {
-    let failed = event(
-        "response.failed",
-        r#"{"type":"response.failed","sequence_number":4,"response":{"id":"resp_1","status":"failed","error":{"type":"usage_limit_reached","message":"limit","resets_in_seconds":60}}}"#,
-    );
-    let body = message_events()
-        .split("event: response.output_text.done")
-        .next()
-        .unwrap()
-        .to_owned()
-        + &failed;
-    let upstream = StreamUpstream::start([Reply::sse(body)]).await;
-    let (streams, exchange) = (Streams::new(), exchange(&upstream));
-    let (started, id, _request) = run(&streams, &exchange, "responses", Operation::Generate, RESPONSES, 64).await;
-    let (outcome, published, _stream) = finish(&streams, started.unwrap(), id).await;
-    let error = outcome.unwrap_err();
-    assert_eq!((error.status, error.scope), (429, FailureScope::Credential));
-    assert_eq!(published.terminal, Some(Terminal::UpstreamError));
-    let records = records(&published);
-    let errors = errors(&records);
-    assert_eq!(errors.len(), 1, "{records:?}");
-    assert!(errors[0].contains(r#""status":429"#), "{records:?}");
-    assert!(records.iter().any(|r| r.contains("hel")), "{records:?}");
+    let limit = r#"{"type":"response.failed","sequence_number":4,"response":{"id":"resp_1","status":"failed","error":{"type":"usage_limit_reached","message":"limit","resets_in_seconds":60}}}"#;
+    let reordered = r#"{"response":{"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9},"output":[{"id":"msg_1","type":"message","status":"incomplete","role":"assistant","content":[{"type":"output_text","text":"hel","annotations":[]}]}],"error":{"message":"internal https://vendor.invalid/x","type":"usage_limit_reached","resets_in_seconds":60},"status":"failed","model":"gpt-5","id":"resp_1"},"sequence_number":4,"type":"response.failed"}"#;
+    // Data the ingress cannot decode never replaces the classification.
+    let not_object = r#"{"type":"response.failed","response":"gone","error":{"type":"usage_limit_reached","message":"limit","resets_in_seconds":60}}"#;
+    let not_json = r#"{"type":"response.failed","response":{"id":"resp_1","error":{"type":"usage_limit_reached","message":"limit","resets_in_seconds":60}},}"#;
+    for (failed, usage) in [
+        (limit, None),
+        (reordered, Some(r#""input_tokens":7"#)),
+        (not_object, None),
+        (not_json, None),
+    ] {
+        let body = message_events()
+            .split("event: response.output_text.done")
+            .next()
+            .unwrap()
+            .to_owned()
+            + &event("response.failed", failed);
+        let upstream = StreamUpstream::start([Reply::sse(body)]).await;
+        let (streams, exchange) = (Streams::new(), exchange(&upstream));
+        let (started, id, _request) = run(&streams, &exchange, "responses", Operation::Generate, RESPONSES, 64).await;
+        let (outcome, published, _stream) = finish(&streams, started.unwrap(), id).await;
+        let error = outcome.unwrap_err();
+        assert_eq!((error.status, error.scope), (429, FailureScope::Credential), "{failed}");
+        assert_eq!(published.terminal, Some(Terminal::UpstreamError));
+        let records = records(&published);
+        let errors = errors(&records);
+        assert_eq!(errors.len(), 1, "{records:?}");
+        assert!(errors[0].contains(r#""status":429"#), "{records:?}");
+        assert!(records.iter().any(|r| r.contains("hel")), "{records:?}");
+        assert!(!records.iter().any(|r| r.contains("vendor.invalid")), "{records:?}");
+        let usage_record = records.iter().position(|r| r.contains("event: x_ck.usage"));
+        let error_record = records.iter().position(|r| r.contains("event: x_ck.error")).unwrap();
+        match usage {
+            Some(count) => {
+                let at = usage_record.unwrap_or_else(|| panic!("no usage: {records:?}"));
+                assert!(records[at].contains(count), "{records:?}");
+                assert!(at < error_record, "{records:?}");
+            }
+            None => assert_eq!(usage_record, None, "{records:?}"),
+        }
+    }
 }
 
 /// An incomplete terminal retains its wire status, even without output.

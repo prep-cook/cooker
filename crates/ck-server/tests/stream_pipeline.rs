@@ -393,6 +393,8 @@ enum Script {
     Answers,
     /// One content chunk, then the body fails once the test releases it.
     FailsAfterContent,
+    /// One content chunk; once the test releases it, 7 input tokens of usage and a body error.
+    UsageFailsAfterContent,
     /// One content chunk and a body error, both ready at once.
     FailsAtOnce,
     /// The whole answer with 7 input tokens of usage, once the test releases it.
@@ -593,6 +595,15 @@ impl Execute for Executor<'_> {
                         let _ = release.await;
                         Err(broken())
                     }))
+                    .boxed()
+            }
+            Script::UsageFailsAfterContent => {
+                let release = self.release.lock().unwrap().take().unwrap();
+                stream::iter([Ok(content())])
+                    .chain(
+                        stream::once(release)
+                            .flat_map(move |_| stream::iter([Ok(Bytes::from_static(USAGE.as_bytes())), Err(broken())])),
+                    )
                     .boxed()
             }
             Script::Panics => panic!("the executor panics"),
@@ -1025,6 +1036,21 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             settled: &[0],
             failed: &[true],
             input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            withheld: 0,
+        },
+        Row {
+            case: "a failure after commitment settles its usage once and does not retry",
+            history: None,
+            scripts: [Script::UsageFailsAfterContent, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: false },
+            started: &["a"],
+            settled: &[0],
+            failed: &[true],
+            input_tokens: Some(7),
             old: 0,
             cooled: &[],
             compact: false,

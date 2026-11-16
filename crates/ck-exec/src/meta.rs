@@ -392,14 +392,19 @@ fn subscription_quota(body: &[u8]) -> bool {
     (code == "rate_limit_exceeded" || code.contains("quota")) && gj::get(body, "error.resets_at").exists()
 }
 
-/// `metaStreamEventError`: an `error` or `response.failed` event ends the response with
-/// `error.code` as status when it is an HTTP error code, else 502.
+/// `metaStreamEventError`: an `error` or `response.failed` event ends the response with its
+/// error code as status when it is an HTTP error code, else 502. A `response.failed` carries its
+/// error in `response.error`; a top-level `error` is read when that has no code.
 pub(crate) fn stream_event_error(event: &[u8]) -> Option<ExecError> {
     let kind = gj::get(event, "type").bytes();
     if &*kind != b"error" && &*kind != b"response.failed" {
         return None;
     }
-    let code = gj::get(event, "error.code").int();
+    let mut code = gj::get(event, "response.error.code");
+    if &*kind == b"error" || !code.exists() {
+        code = gj::get(event, "error.code");
+    }
+    let code = code.int();
     let status = if (400..=599).contains(&code) { code as u16 } else { 502 };
     Some(upstream_error(status, event))
 }
