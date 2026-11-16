@@ -409,8 +409,35 @@ const IMAGE_ONLY: [&str; 8] = [
     "grok-imagine-image-2.0",
 ];
 
+/// Stored prompts own their model; only the native OpenAI/Codex provider resolves them.
+fn prompt_model(call: &Call) -> bool {
+    matches!(call.entry, Format::OpenAIResponse | Format::Codex)
+        && call.model.is_empty()
+        && !ck_wire::json::get(&call.body, "model").exists()
+        && ck_wire::json::get(&call.body, "prompt").exists()
+}
+
+fn model_required() -> Failure {
+    Failure::Exec(ExecError::local(
+        400,
+        ck_core::exec::FailureScope::Request,
+        "model is required when no native prompt resolver is available",
+    ))
+}
+
 /// Go `getRequestDetails`: resolve `auto`, find the providers, keep the suffix.
 fn route(rt: &Runtime, registry: &Registry, call: &Call) -> Result<(Vec<String>, String), RunError> {
+    if prompt_model(call) {
+        if ck_wire::json::get(&call.body, "prompt.id").kind != ck_wire::json::Kind::String {
+            return Err(Failure::Exec(ExecError::local(
+                400,
+                ck_core::exec::FailureScope::Request,
+                "prompt.id must be a string",
+            ))
+            .into());
+        }
+        return Ok((vec!["codex".into()], String::new()));
+    }
     if let Some(provider) = &call.forced_provider {
         let model = gojson::trim(&call.model);
         check_route_only(gojson::trim(canonical_model_raw(model)), call)?;
@@ -1131,6 +1158,9 @@ async fn run_loop<X: Arms>(
             }
             let lease = match rt.acquire(selection.clone(), &cfg, policy.clone(), &registry).await {
                 Ok(lease) => lease,
+                Err(AcquireError::Unavailable { retry_after: None, .. }) if last.is_none() && prompt_model(&call) => {
+                    return Err(model_required().into());
+                }
                 Err(AcquireError::Prepare { id, error }) => {
                     attempted.push(id.clone());
                     selection.exclude.push(id);

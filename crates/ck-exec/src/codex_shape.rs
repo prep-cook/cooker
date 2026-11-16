@@ -159,18 +159,19 @@ fn call_rules(mut body: String, call: Call, model: &str) -> String {
                     set_raw(&body, "stream_options.reasoning_summary_delivery", &raw)
                 };
             }
-            body = set_str_if_different(body, "model", model);
         }
         Call::Websocket => {
-            body = set_str_if_different(body, "model", model);
             body = set_bool_if_different(body, "stream", true);
             body = delete(&body, "prompt_cache_retention");
             body = delete(&body, "safety_identifier");
         }
         Call::Compact => {
-            body = set_str_if_different(body, "model", model);
             body = delete(&body, "stream");
         }
+    }
+    // A stored prompt supplies its own model when the client omitted an override.
+    if !model.is_empty() {
+        body = set_str_if_different(body, "model", model);
     }
     body
 }
