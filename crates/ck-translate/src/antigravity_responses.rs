@@ -13,6 +13,7 @@ use ck_wire::thinking::{SummaryConfig, SummaryMode, parse_suffix};
 use crate::antigravity_claude::provider_compatible;
 use crate::common::{go_lower, trim_space};
 use crate::gemini_web_search as ws;
+use crate::responses::request::PROVEN;
 use crate::stream::GoStream;
 use crate::{Error, Registered, RequestCtx, ResponseCtx, thinking};
 
@@ -50,6 +51,7 @@ fn convert(model: &str, raw: &[u8], model_info: Option<&ModelInfo>) -> Result<Ve
     let out = rewrite_claude_reasoning(model, raw, out);
     let mut out = crate::antigravity_gemini::convert(model, &out);
     strip_google_search(&mut out);
+    let out = restore_proven_call_signatures(model, raw, out);
     Ok(enable_thinking_summary(raw, out))
 }
 
@@ -91,7 +93,8 @@ fn web_search_request(model: &str, raw: &[u8]) -> Result<Vec<u8>, Error> {
     let domains = ws::allowed_domains(&gj::parse(raw));
     let out = crate::gemini_responses::convert(model, raw)?;
     let out = rewrite_claude_reasoning(model, raw, out);
-    let mut out = crate::antigravity_gemini::convert(model, &out);
+    let out = crate::antigravity_gemini::convert(model, &out);
+    let mut out = restore_proven_call_signatures(model, raw, out);
     gj::set_str(&mut out, "requestType", "web_search");
     ensure_web_search_tool(&mut out, &domains);
     ensure_web_search_instruction(&mut out);
@@ -203,10 +206,8 @@ fn enable_thinking_summary(raw: &[u8], out: Vec<u8>) -> Vec<u8> {
 /// rewriteOpenAIResponsesReasoningForAntigravityClaude: for Claude models, the n-th
 /// thought part takes the n-th reasoning item's valid Claude signature as the client holds it
 /// (Settled 68: no double-layer rewrite, only the legacy `<group>#` prefix comes off); thought
-/// parts without one, or without text, are dropped. A function call takes the valid Claude
-/// signature of the reasoning item bound to it (P7b-1; CLIProxyAPI's envelope strips it). A
-/// change re-marshals the whole document the way `json.Unmarshal` into `map[string]any` and
-/// `json.Marshal` do.
+/// parts without one, or without text, are dropped. A change re-marshals the whole document
+/// the way `json.Unmarshal` into `map[string]any` and `json.Marshal` do.
 fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8> {
     if provider_from_model_name(model) != Provider::Claude {
         return gemini;
@@ -231,7 +232,6 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
     if signatures.is_empty() {
         return gemini;
     }
-    let calls = crate::gemini_responses::paired_call_signatures(&input.array());
     let Some(Ok(mut root)) = GoValue::parse_f64(&gemini).map(GoValue::into_object) else {
         return gemini;
     };
@@ -270,10 +270,6 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
                 }
             };
             if map.get("thought") != Some(&GoValue::Bool(true)) {
-                if let Some(signature) = call_signature(&map, &calls) {
-                    changed |= map.get("thoughtSignature") != Some(&signature);
-                    map.insert("thoughtSignature".into(), signature);
-                }
                 kept.push(GoValue::Object(map));
                 continue;
             }
@@ -313,19 +309,46 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
     GoValue::Object(root).marshal()
 }
 
-/// The valid Claude signature bound to function-call part `map`, by its call ID.
-fn call_signature(
-    map: &std::collections::BTreeMap<String, GoValue>,
-    calls: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
-) -> Option<GoValue> {
-    let Some(GoValue::Object(call)) = map.get("functionCall") else {
-        return None;
-    };
-    let Some(GoValue::String(id)) = call.get("id") else {
-        return None;
-    };
-    let signature = provider_compatible(Provider::Claude, calls.get(id.as_bytes())?, BlockKind::Unknown);
-    (!signature.is_empty()).then(|| GoValue::String(String::from_utf8_lossy(&signature).into_owned()))
+/// Owner ruling P7b-1 where provenance allows it: a Claude model's function call takes the
+/// signature of the proven reasoning item the Gemini Responses pairing binds to it, with the
+/// bytes the item holds. The envelope removed every function-call signature before, as
+/// CLIProxyAPI does; an unproven one stays removed, since Anthropic mints the same form.
+fn restore_proven_call_signatures(model: &str, raw: &[u8], mut out: Vec<u8>) -> Vec<u8> {
+    if provider_from_model_name(model) != Provider::Claude {
+        return out;
+    }
+    let input = gj::get(raw, "input");
+    let items = input.array();
+    let proven: Vec<Vec<u8>> = items
+        .iter()
+        .filter(|item| item.get("type").bytes().as_ref() == b"reasoning" && item.get(PROVEN).bool())
+        .map(|item| item.get("encrypted_content").bytes().into_owned())
+        .collect();
+    if proven.is_empty() {
+        return out;
+    }
+    let calls = crate::gemini_responses::paired_call_signatures(&items);
+    let contents = gj::get(&out, "request.contents").into_owned();
+    for (ci, content) in contents.array().iter().enumerate() {
+        for (pi, part) in content.get("parts").array().iter().enumerate() {
+            let Some(paired) = calls.get(part.get("functionCall.id").bytes().as_ref()) else {
+                continue;
+            };
+            // The pairing trims; the proven item keeps the bytes the upstream sent.
+            let Some(held) = proven.iter().find(|p| trim_space(p) == paired.as_slice()) else {
+                continue;
+            };
+            let signature = provider_compatible(Provider::Claude, held, BlockKind::Unknown);
+            if !signature.is_empty() {
+                gj::set_str(
+                    &mut out,
+                    &format!("request.contents.{ci}.parts.{pi}.thoughtSignature"),
+                    &signature,
+                );
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------

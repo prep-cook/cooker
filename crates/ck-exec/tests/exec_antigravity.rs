@@ -810,13 +810,18 @@ async fn sent_signatures(source: &str, payload: &Value) -> Vec<String> {
     strings(&body, &["thoughtSignature"])
 }
 
-/// Ruling 68 and P7b-1: signed thinking and tool calls go back upstream exactly as the client
-/// holds them, on every client protocol that carries them (Chat carries none); CLIProxyAPI would wrap the single-layer form. Only CLIProxyAPI's legacy `<group>#`
-/// prefix comes off. Thinking without a Claude signature is dropped, as CLIProxyAPI and
-/// OmniRoute both drop it, and no cached signature fills the gap.
+/// Ruling 68: signed thinking goes back upstream exactly as the client holds it, byte for byte,
+/// on every client protocol that carries it (Chat carries none); CLIProxyAPI would wrap the
+/// single-layer form. Only CLIProxyAPI's legacy `<group>#` prefix comes off. Thinking without a
+/// Claude signature is dropped, as CLIProxyAPI and OmniRoute both drop it, and no cached
+/// signature fills the gap. A tool-call signature a Gemini or Responses client replays itself is
+/// withheld, since no producer proves who minted it (stored history: `ck-translate`
+/// `history_tests`); the Anthropic path still sends it, the open conflict in PR #170.
 #[tokio::test]
 async fn signed_thinking_goes_upstream_as_the_client_holds_it() {
     let prefixed = format!("claude#{SINGLE_LAYER}");
+    let padded = format!(" \n{SINGLE_LAYER}\r\n");
+    let padded_sent = [padded.as_str()];
     let rows: Vec<(&str, Value, &[&str])> = vec![
         ("claude", anthropic_history(Some(DOUBLE_LAYER)), &[DOUBLE_LAYER]),
         ("claude", anthropic_history(Some(SINGLE_LAYER)), &[SINGLE_LAYER]),
@@ -839,16 +844,14 @@ async fn signed_thinking_goes_upstream_as_the_client_holds_it() {
         ("openai-response", responses_history(Some(&prefixed)), &[SINGLE_LAYER]),
         ("openai-response", responses_history(Some("opaque-signature")), &[]),
         ("openai-response", responses_history(None), &[]),
-        ("openai-response", responses_tool_history(DOUBLE_LAYER), &[DOUBLE_LAYER]),
-        ("openai-response", responses_tool_history(SINGLE_LAYER), &[SINGLE_LAYER]),
-        ("openai-response", responses_tool_history(&prefixed), &[SINGLE_LAYER]),
-        ("openai-response", responses_tool_history("opaque-signature"), &[]),
+        ("openai-response", responses_history(Some(&padded)), &padded_sent),
+        ("openai-response", responses_tool_history(DOUBLE_LAYER), &[]),
+        ("openai-response", responses_tool_history(SINGLE_LAYER), &[]),
         ("gemini", gemini_nested_thinking(DOUBLE_LAYER), &[DOUBLE_LAYER]),
         ("gemini", gemini_nested_thinking(SINGLE_LAYER), &[SINGLE_LAYER]),
-        ("gemini", gemini_tool_call(DOUBLE_LAYER), &[DOUBLE_LAYER]),
-        ("gemini", gemini_tool_call(SINGLE_LAYER), &[SINGLE_LAYER]),
-        ("gemini", gemini_tool_call(&prefixed), &[SINGLE_LAYER]),
-        ("gemini", gemini_tool_call("opaque-signature"), &[]),
+        ("gemini", gemini_nested_thinking(&padded), &padded_sent),
+        ("gemini", gemini_tool_call(DOUBLE_LAYER), &[]),
+        ("claude", anthropic_history(Some(&padded)), &padded_sent),
     ];
     for (source, payload, want) in rows {
         assert_eq!(sent_signatures(source, &payload).await, want, "{source}: {payload}");

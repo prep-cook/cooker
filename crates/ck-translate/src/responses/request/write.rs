@@ -1,7 +1,7 @@
 use super::super::{is, member};
-use super::ANTIGRAVITY;
 use super::native::{item_type, native, typed};
 use super::reasoning::write_reasoning_options;
+use super::{ANTIGRAVITY, PROVEN};
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
@@ -208,10 +208,14 @@ fn write_message(
         }
         let results = write_results(view, content, first, e)?;
         let reasoning = native || any_part(doc, content, true)?;
-        // Settled 62: only Antigravity reads Antigravity's reasoning; elsewhere the item is left out.
-        if reasoning && (destination == ANTIGRAVITY || !antigravity_only(doc, message, content, replay)?) {
+        let provenance = provenance(doc, message, content, replay)?;
+        // Settled 62: reasoning no producer vouches for, in a form only Antigravity reads, is left
+        // out at every other destination.
+        if reasoning && (destination == ANTIGRAVITY || provenance != Provenance::AntigravityForm) {
             separate(first, e)?;
-            write_reasoning(doc, message, content, replay, e)?;
+            // Tells the Antigravity steps that a producer tag proves the item theirs.
+            let proven = destination == ANTIGRAVITY && provenance == Provenance::Producer;
+            write_reasoning(doc, message, content, replay, proven, e)?;
         }
         let text = match doc.node(content)?.value {
             Value::Array => any_part(doc, content, false)? || (!reasoning && !results && calls.is_none()),
@@ -231,20 +235,36 @@ fn write_message(
     }
     Ok(())
 }
-/// Whether an encrypted part of `message` holds reasoning only the Antigravity steps read.
-fn antigravity_only(doc: &Document, message: usize, content: usize, replay: &mut Replay) -> Result<bool> {
+/// Who vouches for the encrypted reasoning of a message.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Provenance {
+    /// No encrypted part, or one no producer tagged in a form any destination may read.
+    None,
+    /// A producer tag: history the server stored and `codec::provenance::admit` admitted for
+    /// this attempt's account (Settled 73).
+    Producer,
+    /// No producer tag, and a form only the Antigravity steps read.
+    AntigravityForm,
+}
+
+/// The provenance of `message`'s encrypted parts. A client replaying an item itself sends no
+/// tag (the owner cut the signed envelope on 2026-11-15).
+fn provenance(doc: &Document, message: usize, content: usize, replay: &mut Replay) -> Result<Provenance> {
     if !matches!(doc.node(content)?.value, Value::Array) {
-        return Ok(false);
+        return Ok(Provenance::None);
     }
+    let mut provenance = Provenance::None;
     for part in doc.children(content)? {
         if is(doc, part, "type", "encrypted")? {
             let entry = replay.seek(doc, doc.unsigned(doc.required(part, "replay_index")?)?, message)?;
-            if antigravity_reasoning(doc, doc.required(entry, "signature")?)? {
-                return Ok(true);
+            if doc.member(entry, "producer")?.is_some() {
+                provenance = Provenance::Producer;
+            } else if antigravity_reasoning(doc, doc.required(entry, "signature")?)? {
+                return Ok(Provenance::AntigravityForm);
             }
         }
     }
-    Ok(false)
+    Ok(provenance)
 }
 
 /// Whether string `value` is Antigravity reasoning: a Claude thinking signature, which reaches a
@@ -413,6 +433,7 @@ fn write_reasoning(
     message: usize,
     content: usize,
     replay: &mut Replay,
+    proven: bool,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
     let compaction = typed(doc, item_type(doc, message)?, "compaction")?;
@@ -443,7 +464,13 @@ fn write_reasoning(
             doc.write(doc.required(entry, "signature")?, e)?;
         }
     }
-    originals(doc, message, e, &["type"])?;
+    if proven && !compaction {
+        e.bytes(b",\"")?;
+        e.bytes(PROVEN.as_bytes())?;
+        e.bytes(b"\":true")?;
+    }
+    // A client's own member of that name never passes as proof.
+    originals(doc, message, e, &["type", PROVEN])?;
     e.bytes(b"}")
 }
 /// Writes member `field` listing the `kind` parts of `content` as `native` parts.

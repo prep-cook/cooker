@@ -217,6 +217,11 @@ impl Capability for AntigravityCapability {
 /// [`AntigravityCapability`]'s destination key.
 pub(crate) const ANTIGRAVITY: &str = "antigravity";
 
+/// The member the Antigravity egress sets on a reasoning item a producer tag proves this
+/// account's own: stored history `codec::provenance::admit` admitted (Settled 73). The egress
+/// never writes a client's own member of this name.
+pub(crate) const PROVEN: &str = "_ck_proven";
+
 /// Responses semantics with the isolated Codex request controls enabled.
 pub struct CodexCapability;
 impl Capability for CodexCapability {
