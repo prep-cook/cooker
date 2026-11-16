@@ -1463,7 +1463,8 @@ async fn live_session_end_is_logged_once_with_cause() {
             Ending::ClientClose => socket
                 .send(Message::Close(Some(CloseFrame {
                     code: 4002.into(),
-                    reason: "bye".into(),
+                    // A close reason is client text: the end log keeps its code only.
+                    reason: "sk-close-secret".into(),
                 })))
                 .await
                 .unwrap(),
@@ -1543,7 +1544,13 @@ async fn live_session_end_is_logged_once_with_cause() {
         }
         let raw = capture.raw();
         let lines: Vec<&str> = raw.lines().filter(|line| line.contains("live_session_end")).collect();
-        for secret in ["owner-key", "only-token", "input_audio_buffer", "flood"] {
+        for secret in [
+            "owner-key",
+            "only-token",
+            "input_audio_buffer",
+            "flood",
+            "sk-close-secret",
+        ] {
             assert!(
                 lines.iter().all(|line| !line.contains(secret)),
                 "{ending:?}: the end log carries {secret}: {lines:?}"

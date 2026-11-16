@@ -293,7 +293,6 @@ pub(super) async fn run(opened: Opened, downstream: WebSocket, upstream: LiveSoc
                 cause,
                 initiator,
                 close_code = close.as_ref().map(|c| u64::from(c.code)),
-                close_reason = close.as_ref().map(|c| String::from_utf8_lossy(&c.reason).into_owned()),
                 duration_ms = ms(started.elapsed()),
                 idle_ms = match stop { Some(Stop::ReadTimeout { idle }) => Some(ms(idle)), _ => None },
                 write_blocked_ms = match stop { Some(Stop::WriteTimeout { blocked }) => Some(ms(blocked)), _ => None },
