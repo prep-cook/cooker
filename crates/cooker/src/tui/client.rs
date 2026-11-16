@@ -1293,7 +1293,7 @@ mod tests {
             .get_config()
             .await
             .unwrap_err();
-        assert_eq!(err, "HTTP 502: request failed for http://127.0.0.1/?code=***#***");
+        assert_eq!(err, "HTTP 502: request failed for <redacted url>");
     }
 
     #[tokio::test]

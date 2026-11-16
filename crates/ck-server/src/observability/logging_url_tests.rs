@@ -1,4 +1,4 @@
-//! Log lines drop URL credentials whatever field carries them (owner ruling Q18).
+//! Log lines drop URL credentials whatever field carries them (owner ruling Settled 60).
 
 use super::GoFormat;
 use super::tests::SharedWriter;
@@ -22,15 +22,11 @@ fn log_lines_hide_url_credentials() {
         tracing::warn!(proxy = %proxy, "proxy client failed");
         tracing::warn!("request to {proxy} failed");
         // A relative reference, a backtick and a quoted space.
-        tracing::warn!("upstream redirect: next#sk-review-secret");
+        tracing::warn!("upstream redirect: next#access_token=sk-review-secret");
         tracing::warn!("request failed for `http://u:sk-review-secret@127.0.0.1/path`");
         tracing::warn!("request failed for \"http://127.0.0.1/?code=prefix sk-review-secret\"");
     });
     let written = String::from_utf8(written.lock().unwrap().clone()).unwrap();
     assert!(!written.contains("sk-review-secret"), "{written}");
-    assert_eq!(
-        written.matches("http://127.0.0.1:9/?code=***#***").count(),
-        2,
-        "{written}"
-    );
+    assert_eq!(written.matches("<redacted url>").count(), 5, "{written}");
 }

@@ -1,9 +1,9 @@
 //! Go request_logging.go / response_writer.go and request_logger_writer.go.
 //! Request bodies in these files are intentionally unredacted, as in Go, except for
-//! URLs: each section of a log is redacted with `ck_wire::redact` when the log is written
-//! (owner ruling Q18), as a whole, or as the messages of a WebSocket timeline that fail
-//! closed at each message end. A URL that a protocol splits across separate JSON values
-//! (stream deltas) is redacted value by value. Spools hold the captured bytes until then,
+//! URLs: each section of a log is redacted word by word with `ck_wire::redact` when the
+//! log is written (owner ruling Settled 60), as a whole, or as the messages of a WebSocket
+//! timeline that fail closed at each message end. A URL that a protocol splits across
+//! separate JSON values (stream deltas) is redacted value by value (owner ruling R-6). Spools hold the captured bytes until then,
 //! with no name in the log directory. Headers and URL queries
 //! are masked before writing; management routes are never captured.
 
@@ -1667,9 +1667,26 @@ mod tests {
                         ("response", contents(&record.api_response)),
                         ("timeline", contents(&record.api_timeline)),
                     ] {
+                        // Go prints URLs as written; cooker redacts the words that may
+                        // hold a credential (owner ruling Settled 60) when the log is
+                        // written, so a deferred request is still raw. In a timeline, a
+                        // message whose last word may go on in the next prints that word
+                        // as the placeholder, and the next message is dropped up to its
+                        // first word end.
+                        let raw = case[name].as_str().unwrap();
+                        let mut want = if kind == "disabled" {
+                            raw.to_owned()
+                        } else {
+                            ck_wire::redact::urls_in(raw).into_owned()
+                        };
+                        if name == "timeline" {
+                            want = want
+                                .replace("\nrequest body\n", "\nrequest <redacted url>\n")
+                                .replace("\n{\"type\":", "\n\"type\":");
+                        }
                         assert_eq!(
                             canonical(std::str::from_utf8(&bytes).unwrap()).trim_end_matches('\n'),
-                            case[name].as_str().unwrap().trim_end_matches('\n'),
+                            want.trim_end_matches('\n'),
                             "{kind} {name}"
                         );
                         assert!(!String::from_utf8_lossy(&bytes).contains("never-print-oauth"));
@@ -1844,7 +1861,7 @@ mod tests {
             assert_eq!(response.status(), status);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             assert_eq!(body, if case["method"] == "HEAD" { "" } else { "outbound\n" });
-            let expected = case["content"].as_str().unwrap();
+            let expected = &*ck_wire::redact::urls_in(case["content"].as_str().unwrap());
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 let files = logs(&dir);
@@ -1920,7 +1937,13 @@ mod tests {
         let files = logs(&dir);
         assert_eq!(files.len(), 1);
         let content = std::fs::read_to_string(&files[0]).unwrap();
-        assert_eq!(canonical(&content), fixture["websocket"]["content"]);
+        // A message whose last word may go on in the next message prints as the
+        // placeholder, and the next message is dropped up to its first word end.
+        let expected = ck_wire::redact::urls_in(fixture["websocket"]["content"].as_str().unwrap())
+            .replace("request-payload\n", "<redacted url>\n")
+            .replace("response-payload\n", "\n")
+            .replace("disconnect-payload\n", "\n");
+        assert_eq!(canonical(&content), expected);
         assert!(!content.contains("REQUEST BODY") && !content.contains("=== RESPONSE ==="));
         std::fs::remove_dir_all(dir).unwrap();
     }

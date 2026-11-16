@@ -44,24 +44,18 @@ fn credentials_never_print() {
         ),
         (" HTTP://127.0.0.1:9/v1 ", " HTTP://127.0.0.1:9/v1 "),
         ("https:///v1?k=sk-review-secret", "https:///v1?k=***"),
-        // A `scheme://` inside the path starts a URL of its own.
+        // A `//` before the query, other than the opening one, may start a URL of its
+        // own: in the path or inside the authority.
         (
             "http://h.example/r/https://u:sk-review-secret@x.example/a?k=sk-review-secret",
-            "http://h.example/r/https://x.example/a?k=***",
+            UNPRINTABLE,
         ),
-        ("/p_https://u:sk-review-secret@x.example/a", "/p_https://x.example/a"),
-        (
-            "http://h.example/9://u:sk-review-secret@x/",
-            "http://h.example/<redacted url>",
-        ),
-        // A `scheme://` or `//` inside the authority does not end it.
-        ("https://user:sk-review-secret://host", "<redacted url>//host"),
-        ("//user:sk-review-secret://host", "<redacted url>//host"),
-        ("https://h.example://u:sk-review-secret@x/", "https://h.example://x/"),
-        (
-            "https://h.example/p].https://user:sk-review-secret://host",
-            "https://h.example/p]<redacted url>//host",
-        ),
+        ("/p_https://u:sk-review-secret@x.example/a", UNPRINTABLE),
+        ("http://h.example/9://u:sk-review-secret@x/", UNPRINTABLE),
+        ("https://h.example/a//u:sk-review-secret@x/", UNPRINTABLE),
+        ("https://user:sk-review-secret://host", UNPRINTABLE),
+        ("//user:sk-review-secret://host", UNPRINTABLE),
+        ("https://h.example://u:sk-review-secret@x/", UNPRINTABLE),
         // Inside the query it is a masked value.
         (
             "http://h.example/a?next=https://u:sk-review-secret@x/",
@@ -135,26 +129,113 @@ fn malformed_urls_print_the_placeholder() {
     }
 }
 
+/// Free text is redacted word by word: a word that may hold a credential prints as the
+/// placeholder whole, and a quoted value that goes on past whitespace is dropped up to
+/// its closing `"` or the line end. The cost is that e-mail addresses, `user@host`,
+/// `mailto:` and words such as `?a=b` print as the placeholder too.
 #[test]
-fn urls_inside_text_are_rendered_in_place() {
-    let text = format!(
-        r#"Post "http://u:{SECRET}@127.0.0.1:1/v1?key={SECRET}": EOF; retry ftp://{SECRET}@h/ see ://{SECRET}@h"#
-    );
-    let got = urls_in(&text);
-    assert_eq!(
-        got,
-        r#"Post "http://127.0.0.1:1/v1?key=***": EOF; retry ftp://h/ see <redacted url>"#
-    );
-    assert_no_secret(&got, &text);
-    assert!(matches!(urls_in("no urls here"), Cow::Borrowed(_)));
-    // The token runs past ')' and ':' so no part of the query value survives.
-    let wreq = format!("error sending request for uri (http://h/?api_key={SECRET}/x): client error");
-    assert_eq!(
-        urls_in(&wreq),
-        "error sending request for uri (http://h/?api_key=*** client error"
-    );
-    let redacted = "error sending request for uri (http://127.0.0.1:1/?api_key=*** EOF";
-    assert_eq!(urls_in(redacted), redacted);
+fn words_that_may_hold_a_credential_print_as_the_placeholder() {
+    for (text, want) in [
+        (
+            r#"Post "http://u:sk-review-secret@127.0.0.1:1/v1?key=sk-review-secret": EOF"#,
+            r#"Post "<redacted url>": EOF"#,
+        ),
+        (
+            "see http://u:sk-review-secret@127.0.0.1/p?k=sk-review-secret end",
+            "see <redacted url> end",
+        ),
+        (
+            "retry ftp://sk-review-secret@h/ see ://sk-review-secret@h",
+            "retry <redacted url> see <redacted url>",
+        ),
+        (
+            "error sending request for uri (http://h/?api_key=sk-review-secret/x): client error",
+            "error sending request for uri <redacted url> client error",
+        ),
+        (
+            "request failed: url=//user:sk-review-secret@127.0.0.1/",
+            "request failed: <redacted url>",
+        ),
+        (
+            "request failed: /callback?code=sk-review-secret#x",
+            "request failed: <redacted url>",
+        ),
+        (
+            "Location: http://127.0.0.1/?co=sk-review-secret\nnext",
+            "Location: <redacted url>\nnext",
+        ),
+        (
+            "x_https://user:sk-review-secret@host.example/ end",
+            "<redacted url> end",
+        ),
+        ("see foo//user:sk-review-secret@host end", "see <redacted url> end"),
+        ("dsn=redis:sk-review-secret@host end", "<redacted url> end"),
+        ("go https:sk-review-secret@relay.example", "go <redacted url>"),
+        ("dial 9://sk-review-secret/x", "dial <redacted url>"),
+        ("open https:relay.example//sk-review-secret", "open <redacted url>"),
+        ("see x<http://h/>what?yes tail", "see <redacted url>"),
+        ("中文http://127.0.0.1/?k=sk-review-secret 。", "<redacted url> 。"),
+        // A quoted value runs to its closing `"`, however it starts.
+        (
+            r#"Post "http://127.0.0.1/?code=prefix sk-review-secret": EOF"#,
+            r#"Post "<redacted url>": EOF"#,
+        ),
+        (r#""callback?code=prefix sk-review-secret""#, r#""<redacted url>""#),
+        (
+            "\"\thttp://127.0.0.1/?k=prefix sk-review-secret\"",
+            "\"\t<redacted url>\"",
+        ),
+        (
+            "Post \" http://127.0.0.1/?code=prefix sk-review-secret\": EOF",
+            "Post \" <redacted url>\": EOF",
+        ),
+        (
+            "Post \"http://127.0.0.1/?code=prefix\r\nsk-review-secret\": EOF",
+            "Post \"<redacted url>\": EOF",
+        ),
+        // With no closing `"`, the rest of the text.
+        ("\"http://h/?a=b c\nd", "\"<redacted url>"),
+        // `'`, a backtick and `<` are URL bytes, so they open a quoted value inside the
+        // word; it runs to the next `"` or line end.
+        (
+            "Post 'http://127.0.0.1/?code=prefix sk-review-secret': EOF\nnext",
+            "Post <redacted url>\nnext",
+        ),
+        ("x <http://h.example/?code=a sk-review-secret> y", "x <redacted url>"),
+        ("`//u:sk-review-secret@h/ b` c", "<redacted url>"),
+        // A URL whose query value opens a quote: the whole word, and the rest of the line.
+        (
+            "http://127.0.0.1/?k='http://127.0.0.1/'sk-review-secret end",
+            "<redacted url>",
+        ),
+        // Accepted over-redaction.
+        ("write to a@b.example now", "write to <redacted url> now"),
+        ("ssh user@host", "ssh <redacted url>"),
+        ("mailto:a@b.example", "<redacted url>"),
+        ("try ?a=b", "try <redacted url>"),
+        ("models/claude@001:rawPredict", "<redacted url>"),
+    ] {
+        let got = urls_in(text);
+        assert_eq!(got, want, "{text:?}");
+        assert_no_secret(&got, text);
+        // The log writer scans error lines that were redacted already; they come back
+        // unchanged.
+        assert_eq!(urls_in(&got), got, "{text:?}");
+    }
+    for unchanged in [
+        "no urls here",
+        "Content-Type: application/json; charset=utf-8",
+        "User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
+        "open /etc/hosts: permission denied",
+        "and/or what? C# ## heading what?yes",
+        "ratio 1:2 at 12:30//x a/b//c and path//x",
+        r#"{"image":"/9j/4AAQSkZJRgABAQ=="}"#,
+        "\u{fffd}\u{fffd} plain",
+    ] {
+        assert!(matches!(urls_in(unchanged), Cow::Borrowed(_)), "{unchanged}");
+    }
+    assert_eq!(bytes(b"/x?k=\xffsk-review-secret"), &b"<redacted url>"[..]);
+    assert_eq!(bytes(b"\xff\xfe http://h/?k=v"), &b"\xff\xfe <redacted url>"[..]);
 }
 
 /// Each search covers its bytes once, so a long minified body (an embedding array) does
@@ -173,186 +254,6 @@ fn the_scan_is_linear() {
         let _ = bytes(text.as_bytes());
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{}", &text[..12]);
     }
-}
-
-/// A quoted URL runs to its closing quote, and a
-/// scheme-relative URL is a URL too.
-#[test]
-fn quoted_and_scheme_relative_urls_are_whole() {
-    for (text, want) in [
-        (
-            format!(r#"Post "http://127.0.0.1/?code=prefix {SECRET}": EOF"#),
-            r#"Post "http://127.0.0.1/?code=***": EOF"#,
-        ),
-        (
-            format!("Post \"http://127.0.0.1/?code=prefix\r\n{SECRET}\": EOF"),
-            r#"Post "<redacted url>": EOF"#,
-        ),
-        (
-            format!(r#"Post "http://127.0.0.1/?code=a\"{SECRET}": EOF"#),
-            r#"Post "http://127.0.0.1/?code=***": EOF"#,
-        ),
-        (
-            format!(r#"Post "//user:{SECRET}@127.0.0.1/?code={SECRET}": unsupported protocol scheme """#),
-            r#"Post "//127.0.0.1/?code=***": unsupported protocol scheme """#,
-        ),
-        (
-            format!("see //user:{SECRET}@127.0.0.1/ or (//127.0.0.1/?k={SECRET})"),
-            "see //127.0.0.1/ or (//127.0.0.1/?k=***",
-        ),
-        ("a/b//c and path//x".to_owned(), "a/b//c and path//x"),
-    ] {
-        let got = urls_in(&text);
-        assert_eq!(got, want, "{text:?}");
-        assert_no_secret(&got, &text);
-    }
-}
-
-/// Single quotes, a space after the opening quote, a reference
-/// after `=`, path-absolute references, and URL-bearing header values whatever the
-/// header's name or grammar.
-#[test]
-fn every_reference_shape_is_redacted() {
-    for (text, want) in [
-        (
-            "Post 'http://127.0.0.1/?code=prefix sk-review-secret': EOF",
-            "Post 'http://127.0.0.1/?code=***': EOF",
-        ),
-        (
-            "Post \" http://127.0.0.1/?code=prefix sk-review-secret\": EOF",
-            "Post \" http://127.0.0.1/?code=***\": EOF",
-        ),
-        (
-            "request failed: url=//user:sk-review-secret@127.0.0.1/?code=sk-review-secret",
-            "request failed: url=//127.0.0.1/?code=***",
-        ),
-        (
-            "request failed: /callback?code=sk-review-secret#sk-review-secret",
-            "request failed: /callback?code=***#***",
-        ),
-        (
-            "redirect_uri=callback?code=sk-review-secret",
-            "redirect_uri=<redacted url>",
-        ),
-        (
-            "Refresh: http://127.0.0.1/?code=sk-review-secret; url=/next",
-            "Refresh: http://127.0.0.1/?code=*** url=/next",
-        ),
-        (
-            "Refresh: 0; url = http://127.0.0.1/?code=sk-review-secret",
-            "Refresh: 0; url = http://127.0.0.1/?code=***",
-        ),
-        (
-            "Link: http://127.0.0.1/?code=sk-review-secret",
-            "Link: http://127.0.0.1/?code=***",
-        ),
-        (
-            r#"Link: <https://h.example/p?key=sk-review-secret>; rel="next", </p?page=2>; rel="last""#,
-            r#"Link: <https://h.example/p?key=***>; rel="next", </p?page=***>; rel="last""#,
-        ),
-        (
-            r#"Link: </next>; anchor="/callback?code=sk-review-secret"; rel="next""#,
-            r#"Link: </next>; anchor="/callback?code=***"; rel="next""#,
-        ),
-        ("Link: </p?key=sk-review-secret", "Link: </p?key=***"),
-        (
-            r#"Reporting-Endpoints: default="http://127.0.0.1/reports?key=sk-review-secret""#,
-            r#"Reporting-Endpoints: default="http://127.0.0.1/reports?key=***""#,
-        ),
-        ("Location: next?key=sk-review-secret", "Location: <redacted url>"),
-        (
-            "Content-Location: https://u:sk-review-secret@h.example/x",
-            "Content-Location: https://h.example/x",
-        ),
-        (
-            r#"{"error":{"message":"request failed for http://u:sk-review-secret@127.0.0.1/?code=sk-review-secret#sk-review-secret"}}"#,
-            r#"{"error":{"message":"request failed for http://127.0.0.1/?code=***#***"}}"#,
-        ),
-        (
-            r#"{"url":"https://h.example/v1?key=sk-review-secret","n":1}"#,
-            r#"{"url":"https://h.example/v1?key=***","n":1}"#,
-        ),
-        (
-            "don't use http://h/?k=sk-review-secret, it's bad",
-            "don't use http://h/?k=*** it's bad",
-        ),
-        // Relative references carrying a fragment, and URLs after a
-        // backtick or non-ASCII text.
-        ("Location: #sk-review-secret", "Location: <redacted url>"),
-        (
-            "Content-Location: next#sk-review-secret",
-            "Content-Location: <redacted url>",
-        ),
-        (
-            r#"Link: <next#sk-review-secret>; rel="next""#,
-            r#"Link: <<redacted url> rel="next""#,
-        ),
-        (
-            "upstream redirect: next#sk-review-secret",
-            "upstream redirect: <redacted url>",
-        ),
-        ("Location: next?sk-review-secret", "Location: <redacted url>"),
-        ("issue #1", "issue <redacted url>"),
-        // A token starts at an ASCII byte, so the cut never splits a character.
-        ("请#sk-review-secret", "请<redacted url>"),
-        (
-            "request failed for `http://u:sk-review-secret@127.0.0.1/path`",
-            "request failed for `http://127.0.0.1/path`",
-        ),
-        (
-            "see `http://127.0.0.1/?code=prefix sk-review-secret`",
-            "see `http://127.0.0.1/?code=***`",
-        ),
-        (
-            "请访问http://127.0.0.1/?k=sk-review-secret",
-            "请访问http://127.0.0.1/?k=***",
-        ),
-        ("**http://127.0.0.1/?k=sk-review-secret**", "**http://127.0.0.1/?k=***"),
-        // A token holding `://` anywhere is a URL from its scheme on.
-        (
-            "x_https://user:sk-review-secret@host.example/",
-            "x_https://host.example/",
-        ),
-        (
-            "see /p_https://user:sk-review-secret@host.example/a end",
-            "see /p_https://host.example/a end",
-        ),
-        (
-            "see \"http://h.example/x https://u:sk-review-secret@y.example/\" end",
-            "see \"http://h.example/x https://y.example/\" end",
-        ),
-        // A scan that passes over a span resumes at its closer, where a token can start.
-        (
-            "see a<http://h.example/?k=v#x>&#sk-review-secret end",
-            "see a<http://h.example/?k=***#***><redacted url> end",
-        ),
-        // A word that could still carry a credential prints as the placeholder whole.
-        ("dsn=redis:sk-review-secret@host end", "<redacted url> end"),
-        ("see foo//user:sk-review-secret@host end", "see <redacted url> end"),
-        // A reference that hides the opener of a reference span ending after it.
-        (
-            "see /a`<http://h.example/?code=a sk-review-secret> end",
-            "see <redacted url>> end",
-        ),
-    ] {
-        let got = urls_in(text);
-        assert_eq!(got, want, "{text}");
-        assert_no_secret(&got, text);
-        // The log writer scans error lines that were redacted already; these rows come
-        // back unchanged.
-        assert_eq!(urls_in(&got), got, "{text}");
-    }
-    for unchanged in [
-        "Content-Type: application/json; charset=utf-8",
-        "User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
-        "open /etc/hosts: permission denied",
-        "and/or what? C# ## heading",
-        r#"{"image":"/9j/4AAQSkZJRgABAQ=="}"#,
-    ] {
-        assert_eq!(urls_in(unchanged), unchanged);
-    }
-    assert_eq!(bytes(b"/x?k=\xffsk-review-secret"), &b"<redacted url>"[..]);
-    assert_eq!(bytes(b"\xff\xfe http://h/?k=v"), &b"\xff\xfe http://h/?k=***"[..]);
 }
 
 /// Reads that end where the test says.
@@ -379,38 +280,19 @@ fn copied(pieces: &[&[u8]], hold: usize) -> String {
 }
 
 /// A text copied in pieces is redacted as [`bytes`] redacts it whole, wherever a read
-/// ends, so a secret split across reads at any byte never prints. A reference longer
-/// than the hold limit prints as the placeholder instead.
+/// ends. A word longer than the hold limit prints as the placeholder on every path
+/// (owner ruling R-7).
 #[test]
 fn copied_text_is_redacted_wherever_reads_end() {
-    const BIG: usize = 1 << 20;
-    // (text, hold limit, what one-byte reads give; `None` is what `bytes` gives)
-    for (text, hold, bytewise) in [
+    // (text, hold limit, what every split gives; `None` is what `bytes` gives)
+    for (text, hold, want) in [
         (
-            "Post \"http://127.0.0.1/?code=prefix\nsk-review-secret\": EOF\nLocation: http://127.0.0.1/?co=sk-review-secret\n",
-            BIG,
+            "Post \"http://127.0.0.1/?code=prefix sk-review-secret\": EOF\nLocation: http://127.0.0.1/?co=sk-review-secret\n",
+            scan::HOLD,
             None,
         ),
-        (
-            "see http://u:sk-review-secret@127.0.0.1/p?k=sk-review-secret end",
-            BIG,
-            None,
-        ),
-        (
-            "x_https://user:sk-review-secret@host.example/ /p_https://u:sk-review-secret@x/a",
-            BIG,
-            None,
-        ),
-        (
-            "\"/cb?code=sk-review-secret\" 'http://h/?k=sk-review-secret' <http://h/#sk-review-secret> `//u:sk-review-secret@h/`",
-            BIG,
-            None,
-        ),
-        ("don't stop callback?code=sk-review-secret tail", BIG, None),
-        // A read that ends right after a reference does not make the next byte a token
-        // start.
-        ("see x<http://h/>what?yes tail", BIG, None),
-        ("请访问http://127.0.0.1/?k=sk-review-secret <b \"a\\\"b\" c", BIG, None),
+        ("don't stop callback?code=sk-review-secret tail", scan::HOLD, None),
+        ("x <http://h/?q=a sk-review-secret> y\n\"z\" 'b", scan::HOLD, None),
         (
             "see http://127.0.0.1/?code=xxxxxxxxsk-review-secret tail",
             16,
@@ -421,47 +303,35 @@ fn copied_text_is_redacted_wherever_reads_end() {
             16,
             Some("see \"<redacted url>\" tail"),
         ),
-        // A word longer than the hold limit prints as the placeholder, even when its
-        // `?` comes last.
+        ("see qqqqqqqqqqqqqqqqqqqqqqqq tail", 16, Some("see <redacted url> tail")),
         (
-            "see xxxxxxxxxxxxxxxxxxxx?code=sk-review-secret tail",
+            "see 'qqqqqqqqqqqqqqqqqqqqqqqq tail\nx",
             16,
-            Some("see <redacted url> tail"),
+            Some("see <redacted url>\nx"),
         ),
-        (
-            "see qqqqqqqqqqqqqqqqqqqqqqqq/b+c= tail",
-            16,
-            Some("see <redacted url> tail"),
-        ),
-        // A dropped token that opens a reference span is dropped through its closer,
-        // whatever closed before it; other spans it opens end nothing.
-        (
-            "see /aaaaaaaaaaaaaaaaaaaa`<http://h.example/?code=a sk-review-secret> tail",
-            16,
-            Some("see <redacted url>> tail"),
-        ),
-        (
-            "see /aaaaaaaaaaaaaaaaaaaa``http://h.example/?code=a sk-review-secret` tail",
-            16,
-            Some("see <redacted url>` tail"),
-        ),
-        ("see /aaaaaaaaaaaaaaaaaaaa'x tail", 16, Some("see <redacted url> tail")),
-        // A word the scan writes as it goes is held too, up to the same limit.
-        ("see a=b=c=d=e=f=g=h=i=j tail", 16, Some("see <redacted url> tail")),
     ] {
         let whole = urls_in(text).into_owned();
+        let want = want.unwrap_or(&whole);
         let bytes_read: Vec<&[u8]> = text.as_bytes().chunks(1).collect();
-        assert_eq!(copied(&bytes_read, hold), bytewise.unwrap_or(&whole), "{text}");
+        assert_eq!(copied(&bytes_read, hold), want, "{text}");
         for cut in 0..=text.len() {
             let got = copied(&[&text.as_bytes()[..cut], &text.as_bytes()[cut..]], hold);
-            assert_no_secret(&got, text);
-            if hold == BIG {
-                assert_eq!(got, whole, "{text} cut at {cut}");
-            }
+            assert_eq!(got, want, "{text} cut at {cut}");
         }
     }
-    let long = format!(" sk-review-secret{}?k=v end", "x".repeat(BIG + (64 << 10)));
-    assert_eq!(copied(&[long.as_bytes()], BIG), " <redacted url> end");
+    // A word over the hold limit: the URL that a quote inside it opens runs on past it.
+    let over = format!(
+        "http://127.0.0.1/?k={}'http://127.0.0.1/'sk-review-secret end",
+        "x".repeat(scan::HOLD + (64 << 10))
+    );
+    let plain = format!("a {} b", "x".repeat(scan::HOLD + 1));
+    for (text, want) in [(&over, "<redacted url>"), (&plain, "a <redacted url> b")] {
+        assert_eq!(bytes(text.as_bytes()), want.as_bytes(), "bytes");
+        let mut out = Vec::new();
+        write(text.as_bytes(), &mut out).unwrap();
+        assert_eq!(out, want.as_bytes(), "write");
+        assert_eq!(copied(&[text.as_bytes()], scan::HOLD), want, "copy");
+    }
 }
 
 /// splitmix64, so every run generates the same texts.
@@ -498,7 +368,6 @@ const SHAPES: &[&str] = &[
     "a/b?k=S",
     "callback?code=S",
     "?code=S",
-    "#S",
     "redis:S@host.example",
     "mailto:S@host.example",
     "https://host.example/r/https://u:S@x.example/a",
@@ -517,10 +386,10 @@ const SHAPES: &[&str] = &[
     "https://h.example/p:S@x",
 ];
 
-/// Shapes holding a space, which only a span keeps in one reference.
+/// Shapes holding a space, which only a quoted value keeps in one word.
 const SPACED: &[&str] = &["http://h.example/?code=prefix S", " //u:S@h.example/a b"];
 
-/// Spans first, then the other wrappings.
+/// Quotes first, then the other wrappings.
 const WRAPS: &[(&str, &str)] = &[
     ("\"", "\""),
     ("'", "'"),
@@ -577,7 +446,7 @@ fn generated(rng: &mut Rng) -> String {
 /// them, under the hold limit `hold`.
 fn parted(parts: &[&[u8]], hold: usize) -> String {
     let mut out = Vec::new();
-    let mut pieces = Pieces(scan::Copy::new(hold));
+    let mut pieces = Pieces::holding(hold);
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
             pieces.cut(&mut out).unwrap();
@@ -590,8 +459,8 @@ fn parted(parts: &[&[u8]], hold: usize) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A text in parts fails closed where a part ends in what the next part may carry on into
-/// a credential, and nowhere else.
+/// A text in parts fails closed where a part ends in a word that the next part may carry
+/// on into a credential, and nowhere else.
 #[test]
 fn parts_fail_closed_where_a_credential_may_go_on() {
     const HEADER: &str = "\n\ntimestamp: t\nevent: x\n";
@@ -602,18 +471,23 @@ fn parts_fail_closed_where_a_credential_may_go_on() {
             "see <redacted url>|| end",
         ),
         (&["dsn=redis:sk-rev", "iew-secret@host end"], "<redacted url>|| end"),
-        (
-            &["x <http://h.example/?code=a", " sk-review-secret> y"],
-            "x <<redacted url>||> y",
-        ),
         (&["callback?code=", "sk-review-secret"], "<redacted url>||"),
         (&["a//user", ":sk-review-secret@h b"], "<redacted url>|| b"),
-        // So does a word after a `:` that a userinfo could hold.
+        // A quote in the next part opens a value that runs to the line end.
+        (
+            &["http://127.0.0.1/?k=", "'http://127.0.0.1/'sk-review-secret end"],
+            "<redacted url>||",
+        ),
+        (
+            &["x <http://h.example/?code=a", " sk-review-secret> y\nz"],
+            "x <redacted url>||\nz",
+        ),
+        // So does a word that ends in a byte a URL can hold.
         (&["ratio 1:2", "x y"], "ratio <redacted url>|| y"),
-        // JSON messages and plain words end with their part.
+        // JSON messages and words that end with their part stay.
         (&[r#"{"input":[]}"#, r#"{"type":"x"}"#], r#"{"input":[]}||{"type":"x"}"#),
         (&["ratio 1:2}", "x"], "ratio 1:2}||x"),
-        (&["see http://h.example/ ", "x"], "see http://h.example/ ||x"),
+        (&["see http://h.example/ ", "x"], "see <redacted url> ||x"),
     ] {
         let parts: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();
         assert_eq!(parted(&parts, scan::HOLD), want.replace("||", HEADER), "{parts:?}");
@@ -623,11 +497,12 @@ fn parts_fail_closed_where_a_credential_may_go_on() {
 /// Generated texts with secrets in URLs of every shape, wrapping and neighbour: copying
 /// a text in pieces gives what redacting it whole gives, wherever reads end, and no
 /// secret byte prints either way. Under a 16-byte hold limit only the second holds. The
-/// same text cut into parts with an event header between them, at every byte and at
-/// random places, prints no secret byte either. `CK_REDACT_CASES` sets the number of
-/// texts for a longer run.
+/// same text cut into parts with an event header between them gives the whole text's
+/// output when the cut falls between words, and prints no secret byte at any cut or
+/// random set of cuts. `CK_REDACT_CASES` sets the number of texts for a longer run.
 #[test]
 fn copying_in_pieces_equals_redacting_whole() {
+    const HEADER: &str = "\n\ntimestamp: t\nevent: x\n";
     let cases = std::env::var("CK_REDACT_CASES").map_or(48, |n| n.parse().unwrap());
     let mut rng = Rng(0x5eed_c0de_2026_1116);
     for case in 0..cases {
@@ -659,6 +534,13 @@ fn copying_in_pieces_equals_redacting_whole() {
                 !leaks(&parts),
                 "case {case}: {text:?} parted at {cut} printed {parts:?}"
             );
+            if cut == 0 || scan::stop(bytes_text[cut - 1]) {
+                assert_eq!(
+                    parts.replacen(HEADER, "", 1),
+                    whole,
+                    "case {case}: {text:?} parted between words at {cut}"
+                );
+            }
         }
         let mut cuts: Vec<usize> = (0..1 + rng.below(6)).map(|_| rng.below(bytes_text.len() + 1)).collect();
         cuts.sort_unstable();

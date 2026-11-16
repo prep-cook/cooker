@@ -1,6 +1,6 @@
-//! URLs in request logs: every query value and fragment masked and the userinfo dropped
-//! (owner ruling Q18), in the downstream URL, upstream HTTP and WebSocket URLs, captured
-//! error text and URL-bearing headers.
+//! URLs in request logs print as `<redacted url>` (owner ruling Settled 60), in the
+//! downstream URL, upstream HTTP and WebSocket URLs, captured error text, bodies and
+//! URL-bearing headers.
 
 use super::tests::{persisted, persisted_request, upstream_request};
 use axum::http::StatusCode;
@@ -32,20 +32,17 @@ async fn upstream_url_credentials_are_redacted_in_logs() {
     let content = String::from_utf8(content).unwrap();
     assert!(!content.contains("h1dden"), "{content}");
     assert!(!content.contains("alice") && !content.contains("bob"), "{content}");
-    line(
-        &content,
-        "Upstream URL: https://proxy.example/v1/models?alt=***&key=***&access_token=***#***",
-    );
-    line(
-        &content,
-        "Upstream URL: wss://ws.example/realtime?client_secret=***&model=***",
+    assert_eq!(
+        content.matches("\nUpstream URL: <redacted url>\n").count(),
+        2,
+        "{content}"
     );
 }
 
-/// Names that no list calls sensitive, bare entries and
-/// fragments, downstream and upstream.
+/// Names that no list calls sensitive, bare entries and fragments, downstream and
+/// upstream.
 #[tokio::test]
-async fn every_query_value_and_fragment_is_masked_in_logs() {
+async fn urls_with_a_query_or_fragment_are_redacted_in_logs() {
     let (content, _) = persisted_request(
         true,
         StatusCode::OK,
@@ -71,16 +68,12 @@ async fn every_query_value_and_fragment_is_masked_in_logs() {
     .await;
     let content = String::from_utf8(content).unwrap();
     assert!(!content.contains(SECRET), "{content}");
-    line(&content, "URL: /fixture?credential=***&***");
-    for want in [
-        "http://127.0.0.1/v1?credential=***\n",
-        "http://127.0.0.1/v1?***\n",
-        "http://127.0.0.1/v1#***\n",
-        "<redacted url>\n",
-        "ws://127.0.0.1/r?credential=***#***\n",
-    ] {
-        assert!(content.contains(&format!("Upstream URL: {want}")), "{want}: {content}");
-    }
+    line(&content, "URL: <redacted url>");
+    assert_eq!(
+        content.matches("\nUpstream URL: <redacted url>\n").count(),
+        5,
+        "{content}"
+    );
 }
 
 /// The logged copies of URL-bearing headers are redacted by value, whatever the name or
@@ -116,14 +109,18 @@ async fn url_headers_are_redacted_in_logs_only() {
         // Downstream request and response, upstream request and its captured response.
         let copies = if enabled { 4 } else { 3 };
         for want in [
-            "Location: http://127.0.0.1/v1?key=***\n",
-            "Content-Location: /v1/r?token=***\n",
-            "Referer: https://127.0.0.1/cb#***\n",
-            "Link: http://127.0.0.1/?code=***\n",
-            "Refresh: http://127.0.0.1/?code=*** url=/next\n",
-            "Reporting-Endpoints: default=\"http://127.0.0.1/reports?key=***\"\n",
+            "Location: <redacted url>",
+            "Content-Location: <redacted url>",
+            "Referer: <redacted url>",
+            "Link: <redacted url>",
+            "Refresh: <redacted url> url=/next",
+            "Reporting-Endpoints: default=\"<redacted url>\"",
         ] {
-            assert_eq!(content.matches(want).count(), copies, "{want}: {content}");
+            assert_eq!(
+                content.lines().filter(|l| *l == want).count(),
+                copies,
+                "{want}: {content}"
+            );
         }
         for (name, value) in HEADERS {
             assert_eq!(received[*name], *value, "{name}");
@@ -152,13 +149,12 @@ async fn urls_in_captured_errors_are_redacted() {
     .await;
     let content = String::from_utf8(content).unwrap();
     assert!(!content.contains(SECRET), "{content}");
-    for want in [
-        r#"Error: Post "ftp://127.0.0.1/?api_key=***": unsupported protocol scheme "ftp""#,
-        r#"Error: Post "<redacted url>": unsupported protocol scheme "ftp""#,
-        "Error: dial failed: error sending request for uri (http://127.0.0.1:1/?api_key=*** EOF",
-    ] {
-        assert!(content.contains(want), "{want}: {content}");
-    }
+    let quoted = r#"Error: Post "<redacted url>": unsupported protocol scheme "ftp""#;
+    assert_eq!(content.matches(quoted).count(), 2, "{content}");
+    line(
+        &content,
+        "Error: dial failed: error sending request for uri <redacted url> EOF",
+    );
 }
 
 /// An upstream error body is captured with its URLs redacted.
@@ -175,13 +171,10 @@ async fn upstream_error_bodies_are_redacted_in_captures() {
     .await;
     let content = String::from_utf8(content).unwrap();
     assert!(!content.contains(SECRET), "{content}");
-    line(
-        &content,
-        r#"{"error":{"message":"request failed for http://127.0.0.1/?code=***#***"}}"#,
-    );
+    line(&content, r#"{"error":{"message":"request failed for <redacted url>"}}"#);
 }
 
-/// Quoted references whatever the quote, references after `=`, and
+/// Quoted values with spaces in them whatever the quote, references after `=`, and
 /// path-absolute references in captured errors.
 #[tokio::test]
 async fn every_reference_shape_in_captured_errors_is_redacted() {
@@ -208,11 +201,9 @@ async fn every_reference_shape_in_captured_errors_is_redacted() {
     let content = String::from_utf8(content).unwrap();
     assert!(!content.contains(SECRET), "{content}");
     for want in [
-        "Error: Post 'http://127.0.0.1/?code=***': EOF",
-        "Error: Post \" http://127.0.0.1/?code=***\": EOF",
-        "Error: request failed: url=//127.0.0.1/?code=***",
-        "Error: request failed: /callback?code=***#***",
-        "Error: dial <redacted url>//host: refused",
+        "Error: Post <redacted url>",
+        "Error: Post \" <redacted url>\": EOF",
+        "Error: request failed: <redacted url>",
         "Error: dial <redacted url> refused",
     ] {
         line(&content, want);
@@ -248,7 +239,7 @@ async fn spools_leave_no_file_in_the_log_directory() {
     .await;
     let content = String::from_utf8(content).unwrap();
     assert!(!content.contains(SECRET), "{content}");
-    line(&content, "Upstream URL: http://127.0.0.1/v1?code=***#***");
+    line(&content, "Upstream URL: <redacted url>");
 }
 
 /// A spooled section is redacted as it is copied into the log: a word longer than the
@@ -309,12 +300,18 @@ fn urls_split_across_timeline_messages_are_redacted() {
             }
         }
     }
-    let mut section = super::Section::framed("timeline");
-    super::upstream_timeline(&mut section, &dir, b"t: 1\n", b"wss://user:");
-    super::upstream_timeline(&mut section, &dir, b"t: 2\n", b"APIKEY@host/");
-    let mut out = Vec::new();
-    section.write_to(&mut out).unwrap();
-    assert_eq!(String::from_utf8(out).unwrap(), "t: 1\n<redacted url>\n\nt: 2\n");
+    // The last message has no next one to go on into.
+    for (messages, want) in [
+        (["wss://user:", "APIKEY@host/"], "t: 1\n<redacted url>\n\nt: 2\n"),
+        (["{}", "done"], "t: 1\n{}\n\nt: 2\ndone"),
+    ] {
+        let mut section = super::Section::framed("timeline");
+        super::upstream_timeline(&mut section, &dir, b"t: 1\n", messages[0].as_bytes());
+        super::upstream_timeline(&mut section, &dir, b"t: 2\n", messages[1].as_bytes());
+        let mut out = Vec::new();
+        section.write_to(&mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), want, "{messages:?}");
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -342,12 +339,12 @@ async fn captured_response_sections_are_redacted_whole() {
                 b"/u:sk-review-secret@127.0.0.1/path end".to_vec(),
             ],
             None,
-            "see http://127.0.0.1/path end",
+            "see <redacted url> end",
         ),
         (
             vec![filler(b" http:/"), b"/u:sk-review-secret@127.0.0.1/path end".to_vec()],
             None,
-            "x http://127.0.0.1/path end",
+            "x <redacted url> end",
         ),
         (
             vec![
@@ -389,14 +386,14 @@ async fn captured_response_sections_are_redacted_whole() {
     }
 }
 
-/// Relative references carrying a fragment are redacted in every
-/// section of the log; the client receives them unchanged.
+/// Relative references carrying a query or fragment value are redacted in every section
+/// of the log; the client receives them unchanged.
 #[tokio::test]
 async fn relative_references_with_fragments_are_redacted() {
     const HEADERS: &[(&str, &str)] = &[
-        ("location", "#sk-review-secret"),
-        ("content-location", "next#sk-review-secret"),
-        ("link", "<next#sk-review-secret>; rel=\"next\""),
+        ("location", "#access_token=sk-review-secret"),
+        ("content-location", "next?code=sk-review-secret"),
+        ("link", "<next#t=sk-review-secret>; rel=\"next\""),
     ];
     let (content, received) = persisted_request(true, StatusCode::BAD_GATEWAY, "/fixture", HEADERS, |log| {
         let sink = log.capture_sink();
@@ -413,7 +410,8 @@ async fn relative_references_with_fragments_are_redacted() {
     for want in [
         "Location: <redacted url>",
         "Content-Location: <redacted url>",
-        "Link: <<redacted url> rel=\"next\"",
+        // `<` opens a quoted value, dropped up to the next `"`.
+        "Link: <redacted url>\"next\"",
     ] {
         assert_eq!(content.lines().filter(|l| *l == want).count(), 4, "{want}: {content}");
     }
@@ -462,7 +460,7 @@ async fn encoded_request_bodies_reach_forced_logs_decoded() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(!content.contains(SECRET), "{content}");
-    line(&content, r#"{"url":"http://127.0.0.1/?code=***"}"#);
+    line(&content, r#"{"url":"<redacted url>"}"#);
     drop(app);
     drop(state);
     std::fs::remove_dir_all(dir).unwrap();

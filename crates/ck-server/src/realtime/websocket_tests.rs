@@ -454,10 +454,7 @@ async fn request_log_records_the_websocket_timeline_and_each_turn() {
     assert_eq!(timeline, want, "\n{log}");
     // The turn's upstream attempt is captured under the upgrade's log.
     let api_request = section("API REQUEST 1 ===");
-    assert!(
-        api_request.contains(&format!("Upstream URL: http://{upstream}/responses")),
-        "{api_request}"
-    );
+    assert!(api_request.contains("Upstream URL: <redacted url>\n"), "{api_request}");
     assert!(
         section("API RESPONSE").contains(&format!("data: {COMPLETED}")),
         "\n{log}"

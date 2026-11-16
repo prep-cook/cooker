@@ -1,8 +1,8 @@
 //! Capture files: an upstream [`Section`] of the request log, kept in memory and then
-//! in a [`Spool`] file. Spools hold captured bytes as they arrive; a section's URLs are
-//! redacted over the whole section as it is copied into the log (owner ruling Q18 and
-//! decisions 2026-11-15 and 2026-11-16), so a URL split across chunks or writes is seen
-//! whole, and a spooled section is never read into memory whole. A WebSocket timeline
+//! in a [`Spool`] file. Spools hold captured bytes as they arrive; a section is redacted
+//! word by word over the whole section as it is copied into the log (owner ruling Settled
+//! 60 and decisions 2026-11-15 and 2026-11-16), so a URL split across chunks or writes is
+//! seen whole, and a spooled section is never read into memory whole. A WebSocket timeline
 //! fails closed at each message end instead ([`Section`]).
 
 use super::trim;
@@ -221,7 +221,9 @@ const FRAME_HEAD: usize = 9;
 /// Writes the frames of a framed section, redacted.
 fn write_frames(input: &mut dyn Read, out: &mut dyn Write) -> io::Result<()> {
     let mut pieces = ck_wire::redact::Pieces::default();
-    let mut in_piece = false;
+    // Inserts after a piece wait until the next piece shows whether the text goes on;
+    // the last piece ends the text instead of a cut. Inserts are event headers.
+    let mut waiting: Option<Vec<u8>> = None;
     let mut head = [0; FRAME_HEAD];
     let mut buf = vec![0; 64 << 10];
     loop {
@@ -232,7 +234,10 @@ fn write_frames(input: &mut dyn Read, out: &mut dyn Write) -> io::Result<()> {
         }
         let mut frame = (&mut *input).take(u64::from_le_bytes(head[1..].try_into().unwrap_or_default()));
         if head[0] == PIECE {
-            in_piece = true;
+            if let Some(inserts) = waiting.take() {
+                pieces.cut(out)?;
+                out.write_all(&inserts)?;
+            }
             loop {
                 match frame.read(&mut buf) {
                     Ok(0) => break,
@@ -241,12 +246,13 @@ fn write_frames(input: &mut dyn Read, out: &mut dyn Write) -> io::Result<()> {
                     Err(error) => return Err(error),
                 }
             }
+            waiting = Some(Vec::new());
+        } else if let Some(inserts) = waiting.as_mut() {
+            ck_wire::redact::copy(&mut frame, inserts)?;
         } else {
-            if std::mem::take(&mut in_piece) {
-                pieces.cut(out)?;
-            }
             ck_wire::redact::copy(&mut frame, out)?;
         }
     }
-    pieces.finish(out)
+    pieces.finish(out)?;
+    out.write_all(&waiting.unwrap_or_default())
 }

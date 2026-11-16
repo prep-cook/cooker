@@ -339,6 +339,6 @@ async fn callback_errors_hide_url_credentials() {
     let (listener, _) = callback().await;
     let error = login_with(&dir, listener, mock, interaction, None).await.unwrap_err();
     let body = String::from_utf8_lossy(&error.body);
-    assert_eq!(body, "OAuth error access_denied: http://127.0.0.1/?code=***#***");
+    assert_eq!(body, "OAuth error access_denied: <redacted url>");
     std::fs::remove_dir_all(dir).unwrap();
 }
