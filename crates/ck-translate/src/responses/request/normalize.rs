@@ -377,6 +377,10 @@ fn replay_encrypted(doc: &mut Document, item: usize, content: usize, data: usize
         Value::Unsigned(doc.children(content)?.count() as u64),
     )?;
     doc.set(entry, "kind", Value::Text("responses_encrypted"))?;
+    // Protocol-neutral, so truncation and admission find a compaction item whatever recorded it.
+    if is(doc, item, "type", "compaction")? {
+        doc.set(entry, "compaction", Value::Bool(true))?;
+    }
     // The binding, not `message_index`, survives deleting an earlier message.
     doc.bind_origin(entry, item, None)?;
     doc.set(entry, "source", Value::Text("responses"))?;

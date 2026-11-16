@@ -26,8 +26,11 @@ use ck_server::inference::streams::{Exchange, StreamId, Uncommitted};
 use ck_stream::{Terminal, Writer};
 use ck_translate::codec::chat::request::{ChatCapability, read_request};
 use ck_translate::codec::chat::response::Ingress as ChatIngress;
-use ck_translate::codec::event::{Direction, LocalId};
+use ck_translate::codec::document::Document;
+use ck_translate::codec::event::{Direction, Identity, LocalId};
+use ck_translate::codec::provenance::Producer;
 use ck_translate::codec::{self, BodyMode, Operation, RequestFence, RequestView, ResponseIngress, ValidatedRequest};
+use ck_translate::responses::history::project;
 use futures_util::{FutureExt, StreamExt, stream};
 use serde_json::Value;
 use stream_fixture::*;
@@ -118,6 +121,85 @@ fn request_view(
         .unwrap()
         .unwrap();
     read_request(&mut exchange.request, &mut records).unwrap()
+}
+
+/// An opaque provider member of a stored response.
+#[derive(Clone, Copy)]
+enum Opaque {
+    /// Anthropic signed thinking.
+    Reasoning,
+    /// A Responses compaction item.
+    Compaction,
+}
+
+/// Projects a stored response that credential `by` produced into `document`, as continuation
+/// expansion does. The request stream keeps the client body, so a view rebuilt from it holds
+/// no history.
+fn project_history(fixture: &Fixture, exchange: &mut Exchange, document: &mut Document, opaque: Opaque, by: &str) {
+    let credential = fixture
+        .rt
+        .store()
+        .snapshot()
+        .into_iter()
+        .find(|c| c.id.ends_with(by))
+        .unwrap();
+    let auth_index = ck_core::config::credentials::auth_index(&credential);
+    let producer = Producer {
+        provider: &credential.provider,
+        credential: &auth_index,
+    };
+    let (mut stored, mut reader) = fixture
+        .rt
+        .streams()
+        .with_store(|store| {
+            let stored = store.create()?;
+            let reader = store.reader(stored.id(), 0)?;
+            Ok::<_, ck_stream::Error>((stored, reader))
+        })
+        .unwrap()
+        .unwrap();
+    let identity = Identity {
+        request_id: LocalId::new("stored").unwrap(),
+        stream_id: LocalId::new("stored").unwrap(),
+        attempt: 1,
+        direction: Direction::Response,
+    };
+    let mut ingress: Box<dyn ResponseIngress> = match opaque {
+        Opaque::Reasoning => Box::new(
+            ck_translate::anthropic::response::Ingress::new(
+                &mut stored,
+                identity,
+                Operation::Generate,
+                BodyMode::Buffered,
+                1 << 20,
+            )
+            .unwrap(),
+        ),
+        Opaque::Compaction => Box::new(
+            ck_translate::responses::response::Ingress::new(
+                &mut stored,
+                identity,
+                Operation::Compact,
+                BodyMode::Buffered,
+                1 << 20,
+            )
+            .unwrap(),
+        ),
+    };
+    let body = match opaque {
+        Opaque::Reasoning => br#"{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[{"type":"thinking","thinking":"hmm","signature":"SIG=="},{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}"#.as_slice(),
+        Opaque::Compaction => br#"{"id":"resp_c","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"CMP=="}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}"#.as_slice(),
+    };
+    ingress.advance(&mut stored, body).unwrap();
+    ingress.finish(&mut stored).unwrap();
+    project(
+        &mut exchange.request,
+        document,
+        &mut stored.allocator(),
+        &mut reader,
+        producer,
+    )
+    .unwrap();
 }
 
 /// Whether `delivery` is still undecided after the published records reached it.
@@ -662,6 +744,8 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
     }
     struct Row {
         case: &'static str,
+        /// A stored response projected into the request view, and the credential that produced it.
+        history: Option<(Opaque, &'static str)>,
         /// Credentials `a` and `b`. A fresh runtime's round robin tries `a` first, as
         /// `scheduler_attempts.rs` relies on.
         scripts: [Script; 2],
@@ -683,11 +767,14 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         cooled: &'static [&'static str],
         /// The call is a `responses/compact` request.
         compact: bool,
+        /// Attempts, on either arm, that went ahead without another account's reasoning.
+        withheld: usize,
     }
     let unsupported = || codec::Error::Unsupported;
-    let rows = [
+    let mut rows = vec![
         Row {
             case: "an executor error before any record fails over",
+            history: None,
             scripts: [Script::Refused, Script::Answers],
             request: None,
             ends: Ends::Commits { clean: true },
@@ -698,9 +785,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a usage snapshot before an executor error is kept",
+            history: None,
             scripts: [Script::UsageThenRefused, Script::Answers],
             request: None,
             ends: Ends::Commits { clean: true },
@@ -711,9 +800,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a producer error before commitment fails over",
+            history: None,
             scripts: [Script::BodyFails, Script::Answers],
             request: None,
             ends: Ends::Commits { clean: true },
@@ -724,9 +815,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "every candidate refuses",
+            history: None,
             scripts: [Script::Refence(unsupported), Script::Refence(unsupported)],
             request: None,
             ends: Ends::Rejects("does not support the request"),
@@ -737,9 +830,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "an unsupported request skips to the next candidate",
+            history: None,
             scripts: [Script::Refence(unsupported), Script::Answers],
             request: None,
             ends: Ends::Commits { clean: true },
@@ -750,9 +845,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a missing max_tokens skips only that candidate",
+            history: None,
             scripts: [Script::Refence(|| codec::Error::MaxTokensRequired), Script::Answers],
             request: None,
             ends: Ends::Commits { clean: true },
@@ -763,9 +860,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "every candidate lacking max_tokens answers the client with that",
+            history: None,
             scripts: [
                 Script::Refence(|| codec::Error::MaxTokensRequired),
                 Script::Refence(|| codec::Error::MaxTokensRequired),
@@ -779,9 +878,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a schema refusal skips to the next candidate",
+            history: None,
             scripts: [Script::Refence(|| codec::Error::Schema), Script::Answers],
             request: None,
             ends: Ends::Commits { clean: true },
@@ -792,9 +893,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "exhausted storage at the fence stops",
+            history: None,
             scripts: [
                 Script::Refence(|| codec::Error::Storage(ck_stream::Error::StorageExhausted)),
                 Script::Answers,
@@ -808,9 +911,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a gone stream at the fence stops",
+            history: None,
             scripts: [
                 Script::Refence(|| codec::Error::Storage(ck_stream::Error::Gone)),
                 Script::Answers,
@@ -824,9 +929,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a codec defect at the fence stops",
+            history: None,
             scripts: [Script::Refence(|| codec::Error::Position), Script::Answers],
             request: None,
             ends: Ends::Status(500),
@@ -837,9 +944,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a cancelled request stops",
+            history: None,
             scripts: [
                 Script::Refence(|| codec::Error::Storage(ck_stream::Error::Closed)),
                 Script::Answers,
@@ -853,9 +962,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a request ended by shutdown stops",
+            history: None,
             scripts: [
                 Script::Refence(|| codec::Error::Storage(ck_stream::Error::Closed)),
                 Script::Answers,
@@ -869,9 +980,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a request ended by exhausted storage stops",
+            history: None,
             scripts: [
                 Script::Refence(|| codec::Error::Storage(ck_stream::Error::Closed)),
                 Script::Answers,
@@ -885,9 +998,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "an executor resource error stops",
+            history: None,
             scripts: [Script::StorageExhausted, Script::Answers],
             request: None,
             ends: Ends::Status(503),
@@ -898,9 +1013,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a failure after commitment does not retry",
+            history: None,
             scripts: [Script::FailsAfterContent, Script::Answers],
             request: None,
             ends: Ends::Commits { clean: false },
@@ -911,9 +1028,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "an old-arm failure fails over to the contract arm",
+            history: None,
             scripts: [Script::Old, Script::Answers],
             request: None,
             ends: Ends::Commits { clean: true },
@@ -924,9 +1043,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 1,
             cooled: &["a"],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a producer failure ready with the first output does not commit",
+            history: None,
             scripts: [Script::FailsAtOnce, Script::Answers],
             request: None,
             ends: Ends::Commits { clean: true },
@@ -937,9 +1058,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a client gone before the first byte still accounts the final usage",
+            history: None,
             scripts: [Script::Held, Script::Answers],
             request: None,
             ends: Ends::Gone,
@@ -950,9 +1073,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            withheld: 0,
         },
         Row {
             case: "a compact the destination refuses sends nothing",
+            history: None,
             scripts: [Script::Refence(unsupported), Script::Refence(unsupported)],
             request: None,
             ends: Ends::Status(400),
@@ -963,8 +1088,71 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: true,
+            withheld: 0,
         },
     ];
+    rows.extend([
+        Row {
+            case: "reasoning another account produced is withheld from that attempt only",
+            history: Some((Opaque::Reasoning, "b")),
+            scripts: [Script::Answers, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["a"],
+            settled: &[0],
+            failed: &[false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            withheld: 1,
+        },
+        Row {
+            case: "an old-arm attempt is admitted as a contract-arm one",
+            history: Some((Opaque::Reasoning, "b")),
+            scripts: [Script::Old, Script::Answers],
+            request: None,
+            ends: Ends::Status(503),
+            started: &[],
+            settled: &[],
+            failed: &[true],
+            input_tokens: None,
+            old: 1,
+            cooled: &["a"],
+            compact: false,
+            withheld: 1,
+        },
+        Row {
+            case: "a request cancelled before a withheld attempt ends as cancelled",
+            history: Some((Opaque::Reasoning, "b")),
+            scripts: [Script::Answers, Script::Answers],
+            request: Some(Terminal::Cancelled),
+            ends: Ends::Status(499),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            withheld: 0,
+        },
+        Row {
+            case: "a compaction item another account produced skips the candidate on either arm",
+            history: Some((Opaque::Compaction, "b")),
+            scripts: [Script::Old, Script::Answers],
+            request: None,
+            ends: Ends::Status(400),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            withheld: 0,
+        },
+    ]);
     let (upstream, sends) = refusing_upstream().await;
     let usage = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
     for row in rows {
@@ -980,7 +1168,10 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             release: Mutex::new(Some(released)),
         };
         let mut exchange = exchange(&fixture, owner(KEY), output(Protocol::Chat, Framing::Sse), CLIENT);
-        let (document, media) = request_view(&fixture, &mut exchange);
+        let (mut document, media) = request_view(&fixture, &mut exchange);
+        if let Some((opaque, by)) = row.history {
+            project_history(&fixture, &mut exchange, &mut document, opaque, by);
+        }
         let request = exchange.request.id();
         if let Some(terminal) = row.request {
             exchange.request.finish(terminal);
@@ -1078,6 +1269,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             )
             .count();
         assert_eq!(log.matches("missing_setting=").count(), lacking, "{case}: {log}");
+        assert_eq!(
+            log.matches("reasoning from another account withheld").count(),
+            row.withheld,
+            "{case}: {log}"
+        );
         assert!(
             lacking == 0 || log.contains("missing_setting=\"model-catalog default-max-tokens\""),
             "{case}: {log}"

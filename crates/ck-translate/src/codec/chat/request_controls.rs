@@ -167,7 +167,7 @@ pub(super) fn destination(doc: &Document) -> Result<()> {
     if let Some(replay) = doc.member(x, "replay")? {
         for entry in doc.children(replay)? {
             let live = match doc.origin(entry)? {
-                Some((parent, _)) => attached(doc, parent)?,
+                Some((parent, _)) => crate::codec::provenance::attached(doc, parent)?,
                 None => true,
             };
             // Request egress strips Claude signatures (owner ruling 2026-11-15).
@@ -294,17 +294,4 @@ pub(super) fn capture_cache(doc: &mut Document, owner: &mut Writer, value: usize
     // Anthropic request egress reads (owner ruling Q3, 2026-11-16).
     let list = isolated_list(doc, "anthropic", "cache_control")?;
     entry(doc, owner, value, list, "value")
-}
-
-fn attached(doc: &Document, mut node: usize) -> Result<bool> {
-    while node != doc.root() {
-        let Some(parent) = doc.node(node)?.parent else {
-            return Ok(false);
-        };
-        if !doc.children(parent)?.any(|child| child == node) {
-            return Ok(false);
-        }
-        node = parent;
-    }
-    Ok(true)
 }

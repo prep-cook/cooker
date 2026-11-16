@@ -3,6 +3,7 @@
 mod audio;
 mod content;
 pub mod egress;
+pub mod history;
 mod image;
 mod opaque;
 pub mod request;
