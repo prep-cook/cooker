@@ -185,18 +185,12 @@ pub(super) fn stop(b: u8) -> bool {
     b.is_ascii_whitespace() || b == b'"'
 }
 
-/// Whether `word` may hold a credential: it holds `://`, an `@`, a `?` or `#` with an
-/// `=` after it, or a letter and `:` with `//` after them.
+/// Whether `word` may hold a credential: it holds an `@`, a `?`, a `#` or `://`, or a
+/// scheme byte and `:` with at least one byte after them (`https:key`, `user:key`).
 fn suspect(word: &[u8]) -> bool {
-    let after = |from: usize, needle: &[u8]| word[from.min(word.len())..].windows(needle.len()).any(|w| w == needle);
-    let colon = (1..word.len()).find(|&i| word[i] == b':' && word[i - 1].is_ascii_alphabetic());
-    word.contains(&b'@')
-        || after(0, b"://")
-        || word
-            .iter()
-            .position(|b| matches!(b, b'?' | b'#'))
-            .is_some_and(|q| word[q + 1..].contains(&b'='))
-        || colon.is_some_and(|c| after(c + 1, b"//"))
+    word.iter().any(|b| matches!(b, b'@' | b'?' | b'#'))
+        || word.windows(3).any(|w| w == b"://")
+        || (1..word.len().saturating_sub(1)).any(|i| word[i] == b':' && super::scheme_byte(word[i - 1]))
 }
 
 /// Whether `b` can be part of a URL: unreserved, `%`, the delimiters a userinfo, path,

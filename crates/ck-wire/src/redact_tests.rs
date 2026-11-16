@@ -132,7 +132,7 @@ fn malformed_urls_print_the_placeholder() {
 /// Free text is redacted word by word: a word that may hold a credential prints as the
 /// placeholder whole, and a quoted value that goes on past whitespace is dropped up to
 /// its closing `"` or the line end. The cost is that e-mail addresses, `user@host`,
-/// `mailto:` and words such as `?a=b` print as the placeholder too.
+/// `mailto:`, words holding `?` or `#`, and `word:word` print as the placeholder too.
 #[test]
 fn words_that_may_hold_a_credential_print_as_the_placeholder() {
     for (text, want) in [
@@ -171,6 +171,10 @@ fn words_that_may_hold_a_credential_print_as_the_placeholder() {
         ("see foo//user:sk-review-secret@host end", "see <redacted url> end"),
         ("dsn=redis:sk-review-secret@host end", "<redacted url> end"),
         ("go https:sk-review-secret@relay.example", "go <redacted url>"),
+        // A `?` or `#` anywhere, and an opaque URL, whatever follows.
+        ("go next#sk-review-secret", "go <redacted url>"),
+        ("go callback?sk-review-secret", "go <redacted url>"),
+        ("go https:sk-review-secret", "go <redacted url>"),
         ("dial 9://sk-review-secret/x", "dial <redacted url>"),
         ("open https:relay.example//sk-review-secret", "open <redacted url>"),
         ("see x<http://h/>what?yes tail", "see <redacted url>"),
@@ -213,6 +217,13 @@ fn words_that_may_hold_a_credential_print_as_the_placeholder() {
         ("ssh user@host", "ssh <redacted url>"),
         ("mailto:a@b.example", "<redacted url>"),
         ("try ?a=b", "try <redacted url>"),
+        (
+            "and/or what? C# ## heading what?yes",
+            "and/or <redacted url> <redacted url> <redacted url> heading <redacted url>",
+        ),
+        ("ratio 1:2 at 12:30", "ratio <redacted url> at <redacted url>"),
+        ("listen 127.0.0.1:8080", "listen <redacted url>"),
+        ("Timestamp: 2026-11-16T15:01:52+11:00", "Timestamp: <redacted url>"),
         ("models/claude@001:rawPredict", "<redacted url>"),
     ] {
         let got = urls_in(text);
@@ -227,8 +238,11 @@ fn words_that_may_hold_a_credential_print_as_the_placeholder() {
         "Content-Type: application/json; charset=utf-8",
         "User-Agent: Mozilla/5.0 (X11; Linux x86_64)",
         "open /etc/hosts: permission denied",
-        "and/or what? C# ## heading what?yes",
-        "ratio 1:2 at 12:30//x a/b//c and path//x",
+        "note: x",
+        "see [1]:2",
+        r#"{"type":"x","n":[1,2]}"#,
+        "error: EOF a/b//c and path//x",
+        "time: 12 :30 1: 2",
         r#"{"image":"/9j/4AAQSkZJRgABAQ=="}"#,
         "\u{fffd}\u{fffd} plain",
     ] {
@@ -368,6 +382,10 @@ const SHAPES: &[&str] = &[
     "a/b?k=S",
     "callback?code=S",
     "?code=S",
+    "#S",
+    "next?S",
+    "https:S",
+    "1:S",
     "redis:S@host.example",
     "mailto:S@host.example",
     "https://host.example/r/https://u:S@x.example/a",
@@ -483,10 +501,10 @@ fn parts_fail_closed_where_a_credential_may_go_on() {
             "x <redacted url>||\nz",
         ),
         // So does a word that ends in a byte a URL can hold.
-        (&["ratio 1:2", "x y"], "ratio <redacted url>|| y"),
+        (&["total 12", "x y"], "total <redacted url>|| y"),
         // JSON messages and words that end with their part stay.
         (&[r#"{"input":[]}"#, r#"{"type":"x"}"#], r#"{"input":[]}||{"type":"x"}"#),
-        (&["ratio 1:2}", "x"], "ratio 1:2}||x"),
+        (&["total 12}", "x"], "total 12}||x"),
         (&["see http://h.example/ ", "x"], "see <redacted url> ||x"),
     ] {
         let parts: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();

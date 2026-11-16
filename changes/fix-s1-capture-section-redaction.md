@@ -1,8 +1,7 @@
 Security
 
-- Request logs, the server log and error text are redacted word by word, a word being the bytes between whitespace and `"`. A word that holds `://`, an `@`, a `?` or `#` with an `=` after it, or a letter and `:` with `//` after them prints as `<redacted url>` whole, so every URL in a log prints as the placeholder. E-mail addresses, `user@host`, `mailto:` addresses and words such as `?a=b` print as the placeholder too.
+- Request logs, the server log and error text are redacted word by word, a word being the bytes between whitespace and `"`. A word that holds `://`, an `@`, a `?` or a `#`, or a letter, digit, `+`, `-` or `.` followed by `:` and at least one more byte prints as `<redacted url>` whole, so every URL in a log prints as the placeholder. E-mail addresses, `user@host`, `mailto:` addresses, opaque URLs (`https:key`), times, `host:port`, SDP attribute lines and words such as `what?` or `C#` print as the placeholder too. The server log's own time and source-location prefix is not redacted.
 - After such a word, a quoted value with spaces in it is dropped up to its closing `"`, or up to the line end for a value opened by `'`, a backtick or `<`.
-- A fragment or query with no `=` (`next#token`, `callback?token`) is no longer redacted.
 - A word longer than 1 MiB prints as `<redacted url>`, in memory and in a spooled section alike.
 - Request logs redact each captured section as a whole, so a URL split across upstream response chunks no longer prints its credentials. A URL that a protocol splits across separate JSON values (stream deltas) is still redacted value by value.
 - In a WebSocket timeline, a message that ends in a word the next message may continue prints that word as `<redacted url>`, and the next message is dropped up to its first whitespace or `"`.

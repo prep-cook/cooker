@@ -339,7 +339,7 @@
       "result": {
         "status": 502,
         "content_type": "application/json; charset=utf-8",
-        "body": "{\"error\":\"quota probe failed: probe request failed: Get \\\"http://127.0.0.1:1/x\\\": dial tcp 127.0.0.1:1: connect: connection refused\"}",
+        "body": "{\"error\":\"quota probe failed: probe request failed: Get \\\"http://127.0.0.1:1/x\\\": dial tcp \\u003credacted url\\u003e connect: connection refused\"}",
         "version_headers": true
       }
     },
