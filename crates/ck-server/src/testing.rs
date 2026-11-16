@@ -369,6 +369,13 @@ pub fn runtime_with_db_clock(
         .map(|(path, bytes)| (path, sha2::Sha256::digest(bytes).into()))
         .collect();
     let rt = Runtime::build(config, credentials, executors, db.clone(), db, clock);
+    // Like the database, the stream pool is private to the runtime: it never depends on, or
+    // shares, the host's `$XDG_RUNTIME_DIR`. The store opens there at first use.
+    let pool = std::env::temp_dir().join(format!("cooker-pool-{}", uuid::Uuid::new_v4()));
+    rt.streams()
+        .directory
+        .set(pool)
+        .expect("a new runtime has no pool directory");
     rt.store().note_loaded(&read);
     rt.deny_external.store(true, Ordering::Relaxed);
     rt
