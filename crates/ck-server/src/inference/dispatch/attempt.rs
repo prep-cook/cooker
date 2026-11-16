@@ -159,7 +159,7 @@ pub(super) async fn run<X: Arms>(
     };
     // §3.2 step 2: one admission for every candidate, either arm. A compaction item another
     // account produced refuses the candidate (Q-C). Its reasoning and signatures are withheld
-    // from this attempt only (pending owner ruling D2-6a-1).
+    // from this attempt only (Settled 73).
     let auth_index = ck_core::config::credentials::auth_index(&credential);
     let producer = provenance::Producer {
         provider: &credential.provider,

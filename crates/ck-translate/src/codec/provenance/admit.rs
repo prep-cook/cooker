@@ -1,5 +1,5 @@
 //! Per-attempt admission of tagged opaque items (D2-PLAN §2.4). Refusing another account's
-//! compaction item follows owner ruling Q-C; dropping its reasoning awaits ruling D2-6a-1.
+//! compaction item follows owner ruling Q-C; dropping its reasoning for that attempt follows Settled 73.
 //!
 //! History projection tags every opaque provider member of a stored response, such as a thinking
 //! signature, encrypted reasoning or a compaction item, with the upstream account that produced
