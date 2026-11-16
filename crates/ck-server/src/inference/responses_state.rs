@@ -832,11 +832,13 @@ pub fn background(streams: &Registry, exchange: &Exchange, model: &str) -> Resul
 }
 
 /// The turn of `exchange` that runs under a slot reserved from its start: a buffered
-/// `background` turn. A streamed one is published as any stored turn.
+/// `background` generation. A streamed one is published as any stored turn, and a compact
+/// answers in its request.
 fn pending_turn(exchange: &Exchange) -> Option<Turn> {
-    exchange
-        .turn
-        .filter(|turn| turn.background && exchange.output.framing == Framing::Json)
+    let output = exchange.output;
+    exchange.turn.filter(|turn| {
+        turn.background && output.framing == Framing::Json && output.operation == codec::Operation::Generate
+    })
 }
 
 impl Pending {

@@ -1034,7 +1034,9 @@ async fn a_background_turn_answers_at_once_and_shows_its_outcome() {
         Waits,
         Cancels,
         Deletes,
-        /// Deletes once the turn committed, while its publication is held.
+        /// Cancels or deletes once the producer ended, while delivery waits at the held
+        /// publication gate.
+        CancelsWhilePublishing,
         DeletesWhilePublishing,
     }
     for (script, then, outcome) in [
@@ -1042,6 +1044,7 @@ async fn a_background_turn_answers_at_once_and_shows_its_outcome() {
         (Script::FailsAfterContent, Then::Waits, "failed"),
         (Script::Held, Then::Cancels, "cancelled"),
         (Script::Held, Then::Deletes, ""),
+        (Script::Held, Then::CancelsWhilePublishing, "cancelled"),
         (Script::Held, Then::DeletesWhilePublishing, ""),
     ] {
         let row = format!("{script:?} {then:?}");
@@ -1049,7 +1052,7 @@ async fn a_background_turn_answers_at_once_and_shows_its_outcome() {
         let fake: &'static Fake = Box::leak(Box::new(Fake::new()));
         fake.set("a", script);
         fake.set("b", Script::Skips);
-        let release = fake.hold();
+        let mut release = Some(fake.hold());
         let queued = committed(send_background(&fixture, fake, Ask::new("hi")).await);
         let queued: Value = serde_json::from_str(&read(queued).await).unwrap();
         assert_eq!(queued["status"], "queued", "{row}: {queued}");
@@ -1069,9 +1072,20 @@ async fn a_background_turn_answers_at_once_and_shows_its_outcome() {
         assert_eq!(running["status"], "in_progress", "{row}: {running}");
         let (_, foreign) = resource(&fixture, OTHER, "GET", &id, "").await;
         assert_eq!(foreign["error"]["message"], "The response was not found.", "{row}");
-        match then {
-            Then::Waits | Then::DeletesWhilePublishing => {}
-            Then::Cancels => {
+        let (stop, publishing) = match then {
+            Then::Waits => (None, false),
+            Then::Cancels => (Some(true), false),
+            Then::Deletes => (Some(false), false),
+            Then::CancelsWhilePublishing => (Some(true), true),
+            Then::DeletesWhilePublishing => (Some(false), true),
+        };
+        if publishing {
+            fixture.rt.streams().holds.publication.close();
+            let _ = release.take().unwrap().send(());
+            tokio::time::sleep(SETTLE).await;
+        }
+        match stop {
+            Some(true) => {
                 let (status, body) = resource(&fixture, KEY, "POST", &id, "/cancel").await;
                 assert_eq!(
                     (status, &body["status"]),
@@ -1079,7 +1093,7 @@ async fn a_background_turn_answers_at_once_and_shows_its_outcome() {
                     "{row}: {body}"
                 );
             }
-            Then::Deletes => {
+            Some(false) => {
                 let (status, body) = resource(&fixture, KEY, "DELETE", &id, "").await;
                 assert_eq!(
                     (status, &body["deleted"]),
@@ -1087,20 +1101,12 @@ async fn a_background_turn_answers_at_once_and_shows_its_outcome() {
                     "{row}: {body}"
                 );
             }
+            None => {}
         }
-        if then == Then::DeletesWhilePublishing {
-            fixture.rt.streams().holds.publication.close();
-        }
-        let _ = release.send(());
-        if then == Then::DeletesWhilePublishing {
-            tokio::time::sleep(SETTLE).await;
-            let (status, body) = resource(&fixture, KEY, "DELETE", &id, "").await;
-            assert_eq!(
-                (status, &body["deleted"]),
-                (StatusCode::OK, &json!(true)),
-                "{row}: {body}"
-            );
+        if publishing {
             fixture.rt.streams().holds.publication.open();
+        } else {
+            let _ = release.take().unwrap().send(());
         }
         let (status, body) = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1138,4 +1144,29 @@ async fn a_background_turn_answers_at_once_and_shows_its_outcome() {
         let continued = matches!(answer, Answer::Committed(_));
         assert_eq!(continued, outcome == "completed", "{row}");
     }
+}
+
+/// `POST {path}` with a bearer key and a JSON `body`: status and body text.
+async fn post(fixture: &Fixture, path: &str, body: &Value) -> (StatusCode, String) {
+    use tower::ServiceExt;
+    let request = axum::http::Request::post(path)
+        .header("authorization", format!("Bearer {KEY}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    status_body(fixture.app().oneshot(request).await.unwrap()).await
+}
+
+/// Only a buffered generation runs in the background: a compact request naming `background`
+/// gets the answer it gets without it, never a queued response.
+#[tokio::test]
+async fn compact_answers_in_the_request_whatever_background_says() {
+    let fixture = fixture(|_| {});
+    let body = json!({"model": MODEL, "input": "hi"});
+    let plain = post(&fixture, "/v1/responses/compact", &body).await;
+    let mut background = body.clone();
+    background["background"] = json!(true);
+    let answer = post(&fixture, "/v1/responses/compact", &background).await;
+    assert!(!answer.1.contains("\"queued\""), "{answer:?}");
+    assert_eq!(answer, plain);
 }
