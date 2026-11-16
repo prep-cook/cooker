@@ -119,7 +119,6 @@ const ZH: &[(&str, &str)] = &[
     ("section_logging", "日志与统计"),
     ("section_quota", "配额超限处理"),
     ("section_routing", "路由"),
-    ("section_websocket", "WebSocket"),
     ("section_other", "其他"),
     ("auth_title", "🔑 认证文件"),
     (
@@ -284,7 +283,6 @@ const EN: &[(&str, &str)] = &[
     ("section_logging", "Logging & Stats"),
     ("section_quota", "Quota Exceeded Handling"),
     ("section_routing", "Routing"),
-    ("section_websocket", "WebSocket"),
     ("section_other", "Other"),
     ("auth_title", "🔑 Auth Files"),
     (
@@ -413,6 +411,6 @@ mod tests {
             table.iter().map(|(k, _)| *k).collect()
         }
         assert_eq!(keys(ZH), keys(EN));
-        assert_eq!(EN.len(), 138);
+        assert_eq!(EN.len(), 137);
     }
 }

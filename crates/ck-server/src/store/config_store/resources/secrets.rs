@@ -20,6 +20,7 @@ fn secret_field(name: &str) -> bool {
             | "client-secret"
             | "authorization"
             | "cookie"
+            | "relay-keys"
     )
 }
 

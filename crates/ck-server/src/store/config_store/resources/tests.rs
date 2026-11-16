@@ -16,6 +16,7 @@ const GO_ONLY: &[(&str, &str, &str)] = &[
     ),
     ("vertex keys carry no websockets", "\n  vertex:\n", "websockets:"),
     ("vertex models carry no is-compat", "\n  vertex:\n", "is-compat:"),
+    ("the AI Studio relay has no ws-auth switch", "aistudio:", "ws-auth:"),
 ];
 
 fn go_only(text: &str) -> Option<&'static str> {
