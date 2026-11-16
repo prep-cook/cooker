@@ -861,18 +861,23 @@ async fn an_idle_turn_expires_after_an_hour() {
 }
 
 /// A token count reads the stored turn its `previous_response_id` names, but is no turn itself:
-/// it issues no response id and stores nothing to continue.
+/// it issues no response id, stores nothing to continue and never runs in the background.
 #[tokio::test]
 async fn a_count_reads_the_stored_turn_and_is_no_turn() {
-    let fixture = fixture(|_| {});
-    let fake = Fake::new();
-    let first = turn(&fixture, &fake, Ask::new("hi")).await;
-    let mut ask = Ask::new("again").after(&first).buffered();
-    ask.body.as_object_mut().unwrap().remove("stream");
-    let (exchange, document, _) = begin(&fixture, &ask, Operation::CountTokens).unwrap();
-    assert!(exchange.turn.is_none(), "a count issues no response id");
-    let messages = document.member(document.root(), "messages").unwrap().unwrap();
-    assert_eq!(document.children(messages).unwrap().count(), 3, "hi, hello, again");
+    for background in [false, true] {
+        let fixture = fixture(|_| {});
+        let fake = Fake::new();
+        let first = turn(&fixture, &fake, Ask::new("hi")).await;
+        let mut ask = Ask::new("again").after(&first).buffered();
+        ask.body.as_object_mut().unwrap().remove("stream");
+        ask.body["background"] = json!(background);
+        let (exchange, document, _) = begin(&fixture, &ask, Operation::CountTokens).unwrap();
+        assert!(exchange.turn.is_none(), "a count issues no response id");
+        let reserved = responses_state::background(fixture.rt.streams(), &exchange, MODEL).unwrap();
+        assert!(reserved.is_none(), "a count reserves no background slot");
+        let messages = document.member(document.root(), "messages").unwrap().unwrap();
+        assert_eq!(document.children(messages).unwrap().count(), 3, "hi, hello, again");
+    }
 }
 
 /// With four stream headers, a chain of ten continuations evicts the oldest turns and their
