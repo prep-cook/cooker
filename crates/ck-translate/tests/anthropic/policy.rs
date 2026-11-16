@@ -272,3 +272,50 @@ fn thinking_config_does_not_reach_chat() {
     assert!(output.get("reasoning").is_none(), "{output}");
     assert_eq!(output["reasoning_effort"], "high");
 }
+
+/// Encodes an Anthropic request for an Anthropic upstream, or returns the fence error.
+fn anthropic_to_anthropic(input: &Value) -> codec::Result<Value> {
+    let mut mapped = Mapped::new();
+    let mut ingress = anthropic::request::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        1024 * 1024,
+    )
+    .unwrap();
+    ingress
+        .advance(&mut mapped.writer, &serde_json::to_vec(input).unwrap())
+        .unwrap();
+    let ready = ingress.finish(&mut mapped.writer, &AnthropicCapability::default())?;
+    let output = anthropic::request::Egress {
+        destination: "anthropic",
+        upstream_stream: false,
+        default_max_tokens: None,
+    }
+    .encode(&ready, &mut mapped.writer)
+    .unwrap();
+    Ok(serde_json::from_slice(&bytes(&output)).unwrap())
+}
+
+/// Every official `thinking.type` reaches Anthropic as sent, beside the effort; `between_tools`
+/// has no form in another protocol, so another destination refuses it.
+#[test]
+fn anthropic_thinking_types_and_a_zero_limit_reach_anthropic_as_sent() {
+    for thinking in [
+        json!({"type":"between_tools"}),
+        json!({"type":"adaptive","display":"omitted"}),
+        json!({"type":"enabled","budget_tokens":1024}),
+        json!({"type":"disabled"}),
+    ] {
+        let input = json!({"model":"m","max_tokens":2048,"thinking":thinking,"output_config":{"effort":"low"},"messages":[{"role":"user","content":"q"}]});
+        let output = anthropic_to_anthropic(&input).unwrap_or_else(|e| panic!("{thinking}: {e:?}"));
+        assert_eq!(output["thinking"], thinking);
+        assert_eq!(output["output_config"], json!({"effort":"low"}), "{thinking}");
+    }
+    // An explicit zero pre-warms the prompt cache.
+    let prewarm = json!({"model":"m","max_tokens":0,"messages":[{"role":"user","content":"q"}]});
+    assert_eq!(anthropic_to_anthropic(&prewarm).unwrap()["max_tokens"], 0);
+    let input = json!({"model":"m","max_tokens":2048,"thinking":{"type":"between_tools"},"messages":[{"role":"user","content":"q"}]});
+    assert!(matches!(anthropic_to_chat(&input), Err(codec::Error::Unsupported)));
+}

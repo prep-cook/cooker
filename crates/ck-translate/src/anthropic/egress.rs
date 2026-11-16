@@ -288,7 +288,7 @@ impl Egress {
             }
             Kind::Opaque => self.opaque(owner, doc, kind, choice, output)?,
             Kind::Done => self.done(owner, doc, output)?,
-            Kind::Error | Kind::Cancelled => self.error(owner, output)?,
+            Kind::Error | Kind::Cancelled => self.error(owner, &doc, output)?,
             _ => self.drop_event(kind, choice, "event has no Anthropic response carrier"),
         }
         Ok(())

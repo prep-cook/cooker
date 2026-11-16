@@ -1,5 +1,5 @@
 use super::{RESPONSES, anthropic, codec, identity, json};
-use crate::{BodyMode, Direction, Mapped, Operation, ResponseIngress, Value, assert_invalid_input, response};
+use crate::{BodyMode, Direction, Mapped, Operation, ResponseIngress, Value, assert_invalid_input, events, response};
 use std::collections::BTreeMap;
 
 // These fixtures include adapter fragments, not just complete Messages streams.
@@ -140,7 +140,8 @@ fn every_recorded_native_sse_stream_obeys_lifecycle_and_preserves_payloads() {
             let rows: Vec<Value> = std::str::from_utf8(&input)
                 .unwrap()
                 .lines()
-                .filter_map(|line| line.strip_prefix("data: "))
+                // SSE allows `data:` without the space.
+                .filter_map(|line| line.strip_prefix("data:"))
                 .map(|line| serde_json::from_str(line).unwrap_or_else(|_| json!({"type":"error"})))
                 .collect();
             if let Some((blocks, reason)) = expected(&rows) {
@@ -187,7 +188,21 @@ fn every_recorded_native_sse_stream_obeys_lifecycle_and_preserves_payloads() {
                 } else {
                     assert!(!output.contains("event: x_ck.done\n"), "{id}");
                     assert!(output.contains("event: x_ck.error\n"), "{id}");
-                    assert_invalid_input(&raw, "upstream");
+                    // The upstream's own error event fails the stream with its type; the
+                    // corpus reports `overloaded_error` or no type.
+                    match rows.iter().find(|row| row["type"] == "error").map(|row| &row["error"]) {
+                        Some(error) if error.is_object() => {
+                            let failure = events(&raw).pop().unwrap();
+                            let overloaded = error["type"] == "overloaded_error";
+                            assert_eq!(failure["status"], if overloaded { 529 } else { 502 }, "{id}");
+                            assert_eq!(
+                                failure["type"],
+                                if overloaded { "overloaded_error" } else { "api_error" }
+                            );
+                            assert_eq!(failure["message"], "Response failed", "{id}");
+                        }
+                        _ => assert_invalid_input(&raw, "upstream"),
+                    }
                 }
             }
         }

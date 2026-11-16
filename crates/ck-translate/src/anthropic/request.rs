@@ -342,22 +342,31 @@ fn controls(doc: &mut Document, root: usize, x: usize) -> Result<(usize, usize)>
         }
     }
     if let Some(thinking) = doc.remove(root, "thinking")? {
-        let normalized = doc.set(x, "thinking", Value::Object)?;
-        if let Some(kind) = doc.member(thinking, "type")? {
-            if doc.string_is(kind, "enabled")? || doc.string_is(kind, "adaptive")? {
-                doc.set(normalized, "enabled", Value::Bool(true))?;
-            } else if doc.string_is(kind, "disabled")? {
-                doc.set(normalized, "enabled", Value::Bool(false))?;
-            } else {
-                return Err(Error::Unsupported);
+        let kind = doc.member(thinking, "type")?;
+        if let Some(kind) = kind
+            && doc.string_is(kind, "between_tools")?
+        {
+            // No other protocol has this mode: as an Anthropic-only control it reaches
+            // Anthropic unchanged, and every other destination's fence refuses it.
+            doc.append(native, thinking)?;
+        } else {
+            let normalized = doc.set(x, "thinking", Value::Object)?;
+            if let Some(kind) = kind {
+                if doc.string_is(kind, "enabled")? || doc.string_is(kind, "adaptive")? {
+                    doc.set(normalized, "enabled", Value::Bool(true))?;
+                } else if doc.string_is(kind, "disabled")? {
+                    doc.set(normalized, "enabled", Value::Bool(false))?;
+                } else {
+                    return Err(Error::Unsupported);
+                }
             }
+            if let Some(budget) = doc.member(thinking, "budget_tokens")? {
+                let value = doc.node(budget)?.value;
+                doc.set(normalized, "budget_tokens", value)?;
+            }
+            doc.rename(thinking, "native")?;
+            doc.append(normalized, thinking)?;
         }
-        if let Some(budget) = doc.member(thinking, "budget_tokens")? {
-            let value = doc.node(budget)?.value;
-            doc.set(normalized, "budget_tokens", value)?;
-        }
-        doc.rename(thinking, "native")?;
-        doc.append(normalized, thinking)?;
     }
     if let Some(output) = doc.remove(root, "output_config")? {
         if let Some(effort) = doc.remove(output, "effort")? {
