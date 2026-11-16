@@ -28,7 +28,7 @@ use crate::openai_compat_payload::{self as compat, ensure_responses_usage_detail
 use crate::xai_auth::{self, CLI_CHAT_PROXY_BASE_URL, DEFAULT_API_BASE_URL, metadata_string};
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_request::{self as request, Prepared};
-use crate::xai_response::{self as response, NamespaceRestorer, OutputItems, XSearchFilter, text};
+use crate::xai_response::{self as response, NamespaceRestorer, OutputItems, text};
 use ck_translate::apply_patch_responses as apply_patch;
 
 pub const PROVIDER: &str = "xai";
@@ -610,21 +610,17 @@ impl XaiExecutor {
 /// response, with streamed output items restored, translated for the client.
 fn buffered(req: &ExecRequest, mut p: Prepared, store: &replay::Store, data: &[u8]) -> Result<Bytes, ExecError> {
     let mut items = OutputItems::default();
-    let mut filter = XSearchFilter::new(p.filter_internal_x_search, std::mem::take(&mut p.client_declared_tools));
     let mut restorer = NamespaceRestorer::new(std::mem::take(&mut p.namespace_tools));
     for line in data.split(|b| *b == b'\n') {
         let Some(rest) = line.strip_prefix(b"data:") else {
             continue;
         };
-        let event = response::normalize_summary_data(trim_space(rest).to_vec());
+        let event = trim_space(rest).to_vec();
         p.apply_patch.remember_dispatcher_event(&event);
         let mut event = restorer.restore(event);
         if !p.web_search_alias.is_empty() {
             event = response::restore_web_search_name(event, &p.web_search_alias);
         }
-        let Some(event) = filter.apply(event).filter(|e| !e.is_empty()) else {
-            continue;
-        };
         let (events, bridge_error) = p.apply_patch.transform(&event);
         if bridge_error.is_some() {
             return Err(apply_patch_error());
@@ -639,7 +635,7 @@ fn buffered(req: &ExecRequest, mut p: Prepared, store: &replay::Store, data: &[u
             match kind.as_slice() {
                 b"response.output_item.done" => items.collect(&event),
                 b"response.completed" | b"response.incomplete" => {
-                    let completed = response::normalize_summary_data(items.patch(&event));
+                    let completed = items.patch(&event);
                     if kind == b"response.completed" {
                         // Only a completed turn carries replayable terminal state.
                         replay::cache_completed(store, &p.replay_scope, &completed);
@@ -681,7 +677,6 @@ struct Pipeline {
     responses: bool,
     apply_patch: apply_patch::State,
     items: OutputItems,
-    filter: XSearchFilter,
     restorer: NamespaceRestorer,
     alias: String,
     store: Arc<replay::Store>,
@@ -713,7 +708,6 @@ impl Pipeline {
             responses: req.response_format == Format::OpenAIResponse,
             apply_patch: p.apply_patch,
             items: OutputItems::default(),
-            filter: XSearchFilter::new(p.filter_internal_x_search, p.client_declared_tools),
             restorer: NamespaceRestorer::new(p.namespace_tools),
             alias: p.web_search_alias,
             store,
@@ -772,7 +766,7 @@ impl Pipeline {
                     b"response.output_item.done" => self.items.collect(&event),
                     b"response.completed" | b"response.incomplete" => {
                         // Reconstructed only after the bridge restored dispatcher children.
-                        let event = response::normalize_summary_data(self.items.patch(&event));
+                        let event = self.items.patch(&event);
                         if &*gj::get(&event, "type").bytes() == b"response.completed" {
                             replay::cache_completed(&self.store, &self.scope, &event);
                         }
@@ -801,7 +795,7 @@ impl Pipeline {
     fn line(&mut self, line: &[u8]) -> bool {
         if line.starts_with(b"event:") {
             if let Some(pending) = self.pending.take()
-                && !self.emit(response::summary_event_line(&pending, ""))
+                && !self.emit(pending)
             {
                 return false;
             }
@@ -809,46 +803,29 @@ impl Pipeline {
             return true;
         }
         if let Some(rest) = line.strip_prefix(b"data:") {
-            let events = response::normalize_summary_data_events(trim_space(rest).to_vec());
-            let had_pending = self.pending.is_some();
-            for (i, event) in events.into_iter().enumerate() {
-                self.apply_patch.remember_dispatcher_event(&event);
-                let mut event = self.restorer.restore(event);
-                if !self.alias.is_empty() {
-                    event = response::restore_web_search_name(event, &self.alias);
-                }
-                let Some(event) = self.filter.apply(event).filter(|e| !e.is_empty()) else {
-                    if had_pending && i == 0 {
-                        self.pending = None;
-                    }
-                    continue;
-                };
-                // ObserveResponseModel and, for terminal events, StreamUsageBuffer.Observe.
-                let name = gj::get(&event, "type").str().into_owned();
-                if self.usage.enabled() {
-                    self.usage
-                        .response_line(Format::Codex, &response::usage_line(&event, &HTTP_USAGE_EVENTS));
-                    if HTTP_USAGE_EVENTS.contains(&name.as_str()) && response::codex_usage_ok(&event) {
-                        self.usage_seen = true;
-                    }
-                }
-                if had_pending {
-                    let event_line = match self.pending.take() {
-                        Some(pending) if i == 0 => response::summary_event_line(&pending, &name),
-                        _ => format!("event: {name}").into_bytes(),
-                    };
-                    if !self.emit(event_line) {
-                        return false;
-                    }
-                }
-                if !self.emit([&b"data: "[..], &event].concat()) {
-                    return false;
+            let event = trim_space(rest).to_vec();
+            self.apply_patch.remember_dispatcher_event(&event);
+            let mut event = self.restorer.restore(event);
+            if !self.alias.is_empty() {
+                event = response::restore_web_search_name(event, &self.alias);
+            }
+            let name = gj::get(&event, "type").str().into_owned();
+            if self.usage.enabled() {
+                self.usage
+                    .response_line(Format::Codex, &response::usage_line(&event, &HTTP_USAGE_EVENTS));
+                if HTTP_USAGE_EVENTS.contains(&name.as_str()) && response::codex_usage_ok(&event) {
+                    self.usage_seen = true;
                 }
             }
-            return true;
+            if let Some(pending) = self.pending.take()
+                && !self.emit(pending)
+            {
+                return false;
+            }
+            return self.emit([&b"data: "[..], &event].concat());
         }
         if let Some(pending) = self.pending.take()
-            && !self.emit(response::summary_event_line(&pending, ""))
+            && !self.emit(pending)
         {
             return false;
         }
@@ -859,7 +836,7 @@ impl Pipeline {
     /// scan error or the client's final frames.
     fn end(&mut self, scan_error: Option<ExecError>) {
         if let Some(pending) = self.pending.take()
-            && !self.emit(response::summary_event_line(&pending, ""))
+            && !self.emit(pending)
         {
             return;
         }

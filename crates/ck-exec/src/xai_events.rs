@@ -1,9 +1,8 @@
 //! The xAI upstream body on its way into the Responses response ingress (`xai_exec`):
 //! Go's per-line xAI rules (xai_executor.go `ExecuteStream`), applied as the body arrives.
 //!
-//! - Grok's reasoning-text events and items take the reasoning-summary shape.
-//! - The namespace calls, the aliased client `web_search` function and the internal X Search
-//!   trace the request rewrote are restored or dropped.
+//! - Native reasoning events and server-tool traces keep their types and indices.
+//! - Namespace calls and the aliased client `web_search` function are restored.
 //! - The apply_patch bridge turns function calls back into the client's custom tool; its
 //!   failure ends the response with Go's 502.
 //! - A completion whose `output` is empty or absent gets the items
@@ -37,7 +36,7 @@ use crate::xai::MAX_LINE;
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_replay_items;
 use crate::xai_request::Prepared;
-use crate::xai_response::{self as response, NamespaceRefs, NamespaceRestorer, XSearchFilter, text};
+use crate::xai_response::{self as response, NamespaceRefs, NamespaceRestorer, text};
 
 /// The response decoder of one xAI attempt: generation through the xAI line rules, a
 /// buffered compact whose success clears the session's replay, or a media operation.
@@ -111,7 +110,6 @@ pub struct Events {
     pending: Option<Vec<u8>>,
     bridge: apply_patch::State,
     items: Items,
-    filter: XSearchFilter,
     restorer: NamespaceRestorer,
     /// The flattened and folded namespace tool names the request sent.
     refs: NamespaceRefs,
@@ -122,6 +120,7 @@ pub struct Events {
 
 impl Events {
     pub(crate) fn new(mut inner: Ingress, prepared: Prepared, store: Arc<replay::Store>) -> Self {
+        inner.xai();
         let scope = prepared.replay_scope;
         if scope.valid() {
             inner.on_completed(Box::new(move |doc, response| {
@@ -134,7 +133,6 @@ impl Events {
             pending: None,
             bridge: prepared.apply_patch,
             items: Items::default(),
-            filter: XSearchFilter::new(prepared.filter_internal_x_search, prepared.client_declared_tools),
             refs: prepared.namespace_tools.clone(),
             restorer: NamespaceRestorer::new(prepared.namespace_tools),
             folded: HashSet::new(),
@@ -176,7 +174,7 @@ impl Events {
             return Ok(());
         }
         if let Some(pending) = self.pending.take()
-            && !self.emit(owner, response::summary_event_line(&pending, ""))?
+            && !self.emit(owner, pending)?
         {
             return Ok(());
         }
@@ -200,57 +198,34 @@ impl Events {
         }
         if line.starts_with(b"event:") {
             return match self.pending.replace(line.to_vec()) {
-                Some(pending) => self.emit(owner, response::summary_event_line(&pending, "")),
+                Some(pending) => self.emit(owner, pending),
                 None => Ok(true),
             };
         }
         let Some(rest) = line.strip_prefix(b"data:") else {
             if let Some(pending) = self.pending.take()
-                && !self.emit(owner, response::summary_event_line(&pending, ""))?
+                && !self.emit(owner, pending)?
             {
                 return Ok(false);
             }
             return self.emit(owner, line.to_vec());
         };
-        let had_pending = self.pending.is_some();
-        let events = response::normalize_summary_data_events(trim_space(rest).to_vec());
-        for (i, event) in events.into_iter().enumerate() {
-            self.bridge.remember_dispatcher_event(&event);
-            let Some(event) = self.unfold(event) else {
-                if had_pending && i == 0 {
-                    self.pending = None;
-                }
-                continue;
-            };
-            let mut event = self.restorer.restore(event);
-            if !self.alias.is_empty() {
-                event = response::restore_web_search_name(event, &self.alias);
-            }
-            let Some(event) = self.filter.apply(event).filter(|e| !e.is_empty()) else {
-                if had_pending && i == 0 {
-                    self.pending = None;
-                }
-                continue;
-            };
-            if i > 0 {
-                // Each event of a split data line is its own SSE event.
-                self.put(owner, b"")?;
-            }
-            if had_pending {
-                let name = gj::get(&event, "type").str().into_owned();
-                let event_line = match self.pending.take() {
-                    Some(pending) if i == 0 => response::summary_event_line(&pending, &name),
-                    _ => format!("event: {name}").into_bytes(),
-                };
-                if !self.emit(owner, event_line)? {
-                    return Ok(false);
-                }
-            }
-            if !self.emit(owner, [&b"data: "[..], &event].concat())? {
-                return Ok(false);
-            }
+        let event = trim_space(rest).to_vec();
+        self.bridge.remember_dispatcher_event(&event);
+        let Some(event) = self.unfold(event) else {
+            self.pending = None;
+            return Ok(true);
+        };
+        let mut event = self.restorer.restore(event);
+        if !self.alias.is_empty() {
+            event = response::restore_web_search_name(event, &self.alias);
         }
-        Ok(true)
+        if let Some(pending) = self.pending.take()
+            && !self.emit(owner, pending)?
+        {
+            return Ok(false);
+        }
+        self.emit(owner, [&b"data: "[..], &event].concat())
     }
 
     /// Keeps a namespace call's identity the same from its first event to its last, as the

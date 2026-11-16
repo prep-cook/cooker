@@ -35,6 +35,8 @@ pub struct Egress {
     blocks: Table<part::Block>,
     /// Streamed parts queued behind a call outside any block until that call ends.
     parked: Table<part::Parked>,
+    /// Server calls have no client-executed Gemini function carrier.
+    server_tools: Table<LocalId>,
     /// Counts streamed content as it arrives, so a failure writes held parts in that order.
     arrival: u64,
     terminal: bool,
@@ -102,6 +104,7 @@ impl Egress {
             choices: Table::new(owner)?,
             blocks: Table::new(owner)?,
             parked: Table::new(owner)?,
+            server_tools: Table::new(owner)?,
             arrival: 0,
             terminal: false,
             failed: false,
@@ -120,6 +123,21 @@ impl Egress {
     ) -> Result<()> {
         if self.identity.is_none() && !matches!(kind, Kind::ResponseStart | Kind::Error | Kind::Cancelled) {
             return Err(Error::Schema);
+        }
+        let root = event.root();
+        let x = event.required(root, "x_ck")?;
+        if let Some(id) = event.member(x, "tool_call_id")? {
+            let id = local(&event, id)?;
+            if kind == Kind::ToolStart && super::is(&event, root, "kind", "server")? {
+                self.server_tools.push(id)?;
+            }
+            if let Some(at) = self.server_tools.iter().position(|tool| *tool == id) {
+                if kind == Kind::ToolEnd {
+                    self.server_tools.swap_remove(at);
+                }
+                (self.diagnostic)(Diagnostic::UnsupportedEvent(kind));
+                return Ok(());
+            }
         }
         match kind {
             Kind::ResponseStart => self.start(owner, &event)?,

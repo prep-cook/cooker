@@ -73,6 +73,7 @@ impl Ingress {
                 next_media: 0,
                 audio: None,
                 completed: None,
+                xai: false,
             },
             failed: false,
         })
@@ -80,6 +81,10 @@ impl Ingress {
     /// Hands the completion that ends this streamed body to `observer`; see [`Completed`].
     pub fn on_completed(&mut self, observer: Completed) {
         self.state.completed = Some(observer);
+    }
+    /// xAI's named X Search custom calls execute upstream, not in the client.
+    pub fn xai(&mut self) {
+        self.state.xai = true;
     }
     fn handle(&mut self, owner: &mut Writer, result: Result<()>) -> Result<()> {
         if let Err(error) = result {
@@ -207,6 +212,7 @@ struct State {
     next_media: u64,
     audio: Option<super::audio::Ingress>,
     completed: Option<Completed>,
+    xai: bool,
 }
 impl Item {
     fn scope(&self, block: Option<u64>) -> Scope {

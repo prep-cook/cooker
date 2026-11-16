@@ -571,6 +571,10 @@ fn provider_members_reach_only_their_provider() {
     let gm_vendor = json!({"contents":[{"role":"user","parts":[{"text":"hi","partMetadata":{"k":"v"}}]}]});
     let rs_vendor = json!({"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi","vendor_hint":1}]}]});
     let ch_root = json!({"model":"m","messages":[{"role":"user","content":"hi"}],"cache_control":breakpoint});
+    let xai_chat = json!({"model":"grok-4.3","max_tokens":32,"messages":[{"role":"user","content":"hi"}],
+        "search_parameters":{"mode":"on","sources":[{"type":"x"}]},"compaction_trigger":{"threshold":123}});
+    let xai_responses = json!({"model":"grok-4.3","max_output_tokens":32,"input":"hi",
+        "search_parameters":{"mode":"on","sources":[{"type":"x"}]},"compaction_trigger":{"threshold":123}});
     let part = "/messages/0/content/0/cache_control";
     let rows: [IsolationRow; 19] = [
         (
@@ -636,7 +640,16 @@ fn provider_members_reach_only_their_provider() {
         (P::Responses, P::Gemini, &rs_vendor, "vendor_hint", None),
     ];
     let mut failures = Vec::new();
-    for (from, to, input, member, expected) in rows {
+    let xai_rows = [(P::Chat, &xai_chat), (P::Responses, &xai_responses)]
+        .into_iter()
+        .flat_map(|(from, input)| {
+            [P::Chat, P::Responses, P::Anthropic, P::Gemini]
+                .into_iter()
+                .flat_map(move |to| {
+                    ["search_parameters", "compaction_trigger"].map(|member| (from, to, input, member, None))
+                })
+        });
+    for (from, to, input, member, expected) in rows.into_iter().chain(xai_rows) {
         let row = format!("{from:?}->{to:?} {member}");
         match (translate(from, to, input), expected) {
             (Ok(out), Some((pointer, value))) if out.pointer(pointer) != Some(&value) => {

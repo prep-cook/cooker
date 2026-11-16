@@ -15,7 +15,7 @@ use ck_wire::thinking::parse_suffix;
 
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_response::{
-    self as response, CUSTOM, ClientToolKey, FUNCTION, NAMESPACE, NamespaceRef, NamespaceRefs, WEB_SEARCH, text,
+    self as response, CUSTOM, FUNCTION, NAMESPACE, NamespaceRef, NamespaceRefs, WEB_SEARCH, text,
 };
 use ck_translate::apply_patch_responses as apply_patch;
 
@@ -25,7 +25,7 @@ const IMAGE_GENERATION: &str = "image_generation";
 const TOOL_SEARCH: &str = "tool_search";
 const X_SEARCH: &str = "x_search";
 const CLIENT_WEB_SEARCH_ALIAS: &str = "clientfn_web_search";
-pub(crate) const MAX_TOOLS: usize = 200;
+pub(crate) const MAX_TOOLS: usize = 1000;
 const CODEX_APP_NAMESPACE: &str = "codex_app";
 const AUTOMATION_UPDATE: &str = "automation_update";
 const SAFE_FUNCTION_PARAMETERS: &str = r#"{"type":"object","properties":{},"additionalProperties":true}"#;
@@ -37,10 +37,8 @@ pub(crate) struct Prepared {
     pub original_payload: Vec<u8>,
     pub body: Vec<u8>,
     pub namespace_tools: NamespaceRefs,
-    pub client_declared_tools: HashSet<ClientToolKey>,
     pub session_id: String,
     pub replay_scope: ReplayScope,
-    pub filter_internal_x_search: bool,
     pub web_search_alias: String,
     /// `helps.ApplyPatchResponsesState`.
     pub apply_patch: apply_patch::State,
@@ -72,6 +70,30 @@ impl Prepared {
 
 fn bad_request(message: impl Into<String>) -> ExecError {
     ExecError::local(400, FailureScope::Request, message)
+}
+
+/// Refuse generation constraints before translation can discard their native spelling.
+fn validate_controls(body: &[u8], source: Format) -> Result<(), ExecError> {
+    let (choices, seed, stop) = match source {
+        Format::Gemini => (
+            "generationConfig.candidateCount",
+            "generationConfig.seed",
+            "generationConfig.stopSequences",
+        ),
+        Format::Claude => ("n", "seed", "stop_sequences"),
+        _ => ("n", "seed", "stop"),
+    };
+    let n = gj::get(body, choices);
+    if n.exists() && n.kind != Kind::Null && n.int() != 1 {
+        return Err(bad_request("xAI Responses cannot generate multiple choices"));
+    }
+    for field in [seed, stop, "web_search_options"] {
+        let value = gj::get(body, field);
+        if value.exists() && value.kind != Kind::Null {
+            return Err(bad_request(format!("xAI Responses cannot preserve {field}")));
+        }
+    }
+    Ok(())
 }
 
 /// `opts.OriginalRequest`, else the payload.
@@ -147,7 +169,14 @@ fn preserve_output_controls(mut body: Vec<u8>, source: &[u8], from: Format) -> V
     if usable(&max) {
         gj::set_raw(&mut body, "max_output_tokens", max.raw());
     }
-    for field in ["temperature", "top_p", "top_k"] {
+    for field in [
+        "temperature",
+        "top_p",
+        "top_k",
+        "parallel_tool_calls",
+        "safety_identifier",
+        "search_parameters",
+    ] {
         let value = gj::get(source, field);
         if usable(&value) {
             gj::set_raw(&mut body, field, value.raw());
@@ -166,6 +195,9 @@ pub(crate) fn prepare(
     replay_store: &replay::Store,
     downstream_websocket: bool,
 ) -> Result<Prepared, ExecError> {
+    if req.alt.as_deref() != Some(crate::xai::COMPACT_ALT) {
+        validate_controls(&req.body, req.source_format)?;
+    }
     let base_model = parse_suffix(&req.model).model_name;
     let original_payload = original(req).to_vec();
     let is_compat = req.resolved_model.as_ref().is_some_and(|r| r.is_compat());
@@ -187,13 +219,16 @@ pub(crate) fn prepare(
 pub(crate) struct Tools {
     pub fold: bool,
     pub namespace_tools: NamespaceRefs,
-    pub client_declared_tools: HashSet<ClientToolKey>,
     pub web_search_alias: String,
 }
 
 /// The `tools` and `tool_choice` rewrites of `prepareResponsesRequestTo`; folded namespace
 /// dispatchers holding a patch tool are registered with `apply_patch`.
-pub(crate) fn shape_tools(mut body: Vec<u8>, cfg: &Config, apply_patch: &mut apply_patch::State) -> (Vec<u8>, Tools) {
+pub(crate) fn shape_tools(
+    mut body: Vec<u8>,
+    cfg: &Config,
+    apply_patch: &mut apply_patch::State,
+) -> Result<(Vec<u8>, Tools), ExecError> {
     let will_inject = inject_x_search(cfg);
     let fold = should_fold_namespace_tools(&body, will_inject);
     let namespace_tools = collect_namespace_refs(&body, fold);
@@ -202,7 +237,6 @@ pub(crate) fn shape_tools(mut body: Vec<u8>, cfg: &Config, apply_patch: &mut app
             apply_patch.add_dispatcher(name, &r.namespace);
         }
     }
-    let client_declared_tools = response::client_declared_tool_keys(&body);
     body = normalize_tools(body, fold);
     body = promote_additional_tools(body);
     let mut web_search_alias = String::new();
@@ -218,14 +252,15 @@ pub(crate) fn shape_tools(mut body: Vec<u8>, cfg: &Config, apply_patch: &mut app
     if will_inject && !requires_hosted_tool_only_any(&body) {
         body = ensure_native_x_search_tool(body);
     }
-    body = clamp_tools_limit(body, MAX_TOOLS, &namespace_tools);
+    if gj::get(&body, "tools").array().len() > MAX_TOOLS {
+        return Err(bad_request("xAI supports at most 1000 tools"));
+    }
     let tools = Tools {
         fold,
         namespace_tools,
-        client_declared_tools,
         web_search_alias,
     };
-    (body, tools)
+    Ok((body, tools))
 }
 
 /// The `input` rewrites of `prepareResponsesRequestTo` after reasoning replay, with the
@@ -621,7 +656,7 @@ fn should_fold_namespace_tools(body: &[u8], will_inject: bool) -> bool {
     if will_inject && !response::request_has_native_x_search(body) && !requires_hosted_tool_only_any(body) {
         count += 1;
     }
-    count > MAX_TOOLS
+    count > 200
 }
 
 /// Go `json.Marshal` of a string.
@@ -975,30 +1010,6 @@ fn has_function_tool_named(body: &[u8], name: &str) -> bool {
             .array()
             .iter()
             .any(|item| &*item.get("type").bytes() == b"additional_tools" && item.get("tools").array().iter().any(is))
-}
-
-/// `clampXAIToolsLimit`: at most `max` tools, namespace dispatchers first.
-fn clamp_tools_limit(body: Vec<u8>, max: usize, refs: &NamespaceRefs) -> Vec<u8> {
-    let tools = gj::get(&body, "tools");
-    if !tools.is_array() || tools.array().len() <= max {
-        return body;
-    }
-    let (mut dispatchers, mut regular) = (Vec::new(), Vec::new());
-    for tool in tools.array() {
-        if refs.get(&text(&tool.get("name"))).is_some_and(|r| r.dispatcher) {
-            dispatchers.push(tool.raw().to_vec());
-        } else {
-            regular.push(tool.raw().to_vec());
-        }
-    }
-    dispatchers.truncate(max);
-    let room = max - dispatchers.len();
-    regular.truncate(room);
-    dispatchers.extend(regular);
-    let Ok(updated) = gj::try_set_raw(&body, "tools", response::marshal_raw(&dispatchers)) else {
-        return body;
-    };
-    normalize_tool_choice_for_tools(prune_orphaned_tool_choice(updated))
 }
 
 /// `promoteXAIAdditionalTools`: Responses Lite `additional_tools` input items move into

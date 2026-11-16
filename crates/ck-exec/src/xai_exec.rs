@@ -17,7 +17,7 @@ use ck_core::format::Format;
 use ck_stream::ScratchLease;
 use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::{self, BodyMode, Capability, Operation, RequestEgress, RequestFence, RequestView};
-use ck_translate::responses::request::{Egress, ResponsesCapability};
+use ck_translate::responses::request::{Egress, validate_xai};
 use ck_translate::responses::response::Ingress;
 use ck_wire::json::{self as gj, Kind};
 use ck_wire::thinking::parse_suffix;
@@ -52,9 +52,9 @@ impl Capability for XaiCapability {
 
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
         match view.operation {
-            Operation::Generate | Operation::Compact => ResponsesCapability.validate(view),
+            Operation::Generate | Operation::Compact => validate_xai(view),
             // A count is valid exactly when the generation it projects is.
-            Operation::CountTokens => ResponsesCapability.validate(RequestView {
+            Operation::CountTokens => validate_xai(RequestView {
                 operation: Operation::Generate,
                 ..view
             }),
@@ -322,16 +322,16 @@ impl<'r> Call<'r> {
     }
 }
 
-/// The members Go's xAI path sends whatever the client asked, from its Codex request shape:
-/// nothing stored upstream, the encrypted reasoning that replay carries to the next turn,
-/// and parallel tool calls (dropped again without tools).
+/// Disable remote storage and request encrypted reasoning for replay, without overriding
+/// the client's explicit parallel-tool policy.
 fn required_members(upload: &[u8]) -> Vec<u8> {
     const SOURCES: &[u8] = b"web_search_call.action.sources";
     let mut body = upload.to_vec();
-    for (path, value) in [("store", false), ("parallel_tool_calls", true)] {
-        if gj::get(&body, path).kind != if value { Kind::True } else { Kind::False } {
-            gj::set_bool(&mut body, path, value);
-        }
+    if gj::get(&body, "store").kind != Kind::False {
+        gj::set_bool(&mut body, "store", false);
+    }
+    if !gj::get(&body, "parallel_tool_calls").exists() {
+        gj::set_bool(&mut body, "parallel_tool_calls", true);
     }
     let include = gj::get(&body, "include");
     let sources = include.is_array()

@@ -85,6 +85,18 @@ fn set_usage(out: &mut Vec<u8>, usage: &Res<'_>) {
     if reasoning.exists() {
         gj::set_int(out, "usage.completion_tokens_details.reasoning_tokens", reasoning.int());
     }
+    for name in [
+        "cost_in_usd_ticks",
+        "cost_in_nano_usd",
+        "num_sources_used",
+        "num_server_side_tools_used",
+        "server_side_tool_usage_details",
+    ] {
+        let value = usage.get(name);
+        if value.exists() {
+            gj::set_raw(out, &format!("usage.{name}"), value.raw());
+        }
+    }
 }
 
 fn tool_arguments(item: &Res<'_>) -> Vec<u8> {
@@ -96,6 +108,23 @@ fn tool_arguments(item: &Res<'_>) -> Vec<u8> {
 
 fn is_tool_call(kind: &[u8]) -> bool {
     kind == b"function_call" || kind == b"custom_tool_call"
+}
+
+fn has_x_search(body: &[u8]) -> bool {
+    gj::get(body, "tools")
+        .array()
+        .iter()
+        .any(|tool| tool.get("type").str() == "x_search")
+        || gj::get(body, "search_parameters").exists()
+}
+
+fn x_search_call(item: &Res<'_>) -> bool {
+    item.get("namespace").str().is_empty()
+        && matches!(
+            item.get("name").str().as_ref(),
+            "x_keyword_search" | "x_semantic_search" | "x_user_search" | "x_thread_fetch"
+        )
+        && (item.get("type").str() == "custom_tool_call" || item.get("call_id").str().starts_with("xs_call"))
 }
 
 /// isOriginalCustomPatch: a custom call whose winning declaration is the apply_patch
@@ -133,6 +162,7 @@ struct ToolState {
     input_started: bool,
     input_closed: bool,
     done: bool,
+    server: bool,
 }
 
 impl ToolState {
@@ -155,6 +185,7 @@ pub fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
         model: ctx.model.as_bytes().to_vec(),
         model_name: ctx.model.as_bytes().to_vec(),
         function_index: -1,
+        x_search: has_x_search(ctx.translated_request),
         ..State::default()
     })
 }
@@ -162,6 +193,7 @@ pub fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
 #[derive(Default)]
 struct State {
     original: Vec<u8>,
+    x_search: bool,
     model_name: Vec<u8>,
     service_tier: Vec<u8>,
     response_id: Vec<u8>,
@@ -355,6 +387,17 @@ impl State {
                 if !item.exists() || !is_tool_call(&item.get("type").bytes()) {
                     return None;
                 }
+                if self.x_search && x_search_call(&item) {
+                    self.register(
+                        &root,
+                        &item,
+                        ToolState {
+                            server: true,
+                            ..ToolState::default()
+                        },
+                    );
+                    return None;
+                }
                 self.function_index += 1;
                 let state = ToolState {
                     index: self.function_index,
@@ -371,7 +414,7 @@ impl State {
                 let mut delta = root.get("delta").bytes().into_owned();
                 let i = self.find(&root, &Res::default())?;
                 let state = &mut self.tools[i];
-                if state.done || delta.is_empty() {
+                if state.server || state.done || delta.is_empty() {
                     return None;
                 }
                 state.arguments_emitted = true;
@@ -387,7 +430,7 @@ impl State {
             b"response.function_call_arguments.done" | b"response.custom_tool_call_input.done" => {
                 let i = self.find(&root, &Res::default())?;
                 let state = &mut self.tools[i];
-                if state.done || state.input_closed || (state.arguments_emitted && !state.patch) {
+                if state.server || state.done || state.input_closed || (state.arguments_emitted && !state.patch) {
                     return None;
                 }
                 let field = if kind == b"response.custom_tool_call_input.done" {
@@ -408,6 +451,9 @@ impl State {
             b"response.output_item.done" => {
                 let item = root.get("item");
                 if !item.exists() {
+                    return None;
+                }
+                if self.x_search && x_search_call(&item) {
                     return None;
                 }
                 let item_kind = item.get("type").bytes().into_owned();
@@ -584,6 +630,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, raw: &[u8]) -> Result<Vec<u8>, Error> {
     set_usage(&mut t, &response.get("usage"));
 
     let mut calls: Vec<Vec<u8>> = vec![];
+    let x_search = has_x_search(ctx.translated_request);
     let output = response.get("output");
     if output.is_array() {
         let (mut text, mut reasoning) = (vec![], vec![]);
@@ -630,6 +677,9 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, raw: &[u8]) -> Result<Vec<u8>, Error> {
                     }
                 }
                 b"function_call" | b"custom_tool_call" => {
+                    if x_search && x_search_call(&item) {
+                        continue;
+                    }
                     let mut call = br#"{"id":"","type":"function","function":{"name":"","arguments":""}}"#.to_vec();
                     let call_id = item.get("call_id");
                     if call_id.exists() {

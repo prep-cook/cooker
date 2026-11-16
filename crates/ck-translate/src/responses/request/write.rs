@@ -99,6 +99,19 @@ pub(super) fn write_request(
     if destination == "meta" {
         super::meta::write_extensions(doc, e)?;
     }
+    if destination == "xai"
+        && let Some(parameters) = crate::codec::provenance::isolated(doc, "xai", "parameters")?
+    {
+        for entry in doc.children(parameters)? {
+            let Value::String(pointer) = doc.node(doc.required(entry, "pointer")?)?.value else {
+                return Err(Error::Schema);
+            };
+            e.bytes(b",")?;
+            doc.write_name(doc.pointer_name(pointer)?, e)?;
+            e.bytes(b":")?;
+            doc.write(doc.required(entry, "value")?, e)?;
+        }
+    }
     e.bytes(b"}")
 }
 /// Writes the reasoning options, the continuation and the Responses provider parameters.

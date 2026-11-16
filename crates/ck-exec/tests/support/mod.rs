@@ -50,7 +50,7 @@ impl Streams {
         Self::with_limits(64, bytes)
     }
 
-    fn with_limits(frames: usize, metadata: usize) -> Self {
+    pub fn with_limits(frames: usize, metadata: usize) -> Self {
         let directory = std::env::temp_dir().join(format!("ck-exec-{}", uuid::Uuid::new_v4()));
         let mut config = ck_stream::Config::new(directory.clone());
         config.pool_bytes = Some(frames * ck_stream::FRAME_BYTES);

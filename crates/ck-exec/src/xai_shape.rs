@@ -16,7 +16,7 @@ use crate::openai_compat_payload::{self as compat, set_bool_if_different, set_st
 use crate::xai::PROVIDER;
 use crate::xai_replay as replay;
 use crate::xai_request::{self as request, Prepared};
-use crate::xai_response::{self as response, text};
+use crate::xai_response::text;
 use ck_translate::apply_patch_responses as apply_patch;
 
 const COMPOSER_PREFIX: &str = "grok-composer-";
@@ -164,12 +164,7 @@ pub(crate) fn shape(
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
     set_str_if_different(&mut body, "model", &base_model);
     set_bool_if_different(&mut body, "stream", stream);
-    for key in [
-        "previous_response_id",
-        "prompt_cache_retention",
-        "safety_identifier",
-        "stream_options",
-    ] {
+    for key in ["previous_response_id", "prompt_cache_retention", "stream_options"] {
         gj::delete(&mut body, key);
     }
     let settings = ck_wire::codex_client::Settings::from_config(cfg);
@@ -178,7 +173,7 @@ pub(crate) fn shape(
     // A plain Go error (translator/common NormalizeApplyPatchResponsesRequest).
     body = apply_patch::normalize_executor_request(&body, Some(inbound.original))
         .map_err(crate::openai_compat::plain_err)?;
-    let (body, tools) = request::shape_tools(body, cfg, &mut apply_patch);
+    let (body, tools) = request::shape_tools(body, cfg, &mut apply_patch)?;
     let replay_scope = replay::scope(inbound, &body);
     let mut body = request::shape_input(replay::apply(store, &replay_scope, body), &tools);
     let session_id = inbound.composer_session_id(&base_model);
@@ -186,12 +181,10 @@ pub(crate) fn shape(
         set_str_if_different(&mut body, "prompt_cache_key", &session_id);
     }
     Ok(Prepared {
-        filter_internal_x_search: response::request_has_native_x_search(&body),
         base_model,
         original_payload: Vec::new(),
         body,
         namespace_tools: tools.namespace_tools,
-        client_declared_tools: tools.client_declared_tools,
         session_id,
         replay_scope,
         web_search_alias: tools.web_search_alias,

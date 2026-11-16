@@ -24,7 +24,7 @@ impl State {
         let native = super::super::mapped(owner, |e| item_metadata(doc, node, e))?;
         let root = native.root();
         let id = media::local_id(b'i', index)?;
-        let server = Server::from_item(&native, root)?;
+        let server = Server::from_item(&native, root)?.filter(|s| *s != Server::XSearch || self.xai);
         let tool = server.is_some()
             || is(&native, root, "type", "function_call")?
             || is(&native, root, "type", "custom_tool_call")?;
@@ -342,6 +342,7 @@ fn item_metadata(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result
         Some(Server::Web) => &["arguments", "input", "action", "results"],
         Some(Server::File) => &["arguments", "input", "results"],
         Some(Server::Mcp) => &["arguments", "input", "output", "error"],
+        Some(Server::XSearch) => &["input"],
         None if is(doc, node, "type", "function_call")? => &["arguments"],
         None if is(doc, node, "type", "custom_tool_call")? => &["input"],
         None if is(doc, node, "type", "image_generation_call")? => &["result"],

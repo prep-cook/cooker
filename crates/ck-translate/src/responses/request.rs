@@ -222,6 +222,28 @@ pub(crate) const ANTIGRAVITY: &str = "antigravity";
 /// never writes a client's own member of this name.
 pub(crate) const PROVEN: &str = "_ck_proven";
 
+/// xAI uses Responses for every generation; Chat-only constraints must fail the fence.
+pub fn validate_xai(view: RequestView<'_>) -> Result<()> {
+    validate(view, "xai")?;
+    let doc = view.document;
+    if let Some(x) = doc.member(doc.root(), "x_ck")?
+        && let Some(original) = doc.member(x, "original")?
+    {
+        for entry in doc.children(original)? {
+            if doc.origin(entry)? != Some((doc.root(), None)) {
+                continue;
+            }
+            let pointer = doc.required(entry, "pointer")?;
+            for key in ["/n", "/seed", "/stop", "/web_search_options"] {
+                if doc.string_is(pointer, key)? {
+                    return Err(Error::Unsupported);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Responses semantics with the isolated Codex request controls enabled.
 pub struct CodexCapability;
 impl Capability for CodexCapability {
@@ -241,7 +263,9 @@ impl codec::RequestEgress for Egress {
     fn encode(&self, request: &ValidatedRequest<'_>, owner: &mut Writer) -> Result<ScratchLease> {
         let view = request.for_destination(self.destination)?;
         view.document.check_owner(owner)?;
-        if self.destination == "meta" {
+        if self.destination == "xai" {
+            validate_xai(view)?;
+        } else if self.destination == "meta" {
             meta::validate(view)?;
         } else {
             validate(view, self.destination)?;

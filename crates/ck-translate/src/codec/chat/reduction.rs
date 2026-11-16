@@ -16,6 +16,7 @@ struct Tool {
     index: u64,
     custom: bool,
     legacy: bool,
+    server: bool,
     /// The projected call id when it is a local id, and whether it is the canonical one.
     id: Option<LocalId>,
     canonical: bool,
@@ -101,6 +102,16 @@ impl Reduction {
                 None
             }
             Kind::Chunk => {
+                if let (Some(choice), Some(index)) = (doc.member(x, "choice_index")?, doc.member(x, "tool_index")?) {
+                    let (choice, index) = (doc.unsigned(choice)?, doc.unsigned(index)?);
+                    if self
+                        .tools
+                        .iter()
+                        .any(|t| t.choice == choice && t.index == index && t.server)
+                    {
+                        return Ok((None, false));
+                    }
+                }
                 if doc.member(x, "media_id")?.is_some() {
                     let id = crate::codec::media::media_id(&doc, x)?;
                     if self.media.iter().any(|media| media.id == id && !media.reachable()) {
@@ -112,7 +123,7 @@ impl Reduction {
                 self.project_tools(&mut doc, x)?;
                 Some(doc)
             }
-            Kind::ToolStart => Some(self.project_tool_start(owner, &doc, x)?),
+            Kind::ToolStart => self.project_tool_start(owner, &doc, x)?,
             Kind::Usage => Some(self.project_usage(owner, &mut doc, x)?),
             Kind::Opaque | Kind::MediaStart | Kind::Data | Kind::MediaTranscript | Kind::MediaEnd => {
                 self.project_media(owner, kind, doc, x)?
@@ -131,7 +142,7 @@ impl Reduction {
     }
 
     /// Publishes a tool call's name and identity as a native tool_calls or function_call delta.
-    fn project_tool_start(&mut self, owner: &mut Writer, doc: &Document, x: usize) -> Result<Document> {
+    fn project_tool_start(&mut self, owner: &mut Writer, doc: &Document, x: usize) -> Result<Option<Document>> {
         let root = doc.root();
         let choice = doc.unsigned(doc.required(x, "choice_index")?)?;
         let index = doc.unsigned(doc.required(x, "tool_index")?)?;
@@ -143,6 +154,7 @@ impl Reduction {
             return Err(Error::Schema);
         }
         let custom = doc.string_is(doc.required(root, "arguments_format")?, "text")?;
+        let server = doc.string_is(doc.required(root, "kind")?, "server")?;
         let legacy = doc.member(x, "chat_legacy")?.is_some();
         let source = doc.required(x, "source")?;
         // A Responses source names the call by `call_id`; its `id` is the output item's. A provider
@@ -173,9 +185,13 @@ impl Reduction {
             index,
             custom,
             legacy,
+            server,
             id: local,
             canonical,
         })?;
+        if server {
+            return Ok(None);
+        }
         let name = doc.required(root, "name")?;
         mapped_document(owner, |e| {
             e.bytes(b"{")?;
@@ -201,6 +217,7 @@ impl Reduction {
             }
             e.bytes(b"}")
         })
+        .map(Some)
     }
 
     /// Publishes usage as a chunk: a Chat source's native value, filled from canonical counts it
@@ -235,6 +252,24 @@ impl Reduction {
             if !chat && let Some(n) = doc.member(usage, canonical)? {
                 let details = doc.set(value, detail, Value::Object)?;
                 doc.set(details, wire, Value::Unsigned(doc.unsigned(n)?))?;
+            }
+        }
+        if !chat
+            && doc.string_is(doc.required(native, "protocol")?, "responses")?
+            && let source = doc.required(native, "value")?
+            && matches!(doc.node(source)?.value, Value::Object)
+        {
+            for name in [
+                "cost_in_usd_ticks",
+                "cost_in_nano_usd",
+                "num_sources_used",
+                "num_server_side_tools_used",
+                "server_side_tool_usage_details",
+            ] {
+                if let Some(field) = doc.member(source, name)? {
+                    doc.detach(source, field)?;
+                    doc.append(value, field)?;
+                }
             }
         }
         mapped_document(owner, |e| {
