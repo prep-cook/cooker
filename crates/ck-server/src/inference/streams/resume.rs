@@ -21,6 +21,7 @@ use super::{Attached, CURSOR_HEADER, Cursor, Owner, ProtocolEgress, Registry, ST
 use crate::Runtime;
 use crate::http::egress::Framing;
 use crate::http::respond::error_detail;
+use crate::inference::responses_state::{Publication, passed};
 
 pub async fn resume(
     State(rt): State<Arc<Runtime>>,
@@ -163,6 +164,11 @@ pub(crate) struct Replay {
     /// record. A terminal without one (cancel, shutdown, expiry, a lost producer) closes the
     /// body abnormally, so the client never sees a clean end of an incomplete response.
     ended: Option<bool>,
+    /// The index publication's gate: the response's `done` is encoded only once it opens, so
+    /// no client sees a completed response whose id does not resolve yet.
+    gate: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The live attempt's publication, reserved when the attempt reaches `done` uncommitted.
+    publication: Option<Arc<Publication>>,
 }
 
 impl Replay {
@@ -171,6 +177,7 @@ impl Replay {
             output,
             mut response,
             mut request,
+            shown,
         } = attached;
         let (reader, mut first, mut records) = streams.with_store(|store| {
             Ok::<_, ck_stream::Error>((
@@ -187,25 +194,35 @@ impl Replay {
             media: &media,
             operation: output.operation,
         };
-        let egress = ProtocolEgress::new(output, &mut response, identity, view)?;
+        let egress = ProtocolEgress::new(output, &mut response, identity, view, shown.id)?;
         Ok(Self {
             response,
             reader,
             egress,
             units: Units::new(output.framing, cursor),
             ended: None,
+            gate: shown.gate,
+            publication: None,
         })
     }
 
     /// Live delivery of the response stream `response`, encoded by `egress` from the zero
-    /// cursor.
-    pub(crate) fn live(response: Writer, reader: Reader, egress: ProtocolEgress, framing: Framing) -> Self {
+    /// cursor. `publication` is the attempt's index publication, if its turn is indexed.
+    pub(crate) fn live(
+        response: Writer,
+        reader: Reader,
+        egress: ProtocolEgress,
+        framing: Framing,
+        publication: Option<Arc<Publication>>,
+    ) -> Self {
         Self {
             response,
             reader,
             egress,
             units: Units::new(framing, Cursor::start(framing)),
             ended: None,
+            gate: publication.as_ref().map(|publication| publication.gate()),
+            publication,
         }
     }
 
@@ -218,6 +235,14 @@ impl Replay {
             let lease = match self.reader.next().await {
                 Some(Read::Record(lease)) if lease.record().kind == Kind::Error as u32 => {
                     return Err(Uncommitted::Error);
+                }
+                // A buffered body commits at its `done`: its slot is reserved before it.
+                Some(Read::Record(lease)) if lease.record().kind == Kind::Done as u32 => {
+                    if let Some(publication) = &self.publication {
+                        publication.reserve();
+                    }
+                    passed(&mut self.gate).await;
+                    lease
                 }
                 Some(Read::Record(lease)) => lease,
                 Some(Read::Terminal(terminal)) => return Err(Uncommitted::Terminal(terminal)),
@@ -283,6 +308,9 @@ impl Replay {
             }
             match self.reader.next().await {
                 Some(Read::Record(lease)) => {
+                    if lease.record().kind == Kind::Done as u32 {
+                        passed(&mut self.gate).await;
+                    }
                     let mut out = Vec::new();
                     let advanced = self.advance(lease, &mut out);
                     pending.extend(out);

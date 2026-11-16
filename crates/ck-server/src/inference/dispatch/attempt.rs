@@ -32,11 +32,13 @@ use ck_translate::codec::event::{Direction, Identity, LocalId};
 use ck_translate::codec::media::Registry;
 use ck_translate::codec::provenance::{self, Admission};
 use ck_translate::codec::{self, RequestView, ValidatedRequest};
+use futures_util::FutureExt;
 use tokio::sync::oneshot;
 
 use super::{Call, Fault, Trace};
 use crate::http::egress::{self, Failed};
 use crate::http::respond;
+use crate::inference::responses_state::Publication;
 use crate::inference::streams::{Exchange, Settled, Uncommitted};
 use crate::observability::usage_record::{Facts, Tracker};
 use crate::observability::usage_snapshot;
@@ -222,10 +224,20 @@ pub(super) async fn run<X: Arms>(
         }
     };
     arm.started += 1;
+    let publication = Publication::new(rt.streams(), &exchange, &response, producer);
+    exchange.publication = publication.clone();
     // From here the attempt's settlement runs on its own stream task, so a client that goes
     // away before commitment cannot drop the record or lose its final usage.
     let settled = exchange.attempt(response.allocator());
-    let (begun, settlement) = settle_spawn(rt, usage, lease, upstream, response.allocator(), reader, settled);
+    let (begun, settlement) = settle_spawn(
+        rt,
+        usage,
+        lease,
+        upstream,
+        (response.allocator(), reader),
+        settled,
+        publication,
+    );
     let sink = match &settlement.sink {
         Some(sink) => sink.clone().with_capture(req.capture().clone()),
         None => req.usage.clone(),
@@ -336,18 +348,19 @@ struct Settlement {
     done: oneshot::Receiver<Result<(), ExecError>>,
 }
 
-/// §5.2 step 2 on a stream task: waits for the attempt's outcome, drains the usage reader to
-/// the stream's terminal, settles the tracker exactly once, releases `settled` so the
-/// exchange may discard the attempt's stream, and then reports the outcome. It runs whether
-/// or not the client is still there.
+/// §5.2 step 2 on a stream task: waits for the attempt's outcome, reports the stream's end to
+/// the index `publication`, drains the usage reader to the stream's terminal, settles the
+/// tracker exactly once, releases `settled` so the exchange may discard the attempt's stream,
+/// and then reports the outcome. It runs whether or not the client is still there; the index
+/// never waits for the usage reader.
 fn settle_spawn(
     rt: &Arc<Runtime>,
     usage: Option<&Arc<Facts>>,
     lease: &Lease,
     upstream: &str,
-    response: Writer,
-    reader: ck_stream::Reader,
+    (response, reader): (Writer, ck_stream::Reader),
     settled: Settled,
+    publication: Option<Arc<Publication>>,
 ) -> (oneshot::Sender<Begun>, Settlement) {
     let mut tracker = usage.map(|facts| {
         let mut tracker = Tracker::start(rt, facts, &lease.credential, upstream);
@@ -359,6 +372,8 @@ fn settle_spawn(
     let sink = tracker.as_ref().map(Tracker::sink);
     let (begun, started) = oneshot::channel();
     let (report, done) = oneshot::channel();
+    #[cfg(any(test, feature = "testing"))]
+    let holds = rt.clone();
     rt.streams().spawn(async move {
         let outcome = match started.await {
             Ok(Begun::Refused(error)) => Err(error),
@@ -371,6 +386,14 @@ fn settle_spawn(
             // The request went away inside `start`; the dropped writer ended the stream.
             Err(_) => Err(abandoned()),
         };
+        if let Some(publication) = publication {
+            #[cfg(any(test, feature = "testing"))]
+            holds.streams().holds.publication.pass().await;
+            let done = outcome.is_ok() && response.cancelled().now_or_never() == Some(Terminal::Done);
+            publication.ended(done);
+        }
+        #[cfg(any(test, feature = "testing"))]
+        holds.streams().holds.usage.pass().await;
         // Every outcome above left the stream with a terminal, so the reader ends.
         let (usage, facts) = usage_snapshot::read(response, reader).await;
         if let Some(mut tracker) = tracker {

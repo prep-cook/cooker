@@ -6,7 +6,7 @@ use crate::codec::{
     media::Registry,
     provenance::{Admission, Producer, admit, drop_foreign},
 };
-use crate::responses::history::{project, truncate};
+use crate::responses::history::{Stored, expand, project, truncate};
 use ck_stream::{Config, ManualClock, Store, Writer};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -46,7 +46,7 @@ impl Rig {
             ingress.finish(w).unwrap();
         };
         match source {
-            Source::Anthropic => {
+            Source::Anthropic | Source::AnthropicText => {
                 let mut i = crate::anthropic::response::Ingress::new(&mut w, id, op, mode, limit).unwrap();
                 feed(&mut i, &mut w);
             }
@@ -65,6 +65,61 @@ impl Rig {
             }
         }
         w
+    }
+
+    /// A request stream holding a Responses client's `body` as request records.
+    fn request(&self, body: Value) -> Writer {
+        let mut owner = self.store.create().unwrap();
+        let mut ingress = crate::responses::request::Ingress::new(
+            &mut owner,
+            &self.store,
+            identity(Direction::Request),
+            Operation::Generate,
+            1 << 20,
+        )
+        .unwrap();
+        ingress
+            .advance(&mut owner, &serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        ingress.finish(&mut owner, &crate::codec::ClientCapability).unwrap();
+        drop(ingress);
+        owner
+    }
+
+    /// The request stream `request` holds, rebuilt as the server does.
+    fn read(&self, request: &mut Writer) -> (Document, Registry) {
+        let mut records = self.store.reader(request.id(), 0).unwrap();
+        crate::codec::chat::request::read_request(request, &mut records).unwrap()
+    }
+
+    /// Expands the client request `body` over the stored turn `(request, response)` that
+    /// `producer` answered: the new request stream and its document.
+    fn expand(
+        &self,
+        body: Value,
+        request: &Writer,
+        response: &Writer,
+        producer: Producer<'_>,
+    ) -> (Writer, Document, Registry) {
+        let mut client = self.request(body);
+        let (doc, media) = self.read(&mut client);
+        let view = RequestView {
+            document: &doc,
+            media: &media,
+            operation: Operation::Generate,
+        };
+        let mut target = self.store.create().unwrap();
+        let (mut request, mut response) = (request.allocator(), response.allocator());
+        let mut request_records = self.store.reader(request.id(), 0).unwrap();
+        let mut response_records = self.store.reader(response.id(), 0).unwrap();
+        let stored = Stored {
+            request: (&mut request, &mut request_records),
+            response: (&mut response, &mut response_records),
+            producer,
+        };
+        expand(&mut target, identity(Direction::Request), view, stored).unwrap();
+        let (doc, media) = self.read(&mut target);
+        (target, doc, media)
     }
 
     /// A Responses client's canonical request, rebuilt from its request records as the server
@@ -120,6 +175,8 @@ enum Source {
     /// A Gemini answer whose signature rides on its text part.
     GeminiText,
     Compaction,
+    /// Anthropic signed thinking and text, without a call.
+    AnthropicText,
     /// A compaction whose item is Anthropic's signed block.
     SignedCompaction,
 }
@@ -143,6 +200,14 @@ impl Source {
                     {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {"a": 1}}
                 ],
                 "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 2}
+            }),
+            Self::AnthropicText => json!({
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "claude",
+                "content": [
+                    {"type": "thinking", "thinking": "hmm", "signature": "SIG/abc+=="},
+                    {"type": "text", "text": "hi"}
+                ],
+                "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 2}
             }),
             Self::Responses => json!({
                 "id": "resp_1", "object": "response", "model": "gpt", "status": "completed",
@@ -654,4 +719,58 @@ fn a_client_cannot_claim_a_producer() {
         let (doc, _) = crate::codec::chat::request::read_request(&mut owner, &mut records).unwrap();
         assert_eq!(admit(&doc, CODEX_B).unwrap(), Admission::Keep);
     }
+}
+
+/// A continuation expands to the new instructions, the stored request's input without its own
+/// instructions, the stored output, then the new input; the upstream gets no continuation and
+/// no storage, and a further expansion keeps each turn's provider members for its producer.
+#[test]
+fn expansion_puts_the_stored_turn_before_the_new_input() {
+    let rig = Rig::new();
+    let first = rig.request(json!({"model": "m", "instructions": "old rules", "input": "q1"}));
+    let answer = rig.stored(Source::AnthropicText, usize::MAX);
+    let continued = json!({
+        "model": "m", "instructions": "new rules", "input": "q2",
+        "previous_response_id": "resp_1", "store": true
+    });
+    let (mut second, mut doc, media) = rig.expand(continued, &first, &answer, CLAUDE_A);
+    let out = attempt(&mut second, &mut doc, &media, CODEX_A, To::Responses).unwrap();
+    assert_eq!(out["instructions"], json!("new rules"), "{out}");
+    assert_eq!(out["store"], json!(false), "{out}");
+    assert!(out.get("previous_response_id").is_none(), "{out}");
+    let input = out["input"].as_array().unwrap();
+    let text: Vec<String> = input.iter().map(|item| item["content"].to_string()).collect();
+    assert_eq!(input.len(), 3, "{out}");
+    assert!(
+        text[0].contains("q1") && text[1].contains("hi") && text[2].contains("q2"),
+        "{text:?}"
+    );
+
+    // A third turn continues the second, which another account answered: the first account
+    // still gets its signature back, and nobody else does.
+    let (second, _, _) = rig.expand(
+        json!({"model": "m", "input": "q2", "previous_response_id": "resp_1"}),
+        &first,
+        &answer,
+        CLAUDE_A,
+    );
+    let answer = rig.stored(Source::Chat, usize::MAX);
+    let third = json!({"model": "m", "input": "q3", "previous_response_id": "resp_2"});
+    for (producer, signed) in [(CLAUDE_A, true), (CLAUDE_B, false)] {
+        let (mut owner, mut doc, media) = rig.expand(third.clone(), &second, &answer, CODEX_A);
+        let out = attempt(&mut owner, &mut doc, &media, producer, To::Anthropic).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 5, "{out}");
+        assert_eq!(out.to_string().contains("SIG/abc+=="), signed, "{producer:?}: {out}");
+    }
+
+    // A compaction answer replaces the history before it.
+    let compacted = rig.stored(Source::Compaction, usize::MAX);
+    let next = json!({"model": "m", "input": "q2", "previous_response_id": "resp_c"});
+    let (mut owner, mut doc, media) = rig.expand(next, &first, &compacted, CODEX_A);
+    let out = attempt(&mut owner, &mut doc, &media, CODEX_A, To::Responses).unwrap();
+    let input = out["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2, "{out}");
+    assert_eq!(input[0]["encrypted_content"], json!("CMP=="), "{out}");
+    drop(second);
 }

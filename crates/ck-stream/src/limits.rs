@@ -122,6 +122,7 @@ impl Config {
             max_event_bytes: self.max_event_bytes,
             max_metadata_bytes: self.max_metadata_bytes,
             cache_ttl: self.cache_ttl,
+            header_slots: self.header_slots,
         })
     }
 }
@@ -134,6 +135,8 @@ pub struct Limits {
     pub max_event_bytes: usize,
     pub max_metadata_bytes: usize,
     pub cache_ttl: Duration,
+    /// Stream headers the pool holds at once: the most streams that can be live together.
+    pub header_slots: u32,
 }
 
 fn invalid(message: &'static str) -> io::Error {

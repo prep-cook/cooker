@@ -13,6 +13,7 @@ pub(crate) mod model_router;
 pub mod model_updater;
 pub(crate) mod models;
 pub(crate) mod openai;
+pub mod responses_state;
 pub(crate) mod sanitize;
 pub(crate) mod speech;
 pub mod streams;

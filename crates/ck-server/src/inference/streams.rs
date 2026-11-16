@@ -21,6 +21,7 @@ use ck_core::exec::Caller;
 use ck_stream::{Store, Terminal, Writer};
 
 use crate::http::egress::Output;
+use crate::inference::responses_state::{Index, Publication, Turn};
 
 pub use cursor::{Cursor, Units};
 pub use protocol::ProtocolEgress;
@@ -99,6 +100,11 @@ pub struct Exchange {
     /// The in-flight attempt: an allocation handle on its response stream and its settlement.
     attempt: Option<(Writer, Arc<Mutex<Settlement>>)>,
     committed: bool,
+    /// A Responses exchange's response id and whether it is indexed
+    /// (`responses_state::begin`).
+    pub turn: Option<Turn>,
+    /// The in-flight attempt's index publication, which delivery reserves at commitment.
+    pub(crate) publication: Option<Arc<Publication>>,
 }
 
 /// Streams an attempt's settlement discards once it is done, or at once when it already is.
@@ -146,6 +152,8 @@ impl Exchange {
             request: store.create()?,
             attempt: None,
             committed: false,
+            turn: None,
+            publication: None,
         })
     }
 
@@ -172,6 +180,10 @@ impl Exchange {
             output: self.output,
             response,
             request: self.request.allocator(),
+            shown: Shown {
+                id: self.turn.map(|turn| turn.id.text()),
+                gate: self.publication.as_ref().map(|publication| publication.gate()),
+            },
         }
     }
 
@@ -217,6 +229,15 @@ pub struct StreamHandle {
     /// Allocation handle on the request stream, which the response stream holds. Resume
     /// rebuilds the request view from its records (`codec::chat::request::read_request`).
     pub request: Writer,
+    pub(crate) shown: Shown,
+}
+
+/// What every delivery of a committed response shows alike, live or resumed: the Responses id
+/// the exchange issued, and the index publication's gate its `done` waits for.
+#[derive(Clone, Default)]
+pub(crate) struct Shown {
+    pub id: Option<ck_translate::codec::event::LocalId>,
+    pub gate: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl StreamHandle {
@@ -233,6 +254,7 @@ pub(crate) struct Attached {
     pub output: Output,
     pub response: Writer,
     pub request: Writer,
+    pub shown: Shown,
 }
 
 /// The runtime's stream store, committed handles and stream tasks ([`crate::Runtime::streams`]).
@@ -241,6 +263,11 @@ pub struct Registry {
     /// Shared so an attempt can hold the store across its awaits (`ck_exec::types::Attempt`).
     store: RwLock<Option<Arc<Store>>>,
     handles: Mutex<Handles>,
+    /// Committed Responses turns a later request may continue.
+    responses: Arc<Index>,
+    /// Finalizer steps a test holds.
+    #[cfg(any(test, feature = "testing"))]
+    pub holds: crate::testing::Holds,
     tasks: tokio_util::task::TaskTracker,
     closed: AtomicBool,
 }
@@ -287,6 +314,11 @@ impl Registry {
         Ok(slot.as_ref().expect("opened above").clone())
     }
 
+    /// The index of committed Responses turns.
+    pub(crate) fn responses(&self) -> &Arc<Index> {
+        &self.responses
+    }
+
     /// Registers a committed handle under its id. After shutdown began, its response stops
     /// with `Shutdown` instead.
     pub fn register(&self, mut handle: StreamHandle) {
@@ -314,6 +346,7 @@ impl Registry {
             output: handle.output,
             response: handle.response.allocator(),
             request: handle.request.allocator(),
+            shown: handle.shown.clone(),
         })
     }
 
@@ -413,6 +446,7 @@ mod tests {
                 },
                 response: response.allocator(),
                 request: request.allocator(),
+                shown: Shown::default(),
             });
         };
         for _ in 0..64 {
