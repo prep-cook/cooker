@@ -53,6 +53,12 @@ pub fn expand(target: &mut Writer, identity: Identity, new: RequestView<'_>, sto
 
     let messages = doc.required(root, "messages")?;
     let current: Vec<usize> = doc.children(messages)?.collect();
+    // Each turn numbers its replay entries in its own list; name them by node before the lists
+    // merge, then number them again in the final message order.
+    let mut named = Vec::new();
+    replayed(&doc, &current, doc.member(x, "replay")?, &mut named)?;
+    let stored_messages: Vec<usize> = doc.children(doc.required(earlier, "messages")?)?.collect();
+    replayed(&doc, &stored_messages, doc.member(earlier_x, "replay")?, &mut named)?;
     for &message in &current {
         doc.detach(messages, message)?;
     }
@@ -66,11 +72,15 @@ pub fn expand(target: &mut Writer, identity: Identity, new: RequestView<'_>, sto
         }
     }
     adopt(&mut doc, earlier, earlier_x, x, messages)?;
+    let before = doc.children(messages)?.count();
     let (response, reader) = stored.response;
     super::project(target, &mut doc, response, reader, stored.producer)?;
+    let projected: Vec<usize> = doc.children(messages)?.skip(before).collect();
+    replayed(&doc, &projected, doc.member(x, "replay")?, &mut named)?;
     for message in input {
         doc.append(messages, message)?;
     }
+    renumber(&mut doc, x, messages, &named)?;
 
     doc.remove(x, "session")?;
     match doc.member(root, "store")? {
@@ -88,6 +98,73 @@ pub fn expand(target: &mut Writer, identity: Identity, new: RequestView<'_>, sto
     }
     provenance::bindings(&mut doc, target)?;
     publish(target, identity, &doc, new)
+}
+
+/// Appends `(part, entry)` for every content part of `messages` that names an entry of `replay`
+/// by its `replay_index`.
+fn replayed(doc: &Document, messages: &[usize], replay: Option<usize>, out: &mut Vec<(usize, usize)>) -> Result<()> {
+    for &message in messages {
+        let Some(content) = doc.member(message, "content")? else {
+            continue;
+        };
+        for part in doc.children(content)? {
+            if !matches!(doc.node(part)?.value, Value::Object) {
+                continue;
+            }
+            if let Some(index) = doc.member(part, "replay_index")? {
+                let index = usize::try_from(doc.unsigned(index)?).map_err(|_| Error::Schema)?;
+                let list = replay.ok_or(Error::Schema)?;
+                out.push((part, doc.children(list)?.nth(index).ok_or(Error::Schema)?));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Orders `x_ck.replay` by the final position of the message each entry describes, keeping the
+/// order within a message, and points every part in `named` at its entry's new position. The
+/// request egress walks the entries once in increasing order and checks each one's binding.
+fn renumber(doc: &mut Document, x: usize, messages: usize, named: &[(usize, usize)]) -> Result<()> {
+    let Some(replay) = doc.member(x, "replay")? else {
+        return Ok(());
+    };
+    let position: std::collections::HashMap<usize, usize> =
+        doc.children(messages)?.enumerate().map(|(i, m)| (m, i)).collect();
+    let mut entries = Vec::new();
+    for entry in doc.children(replay)? {
+        let mut key = usize::MAX;
+        if let Some((mut node, _)) = doc.origin(entry)? {
+            while let Some(parent) = doc.node(node)?.parent {
+                if parent == messages {
+                    key = position.get(&node).copied().unwrap_or(usize::MAX);
+                    break;
+                }
+                node = parent;
+            }
+        }
+        entries.push((key, entry));
+    }
+    entries.sort_by_key(|&(key, _)| key);
+    let mut index = std::collections::HashMap::with_capacity(entries.len());
+    for (i, &(_, entry)) in entries.iter().enumerate() {
+        doc.detach(replay, entry)?;
+        index.insert(entry, i);
+    }
+    for &(_, entry) in &entries {
+        doc.append(replay, entry)?;
+    }
+    for &(part, entry) in named {
+        match index.get(&entry) {
+            Some(&i) => {
+                let field = doc.required(part, "replay_index")?;
+                doc.replace(field, Value::Unsigned(i as u64))?;
+            }
+            // A part of the stored instructions left with its message.
+            None if !provenance::attached(doc, part)? => {}
+            None => return Err(Error::Schema),
+        }
+    }
+    Ok(())
 }
 
 /// Copies the canonical request `from` into `doc` as a detached subtree of `owner`.

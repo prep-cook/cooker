@@ -727,25 +727,53 @@ fn a_client_cannot_claim_a_producer() {
 #[test]
 fn expansion_puts_the_stored_turn_before_the_new_input() {
     let rig = Rig::new();
+    // (case, stored request, stored answer and its producer, new request, upload instructions,
+    // upload input summarised by `items`)
+    let rows = [
+        (
+            "the new instructions replace the stored ones",
+            json!({"model": "m", "instructions": "old rules", "input": "q1"}),
+            (Source::AnthropicText, CLAUDE_A),
+            json!({"model": "m", "instructions": "new rules", "input": "q2", "previous_response_id": "resp_1", "store": true}),
+            json!("new rules"),
+            vec!["user:q1", "assistant:hi", "user:q2"],
+        ),
+        (
+            "encrypted reasoning in both turns keeps its order",
+            json!({"model": "m", "input": [
+                {"type": "reasoning", "summary": [], "encrypted_content": "OLD=="},
+                {"role": "user", "content": "q1"}
+            ]}),
+            (Source::Responses, CODEX_A),
+            json!({"model": "m", "previous_response_id": "resp_1", "input": [
+                {"type": "reasoning", "summary": [], "encrypted_content": "NEW=="},
+                {"role": "user", "content": "q2"}
+            ]}),
+            Value::Null,
+            vec![
+                "reasoning:OLD==",
+                "user:q1",
+                "reasoning:ENC==",
+                "assistant:hi",
+                "function_call:f",
+                "reasoning:NEW==",
+                "user:q2",
+            ],
+        ),
+    ];
+    for (case, stored, (source, producer), continued, instructions, items) in rows {
+        let first = rig.request(stored);
+        let answer = rig.stored(source, usize::MAX);
+        let (mut second, mut doc, media) = rig.expand(continued, &first, &answer, producer);
+        let out = attempt(&mut second, &mut doc, &media, CODEX_A, To::Responses).unwrap();
+        assert_eq!(out["instructions"], instructions, "{case}: {out}");
+        assert_eq!(out["store"], json!(false), "{case}: {out}");
+        assert!(out.get("previous_response_id").is_none(), "{case}: {out}");
+        assert_eq!(summary(&out["input"]), items, "{case}: {out}");
+    }
+
     let first = rig.request(json!({"model": "m", "instructions": "old rules", "input": "q1"}));
     let answer = rig.stored(Source::AnthropicText, usize::MAX);
-    let continued = json!({
-        "model": "m", "instructions": "new rules", "input": "q2",
-        "previous_response_id": "resp_1", "store": true
-    });
-    let (mut second, mut doc, media) = rig.expand(continued, &first, &answer, CLAUDE_A);
-    let out = attempt(&mut second, &mut doc, &media, CODEX_A, To::Responses).unwrap();
-    assert_eq!(out["instructions"], json!("new rules"), "{out}");
-    assert_eq!(out["store"], json!(false), "{out}");
-    assert!(out.get("previous_response_id").is_none(), "{out}");
-    let input = out["input"].as_array().unwrap();
-    let text: Vec<String> = input.iter().map(|item| item["content"].to_string()).collect();
-    assert_eq!(input.len(), 3, "{out}");
-    assert!(
-        text[0].contains("q1") && text[1].contains("hi") && text[2].contains("q2"),
-        "{text:?}"
-    );
-
     // A third turn continues the second, which another account answered: the first account
     // still gets its signature back, and nobody else does.
     let (second, _, _) = rig.expand(
@@ -773,4 +801,25 @@ fn expansion_puts_the_stored_turn_before_the_new_input() {
     assert_eq!(input.len(), 2, "{out}");
     assert_eq!(input[0]["encrypted_content"], json!("CMP=="), "{out}");
     drop(second);
+}
+
+/// One line per Responses input item: its kind and its text, encrypted content or call name.
+fn summary(input: &Value) -> Vec<String> {
+    input
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| match item["type"].as_str() {
+            Some("reasoning") => format!("reasoning:{}", item["encrypted_content"].as_str().unwrap()),
+            Some("function_call") => format!("function_call:{}", item["name"].as_str().unwrap()),
+            _ => {
+                let text = match &item["content"] {
+                    Value::String(text) => text.clone(),
+                    Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
+                    other => other.to_string(),
+                };
+                format!("{}:{text}", item["role"].as_str().unwrap())
+            }
+        })
+        .collect()
 }
