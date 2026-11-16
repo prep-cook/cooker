@@ -995,9 +995,9 @@ enum Early {
 }
 
 /// An answer that ends before its body does fails the attempt with exactly one error on
-/// every client protocol. Rows: scenario, cut, and the input usage the upstream reported
-/// before the cut, which stays published (checked where the client protocol publishes
-/// usage as it arrives).
+/// every client protocol. Rows: scenario, cut, and the input usage the canonical stream
+/// holds afterwards: what the upstream reported in complete lines before the cut, or none
+/// when it reported nothing there. No estimate fills the gap.
 #[tokio::test]
 async fn an_upstream_body_that_ends_early_fails_the_attempt() {
     let rows = [
@@ -1005,6 +1005,8 @@ async fn an_upstream_body_that_ends_early_fails_the_attempt() {
         ("openai_stream", Early::InLastLine, None),
         ("responses_stream", Early::InLastLine, None),
         ("claude_stream_claude_model", Early::InLastLine, None),
+        ("claude_stream_claude_model", Early::AfterFirstEvent, None),
+        ("claude_stream_gemini_model", Early::InLastLine, Some(5)),
         ("gemini_stream", Early::AfterFirstEvent, Some(5)),
         ("gemini_stream", Early::Short, Some(5)),
     ];
@@ -1033,9 +1035,7 @@ async fn an_upstream_body_that_ends_early_fails_the_attempt() {
             .filter(|r| r.starts_with(b"event: x_ck.error\n"))
             .count();
         assert_eq!(errors, 1, "{name} {early:?}: one error record");
-        if let Some(kept) = kept {
-            let input = usage(&published).map(|u| u["input_tokens"].as_u64().unwrap());
-            assert_eq!(input, Some(kept), "{name} {early:?}: the reported input usage stays");
-        }
+        let input = usage(&published).and_then(|u| u["input_tokens"].as_u64());
+        assert_eq!(input, kept, "{name} {early:?}: published input usage");
     }
 }

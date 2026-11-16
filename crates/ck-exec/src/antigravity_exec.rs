@@ -276,7 +276,7 @@ impl AntigravityExecutor {
             usage: UsageSink::new(Arc::new(RequestSide(client.usage.clone())))
                 .with_capture(client.usage.capture().clone()),
         };
-        let answer = AntigravityExecutor::execute(self, attempt.credential, exec, attempt.cfg).await?;
+        let answer = self.execute_reported(attempt.credential, exec, attempt.cfg).await?;
         let (mode, body): (BodyMode, Body) = match answer.body {
             // The Chat handler, not the Antigravity steps, ends a clean Chat stream with
             // `[DONE]` (`ck-server/src/inference/openai.rs`, `ChatSse::end`; Go

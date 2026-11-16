@@ -887,6 +887,13 @@ impl Output {
         self
     }
 
+    /// No Claude input-token estimate or zero default: a canonical attempt accounts the
+    /// usage in `message_start`, so it carries only counts the upstream reported.
+    pub(crate) fn reported_claude_usage(mut self) -> Self {
+        self.claude = self.claude.reported_only();
+        self
+    }
+
     /// helps.EndApplyPatchStream, then the client side's pending frames: the end of a
     /// stream that feeds no `[DONE]`.
     pub(crate) fn end(&mut self) -> Emit {
