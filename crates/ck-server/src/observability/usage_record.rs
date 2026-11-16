@@ -3102,6 +3102,15 @@ mod tests {
                 serde_json::json!({"input_tokens":4,"output_tokens":1,"total_tokens":5}),
                 "",
             ),
+            // A cache count without input, output or total is still a reported count.
+            (
+                "xai",
+                false,
+                body(r#"{"input_tokens_details":{"cached_tokens":3}}"#),
+                Value::Null,
+                serde_json::json!({"cached_tokens":3,"cache_read_tokens":3}),
+                "",
+            ),
             // Partial, null and non-numeric token counts: only the numbers are recorded, and only
             // they enter a derived total or the breakdown.
             (
@@ -3172,15 +3181,18 @@ mod tests {
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect();
             assert_eq!(Value::Object(counts), tokens, "{upstream}");
-            // The breakdown holds only recorded counts: its total and cache reads are the
-            // record's, or zero when unreported.
+            // The breakdown holds only recorded counts: its total is the record's, or zero when
+            // unreported, and with both input and output so are its cache reads.
             let breakdown = &record["token_breakdown"];
             let recorded = |name: &str| tokens.get(name).cloned().unwrap_or(Value::from(0));
-            assert_eq!(
-                (&breakdown["total_tokens"], &breakdown["input"]["cache_read_tokens"]),
-                (&recorded("total_tokens"), &recorded("cache_read_tokens")),
-                "{upstream}"
-            );
+            assert_eq!(breakdown["total_tokens"], recorded("total_tokens"), "{upstream}");
+            if tokens.get("input_tokens").is_some() && tokens.get("output_tokens").is_some() {
+                assert_eq!(
+                    breakdown["input"]["cache_read_tokens"],
+                    recorded("cache_read_tokens"),
+                    "{upstream}"
+                );
+            }
             // Without both input and output the breakdown classifies nothing.
             if tokens.get("input_tokens").is_none() || tokens.get("output_tokens").is_none() {
                 let breakdown = &record["token_breakdown"];

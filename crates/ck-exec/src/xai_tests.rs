@@ -6,6 +6,7 @@
 //! values come only from Go.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ck_core::exec::Caller;
 use serde_json::Value;
@@ -539,24 +540,49 @@ async fn speech_errors_keep_go_scope() {
 /// reports a value, an explicit zero included, and never again (E-Q13), while another job is
 /// charged on its own. A poll of a job the process neither created nor charged, such as one
 /// created before a restart, is refused with a request-scoped 404 before anything is sent. No
-/// idempotency key reaches xAI, so replaying a create cannot bring back a charged job.
+/// idempotency key reaches xAI, so replaying a create cannot bring back a charged job. A poll is
+/// settled by the charge state it was admitted with: a job charged when the poll was admitted is
+/// never charged again, even if its record expires while the poll is in flight, and an expired
+/// job is refused.
 #[tokio::test]
 async fn media_usage_is_charged_once_per_response_or_job() {
     let cfg = Config::default();
     let target: Arc<Mutex<String>> = Arc::default();
+    // The jobs' clock: its offset from `base` now, and the offset it moves to when the upstream
+    // request is sent, after admission and before settlement.
+    let base = std::time::Instant::now();
+    let time: Arc<Mutex<(Duration, Option<Duration>)>> = Arc::default();
     // Two processes in turn: the second starts with none of the first's jobs.
     let processes: [XaiExecutor; 2] = std::array::from_fn(|_| {
-        let target = target.clone();
-        XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &target.lock().unwrap()))
+        let (target, sent) = (target.clone(), time.clone());
+        let mut executor = XaiExecutor::default().with_url_rewrite(move |url| {
+            let mut time = sent.lock().unwrap();
+            if let Some(next) = time.1.take() {
+                time.0 = next;
+            }
+            redirect(url, &target.lock().unwrap())
+        });
+        let now = time.clone();
+        executor.jobs = crate::xai_media::VideoJobs::with_clock(Arc::new(move || base + now.lock().unwrap().0));
+        executor
     });
     let charged =
         r#"{"status":"done","video":{"url":"https://v.example/out.mp4"},"usage":{"cost_in_usd_ticks":5000000000}}"#;
     let image = r#"{"data":[{"b64_json":"AAAA"}],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3,"cost_in_usd_ticks":200000000}}"#;
     const CREATE: &str = "/v1/videos/generations";
     let poll = |id: &str| (format!("/v1/videos/{id}"), format!(r#"{{"request_id":"{id}"}}"#));
-    // (process, op, path, payload, upstream body, expected): `Some(charged)` for a 200 and
-    // whether its usage was reported, `None` for a refusal that sends nothing upstream.
-    type Row = (usize, &'static str, String, String, String, Option<bool>);
+    // (process, op, path, payload, upstream body, expected, clock): `Some(charged)` for a 200
+    // and whether its usage was reported, `None` for a refusal that sends nothing upstream; the
+    // clock's seconds at admission and at the upstream send, when the row sets them.
+    type Row = (
+        usize,
+        &'static str,
+        String,
+        String,
+        String,
+        Option<bool>,
+        Option<(u64, u64)>,
+    );
     let mut rows: Vec<Row> = vec![
         (
             0,
@@ -565,6 +591,7 @@ async fn media_usage_is_charged_once_per_response_or_job() {
             r#"{"prompt":"a"}"#.into(),
             image.into(),
             Some(true),
+            None,
         ),
         (
             0,
@@ -573,6 +600,7 @@ async fn media_usage_is_charged_once_per_response_or_job() {
             r#"{"prompt":"a"}"#.into(),
             image.into(),
             Some(true),
+            None,
         ),
         (
             0,
@@ -581,6 +609,17 @@ async fn media_usage_is_charged_once_per_response_or_job() {
             r#"{"prompt":"a"}"#.into(),
             r#"{"data":[{"b64_json":"AAAA"}]}"#.into(),
             Some(false),
+            None,
+        ),
+        // A cache count without input, output or total is still a reported count.
+        (
+            0,
+            "images",
+            "/v1/images/generations".into(),
+            r#"{"prompt":"a"}"#.into(),
+            r#"{"data":[{"b64_json":"AAAA"}],"usage":{"input_tokens_details":{"cached_tokens":3}}}"#.into(),
+            Some(true),
+            None,
         ),
     ];
     let mut create = |process: usize, body: &str| {
@@ -591,9 +630,10 @@ async fn media_usage_is_charged_once_per_response_or_job() {
             r#"{"prompt":"a"}"#.into(),
             body.into(),
             Some(false),
+            None,
         ));
     };
-    for id in ["vid_9", "vid_10", "vid_11", "vid_12"] {
+    for id in ["vid_9", "vid_10", "vid_11", "vid_12", "vid_30", "vid_31"] {
         create(0, &format!(r#"{{"request_id":"{id}"}}"#));
     }
     // A create answered with `id` instead of `request_id`.
@@ -602,41 +642,55 @@ async fn media_usage_is_charged_once_per_response_or_job() {
     // A replay of vid_9's create, with its idempotency key, after the restart. The key never
     // reaches xAI, which documents none, so the upstream answers with a new job.
     create(1, r#"{"request_id":"vid_21"}"#);
-    for (process, id, body, expected) in [
-        (0, "vid_9", r#"{"status":"pending","usage":null}"#, Some(false)),
-        (0, "vid_9", charged, Some(true)),
-        (0, "vid_9", charged, Some(false)),
-        (0, "vid_10", charged, Some(true)),
+    const DAY: u64 = 24 * 3600;
+    for (process, id, body, expected, clock) in [
+        (0, "vid_9", r#"{"status":"pending","usage":null}"#, Some(false), None),
+        (0, "vid_9", charged, Some(true), None),
+        (0, "vid_9", charged, Some(false), None),
+        (0, "vid_10", charged, Some(true), None),
         // A usage without a billed value is not the job's report; its later charge still counts.
-        (0, "vid_11", r#"{"status":"pending","usage":{}}"#, Some(false)),
+        (0, "vid_11", r#"{"status":"pending","usage":{}}"#, Some(false), None),
         (
             0,
             "vid_11",
             r#"{"status":"pending","usage":{"input_tokens_details":{},"cost_in_usd_ticks":null}}"#,
             Some(false),
+            None,
         ),
-        (0, "vid_11", charged, Some(true)),
+        (0, "vid_11", charged, Some(true), None),
         // An explicit zero charge is a report.
         (
             0,
             "vid_12",
             r#"{"status":"done","usage":{"cost_in_usd_ticks":0}}"#,
             Some(true),
+            None,
         ),
-        (0, "vid_13", charged, Some(true)),
+        (0, "vid_13", charged, Some(true), None),
         // Never created through this process.
-        (0, "vid_99", charged, None),
+        (0, "vid_99", charged, None, None),
         // After a restart: the charged job is unknown and refused; a new job is charged.
-        (1, "vid_9", charged, None),
-        (1, "vid_11", charged, None),
-        (1, "vid_20", charged, Some(true)),
-        (1, "vid_21", charged, Some(true)),
-        (1, "vid_9", charged, None),
+        (1, "vid_9", charged, None, None),
+        (1, "vid_11", charged, None, None),
+        (1, "vid_20", charged, Some(true), None),
+        (1, "vid_21", charged, Some(true), None),
+        (1, "vid_9", charged, None, None),
+        // A day after creation and charge: vid_30 was charged at second 0. A poll admitted at
+        // 86,399 s and answered at 86,401 s settles as charged; the next poll finds it expired.
+        // vid_31, created at second 0 and never charged, is charged once by such a poll.
+        (0, "vid_30", charged, Some(true), None),
+        (0, "vid_30", charged, Some(false), Some((DAY - 1, DAY + 1))),
+        (0, "vid_31", charged, Some(true), Some((DAY - 1, DAY + 1))),
+        (0, "vid_30", charged, None, Some((DAY + 2, DAY + 2))),
+        (0, "vid_31", charged, Some(false), Some((DAY + 2, DAY + 2))),
     ] {
         let (path, payload) = poll(id);
-        rows.push((process, "videos", path, payload, body.into(), expected));
+        rows.push((process, "videos", path, payload, body.into(), expected, clock));
     }
-    for (process, op, path, payload, body, expected) in rows {
+    for (process, op, path, payload, body, expected, clock) in rows {
+        if let Some((admitted, sent)) = clock {
+            *time.lock().unwrap() = (Duration::from_secs(admitted), Some(Duration::from_secs(sent)));
+        }
         let mock = Mock::start(
             &serde_json::json!({"status": 200, "headers": [["Content-Type", "application/json"]], "body": body}),
         )

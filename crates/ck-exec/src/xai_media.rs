@@ -3,7 +3,7 @@
 //! the routes onto it.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -71,7 +71,7 @@ impl XaiExecutor {
             IMAGES_GENERATIONS
         };
         let payload = media_rules(&req, cfg.as_ref(), request::normalize_image_refs(req.body.to_vec()));
-        self.media(credential, &req, cfg.as_ref(), wreq::Method::POST, path, payload, false)
+        self.media(credential, &req, cfg.as_ref(), wreq::Method::POST, path, payload, None)
             .await
     }
 
@@ -96,10 +96,15 @@ impl XaiExecutor {
             None if !request_id.is_empty() => (wreq::Method::GET, format!("/videos/{}", path_escape(&request_id))),
             None => (wreq::Method::POST, VIDEOS_GENERATIONS.to_owned()),
         };
-        if method == wreq::Method::GET && !self.jobs.known(&request_id) {
-            return Err(unknown_job(&request_id));
-        }
-        self.media(credential, &req, cfg.as_ref(), method, &path, payload, true)
+        let job = if method == wreq::Method::GET {
+            let Some(charged) = self.jobs.admit(&request_id) else {
+                return Err(unknown_job(&request_id));
+            };
+            VideoJob::Poll(request_id, charged)
+        } else {
+            VideoJob::Create
+        };
+        self.media(credential, &req, cfg.as_ref(), method, &path, payload, Some(job))
             .await
     }
 
@@ -115,11 +120,10 @@ impl XaiExecutor {
         method: wreq::Method,
         path: &str,
         payload: Vec<u8>,
-        video: bool,
+        video: Option<VideoJob>,
     ) -> Result<ExecResponse, ExecError> {
         let logged = payload.as_slice();
         let body = (method == wreq::Method::POST).then(|| payload.clone());
-        let poll = method == wreq::Method::GET;
         let (token, _) = creds(credential);
         let headers = plain_headers(credential, &token, false, "", req);
         // xAI documents no idempotency key for video creates (https://docs.x.ai/openapi.json,
@@ -135,22 +139,24 @@ impl XaiExecutor {
             return Err(error);
         }
         // A video is a job: its usage is that of the job, which a poll repeats. A create names
-        // it as the server's `video_id` reads it.
-        let job = video.then(|| {
-            if poll {
-                return text(&gj::get(&payload, "request_id"));
+        // it as the server's `video_id` reads it; a poll settles with the charge state it was
+        // admitted with, never one looked up again after the response.
+        let (job, charged) = match video {
+            None => (String::new(), false),
+            Some(VideoJob::Poll(job, charged)) => (job, charged),
+            Some(VideoJob::Create) => {
+                let id = text(&gj::get(&data, "request_id"));
+                let job = if id.trim().is_empty() {
+                    text(&gj::get(&data, "id"))
+                } else {
+                    id
+                };
+                let charged = self.jobs.created(&job);
+                (job, charged)
             }
-            let id = text(&gj::get(&data, "request_id"));
-            let job = if id.trim().is_empty() {
-                text(&gj::get(&data, "id"))
-            } else {
-                id
-            };
-            self.jobs.created(&job);
-            job
-        });
+        };
         if req.usage.enabled() {
-            if reports_usage(&data) && job.is_none_or(|job| self.jobs.first_charge(&job)) {
+            if reports_usage(&data) && self.jobs.settle(&job, charged) {
                 // The top-level usage of an image or video body, read as a Responses body's.
                 req.usage.response_body(Format::Codex, &data);
             } else {
@@ -168,66 +174,123 @@ impl XaiExecutor {
     }
 }
 
-/// The usage members accounting records from an image or video body: the charge and the token
-/// counts (xAI images and videos reference).
+/// The usage members accounting records from an image or video body: the charge, and every
+/// token count the server's Responses usage reader records (xAI images and videos reference).
 const BILLED: &[&str] = &[
     "usage.cost_in_usd_ticks",
     "usage.cost_in_nano_usd",
+    "usage.prompt_tokens",
     "usage.input_tokens",
+    "usage.completion_tokens",
     "usage.output_tokens",
     "usage.total_tokens",
+    "usage.prompt_tokens_details.cached_tokens",
+    "usage.input_tokens_details.cached_tokens",
+    "usage.prompt_tokens_details.cache_write_tokens",
+    "usage.prompt_tokens_details.cache_creation_tokens",
+    "usage.input_tokens_details.cache_write_tokens",
+    "usage.input_tokens_details.cache_creation_tokens",
+    "usage.completion_tokens_details.reasoning_tokens",
+    "usage.output_tokens_details.reasoning_tokens",
 ];
 
-/// Whether `body` reports a billed value: a number, zero included, in one of [`BILLED`]. An
-/// absent, null or empty usage reports nothing, so it does not spend a job's charge (E-Q13).
+/// Whether `body` reports a billed value: an integer, zero included, in one of [`BILLED`]. An
+/// absent, null, non-integer or empty usage reports nothing, so it does not spend a job's charge
+/// (E-Q13).
 fn reports_usage(body: &[u8]) -> bool {
-    BILLED.iter().any(|path| gj::get(body, path).kind == gj::Kind::Number)
+    BILLED.iter().any(|path| {
+        let value = gj::get(body, path);
+        let raw = std::str::from_utf8(value.raw()).unwrap_or_default();
+        value.kind == gj::Kind::Number && (raw.parse::<u64>().is_ok() || raw.parse::<i64>().is_ok())
+    })
 }
 
 /// How long a job is remembered: well past the binding TTL a client polls within.
 const JOB_TTL: Duration = Duration::from_secs(24 * 3600);
 
+/// What a video request is to its job: a create, whose response names the job, or a poll of a
+/// job admitted with its charge state.
+pub(crate) enum VideoJob {
+    Create,
+    Poll(String, bool),
+}
+
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 /// The video jobs this process created or charged (E-Q13): a job is charged at the first poll
 /// that reports usage and never again, however often it is polled after. A job missing here may
 /// already have been charged by an earlier process, so its poll is refused rather than risk a
-/// second charge.
+/// second charge. Admission reads a job's charge state once and settlement uses it, so expiry
+/// can only refuse a later poll, never charge an admitted one again.
 // ponytail: process memory, so a job created before a restart cannot be polled through cooker.
 // No store on this path outlives the process: the usage queue is in memory, and SQLite holds
 // configuration and credentials only. A durable job ledger (F06-1) lifts this; its store awaits
 // an owner decision.
-#[derive(Default)]
-pub(crate) struct VideoJobs(Mutex<HashMap<String, (bool, Instant)>>);
+pub(crate) struct VideoJobs {
+    jobs: Mutex<HashMap<String, (bool, Instant)>>,
+    clock: Clock,
+}
+
+impl Default for VideoJobs {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(Instant::now))
+    }
+}
 
 impl VideoJobs {
-    fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<String, (bool, Instant)>> {
-        let mut jobs = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = Instant::now();
-        jobs.retain(|_, (_, at)| now.duration_since(*at) < JOB_TTL);
-        jobs
-    }
-
-    /// Records a job this process created, keeping its charge if it already has one.
-    pub(crate) fn created(&self, job: &str) {
-        let job = job.trim();
-        if !job.is_empty() {
-            self.jobs().entry(job.to_owned()).or_insert((false, Instant::now()));
+    pub(crate) fn with_clock(clock: Clock) -> Self {
+        Self {
+            jobs: Mutex::default(),
+            clock,
         }
     }
 
-    /// Whether this process created or charged `job`.
-    fn known(&self, job: &str) -> bool {
-        self.jobs().contains_key(job.trim())
+    /// The live jobs: records older than [`JOB_TTL`] are dropped first.
+    fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, (bool, Instant)>> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        jobs.retain(|_, (_, at)| now.saturating_duration_since(*at) < JOB_TTL);
+        jobs
     }
 
-    /// Marks `job` charged; false when it already was. A job without an ID cannot be matched
-    /// with a later poll, so its every report is charged.
-    fn first_charge(&self, job: &str) -> bool {
+    /// Records a job this process created and returns its charge state, keeping a charge it
+    /// already has.
+    pub(crate) fn created(&self, job: &str) -> bool {
+        let job = job.trim();
+        if job.is_empty() {
+            return false;
+        }
+        let now = (self.clock)();
+        self.live().entry(job.to_owned()).or_insert((false, now)).0
+    }
+
+    /// A poll's admission: the job's charge state, or `None` when this process neither created
+    /// nor charged it, or its record expired.
+    fn admit(&self, job: &str) -> Option<bool> {
+        self.live().get(job.trim()).map(|(charged, _)| *charged)
+    }
+
+    /// Settles a report of `job`'s usage, admitted with `charged`: whether to charge it now. A
+    /// job charged at admission is never charged again, whatever its record became since;
+    /// otherwise the first settlement charges it and marks it, and a later one finds the mark,
+    /// which the charge refreshed. A job without an ID cannot be matched with a later poll, so its
+    /// every report is charged.
+    fn settle(&self, job: &str, charged: bool) -> bool {
         let job = job.trim();
         if job.is_empty() {
             return true;
         }
-        let previous = self.jobs().insert(job.to_owned(), (true, Instant::now()));
-        !previous.is_some_and(|(charged, _)| charged)
+        if charged {
+            return false;
+        }
+        let now = (self.clock)();
+        let mut jobs = self.live();
+        let entry = jobs.entry(job.to_owned()).or_insert((false, now));
+        if entry.0 {
+            return false;
+        }
+        *entry = (true, now);
+        true
     }
 }
 
