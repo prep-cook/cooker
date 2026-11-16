@@ -702,7 +702,8 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
     assert_eq!(reply["model"], "friendly", "force-mapping rewrites the response model");
     // An alias passes the candidate's fence whichever arm serves it, and nothing invents a
     // `max_tokens` (Q-H): the catalog default is sent, a payload default rule does not replace
-    // it (Settled 49), and without one the only candidate is refused before any upstream request.
+    // it (Settled 49) but serves when no catalog or registered limit exists, and without
+    // either the only candidate is refused before any upstream request.
     let catalog = format!("model-catalog: [{{match: {MODEL}, overrides: {{default-max-tokens: 777}}}}]\n");
     let payload = "requests:\n  payload:\n    default:\n      - models: [{name: \"*\", protocol: claude}]\n        params: {max_tokens: 16384}\n";
     let both = format!("{catalog}{payload}");
@@ -713,6 +714,9 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
         (catalog, true, 200, Some(777)),
         (both.clone(), true, 200, Some(777)),
         (both, false, 200, Some(777)),
+        // Without a catalog default, a configured payload default rule is the limit.
+        (payload.to_owned(), true, 200, Some(16384)),
+        (payload.to_owned(), false, 200, Some(16384)),
     ];
     for (config, force, status, sent) in rows {
         let mut key = key.clone();

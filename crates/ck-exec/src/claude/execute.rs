@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use ck_core::config::Config;
-use ck_core::exec::{CaptureEvent, ExecError, FailureScope, ResolvedModel, ResponseBody, UsageSink};
+use ck_core::exec::{CaptureEvent, ExecError, FailureScope, ResponseBody, UsageSink};
 use ck_core::format::Format;
 use ck_stream::{ScratchLease, Writer};
 use ck_translate::anthropic::request::{AnthropicCapability, Budget, Egress};
@@ -46,7 +46,7 @@ impl Execute for ClaudeExecutor {
     type Ingress = ClaudeIngress;
 
     fn capability(&self, attempt: &Attempt<'_>) -> AnthropicCapability {
-        capability(attempt.cfg, attempt.model, attempt.resolved_model)
+        capability(attempt)
     }
 
     async fn execute(
@@ -79,14 +79,17 @@ impl Execute for ClaudeExecutor {
 }
 
 /// The `max_tokens` Messages gets for a request without one: the `model-catalog` override, else
-/// the `max_completion_tokens` of a model a Claude credential registered. `None` makes the fence
-/// refuse such a request, so the scheduler skips this candidate instead of sending a guessed
-/// value (owner ruling Q-H).
-fn default_max_tokens(cfg: &Config, model: &str) -> Option<u64> {
+/// the `max_completion_tokens` of a model a Claude credential registered, else the value a
+/// `requests.payload.default` rule sets for this model. `None` makes the fence refuse such a
+/// request, so the scheduler skips this candidate instead of sending a guessed value (owner
+/// ruling Q-H).
+fn default_max_tokens(cfg: &Config, model: &str, headers: &http::HeaderMap) -> Option<u64> {
     max_tokens_for(&ck_core::config::model_catalog::catalog(cfg), model)
+        .or_else(|| payload_max_tokens(&ck_wire::payload::Rules::of(cfg), model, headers))
 }
 
-/// [`default_max_tokens`] against a catalog the caller already holds.
+/// The configured or registered limit alone: the old path's payload rules run on the real body
+/// and fill their own default.
 pub(super) fn max_tokens_for(catalog: &ck_core::config::model_catalog::ModelCatalog, model: &str) -> Option<u64> {
     let model = base_model(model);
     let model = model.trim();
@@ -104,13 +107,35 @@ pub(super) fn max_tokens_for(catalog: &ck_core::config::model_catalog::ModelCata
     })
 }
 
-/// The destination policy for `model`. The thinking budget follows the model's registry
-/// `thinking` data.
-pub(super) fn capability(cfg: &Config, model: &str, resolved: Option<&ResolvedModel>) -> AnthropicCapability {
-    let default_max_tokens = default_max_tokens(cfg, model);
+/// The `max_tokens` the payload default rules set on an empty Claude body for `model`.
+/// ponytail: rules are matched by model, protocol and headers only; a rule gated on the source
+/// protocol, the requested alias or body conditions is not seen here, so such a candidate is
+/// still refused. Evaluate against the request view if such rules need to count.
+fn payload_max_tokens(rules: &ck_wire::payload::Rules, model: &str, headers: &http::HeaderMap) -> Option<u64> {
+    if !rules.has_defaults() {
+        return None;
+    }
     let model = base_model(model);
+    let request = ck_wire::payload::Request {
+        target_executor: "claude",
+        model: model.trim(),
+        protocol: Format::Claude.as_str(),
+        headers: Some(headers),
+        ..Default::default()
+    };
+    let body = ck_wire::payload::apply(rules, &request, b"{}".to_vec());
+    serde_json::from_slice::<serde_json::Value>(&body).ok()?["max_tokens"]
+        .as_u64()
+        .filter(|n| *n > 0)
+}
+
+/// The destination policy for the attempt's model. The thinking budget follows the model's
+/// registry `thinking` data.
+pub(super) fn capability(attempt: &Attempt<'_>) -> AnthropicCapability {
+    let default_max_tokens = default_max_tokens(attempt.cfg, attempt.model, attempt.headers);
+    let model = base_model(attempt.model);
     let model = model.trim();
-    let thinking = match resolved {
+    let thinking = match attempt.resolved_model {
         Some(resolved) => resolved.info.thinking.clone(),
         None => ck_core::registry::lookup_model(model, Some("claude")).and_then(|info| info.thinking),
     };
@@ -162,7 +187,7 @@ impl ClaudeExecutor {
                 (original, &translated)
             }
             None => {
-                let default_max_tokens = default_max_tokens(attempt.cfg, attempt.model);
+                let default_max_tokens = default_max_tokens(attempt.cfg, attempt.model, attempt.headers);
                 encoded = encode(&request.validated(), streams.request, stream, default_max_tokens)?;
                 (&encoded, &encoded)
             }
@@ -230,7 +255,7 @@ impl ClaudeExecutor {
                     ..request.validated().view()
                 };
                 // A count carries no `max_tokens`; the projection only needs one to pass the fence.
-                let mut capability = capability(attempt.cfg, attempt.model, attempt.resolved_model);
+                let mut capability = capability(attempt);
                 capability.default_max_tokens = capability.default_max_tokens.or(Some(u64::MAX));
                 let generate = RequestFence::default().end(view, &capability).map_err(encoding)?;
                 encoded = encode(&generate, streams.request, false, capability.default_max_tokens)?;
