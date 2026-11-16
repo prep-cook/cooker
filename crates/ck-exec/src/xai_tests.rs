@@ -537,7 +537,8 @@ async fn speech_errors_keep_go_scope() {
 /// null or empty) reports only its model. A video job is charged at the first poll whose usage
 /// reports a value, an explicit zero included, and never again (E-Q13), while another job is
 /// charged on its own. A poll of a job the process neither created nor charged, such as one
-/// created before a restart, is refused with a request-scoped 404 before anything is sent.
+/// created before a restart, is refused with a request-scoped 404 before anything is sent. No
+/// idempotency key reaches xAI, so replaying a create cannot bring back a charged job.
 #[tokio::test]
 async fn media_usage_is_charged_once_per_response_or_job() {
     let cfg = Config::default();
@@ -597,6 +598,9 @@ async fn media_usage_is_charged_once_per_response_or_job() {
     // A create answered with `id` instead of `request_id`.
     create(0, r#"{"id":"vid_13","status":"in_progress"}"#);
     create(1, r#"{"request_id":"vid_20"}"#);
+    // A replay of vid_9's create, with its idempotency key, after the restart. The key never
+    // reaches xAI, which documents none, so the upstream answers with a new job.
+    create(1, r#"{"request_id":"vid_21"}"#);
     for (process, id, body, expected) in [
         (0, "vid_9", r#"{"status":"pending","usage":null}"#, Some(false)),
         (0, "vid_9", charged, Some(true)),
@@ -625,6 +629,8 @@ async fn media_usage_is_charged_once_per_response_or_job() {
         (1, "vid_9", charged, None),
         (1, "vid_11", charged, None),
         (1, "vid_20", charged, Some(true)),
+        (1, "vid_21", charged, Some(true)),
+        (1, "vid_9", charged, None),
     ] {
         let (path, payload) = poll(id);
         rows.push((process, "videos", path, payload, body.into(), expected));
@@ -643,6 +649,8 @@ async fn media_usage_is_charged_once_per_response_or_job() {
             "payload": payload,
             "model": "grok-imagine",
             "request_path": path,
+            // Every create carries the same client idempotency key.
+            "headers": {"Idempotency-Key": "replay-1", "x-idempotency-key": "replay-1"},
         });
         let (recorder, _capture, sink) = crate::openai_compat_usage::sinks();
         let req = request(&s, sink);
@@ -652,6 +660,11 @@ async fn media_usage_is_charged_once_per_response_or_job() {
             _ => executor.videos(&credential(&s, &cfg), req, &path, &cfg).await,
         };
         let row = format!("process {process} {op} {path} {body}");
+        let sent = mock.request().unwrap_or_default().go_lower();
+        assert!(
+            !sent.contains("idempotency"),
+            "{row}: no idempotency key goes upstream:\n{sent}"
+        );
         let reports = recorder.0.lock().unwrap();
         let bodies: Vec<String> = reports
             .iter()

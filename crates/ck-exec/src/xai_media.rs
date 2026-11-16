@@ -115,31 +115,16 @@ impl XaiExecutor {
         method: wreq::Method,
         path: &str,
         payload: Vec<u8>,
-        idempotent: bool,
+        video: bool,
     ) -> Result<ExecResponse, ExecError> {
         let logged = payload.as_slice();
         let body = (method == wreq::Method::POST).then(|| payload.clone());
         let poll = method == wreq::Method::GET;
         let (token, _) = creds(credential);
-        let mut headers = plain_headers(credential, &token, false, "", req);
-        if idempotent && method == wreq::Method::POST {
-            let header = |name: &str| {
-                req.headers
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::trim)
-                    .unwrap_or_default()
-                    .to_owned()
-            };
-            // The handler's `Idempotency-Key` metadata, else the client's own header.
-            let mut key = header("Idempotency-Key");
-            if key.is_empty() {
-                key = header("x-idempotency-key");
-            }
-            if !key.is_empty() {
-                headers.set("x-idempotency-key", key);
-            }
-        }
+        let headers = plain_headers(credential, &token, false, "", req);
+        // xAI documents no idempotency key for video creates (https://docs.x.ai/openapi.json,
+        // `POST /v1/videos/generations`, `/edits`, `/extensions`: no header parameters), so
+        // none is sent: a replayed create must not hand back a job a previous process charged.
         let url = self.url(endpoint(&chat_base_url(credential), path));
         let (status, headers, data) = self
             .send_buffered(credential, req, cfg, method, &url, headers, body, logged)
@@ -151,7 +136,7 @@ impl XaiExecutor {
         }
         // A video is a job: its usage is that of the job, which a poll repeats. A create names
         // it as the server's `video_id` reads it.
-        let job = idempotent.then(|| {
+        let job = video.then(|| {
             if poll {
                 return text(&gj::get(&payload, "request_id"));
             }

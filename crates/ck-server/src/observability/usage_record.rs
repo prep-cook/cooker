@@ -74,17 +74,6 @@ pub struct Unreported {
     pub total: bool,
 }
 
-impl Unreported {
-    pub const ALL: Self = Self {
-        input: true,
-        output: true,
-        reasoning: true,
-        cache_read: true,
-        cache_creation: true,
-        total: true,
-    };
-}
-
 impl Detail {
     /// The record of an attempt's canonical usage. Canonical counts are inclusive, cache
     /// reads and writes inside input and reasoning inside output, so the breakdown is Go's
@@ -656,26 +645,66 @@ pub fn parse_openai(body: &[u8]) -> Detail {
     parse_usage(body, parse_openai_node)
 }
 
-/// A Responses usage reporting billed units but no token count, such as an xAI video's
-/// `{"cost_in_usd_ticks":…}` or a Codex terminal's `{"codex_rollout_budget_units":…}`: its
-/// units, with every token count unreported rather than zero.
-fn billed_only(node: &Res<'_>, tier: String) -> Option<Detail> {
-    if !node.is_object() || has_openai_token_fields(node) {
+/// The paths `parse_openai_node` reads each token count from, first present wins.
+const INPUT: &[&str] = &["prompt_tokens", "input_tokens"];
+const OUTPUT: &[&str] = &["completion_tokens", "output_tokens"];
+const REASONING: &[&str] = &[
+    "completion_tokens_details.reasoning_tokens",
+    "output_tokens_details.reasoning_tokens",
+];
+const CACHED: &[&str] = &[
+    "prompt_tokens_details.cached_tokens",
+    "input_tokens_details.cached_tokens",
+];
+const CACHE_CREATION: &[&str] = &[
+    "input_tokens_details.cache_creation_tokens",
+    "input_tokens_details.cache_write_tokens",
+    "prompt_tokens_details.cache_creation_tokens",
+    "prompt_tokens_details.cache_write_tokens",
+];
+
+/// The token counts a usage object does not report as numbers. A total it omits is still
+/// reported when its input and output are, as their sum, as the canonical reader derives it.
+fn unreported_counts(node: &Res<'_>) -> Unreported {
+    let absent = |paths: &[&str]| first(node, paths).kind != Kind::Number;
+    let (input, output) = (absent(INPUT), absent(OUTPUT));
+    Unreported {
+        input,
+        output,
+        reasoning: absent(REASONING),
+        cache_read: absent(CACHED),
+        cache_creation: absent(CACHE_CREATION),
+        total: absent(&["total_tokens"]) && (input || output),
+    }
+}
+
+/// A Responses usage object's counts and billed units, every token count it does not report
+/// as a number left unreported rather than zero: an xAI video's `{"cost_in_usd_ticks":…}`, a
+/// Codex terminal's `{"codex_rollout_budget_units":…}` or a partial count. `None` when it
+/// reports neither a count nor a unit.
+fn responses_usage(node: &Res<'_>, tier: String) -> Option<Detail> {
+    if !node.is_object() {
         return None;
     }
-    let dimensions = native_dimensions("responses", node);
-    (!dimensions.is_empty()).then(|| Detail {
-        dimensions,
-        unreported: Unreported::ALL,
+    let mut d = parse_responses_node(node);
+    if !has_openai_token_fields(node) && d.dimensions.is_empty() {
+        return None;
+    }
+    d.unreported = unreported_counts(node);
+    if d.unreported.input || d.unreported.output {
+        d.breakdown = Some(unclassified(if d.unreported.total { 0 } else { d.total }));
+    }
+    d.response_service_tier = tier;
+    Some(d)
+}
+
+/// [`parse_openai`] of a buffered Responses body, through [`responses_usage`].
+fn parse_responses(body: &[u8]) -> Detail {
+    let tier = service_tier(body);
+    responses_usage(&gj::parse(body).get("usage"), tier.clone()).unwrap_or(Detail {
         response_service_tier: tier,
         ..Detail::default()
     })
-}
-
-/// [`parse_openai`] of a buffered Responses body, or its [`billed_only`] usage.
-fn parse_responses(body: &[u8]) -> Detail {
-    billed_only(&gj::parse(body).get("usage"), service_tier(body))
-        .unwrap_or_else(|| parse_usage(body, parse_responses_node))
 }
 
 fn parse_usage(body: &[u8], parse: fn(&Res<'_>) -> Detail) -> Detail {
@@ -692,22 +721,16 @@ fn parse_usage(body: &[u8], parse: fn(&Res<'_>) -> Detail) -> Detail {
     d
 }
 
-/// Go `ParseCodexUsage`, or the terminal's [`billed_only`] usage.
+/// Go `ParseCodexUsage`, through [`responses_usage`].
 pub fn parse_codex(data: &[u8]) -> Option<Detail> {
     let tier = service_tier(data);
     let node = gj::parse(data).get("response.usage");
-    if !has_openai_token_fields(&node) {
-        if let Some(d) = billed_only(&node, tier.clone()) {
-            return Some(d);
-        }
-        return (!tier.is_empty()).then(|| Detail {
+    responses_usage(&node, tier.clone()).or_else(|| {
+        (!tier.is_empty()).then(|| Detail {
             response_service_tier: tier,
             ..Detail::default()
-        });
-    }
-    let mut d = parse_responses_node(&node);
-    d.response_service_tier = tier;
-    Some(d)
+        })
+    })
 }
 
 /// Go `parseClaudeUsageNode`: cache buckets are separate from `input_tokens`;
@@ -2955,8 +2978,10 @@ mod tests {
     /// The billed units of a Responses usage an executor reports, streamed or as a buffered
     /// body, reach the record as their own dimensions in their own units: xAI ticks, nano-USD
     /// and tool counts as integers, Codex rollout budget units as the number the upstream wrote.
-    /// A usage, streamed or buffered, reporting units but no token count leaves the tokens
-    /// unreported, not zero; a body without usage records no dimension.
+    /// A token count is recorded only when the usage reports it as a number: an absent, null or
+    /// non-numeric count is left out, whatever else the usage reports, and without both input
+    /// and output the breakdown classifies nothing. A body without usage keeps the legacy record
+    /// of zero counts.
     #[test]
     fn responses_billed_units_reach_the_record() {
         let rt = usage_runtime();
@@ -2970,6 +2995,10 @@ mod tests {
             &crate::inference::dispatch::Trace::default(),
         ));
         let terminal = |usage: &str| format!(r#"data: {{"type":"response.completed","response":{{"usage":{usage}}}}}"#);
+        let body = |usage: &str| format!(r#"{{"data":[{{"b64_json":"AAAA"}}],"usage":{usage}}}"#);
+        let ticks = serde_json::json!({"cost_in_usd_ticks":200000000});
+        let none = serde_json::json!({});
+        let zeros = serde_json::json!({"input_tokens":0,"output_tokens":0,"reasoning_tokens":0,"cached_tokens":0,"cache_read_tokens":0,"cache_creation_tokens":0,"total_tokens":0});
         for (provider, streamed, upstream, dimensions, tokens, literal) in [
             (
                 "xai",
@@ -2978,23 +3007,23 @@ mod tests {
                     r#"{"input_tokens":5,"output_tokens":2,"total_tokens":7,"cost_in_usd_ticks":158100000,"cost_in_nano_usd":15810000,"num_server_side_tools_used":1,"server_side_tool_usage_details":{"x_posts_fetched":7}}"#,
                 ),
                 serde_json::json!({"cost_in_usd_ticks":158100000,"cost_in_nano_usd":15810000,"num_server_side_tools_used":1,"x_posts_fetched":7}),
-                Some(7),
+                serde_json::json!({"input_tokens":5,"output_tokens":2,"total_tokens":7}),
                 "",
             ),
             (
                 "codex",
                 true,
-                terminal(r#"{"input_tokens":100,"output_tokens":10,"total_tokens":110,"codex_rollout_budget_units":2.50}"#),
+                terminal(r#"{"input_tokens":100,"input_tokens_details":{"cached_tokens":40},"output_tokens":10,"output_tokens_details":{"reasoning_tokens":4},"total_tokens":110,"codex_rollout_budget_units":2.50}"#),
                 serde_json::json!({"codex_rollout_budget_units":2.5}),
-                Some(110),
+                serde_json::json!({"input_tokens":100,"output_tokens":10,"reasoning_tokens":4,"cached_tokens":40,"cache_read_tokens":40,"total_tokens":110}),
                 r#""codex_rollout_budget_units":2.50"#,
             ),
             (
                 "xai",
                 false,
-                r#"{"data":[{"b64_json":"AAAA"}],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3,"cost_in_usd_ticks":200000000}}"#.to_owned(),
-                serde_json::json!({"cost_in_usd_ticks":200000000}),
-                Some(3),
+                body(r#"{"input_tokens":3,"output_tokens":0,"total_tokens":3,"cost_in_usd_ticks":200000000}"#),
+                ticks.clone(),
+                serde_json::json!({"input_tokens":3,"output_tokens":0,"total_tokens":3}),
                 "",
             ),
             (
@@ -3002,16 +3031,16 @@ mod tests {
                 false,
                 r#"{"status":"done","video":{"url":"https://v.example/out.mp4"},"usage":{"cost_in_usd_ticks":5000000000}}"#.to_owned(),
                 serde_json::json!({"cost_in_usd_ticks":5000000000_u64}),
-                None,
+                none.clone(),
                 "",
             ),
-            ("xai", false, r#"{"status":"pending"}"#.to_owned(), Value::Null, Some(0), ""),
+            ("xai", false, r#"{"status":"pending"}"#.to_owned(), Value::Null, zeros, ""),
             (
                 "codex",
                 true,
                 terminal(r#"{"codex_rollout_budget_units":2.50}"#),
                 serde_json::json!({"codex_rollout_budget_units":2.5}),
-                None,
+                none.clone(),
                 r#""codex_rollout_budget_units":2.50"#,
             ),
             (
@@ -3019,7 +3048,7 @@ mod tests {
                 true,
                 terminal(r#"{"cost_in_usd_ticks":5000000000}"#),
                 serde_json::json!({"cost_in_usd_ticks":5000000000_u64}),
-                None,
+                none.clone(),
                 "",
             ),
             (
@@ -3027,8 +3056,51 @@ mod tests {
                 true,
                 r#"data: {"type":"response.completed","response":{"service_tier":"priority","usage":{"cost_in_usd_ticks":5000000000}}}"#.to_owned(),
                 serde_json::json!({"cost_in_usd_ticks":5000000000_u64}),
-                None,
+                none.clone(),
                 r#""response_service_tier":"priority""#,
+            ),
+            // A total the usage omits is its input and output's sum, as the canonical reader
+            // derives it.
+            (
+                "xai",
+                false,
+                body(r#"{"cost_in_usd_ticks":200000000,"input_tokens":4,"output_tokens":1}"#),
+                ticks.clone(),
+                serde_json::json!({"input_tokens":4,"output_tokens":1,"total_tokens":5}),
+                "",
+            ),
+            // Partial, null and non-numeric token counts: only the numbers are recorded.
+            (
+                "xai",
+                false,
+                body(r#"{"cost_in_usd_ticks":200000000,"input_tokens":3}"#),
+                ticks.clone(),
+                serde_json::json!({"input_tokens":3}),
+                "",
+            ),
+            (
+                "xai",
+                false,
+                body(r#"{"cost_in_usd_ticks":200000000,"input_tokens":null}"#),
+                ticks.clone(),
+                none.clone(),
+                "",
+            ),
+            (
+                "xai",
+                false,
+                body(r#"{"cost_in_usd_ticks":200000000,"input_tokens":"3","output_tokens":2,"total_tokens":null,"input_tokens_details":{"cached_tokens":null}}"#),
+                ticks.clone(),
+                serde_json::json!({"output_tokens":2}),
+                "",
+            ),
+            (
+                "xai",
+                true,
+                terminal(r#"{"input_tokens":3,"output_tokens":null,"cost_in_usd_ticks":200000000}"#),
+                ticks.clone(),
+                serde_json::json!({"input_tokens":3}),
+                "",
             ),
         ] {
             let tracker = Tracker::start(&rt, &facts, &credential_for(provider), "m");
@@ -3042,8 +3114,23 @@ mod tests {
             let record: Value = serde_json::from_slice(&raw[0]).unwrap();
             let got = record.get("dimensions").cloned().unwrap_or(Value::Null);
             assert_eq!(got, dimensions, "{upstream}");
-            assert_eq!(record["tokens"].get("total_tokens").and_then(Value::as_i64), tokens, "{upstream}");
-            assert_eq!(record["tokens"].get("input_tokens").is_some(), tokens.is_some(), "{upstream}");
+            let counts: serde_json::Map<String, Value> = record["tokens"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(name, value)| value.is_number() && !name.contains("_tokens_") && !name.contains("_5m") && !name.contains("_1h"))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            assert_eq!(Value::Object(counts), tokens, "{upstream}");
+            // Without both input and output the breakdown classifies nothing.
+            if tokens.get("input_tokens").is_none() || tokens.get("output_tokens").is_none() {
+                let breakdown = &record["token_breakdown"];
+                assert_eq!(
+                    (&breakdown["input"]["total_tokens"], &breakdown["output"]["total_tokens"]),
+                    (&Value::from(0), &Value::from(0)),
+                    "{upstream}"
+                );
+            }
             assert!(String::from_utf8_lossy(&raw[0]).contains(literal), "{upstream}");
         }
     }

@@ -3071,7 +3071,7 @@
         "failed": false
       },
       "url": "https://api.x.ai/v1/videos/generations",
-      "request": "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 105\r\nAccept: application/json\r\nAuthorization: Bearer sk-fake-xai\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nX-Idempotency-Key: idem-1\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"a wave\",\"reference_images\":[{\"url\":\"https://img.example/r.png\"}]}",
+      "request": "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 105\r\nAccept: application/json\r\nAuthorization: Bearer sk-fake-xai\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"a wave\",\"reference_images\":[{\"url\":\"https://img.example/r.png\"}]}",
       "output": "{\"request_id\":\"vid_1\"}"
     },
     {
@@ -3112,7 +3112,7 @@
         "failed": false
       },
       "url": "https://cli-chat-proxy.grok.com/v1/videos/edits",
-      "request": "POST /v1/videos/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 88\r\nAccept: application/json\r\nAuthorization: Bearer xai-fake-token\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nX-Idempotency-Key: xi-2\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"edit\",\"video\":{\"url\":\"https://v.example/a.mp4\"}}",
+      "request": "POST /v1/videos/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 88\r\nAccept: application/json\r\nAuthorization: Bearer xai-fake-token\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"edit\",\"video\":{\"url\":\"https://v.example/a.mp4\"}}",
       "output": "{\"request_id\":\"vid_2\"}"
     },
     {
