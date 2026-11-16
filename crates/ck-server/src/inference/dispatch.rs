@@ -100,6 +100,9 @@ pub enum MediaKind {
     /// [`ck_exec::Executors::speech`]; speech-only models are allowed, and no
     /// non-stream keep-alive runs: its newlines would prefix the audio.
     Speech,
+    /// A deferred xAI Chat create or poll (X11); an empty success body denotes pending
+    /// (202), and no non-stream keep-alive runs: its newlines would prefix an empty body.
+    DeferredChat,
 }
 
 impl Call {
@@ -730,10 +733,14 @@ fn waits_for_kimi_proof(rt: &Runtime, call: &Call) -> bool {
 /// `requests.nonstream-keepalive-interval` seconds (Go `NonStreamingKeepAliveInterval`;
 /// 0 or below disables it), for the calls whose Go handler starts the keep-alive: only
 /// non-stream generate handlers do; the count-tokens handlers (code_handlers.go,
-/// gemini_handlers.go) and the speech handler never call `StartNonStreamingKeepAlive`.
+/// gemini_handlers.go), the speech handler and deferred Chat never call
+/// `StartNonStreamingKeepAlive`.
 fn nonstream_keepalive(call: &Call, cfg: &Config) -> Option<Duration> {
-    let speech = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Speech);
-    if call.stream || call.operation != Operation::Generate || speech {
+    let control = call
+        .media
+        .as_ref()
+        .is_some_and(|m| matches!(m.kind, MediaKind::Speech | MediaKind::DeferredChat));
+    if call.stream || call.operation != Operation::Generate || control {
         return None;
     }
     let seconds = cfg
@@ -1637,6 +1644,7 @@ async fn attempt<X: Arms>(
                         rt.executors.videos(&credential, req, &path, cfg).await
                     }
                     (None, Some(MediaKind::Speech)) => rt.executors.speech(&credential, req, cfg).await,
+                    (None, Some(MediaKind::DeferredChat)) => rt.executors.deferred_chat(&credential, req, cfg).await,
                     (None, None) => rt.executors.execute(&credential, req, cfg).await,
                 }
             };

@@ -140,7 +140,7 @@ impl XaiExecutor {
         // none is sent: a replayed create must not hand back a job a previous process charged.
         let url = self.url(endpoint(&chat_base_url(credential), path));
         let (status, headers, data) = self
-            .send_buffered(credential, req, cfg, method, &url, headers, body, logged)
+            .send_buffered(credential, req, cfg, method, &url, headers, body, Some(logged))
             .await?;
         if !(200..300).contains(&status) {
             let mut error = response::status_error(status, &data);
@@ -206,7 +206,7 @@ const BILLED: &[&str] = &[
 /// Whether `body` reports a billed value: an integer, zero included, in one of [`BILLED`]. An
 /// absent, null, non-integer or empty usage reports nothing, so it does not spend a job's charge
 /// (E-Q13).
-fn reports_usage(body: &[u8]) -> bool {
+pub(crate) fn reports_usage(body: &[u8]) -> bool {
     BILLED.iter().any(|path| {
         let value = gj::get(body, path);
         let raw = std::str::from_utf8(value.raw()).unwrap_or_default();
@@ -241,6 +241,8 @@ fn owner(caller: &Caller) -> String {
 pub enum JobKind {
     Image,
     Video,
+    /// A deferred Chat completion (X11).
+    Chat,
 }
 
 impl JobKind {
@@ -248,6 +250,7 @@ impl JobKind {
         match self {
             Self::Image => "image",
             Self::Video => "video",
+            Self::Chat => "chat",
         }
     }
 }
@@ -282,8 +285,8 @@ struct Table {
     pending: usize,
 }
 
-/// The video and deferred image jobs this process created (E-Q5, E-Q13), in one table and one
-/// capacity. A job id belongs to the caller that
+/// The video, deferred image and deferred Chat jobs this process created (E-Q5, E-Q13), in
+/// one table and one capacity. A job id belongs to the caller that
 /// created it; any other caller, an expired id or one this process never issued is not found.
 /// A job is charged at the first poll that reports usage and never again. A job missing here
 /// may already have been charged by an earlier process, so its poll is refused rather than risk
@@ -505,13 +508,18 @@ impl video::Ledger for JobLedger {
 
 /// The 404 for a poll of a `kind` job [`VideoJobs`] does not know for this caller, in the error
 /// shape OpenAI and xAI give an unknown ID. It is the request's fault: no other credential is tried.
-fn unknown_job(kind: JobKind, job: &str) -> ExecError {
+pub(crate) fn unknown_job(kind: JobKind, job: &str) -> ExecError {
     let message = match kind {
         JobKind::Video => {
             format!("Video job '{job}' does not exist for this API key, or has expired. Create the video again.")
         }
         JobKind::Image => {
             format!("Image job '{job}' does not exist for this API key, or has expired. Create the image again.")
+        }
+        JobKind::Chat => {
+            format!(
+                "Deferred completion '{job}' does not exist for this API key, or has expired. Create the completion again."
+            )
         }
     };
     let body = serde_json::json!({"error": {"message": message, "type": "invalid_request_error", "param": null, "code": null}});
@@ -520,7 +528,7 @@ fn unknown_job(kind: JobKind, job: &str) -> ExecError {
 
 /// The 503 for a create while the job table is full (E-Q5): nothing is sent, so no upstream job
 /// exists. It is the request's fault for routing: no other credential is tried or cooled.
-fn jobs_full(kind: JobKind) -> ExecError {
+pub(crate) fn jobs_full(kind: JobKind) -> ExecError {
     let kind = kind.name();
     let message = format!("Too many {kind} jobs are being tracked. Retry after polling or waiting out existing jobs.");
     let code = format!("{kind}_jobs_full");
@@ -530,9 +538,10 @@ fn jobs_full(kind: JobKind) -> ExecError {
 
 impl XaiExecutor {
     /// One request whose whole response body is read: captured, timed and canceled like
-    /// every xAI call. `logged` is what the capture records as the body.
+    /// every xAI call. `logged` is what the capture records as the body; without it the
+    /// sent body, or an empty GET, is recorded.
     #[allow(clippy::too_many_arguments)]
-    async fn send_buffered(
+    pub(crate) async fn send_buffered(
         &self,
         credential: &Credential,
         req: &ExecRequest,
@@ -541,7 +550,7 @@ impl XaiExecutor {
         url: &str,
         headers: GoHeaders,
         body: Option<Vec<u8>>,
-        logged: &[u8],
+        logged: Option<&[u8]>,
     ) -> Result<(u16, HeaderMap, Bytes), ExecError> {
         let client = self.clients.for_credential(credential, cfg);
         let route = |_: &url::Url| {
@@ -550,7 +559,14 @@ impl XaiExecutor {
                 order: None,
             })
         };
-        let capture = capture_request(req, credential, method.as_str(), url, &headers, logged);
+        let capture = capture_request(
+            req,
+            credential,
+            method.as_str(),
+            url,
+            &headers,
+            logged.unwrap_or_else(|| body.as_deref().unwrap_or_default()),
+        );
         req.usage.round_trip_started();
         let send = crate::proxy::send_request(&route, method, url, headers, body.map(Bytes::from), None);
         let upstream = fail_if_canceled(&req.usage, send).await;
@@ -607,7 +623,7 @@ impl XaiExecutor {
                 &url,
                 headers,
                 Some(payload.clone()),
-                &payload,
+                Some(&payload),
             )
             .await?;
         if !(200..300).contains(&status) {

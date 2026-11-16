@@ -132,6 +132,9 @@ pub async fn chat_completions(
         Err(rejection) => return read_failed(&rejection),
     };
     let fields = peek(&body);
+    if ck_wire::json::get(&body, "deferred").kind == ck_wire::json::Kind::True {
+        return super::xai_deferred::create(&rt, caller, peer, matched, &uri, headers, body).await;
+    }
     let mut stream = fields.get("stream") == Some(&Value::Bool(true));
     // Go converts Responses-shaped payloads sent to this route into Chat Completions.
     // Like Go, the handler ignores the conversion's refusal of an emptied user turn and

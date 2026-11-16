@@ -61,6 +61,10 @@ fn api(rt: Arc<Runtime>) -> Router {
         .route("/v1/models/", get(models::detail))
         .route("/v1/models/{*model}", get(models::detail))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route(
+            "/v1/chat/deferred-completion/{request_id}",
+            get(inference::xai_deferred::retrieve),
+        )
         .route("/v1/completions", post(openai::completions))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))

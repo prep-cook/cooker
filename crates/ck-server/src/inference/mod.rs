@@ -20,3 +20,4 @@ pub mod sessions;
 pub(crate) mod speech;
 pub mod streams;
 pub(crate) mod videos;
+pub(crate) mod xai_deferred;
