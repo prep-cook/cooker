@@ -269,35 +269,6 @@ pub fn ensure_frame(event: Bytes) -> Bytes {
     }
 }
 
-/// The `data:` payloads of one SSE frame, joined with newlines.
-pub fn data_payload(frame: &[u8]) -> Option<Vec<u8>> {
-    let mut out: Option<Vec<u8>> = None;
-    for line in frame.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line).trim_ascii();
-        let Some(data) = line.strip_prefix(b"data:") else {
-            continue;
-        };
-        let data = data.trim_ascii();
-        match &mut out {
-            Some(buf) => {
-                buf.push(b'\n');
-                buf.extend_from_slice(data);
-            }
-            None => out = Some(data.to_vec()),
-        }
-    }
-    out
-}
-
-/// The `event:` name of one SSE frame.
-pub fn event_name(frame: &[u8]) -> String {
-    frame
-        .split(|&b| b == b'\n')
-        .find_map(|line| line.trim_ascii().strip_prefix(b"event:"))
-        .map(|name| String::from_utf8_lossy(name.trim_ascii()).into_owned())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,18 +325,9 @@ mod tests {
     }
 
     #[test]
-    fn frames_and_payloads() {
+    fn frames() {
         assert_eq!(ensure_frame(Bytes::from_static(b"{}")), "data: {}\n\n");
         assert_eq!(ensure_frame(Bytes::from_static(b"data: {}\n")), "data: {}\n\n");
-        assert_eq!(
-            data_payload(b"event: x\r\ndata: {\"a\":1}\r\n\r\n").unwrap(),
-            b"{\"a\":1}"
-        );
-        assert_eq!(
-            event_name(b"event: response.completed\ndata: {}\n\n"),
-            "response.completed"
-        );
-        assert!(data_payload(b": ping\n\n").is_none());
     }
 
     /// Go `handlers.FilterUpstreamHeaders` (tests/reference/server/main.go

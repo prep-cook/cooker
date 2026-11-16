@@ -203,8 +203,9 @@ async fn run_on(streams: &Streams, s: &Value, upstream: &StreamUpstream, usage: 
         ($ingress:expr) => {{
             let mut ingress = $ingress.unwrap();
             ingress.advance(&mut writer, &body).unwrap();
-            let validated = executors
-                .fence(&attempt, &mut ingress, &mut writer)
+            let validated = ingress
+                .finish(&mut writer, &ck_translate::codec::ClientCapability)
+                .and_then(|fenced| executors.refence(&attempt, fenced.view()))
                 .expect("the fence accepts");
             let validated = executors
                 .refence(&attempt, validated.view())

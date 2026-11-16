@@ -122,7 +122,10 @@ impl Fixture {
             ingress.advance(request, byte)?;
         }
         let attempt = self.exchange.attempt(&self.streams.store);
-        self.executors.fence(&attempt, ingress, request).map(|_| ())
+        ingress
+            .finish(request, &ck_translate::codec::ClientCapability)
+            .and_then(|fenced| self.executors.refence(&attempt, fenced.view()))
+            .map(|_| ())
     }
 
     /// Fences `body` and starts the attempt; returns the outcome and the response stream id.
@@ -136,7 +139,10 @@ impl Fixture {
             ingress.advance(request, byte).unwrap();
         }
         let attempt = self.exchange.attempt(&self.streams.store);
-        let validated = self.executors.fence(&attempt, ingress, request).unwrap();
+        let validated = ingress
+            .finish(request, &ck_translate::codec::ClientCapability)
+            .and_then(|fenced| self.executors.refence(&attempt, fenced.view()))
+            .unwrap();
         let mut handle = self.exchange.request_with(validated, body);
         let response = self.streams.response(request);
         let id = response.id();

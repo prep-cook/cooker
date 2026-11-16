@@ -77,7 +77,10 @@ async fn check(provider: &str) {
                 )
                 .unwrap();
                 ingress.advance(&mut writer, &req.body).unwrap();
-                let validated = executors.fence(&attempt, &mut ingress, &mut writer).unwrap();
+                let validated = ingress
+                    .finish(&mut writer, &ck_translate::codec::ClientCapability)
+                    .and_then(|fenced| executors.refence(&attempt, fenced.view()))
+                    .unwrap();
                 let mut request = exchange.request_with(validated, &req.body);
                 let error = executors
                     .start(&attempt, &mut request, &mut writer, response)

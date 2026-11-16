@@ -597,7 +597,10 @@ async fn the_selector_runs_relays_through_the_executor() {
     for chunk in CHAT.chunks(16) {
         ingress.advance(&mut request, chunk).unwrap();
     }
-    let validated = executors.fence(&attempt, &mut ingress, &mut request).unwrap();
+    let validated = ingress
+        .finish(&mut request, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| executors.refence(&attempt, fenced.view()))
+        .unwrap();
     let response = streams.response(&request);
     let id = response.id();
     let mut handle = exchange.request(validated);

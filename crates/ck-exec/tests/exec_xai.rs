@@ -104,7 +104,10 @@ async fn run_with<I: RequestIngress>(
         ingress.advance(&mut writer, chunk).unwrap();
     }
     assert_eq!(executors.destination(&attempt), Some(ck_exec::xai_exec::DESTINATION));
-    let validated = match executors.fence(&attempt, &mut ingress, &mut writer) {
+    let validated = match ingress
+        .finish(&mut writer, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| executors.refence(&attempt, fenced.view()))
+    {
         Ok(validated) => validated,
         Err(error) => {
             let started = Err(ExecError::local(400, FailureScope::Request, format!("fence: {error}")));

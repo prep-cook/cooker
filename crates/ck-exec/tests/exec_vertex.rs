@@ -81,8 +81,9 @@ async fn run_with<I: RequestIngress>(
     }
     let executors = executors();
     assert!(executors.destination(&attempt).is_some());
-    let validated = executors
-        .fence(&attempt, &mut ingress, &mut writer)
+    let validated = ingress
+        .finish(&mut writer, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| executors.refence(&attempt, fenced.view()))
         .expect("the fence accepts");
     let validated = executors
         .refence(&attempt, validated.view())
@@ -462,7 +463,9 @@ async fn compact_is_refused_on_both_routes() {
         let mut ingress =
             responses::request::Ingress::new(&mut writer, &streams.store, id, Operation::Compact, LIMIT).unwrap();
         ingress.advance(&mut writer, body).unwrap();
-        let fenced = executors().fence(&attempt, &mut ingress, &mut writer);
+        let fenced = ingress
+            .finish(&mut writer, &ck_translate::codec::ClientCapability)
+            .and_then(|fenced| executors().refence(&attempt, fenced.view()));
         assert!(matches!(fenced, Err(codec::Error::Unsupported)), "{model}");
     }
 }

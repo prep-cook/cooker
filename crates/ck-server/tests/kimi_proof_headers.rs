@@ -14,7 +14,7 @@ use tower::ServiceExt;
 use upstream::{Reply, StreamUpstream};
 
 fn runtime(url: &str) -> Arc<ck_server::Runtime> {
-    runtime_with(url, "requests:\n  nonstream-keepalive-interval: 1\n", None)
+    runtime_with(url, "{}\n", None)
 }
 
 fn runtime_with(url: &str, yaml: &str, nonce: Option<&str>) -> Arc<ck_server::Runtime> {
@@ -123,7 +123,7 @@ fn answer(protocol: &str, stream: bool) -> Reply {
 }
 
 #[tokio::test]
-async fn proof_headers_reach_the_client_buffered_and_streamed_despite_keepalive() {
+async fn proof_headers_reach_the_client_buffered_and_streamed() {
     for protocol in ["chat/completions", "responses", "messages"] {
         for stream in [false, true] {
             let reply = answer(protocol, stream)
@@ -177,16 +177,14 @@ async fn proof_headers_reach_the_client_buffered_and_streamed_despite_keepalive(
 }
 
 #[tokio::test]
-async fn a_routed_response_after_the_keepalive_deadline_keeps_the_proof() {
+async fn a_slow_routed_response_keeps_the_proof() {
     let upstream = StreamUpstream::start([answer("chat/completions", false)
         .header("Msh-Request-Timestamp", "1786338000123")
         .header("Msh-Request-Signature", "reqsigv1_routed")
         .first_byte_after(Duration::from_millis(1200))])
     .await;
     let yaml = format!(
-        r#"requests:
-  nonstream-keepalive-interval: 1
-model-routers:
+        r#"model-routers:
   - name: smart
     judge: unused-judge
     models: [kimi-k3]

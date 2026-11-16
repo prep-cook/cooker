@@ -75,7 +75,7 @@ When a provider answers 429 (too many requests, or a used-up limit), the proxy r
 
 `routing.retry.request-retry` (default 0) adds rounds over the accounts when every attempt in a round failed, and `routing.retry.max-retry-interval` (seconds, default 0) lets the proxy wait for an account to come out of cooldown instead of failing at once. The Reset cooldown action in an account's panel on the Accounts page clears the proxy's own record only; it does not give back any provider limit.
 
-The optional [fail over only on 429 preset](CONFIGURATION.md#optional-preset-fail-over-only-on-429) keeps 429 failover for OAuth accounts. It stops ordinary failover after a failed attempt for the listed non-429 statuses. Credential-preparation failures and an enabled `requests.streaming.bootstrap-retries` can still cause another attempt.
+The optional [fail over only on 429 preset](CONFIGURATION.md#optional-preset-fail-over-only-on-429) keeps 429 failover for OAuth accounts. It stops ordinary failover after a failed attempt for the listed non-429 statuses. Credential-preparation failures can still cause another attempt.
 
 ## Read the quota view
 

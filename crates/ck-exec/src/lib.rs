@@ -242,34 +242,8 @@ impl Executors {
         }
     }
 
-    /// Step 1: closes the client fence against the first attempt's destination.
-    pub fn fence<'a, I: ck_translate::codec::RequestIngress>(
-        &self,
-        attempt: &types::Attempt<'_>,
-        ingress: &'a mut I,
-        request: &mut ck_stream::Writer,
-    ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
-        match attempt.credential.provider.as_str() {
-            "codex" => pipeline::fence(&self.codex, attempt, ingress, request),
-            "claude" => {
-                let validated = pipeline::fence(&self.claude, attempt, ingress, request)?;
-                if !self.claude.contract_path(attempt, validated.view()) {
-                    return Err(ck_translate::codec::Error::Destination);
-                }
-                Ok(validated)
-            }
-            p if openai_compat::handles(p) => pipeline::fence(&self.openai.compat, attempt, ingress, request),
-            gemini_exec::PROVIDER => pipeline::fence(&self.google.gemini, attempt, ingress, request),
-            xai::PROVIDER => pipeline::fence(&self.openai.xai, attempt, ingress, request),
-            meta::PROVIDER => pipeline::fence(&self.devices.meta, attempt, ingress, request),
-            p if vertex::handles(p) => pipeline::fence(&self.google.vertex, attempt, ingress, request),
-            p if kimi::PROVIDERS.contains(&p) => pipeline::fence(&self.devices.kimi, attempt, ingress, request),
-            antigravity::PROVIDER => pipeline::fence(&self.google.antigravity, attempt, ingress, request),
-            _ => Err(ck_translate::codec::Error::Destination),
-        }
-    }
-
-    /// Step 2: re-fences the client view for this attempt's destination.
+    /// Re-fences the client view for this attempt's destination (contract §4 step 2; the
+    /// server closes the client fence against `ClientCapability` first).
     pub fn refence<'a>(
         &self,
         attempt: &types::Attempt<'_>,

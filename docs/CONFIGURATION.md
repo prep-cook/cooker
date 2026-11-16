@@ -283,11 +283,11 @@ routing:
 
 ### Settings that do not apply to Chat, Anthropic, Gemini and Responses routes
 
-`/v1/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, the Gemini `/v1beta/models/...` routes, `POST /v1/responses` and `/v1/responses/compact` (with their `/backend-api/codex/` paths), `/v1/responses/input_tokens` send nothing before the first byte of the answer, so `requests.nonstream-keepalive-interval`, `requests.streaming.keepalive-seconds` and `requests.streaming.bootstrap-retries` have no effect on them. A failure before that byte fails over to the next candidate instead. The settings still apply to the Responses WebSocket, image, video and speech routes.
+`/v1/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, the Gemini `/v1beta/models/...` routes, `POST /v1/responses` and `/v1/responses/compact` (with their `/backend-api/codex/` paths) and `/v1/responses/input_tokens` send nothing before the first byte of the answer, so `requests.streaming.keepalive-seconds` has no effect on them. A failure before that byte fails over to the next candidate instead.
 
 ### Optional preset: fail over only on 429
 
-This commented preset keeps 429 cooldown and failover for Claude and Codex OAuth accounts. It stops ordinary failover after a failed attempt for the listed non-429 statuses, without adding a cooldown. Credential-preparation failures and an enabled `requests.streaming.bootstrap-retries` can still cause another attempt. Unlisted statuses keep normal handling. The preset applies only to OAuth accounts and leaves plan limits and provider checks unchanged. A credential's own `request_scoped_errors` rules take precedence.
+This commented preset keeps 429 cooldown and failover for Claude and Codex OAuth accounts. It stops ordinary failover after a failed attempt for the listed non-429 statuses, without adding a cooldown. Credential-preparation failures can still cause another attempt. Unlisted statuses keep normal handling. The preset applies only to OAuth accounts and leaves plan limits and provider checks unchanged. A credential's own `request_scoped_errors` rules take precedence.
 
 Uncomment the block to use it. `(?s).*` matches any body, including an empty one. Rules need a body matcher; status alone does not match.
 

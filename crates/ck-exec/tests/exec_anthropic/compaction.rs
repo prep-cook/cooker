@@ -77,7 +77,9 @@ async fn run<I: RequestIngress>(
     for byte in body.chunks(1) {
         ingress.advance(request, byte)?;
     }
-    let validated = fixture.executors.fence(attempt, ingress, request)?;
+    let validated = ingress
+        .finish(request, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| fixture.executors.refence(attempt, fenced.view()))?;
     assert!(fixture.executors.refence(attempt, validated.view()).is_ok());
     let mut handle = fixture.exchange.request_with(validated, body);
     let response = fixture.streams.response(request);
@@ -234,7 +236,10 @@ async fn replay_eligible_compaction_takes_new_arm() {
         ingress.advance(&mut request, byte).unwrap();
     }
     let api_key = fixture.exchange.attempt(&fixture.streams.store);
-    let validated = fixture.executors.fence(&api_key, &mut ingress, &mut request).unwrap();
+    let validated = ingress
+        .finish(&mut request, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| fixture.executors.refence(&api_key, fenced.view()))
+        .unwrap();
     let refused = fixture.executors.refence(&attempt, validated.view());
     assert!(matches!(refused.err(), Some(codec::Error::Destination)));
     let mut handle = fixture.exchange.request_with(validated, plain);
@@ -269,7 +274,10 @@ async fn other_destinations_refuse_a_compaction_block() {
         ingress.advance(&mut request, byte).unwrap();
     }
     let attempt = fixture.exchange.attempt(&fixture.streams.store);
-    let validated = fixture.executors.fence(&attempt, &mut ingress, &mut request).unwrap();
+    let validated = ingress
+        .finish(&mut request, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| fixture.executors.refence(&attempt, fenced.view()))
+        .unwrap();
     fn refused(view: RequestView<'_>, capability: &impl Capability) -> bool {
         matches!(
             RequestFence::default().end(view, capability),

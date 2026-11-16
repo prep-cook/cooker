@@ -19,7 +19,12 @@ async fn compact_is_refused_at_the_fence() {
         .unwrap();
     let exchange = Exchange::new(credential("gemini", "http://127.0.0.1:1", KEY), MODEL, "/client");
     let attempt = exchange.attempt(&streams.store);
-    assert!(executors().fence(&attempt, &mut ingress, &mut writer).is_err());
+    assert!(
+        ingress
+            .finish(&mut writer, &ck_translate::codec::ClientCapability)
+            .and_then(|fenced| executors().refence(&attempt, fenced.view()))
+            .is_err()
+    );
 }
 
 /// Closes the client fence for the Gemini destination, without an upstream.
@@ -31,8 +36,9 @@ fn fenced<I: RequestIngress>(
 ) -> Result<(), codec::Error> {
     let exchange = Exchange::new(credential("gemini", "http://127.0.0.1:1", KEY), MODEL, "/client");
     ingress.advance(&mut writer, body.as_bytes())?;
-    executors()
-        .fence(&exchange.attempt(&streams.store), &mut ingress, &mut writer)
+    ingress
+        .finish(&mut writer, &ck_translate::codec::ClientCapability)
+        .and_then(|fenced| executors().refence(&exchange.attempt(&streams.store), fenced.view()))
         .map(drop)
 }
 
