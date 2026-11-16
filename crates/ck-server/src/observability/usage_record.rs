@@ -15,7 +15,7 @@ use ck_core::format::Format;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Kind, Res};
 
-use super::usage_snapshot::{self, CanonicalUsage, Dimension, ResponseFacts};
+use super::usage_snapshot::{self, CanonicalUsage, Dimension, ResponseFacts, Unit};
 
 /// Go `usage.TokenAccountingQuality`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +72,17 @@ pub struct Unreported {
     pub cache_read: bool,
     pub cache_creation: bool,
     pub total: bool,
+}
+
+impl Unreported {
+    pub const ALL: Self = Self {
+        input: true,
+        output: true,
+        reasoning: true,
+        cache_read: true,
+        cache_creation: true,
+        total: true,
+    };
 }
 
 impl Detail {
@@ -518,13 +529,20 @@ fn uint_at(node: &Res<'_>, path: &str) -> Option<u64> {
 /// canonical reader reads them from a snapshot's native value.
 fn native_dimensions(protocol: &str, node: &Res<'_>) -> Vec<(&'static str, Dimension)> {
     usage_snapshot::dimension_rows(protocol)
-        .filter_map(|(path, name, count)| {
+        .filter_map(|(path, name, unit)| {
             let path = path.join(".");
-            let value = if count {
-                uint_at(node, &path).map(Dimension::Count)
-            } else {
-                let value = node.get(path.as_str());
-                (value.kind == Kind::String).then(|| Dimension::Text(value.str().into_owned()))
+            let value = match unit {
+                Unit::Count => uint_at(node, &path).map(Dimension::Count),
+                Unit::Decimal => {
+                    let value = node.get(path.as_str());
+                    let raw = std::str::from_utf8(value.raw()).ok();
+                    raw.filter(|_| value.kind == Kind::Number)
+                        .map(|raw| Dimension::Decimal(raw.to_owned()))
+                }
+                Unit::Text => {
+                    let value = node.get(path.as_str());
+                    (value.kind == Kind::String).then(|| Dimension::Text(value.str().into_owned()))
+                }
             };
             value.map(|value| (name, value))
         })
@@ -638,8 +656,22 @@ pub fn parse_openai(body: &[u8]) -> Detail {
     parse_usage(body, parse_openai_node)
 }
 
-/// [`parse_openai`] of a buffered Responses body.
+/// [`parse_openai`] of a buffered Responses body. A usage reporting billed units but no token
+/// count, such as an xAI video's `{"cost_in_usd_ticks":…}`, keeps those units and leaves every
+/// token count unreported rather than zero.
 fn parse_responses(body: &[u8]) -> Detail {
+    let node = gj::parse(body).get("usage");
+    if node.is_object() && !has_openai_token_fields(&node) {
+        let dimensions = native_dimensions("responses", &node);
+        if !dimensions.is_empty() {
+            return Detail {
+                dimensions,
+                unreported: Unreported::ALL,
+                response_service_tier: service_tier(body),
+                ..Detail::default()
+            };
+        }
+    }
     parse_usage(body, parse_responses_node)
 }
 
@@ -1580,6 +1612,11 @@ impl Writer {
         // Straight into the record: no string per number.
         let _ = write!(self.0, "{v}");
     }
+    /// `v` is a JSON number literal both usage readers validated.
+    fn number(&mut self, k: &str, v: &str) {
+        self.key(k);
+        self.0.extend_from_slice(v.as_bytes());
+    }
     fn bool(&mut self, k: &str, v: bool) {
         self.key(k);
         self.0.extend_from_slice(if v { b"true" } else { b"false" });
@@ -1621,6 +1658,7 @@ fn write_dimensions(w: &mut Writer, dimensions: &[(&'static str, Dimension)]) {
         for (name, value) in dimensions {
             match value {
                 Dimension::Count(n) => d.int(name, i64::try_from(*n).unwrap_or(i64::MAX)),
+                Dimension::Decimal(number) => d.number(name, number),
                 Dimension::Text(text) => d.str(name, text),
             }
         }
@@ -2901,6 +2939,78 @@ mod tests {
                 ("video_frames_processed", Dimension::Count(0)),
             ]
         );
+    }
+
+    /// The billed units of a Responses usage an executor reports, streamed or as a buffered
+    /// body, reach the record as their own dimensions in their own units: xAI ticks, nano-USD
+    /// and tool counts as integers, Codex rollout budget units as the number the upstream wrote.
+    /// A body reporting units but no token count leaves the tokens unreported, not zero; a body
+    /// without usage records no dimension.
+    #[test]
+    fn responses_billed_units_reach_the_record() {
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAI,
+            Format::OpenAI,
+            "m",
+            b"{}",
+            false,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let terminal = |usage: &str| format!(r#"data: {{"type":"response.completed","response":{{"usage":{usage}}}}}"#);
+        for (provider, streamed, upstream, dimensions, tokens, literal) in [
+            (
+                "xai",
+                true,
+                terminal(
+                    r#"{"input_tokens":5,"output_tokens":2,"total_tokens":7,"cost_in_usd_ticks":158100000,"cost_in_nano_usd":15810000,"num_server_side_tools_used":1,"server_side_tool_usage_details":{"x_posts_fetched":7}}"#,
+                ),
+                serde_json::json!({"cost_in_usd_ticks":158100000,"cost_in_nano_usd":15810000,"num_server_side_tools_used":1,"x_posts_fetched":7}),
+                Some(7),
+                "",
+            ),
+            (
+                "codex",
+                true,
+                terminal(r#"{"input_tokens":100,"output_tokens":10,"total_tokens":110,"codex_rollout_budget_units":2.50}"#),
+                serde_json::json!({"codex_rollout_budget_units":2.5}),
+                Some(110),
+                r#""codex_rollout_budget_units":2.50"#,
+            ),
+            (
+                "xai",
+                false,
+                r#"{"data":[{"b64_json":"AAAA"}],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3,"cost_in_usd_ticks":200000000}}"#.to_owned(),
+                serde_json::json!({"cost_in_usd_ticks":200000000}),
+                Some(3),
+                "",
+            ),
+            (
+                "xai",
+                false,
+                r#"{"status":"done","video":{"url":"https://v.example/out.mp4"},"usage":{"cost_in_usd_ticks":5000000000}}"#.to_owned(),
+                serde_json::json!({"cost_in_usd_ticks":5000000000_u64}),
+                None,
+                "",
+            ),
+            ("xai", false, r#"{"status":"pending"}"#.to_owned(), Value::Null, Some(0), ""),
+        ] {
+            let tracker = Tracker::start(&rt, &facts, &credential_for(provider), "m");
+            if streamed {
+                tracker.sink().response_line(Format::Codex, upstream.as_bytes());
+            } else {
+                tracker.sink().response_body(Format::Codex, upstream.as_bytes());
+            }
+            tracker.succeed();
+            let raw = rt.usage_queue().pop_oldest(10);
+            let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+            let got = record.get("dimensions").cloned().unwrap_or(Value::Null);
+            assert_eq!(got, dimensions, "{upstream}");
+            assert_eq!(record["tokens"].get("total_tokens").and_then(Value::as_i64), tokens, "{upstream}");
+            assert_eq!(record["tokens"].get("input_tokens").is_some(), tokens.is_some(), "{upstream}");
+            assert!(String::from_utf8_lossy(&raw[0]).contains(literal), "{upstream}");
+        }
     }
 
     /// Gemini reports its tier inside `usageMetadata`, on the buffered and streamed paths.

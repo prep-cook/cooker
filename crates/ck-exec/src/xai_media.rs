@@ -2,6 +2,10 @@
 //! contract; `images`, `videos` and `speech` are the old routes' entry points until E7 moves
 //! the routes onto it.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::Credential;
@@ -111,6 +115,7 @@ impl XaiExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let logged = payload.as_slice();
         let body = (method == wreq::Method::POST).then(|| payload.clone());
+        let poll = method == wreq::Method::GET;
         let (token, _) = creds(credential);
         let mut headers = plain_headers(credential, &token, false, "", req);
         if idempotent && method == wreq::Method::POST {
@@ -140,16 +145,50 @@ impl XaiExecutor {
             error.headers = Box::new(headers);
             return Err(error);
         }
-        // Go only observes the response model here (no usage parse): a Codex-format line
-        // that is not a terminal event carries exactly that.
         if req.usage.enabled() {
-            req.usage.response_line(Format::Codex, &data);
+            // A video is a job: its usage is that of the job, which a poll repeats.
+            let job = idempotent.then(|| {
+                let source = if poll { &payload[..] } else { &data[..] };
+                text(&gj::get(source, "request_id"))
+            });
+            if gj::get(&data, "usage").is_object() && job.is_none_or(|job| self.jobs.first_charge(&job)) {
+                // The top-level usage of an image or video body, read as a Responses body's.
+                req.usage.response_body(Format::Codex, &data);
+            } else {
+                // The model only: a line that is not a terminal event carries no usage.
+                req.usage.response_line(Format::Codex, &data);
+            }
         }
         Ok(ExecResponse {
             status: 200,
             headers,
             body: ResponseBody::Buffered(data),
         })
+    }
+}
+
+/// How long a charged job is remembered: well past the binding TTL a client polls within.
+const CHARGED_JOB_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// The video jobs whose usage was recorded (E-Q13): a job is charged at the first poll that
+/// reports usage and never again, however often it is polled after.
+// ponytail: process memory, so a poll after a restart can charge a job again; a durable job
+// table removes that.
+#[derive(Default)]
+pub(crate) struct ChargedJobs(Mutex<HashMap<String, Instant>>);
+
+impl ChargedJobs {
+    /// Marks `job` charged; false when it already was. A job without an ID cannot be matched
+    /// with a later poll, so its every report is charged.
+    fn first_charge(&self, job: &str) -> bool {
+        let job = job.trim();
+        if job.is_empty() {
+            return true;
+        }
+        let now = Instant::now();
+        let mut jobs = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        jobs.retain(|_, at| now.duration_since(*at) < CHARGED_JOB_TTL);
+        jobs.insert(job.to_owned(), now).is_none()
     }
 }
 

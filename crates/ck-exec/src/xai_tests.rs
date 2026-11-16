@@ -524,6 +524,102 @@ async fn speech_errors_keep_go_scope() {
     }
 }
 
+/// An image or video body reports its top-level usage as a buffered Responses body, so the
+/// server reads its counts and billed units. A body without usage reports only its model. A
+/// video job is charged at the first poll that reports usage and never again (E-Q13), while
+/// another job is charged on its own.
+#[tokio::test]
+async fn media_usage_is_charged_once_per_response_or_job() {
+    let cfg = Config::default();
+    let target: Arc<Mutex<String>> = Arc::default();
+    let executor = {
+        let target = target.clone();
+        XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &target.lock().unwrap()))
+    };
+    let charged =
+        r#"{"status":"done","video":{"url":"https://v.example/out.mp4"},"usage":{"cost_in_usd_ticks":5000000000}}"#;
+    let image = r#"{"data":[{"b64_json":"AAAA"}],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3,"cost_in_usd_ticks":200000000}}"#;
+    let rows: [(&str, &str, &str, &str, bool); 8] = [
+        ("images", "/v1/images/generations", r#"{"prompt":"a"}"#, image, true),
+        ("images", "/v1/images/generations", r#"{"prompt":"a"}"#, image, true),
+        (
+            "images",
+            "/v1/images/generations",
+            r#"{"prompt":"a"}"#,
+            r#"{"data":[{"b64_json":"AAAA"}]}"#,
+            false,
+        ),
+        (
+            "videos",
+            "/v1/videos/generations",
+            r#"{"prompt":"a"}"#,
+            r#"{"request_id":"vid_9"}"#,
+            false,
+        ),
+        (
+            "videos",
+            "/v1/videos/vid_9",
+            r#"{"request_id":"vid_9"}"#,
+            r#"{"status":"pending","usage":null}"#,
+            false,
+        ),
+        ("videos", "/v1/videos/vid_9", r#"{"request_id":"vid_9"}"#, charged, true),
+        (
+            "videos",
+            "/v1/videos/vid_9",
+            r#"{"request_id":"vid_9"}"#,
+            charged,
+            false,
+        ),
+        (
+            "videos",
+            "/v1/videos/vid_10",
+            r#"{"request_id":"vid_10"}"#,
+            charged,
+            true,
+        ),
+    ];
+    for (op, path, payload, body, reports_usage) in rows {
+        let mock = Mock::start(
+            &serde_json::json!({"status": 200, "headers": [["Content-Type", "application/json"]], "body": body}),
+        )
+        .await;
+        *target.lock().unwrap() = mock.addr.clone();
+        let s = serde_json::json!({
+            "config_auth": -1,
+            "attributes": {"api_key": "sk-fake-xai"},
+            "op": op,
+            "source": "openai",
+            "payload": payload,
+            "model": "grok-imagine",
+            "request_path": path,
+        });
+        let (recorder, _capture, sink) = crate::openai_compat_usage::sinks();
+        let req = request(&s, sink);
+        match op {
+            "images" => executor.images(&credential(&s, &cfg), req, path, &cfg).await,
+            _ => executor.videos(&credential(&s, &cfg), req, path, &cfg).await,
+        }
+        .expect("a 200");
+        let reports = recorder.0.lock().unwrap();
+        let bodies: Vec<String> = reports
+            .iter()
+            .filter_map(|r| match r {
+                crate::openai_compat_usage::Report::Body(Format::Codex, data) => {
+                    Some(String::from_utf8_lossy(data).into_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        let want: Vec<String> = if reports_usage {
+            vec![body.to_owned()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(bodies, want, "{op} {path} {body}");
+    }
+}
+
 /// TestXAIExecutorCompactUsesCompactEndpoint (868e137): compact's deletes run before the
 /// payload rules, so a configured `top_k` survives while the deleted fields stay gone.
 #[tokio::test]

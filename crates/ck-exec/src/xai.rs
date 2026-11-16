@@ -57,6 +57,8 @@ pub struct XaiExecutor {
     rewrite: Option<UrlRewrite>,
     /// The upstream Responses WebSocket sessions (xai_ws.rs).
     pub(crate) ws: Arc<crate::xai_ws::Ws>,
+    /// Video jobs whose usage was recorded (xai_media.rs).
+    pub(crate) jobs: crate::xai_media::ChargedJobs,
 }
 
 pub(crate) fn apply_patch_error() -> ExecError {
