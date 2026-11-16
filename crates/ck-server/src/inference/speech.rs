@@ -116,8 +116,6 @@ pub async fn speech(
         media: Some(Arc::new(Media {
             kind: MediaKind::Speech,
             pinned: None,
-            on_selected: None,
-            sse: false,
             disallow_free: false,
         })),
     };

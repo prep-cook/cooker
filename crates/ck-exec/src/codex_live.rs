@@ -16,13 +16,13 @@ use ck_core::credential::Credential;
 use ck_core::exec::{CaptureEvent, CaptureSink, ExecError, UpstreamRequest};
 use ck_wire::gostr::{GoStr, quote as go_quote, trim_space};
 use ck_wire::json::{self as gj, GoValue, Kind};
+use ck_wire::mime::{MediaType, parse_media_type};
 use http::HeaderMap;
 use wreq::ws::message as up;
 
 use crate::codex::CodexExecutor;
 use crate::codex_request::{self as request, View};
 use crate::meta_wire::{check_valid, fold, kind_name};
-use crate::openai_compat_multipart::{MediaType, parse_media_type};
 use crate::proxy::{self, GoHeaders, Route, Upstream, canonical_header};
 use crate::session::{Close, Frame, FrameSink, LiveUpstream};
 
@@ -1456,7 +1456,7 @@ mod form {
                 };
                 slot.get_or_insert_with(|| String::from_utf8_lossy(&value).into_owned());
             }
-            let name = match disposition.map(|d| crate::openai_compat_multipart::parse_media_type(&d)) {
+            let name = match disposition.map(|d| ck_wire::mime::parse_media_type(&d)) {
                 Some(MediaType::Ok(kind, params)) if kind == "form-data" => {
                     params.get("name").cloned().unwrap_or_default()
                 }

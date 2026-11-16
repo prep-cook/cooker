@@ -106,8 +106,6 @@ fn call(
         media: Some(Arc::new(Media {
             kind: MediaKind::DeferredChat,
             pinned,
-            on_selected: None,
-            sse: false,
             disallow_free: false,
         })),
     }

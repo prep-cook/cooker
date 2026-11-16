@@ -26,11 +26,15 @@ const LIMIT: u64 = 1 << 20;
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Provider {
     Codex,
+    /// A Codex credential under [`SIZE_RULE`].
+    CodexRules,
     /// A Codex ChatGPT login with cloaking off, so the client's headers reach the header rules.
     CodexLogin,
     /// A Sign in with ChatGPT credential, which has no direct Images endpoint.
     CodexSiwc,
     Compat,
+    /// An OpenAI-compatible credential under [`SIZE_RULE`].
+    CompatRules,
     Xai,
 }
 
@@ -113,12 +117,21 @@ fn exchange(provider: Provider, upstream: &StreamUpstream, model: &str) -> Excha
         return Exchange::new(siwc, model, "/v1/images/generations");
     }
     let (name, base) = match provider {
-        Provider::Codex | Provider::CodexLogin | Provider::CodexSiwc => ("codex", upstream.url()),
-        Provider::Compat => ("openai-compatibility", format!("{}/v1", upstream.url())),
+        Provider::Codex | Provider::CodexRules | Provider::CodexLogin | Provider::CodexSiwc => {
+            ("codex", upstream.url())
+        }
+        Provider::Compat | Provider::CompatRules => ("openai-compatibility", format!("{}/v1", upstream.url())),
         Provider::Xai => ("xai", upstream.url()),
     };
-    Exchange::new(credential(name, &base, "sk-up"), model, "/v1/images/generations")
+    let mut exchange = Exchange::new(credential(name, &base, "sk-up"), model, "/v1/images/generations");
+    if matches!(provider, Provider::CodexRules | Provider::CompatRules) {
+        exchange.cfg = ck_core::config::Config::parse(SIZE_RULE).unwrap();
+    }
+    exchange
 }
+
+/// A payload rule that sets `size` on every `openai`-protocol body.
+const SIZE_RULE: &str = "requests:\n  payload:\n    override:\n      - models: [{name: \"*\", protocol: openai}]\n        params: {size: auto}\n";
 
 type Held = (Writer, Document, Registry);
 type Outcome = Result<(Result<(), ExecError>, Vec<(String, Value)>, Option<Terminal>, Writer), codec::Error>;
@@ -179,11 +192,11 @@ async fn run_as(
 ) -> Outcome {
     let op = Operation::Media(ask.claimed.unwrap_or(ask.op));
     match provider {
-        Provider::Codex | Provider::CodexLogin | Provider::CodexSiwc => {
+        Provider::Codex | Provider::CodexRules | Provider::CodexLogin | Provider::CodexSiwc => {
             let codex = CodexExecutor::with_client(wreq::Client::new(), CodexOAuth::new(wreq::Client::new()));
             run_on(&codex, streams, exchange, held, op, client_only).await
         }
-        Provider::Compat => {
+        Provider::Compat | Provider::CompatRules => {
             let compat = OpenAICompatExecutor::with_client(wreq::Client::new());
             run_on(&compat, streams, exchange, held, op, client_only).await
         }
@@ -277,21 +290,18 @@ fn sent_body(captured: &Captured) -> Value {
     let Some(boundary) = content_type.strip_prefix("multipart/form-data; boundary=") else {
         return serde_json::from_slice(&captured.body).unwrap();
     };
-    let body = String::from_utf8_lossy(&captured.body).into_owned();
+    let parsed = ck_exec::multipart::read_form(&captured.body, boundary).unwrap();
     let mut form = serde_json::Map::new();
-    for part in body.split(&format!("--{boundary}")).filter(|p| p.starts_with("\r\n")) {
-        let (head, value) = part[2..].split_once("\r\n\r\n").unwrap();
-        let value = value.strip_suffix("\r\n").unwrap();
-        let name = head.split("name=\"").nth(1).unwrap().split('"').next().unwrap();
-        let value = match head.split("filename=\"").nth(1) {
-            Some(rest) => {
-                let filename = rest.split('"').next().unwrap();
-                let mime = head.split("Content-Type: ").nth(1).unwrap();
-                format!("{filename};{mime};{}", value.len())
-            }
-            None => value.to_owned(),
-        };
-        form.insert(name.to_owned(), value.into());
+    for (name, values) in &parsed.values {
+        form.insert(name.clone(), String::from_utf8_lossy(&values[0]).into_owned().into());
+    }
+    for (name, files) in &parsed.files {
+        let file = &files[0];
+        let mime = String::from_utf8_lossy(file.header("Content-Type").unwrap());
+        form.insert(
+            name.clone(),
+            format!("{};{mime};{}", file.filename, file.body.len()).into(),
+        );
     }
     Value::Object(form)
 }
@@ -351,6 +361,17 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
             &[("content-type", Some("application/json")), ("user-agent", None)],
         ),
         (
+            "Codex gpt-image model with the payload rules run last",
+            Provider::CodexRules,
+            "gpt-image-2",
+            ask(Media::ImageGenerate, GENERATE),
+            Reply::json(IMAGES_JSON),
+            "POST",
+            "/images/generations",
+            json!({"model":"gpt-image-2","prompt":"a cat","size":"auto"}),
+            &[],
+        ),
+        (
             "Codex text model forces the image tool on Responses",
             Provider::Codex,
             "gpt-5",
@@ -382,6 +403,17 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
             "POST",
             "/v1/images/edits",
             json!({"model":"up-image","prompt":"add a hat","image":"image1;image/png;3"}),
+            &[],
+        ),
+        (
+            "OpenAI-compatible multipart edit with the payload rules run last, its file kept",
+            Provider::CompatRules,
+            "up-image",
+            ask(Media::ImageEdit, EDIT),
+            Reply::json(IMAGES_JSON),
+            "POST",
+            "/v1/images/edits",
+            json!({"model":"up-image","size":"auto","image":"image1;image/png;3"}),
             &[],
         ),
         (
@@ -543,7 +575,10 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
         for (key, value) in members.as_object().unwrap() {
             assert_eq!(&body[key], value, "{name}: member {key}");
         }
-        if matches!(provider, Provider::Codex | Provider::CodexLogin | Provider::CodexSiwc) {
+        if matches!(
+            provider,
+            Provider::Codex | Provider::CodexRules | Provider::CodexLogin | Provider::CodexSiwc
+        ) {
             assert!(body["prompt_cache_key"].is_string(), "{name}: the session's cache key");
         }
     }
@@ -911,6 +946,62 @@ async fn media_failures_publish_no_result() {
             Some((FailureScope::Request, true)),
         ),
         (
+            "a speech model refused in the error message is left to the upstream classification",
+            Provider::Xai,
+            "grok-tts",
+            ask(Media::Speech, SPEECH),
+            Reply::status(
+                404,
+                "application/json",
+                r#"{"error":{"message":"Unsupported model: grok-tts"}}"#,
+            ),
+            Some((FailureScope::Request, true)),
+        ),
+        (
+            "a speech model refused in a plain-text body is left to the upstream classification",
+            Provider::Xai,
+            "grok-tts",
+            ask(Media::Speech, SPEECH),
+            Reply::status(404, "text/plain", "model is not available"),
+            Some((FailureScope::Request, true)),
+        ),
+        (
+            "a speech model refused by its error code is left to the upstream classification",
+            Provider::Xai,
+            "grok-tts",
+            ask(Media::Speech, SPEECH),
+            Reply::status(
+                404,
+                "application/json",
+                r#"{"error":{"code":"model_not_found","message":"The model grok-tts does not exist"}}"#,
+            ),
+            Some((FailureScope::Request, true)),
+        ),
+        (
+            "a speech model refused by its top-level code is left to the upstream classification",
+            Provider::Xai,
+            "grok-tts",
+            ask(Media::Speech, SPEECH),
+            Reply::status(
+                404,
+                "application/json",
+                r#"{"code":"model_not_found","error":"model unavailable"}"#,
+            ),
+            Some((FailureScope::Request, true)),
+        ),
+        (
+            "a speech model the account cannot use is left to the upstream classification",
+            Provider::Xai,
+            "grok-tts",
+            ask(Media::Speech, SPEECH),
+            Reply::status(
+                404,
+                "application/json",
+                r#"{"error":"The model grok-tts is not available for your account"}"#,
+            ),
+            Some((FailureScope::Request, true)),
+        ),
+        (
             "a job this process never created is refused before anything is sent",
             Provider::Xai,
             "grok-imagine-video",
@@ -964,25 +1055,9 @@ async fn media_failures_publish_no_result() {
     }
 }
 
-/// The bodies a buffered video route reports to its usage record.
-#[derive(Default)]
-struct Reported(std::sync::Mutex<Vec<Value>>);
-
-impl ck_core::exec::UsageObserver for Reported {
-    fn response_body(&self, _: ck_core::format::Format, body: &[u8]) {
-        self.0.lock().unwrap().push(serde_json::from_slice(body).unwrap());
-    }
-
-    fn response_line(&self, _: ck_core::format::Format, _: &[u8]) {}
-
-    fn request(&self, _: ck_core::format::Format, _: &[u8]) {}
-}
-
-/// The route a video request takes through the xAI executor.
+/// The stream a video request's records go to.
 #[derive(Clone, Copy, Debug)]
 enum Route {
-    /// `XaiExecutor::videos`: the whole body, reported to the usage record.
-    Buffered,
     /// The execution contract: canonical records through the video codec.
     Contract,
     /// The execution contract onto a stream whose event limit cannot hold the usage record, so
@@ -999,75 +1074,34 @@ async fn video_step(
     job: &'static str,
     body: Option<&str>,
 ) -> bool {
+    let streams = match route {
+        Route::ContractNoRoom => Streams::with_event_bytes(400),
+        _ => Streams::new(),
+    };
+    let exchange = exchange(Provider::Xai, upstream, "grok-imagine-video");
+    let ask = match body {
+        None => ask(Media::VideoCreate, VIDEO),
+        Some(_) => foreign(Media::VideoRetrieve, job),
+    };
+    let mut held = decoded(&streams, ask);
+    let operation = Operation::Media(ask.op);
+    let (outcome, records, ..) = run_on(xai, &streams, &exchange, &mut held, operation, false)
+        .await
+        .unwrap();
     match route {
-        Route::Contract | Route::ContractNoRoom => {
-            let streams = match route {
-                Route::ContractNoRoom => Streams::with_event_bytes(400),
-                _ => Streams::new(),
-            };
-            let exchange = exchange(Provider::Xai, upstream, "grok-imagine-video");
-            let ask = match body {
-                None => ask(Media::VideoCreate, VIDEO),
-                Some(_) => foreign(Media::VideoRetrieve, job),
-            };
-            let mut held = decoded(&streams, ask);
-            let operation = Operation::Media(ask.op);
-            let (outcome, records, ..) = run_on(xai, &streams, &exchange, &mut held, operation, false)
-                .await
-                .unwrap();
-            match route {
-                Route::ContractNoRoom => assert!(outcome.is_err(), "{job}: the usage record did not fit"),
-                _ => outcome.unwrap_or_else(|e| panic!("{route:?} {job}: {e:?}")),
-            }
-            usages(&records)
-                .iter()
-                .any(|record| record["scope"] == format!("job:{job}"))
-        }
-        Route::Buffered => {
-            let (path, payload) = match body {
-                None => ("/v1/videos/generations".to_owned(), VIDEO.to_owned()),
-                Some(_) => (format!("/v1/videos/{job}"), json!({"request_id": job}).to_string()),
-            };
-            let reported = std::sync::Arc::new(Reported::default());
-            let payload = bytes::Bytes::from(payload);
-            let request = ck_core::exec::ExecRequest {
-                operation: ck_core::exec::Operation::Generate,
-                source_format: ck_core::format::Format::OpenAI,
-                response_format: ck_core::format::Format::OpenAI,
-                model: "grok-imagine-video".into(),
-                requested_model: "client-video".into(),
-                body: payload.clone(),
-                original_body: payload,
-                stream: false,
-                alt: None,
-                session: None,
-                execution_session: None,
-                derived_session: None,
-                request_path: path.clone(),
-                headers: http::HeaderMap::new(),
-                caller: ck_core::exec::Caller {
-                    principal: "sk-client-test".into(),
-                    source: "authorization",
-                    provider: "config-inline".into(),
-                },
-                resolved_model: None,
-                usage: ck_core::exec::UsageSink::new(reported.clone()),
-            };
-            let credential = credential("xai", &upstream.url(), "sk-up");
-            xai.videos(&credential, request, &path, &ck_core::config::Config::default())
-                .await
-                .unwrap_or_else(|e| panic!("{route:?} {job}: {e:?}"));
-            let bodies = reported.0.lock().unwrap();
-            bodies.iter().any(|body| body.get("usage").is_some())
-        }
+        Route::ContractNoRoom => assert!(outcome.is_err(), "{job}: the usage record did not fit"),
+        _ => outcome.unwrap_or_else(|e| panic!("{route:?} {job}: {e:?}")),
     }
+    usages(&records)
+        .iter()
+        .any(|record| record["scope"] == format!("job:{job}"))
 }
 
-/// A video job's usage is charged once, at the first answer that reports it, whichever route
-/// carries its create and its polls (E-Q13): both settle against the executor's one job table.
+/// A video job's usage is charged once, at the first answer that reports it (E-Q13): every poll
+/// settles against the executor's one job table.
 #[tokio::test]
-async fn video_job_usage_is_charged_once_whichever_route_polls_it() {
-    use Route::{Buffered, Contract, ContractNoRoom};
+async fn video_job_usage_is_charged_once_at_its_first_report() {
+    use Route::{Contract, ContractNoRoom};
     let done = r#"{"status":"done","usage":{"cost_in_usd_ticks":7}}"#;
     let pending = r#"{"status":"pending","usage":{"cost_in_usd_ticks":7}}"#;
     let large = r#"{"status":"done","usage":{"cost_in_usd_ticks":7,"input_tokens":1000000000000000000,"output_tokens":1000000000000000000,"total_tokens":2000000000000000000}}"#;
@@ -1087,25 +1121,6 @@ async fn video_job_usage_is_charged_once_whichever_route_polls_it() {
                 .chain(std::iter::once(true))
                 .chain(std::iter::repeat_n(false, 9))
                 .collect(),
-        ),
-        (
-            "a buffered poll's charge holds for the contract's polls",
-            vec![
-                (Buffered, "vid_2", None),
-                (Buffered, "vid_2", Some(done)),
-                (Contract, "vid_2", Some(done)),
-                (Contract, "vid_2", Some(done)),
-            ],
-            vec![false, true, false, false],
-        ),
-        (
-            "a contract poll's charge holds for the buffered route",
-            vec![
-                (Contract, "vid_3", None),
-                (Contract, "vid_3", Some(done)),
-                (Buffered, "vid_3", Some(done)),
-            ],
-            vec![false, true, false],
         ),
         (
             "a pending report is the charge and the finished one is not",

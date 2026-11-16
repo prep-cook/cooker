@@ -364,8 +364,6 @@ pub(crate) enum Logged {
     Whole,
     /// One chunk per `bufio.Scanner` line.
     Lines,
-    /// One chunk per raw read.
-    Reads,
 }
 
 /// Headers the Go transport adds after the executor logs `httpReq.Header`.
@@ -470,19 +468,6 @@ pub(crate) fn http_capture_problems(events: &[Captured], a: &HttpAttempt<'_>) ->
     if a.logged == Logged::Whole {
         if rest != [Captured::Chunk(a.body.to_owned())] {
             problems.push(format!("capture body events: {rest:?}"));
-        }
-        return problems;
-    }
-    if a.logged == Logged::Reads {
-        let joined: String = rest
-            .iter()
-            .map(|e| match e {
-                Captured::Chunk(c) => c.as_str(),
-                _ => "<not a chunk>",
-            })
-            .collect();
-        if joined != a.body {
-            problems.push(format!("capture reads: {rest:?}"));
         }
         return problems;
     }

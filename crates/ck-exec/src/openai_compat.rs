@@ -17,10 +17,10 @@ use ck_wire::json as gj;
 use ck_wire::thinking::{self, ModelCaps, RequestThinking, parse_suffix};
 
 use crate::gemini_stream::ClaudeInputTokens;
+use crate::multipart;
 use crate::openai_compat_go as go;
 use crate::openai_compat_headers::base_headers;
 use crate::openai_compat_http::{self as wire, Clients, GoHeaders};
-use crate::openai_compat_multipart as multipart;
 use crate::openai_compat_payload as payload;
 
 #[path = "openai_compat_chat.rs"]
@@ -32,8 +32,6 @@ use stream::frames;
 
 pub const USER_AGENT: &str = "cooker";
 const COMPACT_ALT: &str = "responses/compact";
-const IMAGES_GENERATIONS: &str = "/images/generations";
-const IMAGES_EDITS: &str = "/images/edits";
 /// `scanner.Buffer(nil, 52_428_800)`.
 pub(crate) const MAX_LINE: usize = 52_428_800;
 /// helps.ApplyPatchUpstreamErrorMessage: Go's error for an empty or rejected translation.
@@ -84,19 +82,6 @@ async fn upstream_error(upstream: wire::Upstream, capture: &wire::Capture) -> Ex
     let (status, headers, body) = wire::read_error_body(upstream).await;
     capture.chunk(&body);
     status_error(status, headers, body, true)
-}
-
-/// An images non-2xx response: the whole body is read first and a read error is
-/// captured and returned instead, then `newOpenAICompatStatusError`, or the plain
-/// `statusErr` the image stream path uses.
-async fn images_error(upstream: wire::Upstream, with_retry: bool, capture: &wire::Capture) -> ExecError {
-    let (status, headers) = (upstream.status, upstream.headers.clone());
-    let body = wire::read_all(upstream).await;
-    capture.read(&body);
-    match body {
-        Ok(body) => status_error(status, headers, body, with_retry),
-        Err(error) => error,
-    }
 }
 
 /// `newOpenAICompatStatusError`: the upstream's status and its body as received, an empty or
@@ -289,139 +274,6 @@ impl OpenAICompatExecutor {
         )
         .await
     }
-
-    /// `executeImages` / `executeImagesStream`: the body (JSON or multipart) goes to
-    /// `/images/edits` or `/images/generations` with the model replaced. `request_path` is
-    /// the inbound route; `req.stream` selects raw SSE passthrough.
-    pub async fn images(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        request_path: &str,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        let base_model = parse_suffix(&req.model).model_name.trim().to_owned();
-        let (base_url, api_key) = credentials(credential);
-        if base_url.is_empty() {
-            return Err(missing_base_url());
-        }
-        let client_content_type = req
-            .headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        let (body, content_type) = prepare_images_payload(&req.body, &base_model, &client_content_type, req.stream)?;
-        let content_type = if content_type.is_empty() {
-            "application/json".to_owned()
-        } else {
-            content_type
-        };
-        let (body, content_type) = media_barrier(
-            credential,
-            &req,
-            cfg,
-            &base_model,
-            &body,
-            &content_type,
-            &client_content_type,
-        )?;
-        let path = if request_path.trim().ends_with(IMAGES_EDITS) {
-            IMAGES_EDITS
-        } else {
-            IMAGES_GENERATIONS
-        };
-        // SetTranslatedReasoningEffort(payload, "openai").
-        if req.usage.enabled() {
-            req.usage.request(Format::OpenAI, &body);
-        }
-        let mut headers = base_headers(&api_key, &content_type, true);
-        if req.stream {
-            headers.set("Accept", "text/event-stream");
-            headers.set("Cache-Control", "no-cache");
-        }
-        apply_custom(&mut headers, credential, &req);
-        headers.set("User-Agent", USER_AGENT);
-        let client = self.clients.for_credential(credential, cfg);
-        let url = endpoint(&base_url, path);
-        let capture = wire::Capture::request(
-            &req,
-            credential,
-            &credential.provider,
-            &url,
-            "POST",
-            headers.pairs(),
-            &body,
-        );
-        let upstream = wire::send(&client, &url, headers, body).await;
-        capture.sent(&upstream);
-        let upstream = upstream?;
-        if !(200..300).contains(&upstream.status) {
-            return Err(images_error(upstream, !req.stream, &capture).await);
-        }
-        let headers = upstream.headers.clone();
-        if req.stream {
-            // Each raw read is logged; a read error is logged and published as a failure
-            // before the client gets it.
-            let usage = req.usage.clone();
-            let stream = capture
-                .stream(upstream.body)
-                .inspect(move |item| {
-                    if let Err(error) = item {
-                        wire::publish_failure(&usage, error);
-                    }
-                })
-                .boxed();
-            return Ok(ExecResponse {
-                status: 200,
-                headers,
-                body: ResponseBody::Stream(stream),
-            });
-        }
-        let data = wire::read_all(upstream).await;
-        capture.read(&data);
-        let data = data?;
-        if req.usage.enabled() {
-            req.usage.response_body(Format::OpenAI, &data);
-        }
-        Ok(ExecResponse {
-            status: 200,
-            headers,
-            body: ResponseBody::Buffered(data),
-        })
-    }
-}
-
-/// `ApplyMediaPayloadConfig` on a prepared images request (868e137): the payload rules
-/// run last, on the body's JSON view, against the client's original request.
-fn media_barrier(
-    credential: &Credential,
-    req: &ExecRequest,
-    cfg: &Config,
-    model: &str,
-    body: &[u8],
-    content_type: &str,
-    client_content_type: &str,
-) -> Result<(Bytes, String), ExecError> {
-    let original = if req.original_body.is_empty() {
-        &req.body
-    } else {
-        &req.original_body
-    };
-    let (body, content_type) =
-        crate::payload_media::apply(body, content_type, original, client_content_type, |view, original| {
-            crate::payload_barrier::Barrier {
-                executor: &credential.provider,
-                model,
-                protocol: Format::OpenAI.as_str(),
-                root: "",
-                original,
-            }
-            .apply(cfg, req, view)
-        })
-        .map_err(plain_err)?;
-    Ok((Bytes::from(body), content_type))
 }
 
 /// `prepareOpenAICompatImagesPayload`.

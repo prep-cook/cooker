@@ -86,6 +86,7 @@ pub mod meta_auth;
 mod meta_codex;
 pub mod meta_exec;
 mod meta_wire;
+pub mod multipart;
 pub mod oauth;
 pub mod openai_compat;
 pub mod openai_compat_exec;
@@ -93,7 +94,6 @@ mod openai_compat_go;
 mod openai_compat_headers;
 mod openai_compat_http;
 mod openai_compat_media;
-pub mod openai_compat_multipart;
 mod openai_compat_payload;
 #[cfg(test)]
 mod openai_compat_usage;
@@ -323,40 +323,6 @@ impl Executors {
         }
     }
 
-    /// The Images API (`/v1/images/generations`, `/v1/images/edits`) for providers that
-    /// serve it directly. `request_path` is the inbound route; `req.stream` asks for the
-    /// upstream event stream passed through raw.
-    pub async fn images(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        request_path: &str,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        match credential.provider.as_str() {
-            "codex" => self.codex.images(credential, req, request_path, cfg).await,
-            p if openai_compat::handles(p) => self.openai.compat.images(credential, req, request_path, cfg).await,
-            xai::PROVIDER => self.openai.xai.images(credential, req, request_path, cfg).await,
-            other => Err(no_executor(other)),
-        }
-    }
-
-    /// The Videos API (`/v1/videos*`, `/openai/v1/videos*`) for providers that serve it.
-    /// `request_path` is the inbound route; a route other than generations, edits or
-    /// extensions polls the job named by the body's `request_id`.
-    pub async fn videos(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        request_path: &str,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        match credential.provider.as_str() {
-            xai::PROVIDER => self.openai.xai.videos(credential, req, request_path, cfg).await,
-            other => Err(no_executor(other)),
-        }
-    }
-
     /// Where `caller`'s video job `job` is polled: the credential and model it was created on
     /// (E-Q5). `None` when the job is another caller's, expired or unknown.
     pub fn video_binding(&self, caller: &ck_core::exec::Caller, job: &str) -> Option<JobBinding> {
@@ -373,20 +339,6 @@ impl Executors {
     /// finds a video job's.
     pub fn chat_binding(&self, caller: &ck_core::exec::Caller, job: &str) -> Option<JobBinding> {
         self.openai.xai.jobs.binding(caller, JobKind::Chat, job)
-    }
-
-    /// The OpenAI speech routes (`/v1/audio/speech`, `/v1/tts`): Go's `openai-speech`
-    /// source, which only the xAI executor serves.
-    pub async fn speech(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        match credential.provider.as_str() {
-            xai::PROVIDER => self.openai.xai.speech(credential, req, cfg).await,
-            other => Err(no_executor(other)),
-        }
     }
 
     /// A deferred xAI Chat create or poll (X11); only xAI serves it.
@@ -603,7 +555,8 @@ impl Executors {
     }
 }
 
-fn no_executor(provider: &str) -> ExecError {
+/// The failure of a call no executor of `provider` serves; it fails over to another credential.
+pub fn no_executor(provider: &str) -> ExecError {
     ExecError::local(
         500,
         FailureScope::Credential,
