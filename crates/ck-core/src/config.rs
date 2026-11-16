@@ -15,11 +15,13 @@ pub mod credentials;
 mod document;
 pub mod go_url;
 pub mod model_catalog;
+mod realtime;
 mod schema;
 mod timestamp;
 mod trusted;
 mod validate;
 pub use document::ConfigDocument;
+pub use realtime::Realtime;
 pub use schema::ValidationPath;
 pub use schema::validate as validate_config_fields;
 pub use schema::{coerce_typed_scalars, go_bool, go_int};
@@ -625,6 +627,7 @@ impl Config {
         };
         trusted::validate(&trusted_proxies)?;
         validate::go_custom(document.value())?;
+        realtime::Realtime::read(document.value().get("realtime"))?;
         let oauth_only = schema::oauth_only_paths(&Value::Mapping(root.clone()));
         Ok(Config {
             host,

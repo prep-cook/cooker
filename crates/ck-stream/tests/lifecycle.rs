@@ -352,6 +352,7 @@ fn terminals_render_only_registered_codes_and_reasons() {
     let rendered: Vec<_> = [
         Done,
         Cancelled,
+        ClientDisconnected,
         Shutdown,
         UpstreamError,
         StorageExhausted,
@@ -366,6 +367,7 @@ fn terminals_render_only_registered_codes_and_reasons() {
         [
             (None, None),
             (None, Some("client_cancel")),
+            (None, Some("client_disconnect")),
             (None, Some("shutdown")),
             (None, None),
             (Some("stream.storage_exhausted"), None),

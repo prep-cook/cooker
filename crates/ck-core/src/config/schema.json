@@ -1577,6 +1577,14 @@
           }
         }
       }
+    },
+    "realtime": {
+      "fields": {
+        "ping-interval-seconds": "int",
+        "read-timeout-seconds": "int",
+        "write-timeout-seconds": "int",
+        "max-sockets-per-key": "int"
+      }
     }
   }
 }

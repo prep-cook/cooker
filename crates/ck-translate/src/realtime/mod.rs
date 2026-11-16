@@ -26,7 +26,9 @@
 //!   client message ordinal), `response.cancel`, `input_audio_buffer.commit` and `.clear`
 //!   (`audio.commit` and `audio.clear` on track `input`) and sideband `session.close`;
 //! - `operation` `realtime.rates` for `rate_limits.updated`;
-//! - `usage` for each upstream `response.done` that reports usage, then its `opaque` record;
+//! - `usage` for each upstream `response.done` that reports usage, under the scope
+//!   `response:<id>`, and for each completed input audio transcription that reports tokens,
+//!   under `transcription:<item_id>`; then the event's own record;
 //! - `opaque` for every other event type, named after it, with status, reason, error type
 //!   and code where the event has them;
 //! - `operation` `realtime.counters` at the end.

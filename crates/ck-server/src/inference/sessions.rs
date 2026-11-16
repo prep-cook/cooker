@@ -117,9 +117,7 @@ impl End {
     /// The terminal the session stream and every open exchange end with.
     pub fn terminal(&self) -> Terminal {
         match self {
-            // ponytail: Settled 55 names `Terminal::ClientDisconnected` (`client_disconnect`)
-            // for these; W2 adds that variant and changes this arm.
-            Self::ClientClose(_) | Self::ClientGone => Terminal::Cancelled,
+            Self::ClientClose(_) | Self::ClientGone => Terminal::ClientDisconnected,
             Self::UpstreamClose(_) => Terminal::Done,
             Self::UpstreamGone => Terminal::UpstreamError,
             Self::Shutdown => Terminal::Shutdown,
@@ -127,7 +125,8 @@ impl End {
         }
     }
 
-    /// The close frame the upstream gets; `None` when the upstream itself ended.
+    /// The close frame the upstream gets: an upstream close is echoed to complete the closing
+    /// handshake (RFC 6455 §5.5.1); `None` when the upstream connection was lost.
     fn upstream_close(&self) -> Option<Option<Close>> {
         let close = |code| {
             Some(Some(Close {
@@ -136,8 +135,8 @@ impl End {
             }))
         };
         match self {
-            Self::UpstreamClose(_) | Self::UpstreamGone => None,
-            Self::ClientClose(close) => Some(close.clone()),
+            Self::UpstreamGone => None,
+            Self::ClientClose(close) | Self::UpstreamClose(close) => Some(close.clone()),
             // 1001 going away and 1011 internal error (RFC 6455 §7.4.1).
             Self::ClientGone | Self::Shutdown => close(1001),
             Self::Failed(_) => close(1011),

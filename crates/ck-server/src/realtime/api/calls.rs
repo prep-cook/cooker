@@ -3,13 +3,14 @@
 //!
 //! A call expires an hour after it was stored or last released. One sideband may claim
 //! it at a time; a claimed call does not expire. Completing a call (hangup, sideband end,
-//! replacement, shutdown) closes everything registered on it.
+//! replacement, shutdown) ends its sideband session.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use tokio::task::AbortHandle;
+use tokio_util::sync::CancellationToken;
 
 /// `sessionLifetime`.
 const LIFETIME: Duration = Duration::from_secs(3600);
@@ -27,37 +28,12 @@ pub(super) struct Call {
     pub owner_provider: String,
     /// The ephemeral key's `sess_` identity when one created it.
     pub secret_principal: String,
-    pub resources: Resources,
+    /// Cancelled when the call ends; its sideband session ends with it.
+    pub ended: CancellationToken,
     /// The relayed media session, when the media relay handled the call.
     pub media: Option<Arc<dyn super::relay::MediaSession>>,
     /// Assigned by [`Calls::put`]; tells a stale handle from the current call.
     pub token: u64,
-}
-
-/// Tasks tied to a call's lifetime (the sideband relay); aborted when the call ends.
-#[derive(Debug, Default)]
-pub(super) struct Resources(Mutex<(bool, Vec<AbortHandle>)>);
-
-impl Resources {
-    pub fn add(&self, handle: AbortHandle) {
-        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.0 {
-            handle.abort();
-        } else {
-            state.1.push(handle);
-        }
-    }
-
-    fn close(&self) {
-        let handles = {
-            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            state.0 = true;
-            std::mem::take(&mut state.1)
-        };
-        for handle in handles {
-            handle.abort();
-        }
-    }
 }
 
 struct Entry {
@@ -217,9 +193,8 @@ fn end(entry: Entry, reason: &str) {
         timer.abort();
     }
     tracing::debug!(call_id = %entry.call.call_id, reason, "codex live call ended");
-    // Go `endLiveSession`: resources, then media.
-    // ponytail: aborted sideband tasks drop their sockets when next polled, right after.
-    entry.call.resources.close();
+    // Go `endLiveSession`: the sideband, then media.
+    entry.call.ended.cancel();
     if let Some(media) = &entry.call.media {
         media.close(reason);
     }
@@ -284,22 +259,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_and_completion_end_resources() {
+    async fn replacement_and_completion_end_the_sideband() {
         let calls = Calls::new_shared(Duration::from_secs(60));
         let first = calls.put("call-1", call("a")).unwrap();
-        let task = tokio::spawn(std::future::pending::<()>());
-        first.resources.add(task.abort_handle());
         let second = calls.put("call-1", call("b")).unwrap();
-        assert!(task.await.unwrap_err().is_cancelled(), "replaced call's relay aborted");
+        assert!(first.ended.is_cancelled(), "replaced call's sideband ended");
+        assert!(!second.ended.is_cancelled());
         // A stale completion (old token) must not remove the replacement.
         calls.complete(&first, "late");
         assert_eq!(calls.peek("call-1").unwrap().auth_id, "b");
         calls.complete(&second, "client_hangup");
         assert!(calls.peek("call-1").is_none());
-        // Resources added after the end are aborted at once.
-        let late = tokio::spawn(std::future::pending::<()>());
-        second.resources.add(late.abort_handle());
-        assert!(late.await.unwrap_err().is_cancelled());
+        assert!(second.ended.is_cancelled(), "completed call's sideband ended");
         assert!(calls.put("bad id", call("c")).is_none());
         assert!(calls.put(&"a".repeat(129), call("c")).is_none());
     }

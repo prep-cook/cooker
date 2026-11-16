@@ -15,6 +15,9 @@ use crate::codec::{
     live::Sender,
 };
 
+/// The server event carrying an input audio transcription's own usage (owner ruling E10a-3).
+const TRANSCRIPTION_COMPLETED: &str = "conversation.item.input_audio_transcription.completed";
+
 /// `x_ck.source.ids` members: the root id, else the id of the object the event carries.
 const IDS: [(&str, T, Option<T>); 6] = [
     ("event_id", T::EventId, None),
@@ -26,7 +29,7 @@ const IDS: [(&str, T, Option<T>); 6] = [
 ];
 
 /// Canonical usage fields (`docs/INTERNAL-STREAM.md` §3.5) and details, from
-/// `response.usage`.
+/// `response.usage` or a transcription's root `usage`.
 const USAGE: [(&str, N); 6] = [
     ("input_tokens", N::Input),
     ("output_tokens", N::Output),
@@ -130,8 +133,14 @@ pub(super) struct Record<'a> {
 impl Record<'_> {
     pub(super) fn publish(&self, emitter: &mut Emitter, owner: &mut Writer) -> Result<()> {
         let source = |e: &mut Encoder<'_, '_>| self.source(e);
-        if self.sender == Sender::Upstream && self.event == "response.done" && self.envelope.entered(At::Usage) {
-            emitter.emit(owner, Kind::Usage, Scope::default(), |e| self.usage(e), source)?;
+        if let Some(scope) = self.usage_scope() {
+            emitter.emit(
+                owner,
+                Kind::Usage,
+                Scope::default(),
+                |e| self.usage(e, scope.as_deref()),
+                source,
+            )?;
         }
         let action = self.control();
         let rates = action.is_none() && self.sender == Sender::Upstream && self.event == "rate_limits.updated";
@@ -147,6 +156,28 @@ impl Record<'_> {
         };
         emitter.emit(owner, kind, Scope::default(), payload, source)?;
         Ok(())
+    }
+
+    /// Whether the message reports usage, and the usage scope (E-Q13) it is recorded under:
+    /// `response:<id>` for a `response.done`, `transcription:<item_id>` for a completed input
+    /// audio transcription that reports tokens. Without an id the usage is the session's own.
+    fn usage_scope(&self) -> Option<Option<String>> {
+        let envelope = self.envelope;
+        if self.sender != Sender::Upstream || !envelope.entered(At::Usage) {
+            return None;
+        }
+        let (prefix, id) = match self.event {
+            "response.done" => ("response:", T::ResponseObjectId),
+            TRANSCRIPTION_COMPLETED
+                if [N::Input, N::Output, N::Total]
+                    .iter()
+                    .any(|&n| envelope.count(n).known().is_some()) =>
+            {
+                ("transcription:", T::ItemId)
+            }
+            _ => return None,
+        };
+        Some(envelope.text(id).get().map(|id| format!("{prefix}{id}")))
     }
 
     /// The `realtime.control` action of a mapped control message.
@@ -285,7 +316,11 @@ impl Record<'_> {
         e.bytes(b"}")
     }
 
-    fn usage(&self, e: &mut Encoder<'_, '_>) -> Result<()> {
+    fn usage(&self, e: &mut Encoder<'_, '_>, scope: Option<&str>) -> Result<()> {
+        if let Some(scope) = scope {
+            e.bytes(b",\"scope\":")?;
+            e.string(scope)?;
+        }
         e.bytes(b",\"usage\":{\"native\":{\"protocol\":\"openai_realtime\",\"value\":")?;
         native(e, self.envelope, NATIVE)?;
         e.bytes(b"},\"final\":true")?;

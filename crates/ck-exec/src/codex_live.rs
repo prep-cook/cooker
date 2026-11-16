@@ -17,12 +17,14 @@ use ck_core::exec::{CaptureEvent, CaptureSink, ExecError, UpstreamRequest};
 use ck_wire::gostr::{GoStr, quote as go_quote, trim_space};
 use ck_wire::json::{self as gj, GoValue, Kind};
 use http::HeaderMap;
+use wreq::ws::message as up;
 
 use crate::codex::CodexExecutor;
 use crate::codex_request::{self as request, View};
 use crate::meta_wire::{check_valid, fold, kind_name};
 use crate::openai_compat_multipart::{MediaType, parse_media_type};
 use crate::proxy::{self, GoHeaders, Route, Upstream, canonical_header};
+use crate::session::{Close, Frame, FrameSink, LiveUpstream};
 
 /// `upstreamCallURL`.
 pub const CALL_URL: &str = "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas";
@@ -908,6 +910,78 @@ pub struct LiveSocket {
     pub protocol: Option<String>,
     pub status: u16,
     pub headers: HeaderMap,
+}
+
+impl LiveSocket {
+    /// Both halves of the open socket as a live session (`crate::session`): messages pass in
+    /// either direction with their opcode and payload unchanged; ping and pong stay inside the
+    /// transport. The upstream messages end after a close frame, or without one when the
+    /// connection is lost.
+    pub fn into_session(self) -> LiveUpstream<SocketSink> {
+        use futures_util::StreamExt;
+        let (sink, stream) = self.socket.split();
+        let frames = stream
+            .scan(false, |closed, message| {
+                if *closed {
+                    return std::future::ready(None);
+                }
+                let frame = match message {
+                    Ok(up::Message::Text(text)) => Some(Frame::Text(Bytes::from(text))),
+                    Ok(up::Message::Binary(data)) => Some(Frame::Binary(data)),
+                    Ok(up::Message::Ping(_) | up::Message::Pong(_)) => None,
+                    Ok(up::Message::Close(close)) => {
+                        *closed = true;
+                        Some(Frame::Close(close.map(|close| Close {
+                            code: u16::from(close.code),
+                            reason: Bytes::from(close.reason),
+                        })))
+                    }
+                    Err(_) => return std::future::ready(None),
+                };
+                std::future::ready(Some(frame))
+            })
+            .filter_map(std::future::ready)
+            .boxed();
+        LiveUpstream {
+            sink: SocketSink(sink),
+            frames,
+        }
+    }
+}
+
+/// The client-to-upstream half of a live session on an upstream WebSocket.
+pub struct SocketSink(futures_util::stream::SplitSink<wreq::ws::WebSocket, up::Message>);
+
+impl FrameSink for SocketSink {
+    async fn send(&mut self, frame: Frame) -> Result<(), ExecError> {
+        use futures_util::SinkExt;
+        let failed = |message: &str| ExecError::local(502, ck_core::exec::FailureScope::Transport, message);
+        let message = match frame {
+            Frame::Text(text) => {
+                up::Message::Text(up::Utf8Bytes::try_from(text).map_err(|_| failed("text message is not UTF-8"))?)
+            }
+            Frame::Binary(data) => up::Message::Binary(data),
+            Frame::Close(close) => {
+                let close = up::Message::Close(close.map(|close| up::CloseFrame {
+                    code: close.code.into(),
+                    // A close reason that is not UTF-8 is dropped rather than sent invalid.
+                    reason: up::Utf8Bytes::try_from(close.reason).unwrap_or_default(),
+                }));
+                // After the upstream's own close the transport refuses another; closing the
+                // sink then flushes the transport's echo of the upstream's close instead.
+                let _ = self.0.send(close).await;
+                return self
+                    .0
+                    .close()
+                    .await
+                    .map_err(|_| failed("upstream live socket close failed"));
+            }
+        };
+        self.0
+            .send(message)
+            .await
+            .map_err(|_| failed("upstream live socket write failed"))
+    }
 }
 
 /// A failed upstream WebSocket dial.

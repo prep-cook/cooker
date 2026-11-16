@@ -80,7 +80,7 @@ pub(crate) enum T {
 }
 const TEXTS: usize = T::DetailsErrorCode as usize + 1;
 
-/// Captured counts: indexes, truncation point and `response.usage`.
+/// Captured counts: indexes, truncation point and usage (`response.usage` or root `usage`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum N {
@@ -148,7 +148,7 @@ pub(crate) enum Role {
 
 /// Members the gateway reads, by container. The index is the member's duplicate bit; the
 /// last column is its dotted path for refusals.
-pub(crate) const FIELDS: [(At, &str, Role, &str); 45] = [
+pub(crate) const FIELDS: [(At, &str, Role, &str); 46] = [
     (At::Root, "type", Role::Text(T::Type), "type"),
     (At::Root, "event_id", Role::Text(T::EventId), "event_id"),
     (At::Root, "item_id", Role::Text(T::ItemId), "item_id"),
@@ -170,6 +170,8 @@ pub(crate) const FIELDS: [(At, &str, Role, &str); 45] = [
     (At::Root, "response", Role::Enter(At::Response), "response"),
     (At::Root, "error", Role::Enter(At::Error), "error"),
     (At::Root, "rate_limits", Role::Enter(At::Limits), "rate_limits"),
+    // A completed input audio transcription's usage; read with `response.usage`'s members.
+    (At::Root, "usage", Role::Enter(At::Usage), "usage"),
     (At::Session, "id", Role::Text(T::SessionId), "session.id"),
     (At::Session, "model", Role::Text(T::Model), "session.model"),
     (At::Item, "id", Role::Text(T::ItemObjectId), "item.id"),
