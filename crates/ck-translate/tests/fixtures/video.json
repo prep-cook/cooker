@@ -1,0 +1,243 @@
+[
+  {
+    "name": "openai create keeps options and hostile native fields",
+    "dialect": "openai",
+    "phase": "create",
+    "job_id": null,
+    "wire": {
+      "model": "sora-2",
+      "prompt": "a cat <on> 雪",
+      "seconds": "8",
+      "size": "1280x720",
+      "input_reference": {"image_url": "https://example.test/cat.png"},
+      "kind": "native-kind",
+      "value": null,
+      "x_ck": {"v": 9},
+      "a/~\"雪": [null, false, 1.25]
+    },
+    "kind": "video.request",
+    "value": {
+      "action": "create",
+      "model": "sora-2",
+      "prompt": "a cat <on> 雪",
+      "seconds": "8",
+      "size": "1280x720",
+      "input_reference": {"image_url": "https://example.test/cat.png"}
+    }
+  },
+  {
+    "name": "openai edit carries the job id outside the body",
+    "dialect": "openai",
+    "phase": "edit",
+    "job_id": "video_1",
+    "wire": {"prompt": "redo", "video": {"id": "video_1"}, "extra": true},
+    "kind": "video.request",
+    "value": {"action": "edit", "job_id": "video_1", "prompt": "redo", "video": {"id": "video_1"}}
+  },
+  {
+    "name": "openai extend",
+    "dialect": "openai",
+    "phase": "extend",
+    "job_id": "video_1",
+    "wire": {"prompt": "more", "seconds": "4", "video": {"id": "video_1"}},
+    "kind": "video.request",
+    "value": {"action": "extend", "job_id": "video_1", "prompt": "more", "seconds": "4", "video": {"id": "video_1"}}
+  },
+  {
+    "name": "retrieve has no body",
+    "dialect": "openai",
+    "phase": "retrieve",
+    "job_id": "video_1",
+    "wire": null,
+    "kind": "video.request",
+    "value": {"action": "retrieve", "job_id": "video_1"}
+  },
+  {
+    "name": "openai content variant",
+    "dialect": "openai",
+    "phase": "content",
+    "job_id": "video_1",
+    "wire": {"variant": "thumbnail"},
+    "kind": "video.request",
+    "value": {"action": "content", "job_id": "video_1", "variant": "thumbnail"}
+  },
+  {
+    "name": "xai create keeps a null option as native",
+    "dialect": "xai",
+    "phase": "create",
+    "job_id": null,
+    "wire": {
+      "model": "grok-imagine-video",
+      "prompt": "p",
+      "duration": 6,
+      "resolution": "720p",
+      "aspect_ratio": "16:9",
+      "image": {"url": "https://example.test/i.png"},
+      "storage_options": null,
+      "future": {"k": 1}
+    },
+    "kind": "video.request",
+    "value": {
+      "action": "create",
+      "model": "grok-imagine-video",
+      "prompt": "p",
+      "duration": 6,
+      "resolution": "720p",
+      "aspect_ratio": "16:9",
+      "image": {"url": "https://example.test/i.png"}
+    }
+  },
+  {
+    "name": "xai extend",
+    "dialect": "xai",
+    "phase": "extend",
+    "job_id": "req-1",
+    "wire": {"prompt": "p", "video": {"url": "https://example.test/v.mp4"}, "duration": 4},
+    "kind": "video.request",
+    "value": {
+      "action": "extend",
+      "job_id": "req-1",
+      "prompt": "p",
+      "duration": 4,
+      "video": {"url": "https://example.test/v.mp4"}
+    }
+  },
+  {
+    "name": "openai queued job keeps null fields as native",
+    "dialect": "openai",
+    "phase": "job",
+    "job_id": null,
+    "wire": {
+      "id": "video_1",
+      "object": "video",
+      "model": "sora-2",
+      "status": "queued",
+      "progress": 0,
+      "created_at": 1700000000,
+      "completed_at": null,
+      "expires_at": null,
+      "error": null,
+      "seconds": "8",
+      "size": "1280x720"
+    },
+    "kind": "video.job",
+    "value": {"job_id": "video_1", "status": "queued", "progress": 0, "created_at": 1700000000}
+  },
+  {
+    "name": "openai in progress progress is a fraction",
+    "dialect": "openai",
+    "phase": "job",
+    "job_id": null,
+    "wire": {"id": "video_1", "object": "video", "status": "in_progress", "progress": 42},
+    "kind": "video.job",
+    "value": {"job_id": "video_1", "status": "running", "progress": 0.42}
+  },
+  {
+    "name": "openai completed",
+    "dialect": "openai",
+    "phase": "job",
+    "job_id": null,
+    "wire": {
+      "id": "video_1",
+      "object": "video",
+      "status": "completed",
+      "progress": 100,
+      "created_at": 1700000000,
+      "completed_at": 1700000060
+    },
+    "kind": "video.job",
+    "value": {
+      "job_id": "video_1",
+      "status": "completed",
+      "progress": 1,
+      "created_at": 1700000000,
+      "completed_at": 1700000060
+    }
+  },
+  {
+    "name": "openai failed with an error",
+    "dialect": "openai",
+    "phase": "job",
+    "job_id": null,
+    "wire": {
+      "id": "video_1",
+      "object": "video",
+      "status": "failed",
+      "error": {"code": "moderation_blocked", "message": "blocked"}
+    },
+    "kind": "video.job",
+    "value": {
+      "job_id": "video_1",
+      "status": "failed",
+      "error": {"code": "moderation_blocked", "message": "blocked"}
+    }
+  },
+  {
+    "name": "an error object with extra members stays native",
+    "dialect": "openai",
+    "phase": "job",
+    "job_id": null,
+    "wire": {
+      "id": "video_1",
+      "status": "failed",
+      "error": {"code": "c", "message": "m", "type": "t"}
+    },
+    "kind": "video.job",
+    "value": {"job_id": "video_1", "status": "failed"}
+  },
+  {
+    "name": "xai accepted job has an id and no status",
+    "dialect": "xai",
+    "phase": "accepted",
+    "job_id": null,
+    "wire": {"request_id": "req-1"},
+    "kind": "video.job",
+    "value": {"job_id": "req-1", "status": "queued"}
+  },
+  {
+    "name": "xai pending retrieval takes the id from the route",
+    "dialect": "xai",
+    "phase": "job",
+    "job_id": "req-1",
+    "wire": {"status": "pending", "progress": 10, "model": "grok-imagine-video"},
+    "kind": "video.job",
+    "value": {"job_id": "req-1", "status": "queued", "progress": 0.1}
+  },
+  {
+    "name": "xai done keeps the video and usage natively",
+    "dialect": "xai",
+    "phase": "job",
+    "job_id": "req-1",
+    "wire": {
+      "status": "done",
+      "progress": 100,
+      "model": "grok-imagine-video",
+      "video": {"url": "https://example.test/v.mp4", "duration": 6, "respect_moderation": true},
+      "usage": {"cost_in_usd_ticks": 120000000}
+    },
+    "kind": "video.job",
+    "value": {"job_id": "req-1", "status": "completed", "progress": 1}
+  },
+  {
+    "name": "xai expired stays expired",
+    "dialect": "xai",
+    "phase": "job",
+    "job_id": "req-1",
+    "wire": {"status": "expired"},
+    "kind": "video.job",
+    "value": {"job_id": "req-1", "status": "expired"}
+  },
+  {
+    "name": "xai failed with an error",
+    "dialect": "xai",
+    "phase": "job",
+    "job_id": "req-1",
+    "wire": {"status": "failed", "error": {"code": "internal_error", "message": "boom"}},
+    "kind": "video.job",
+    "value": {
+      "job_id": "req-1",
+      "status": "failed",
+      "error": {"code": "internal_error", "message": "boom"}
+    }
+  }
+]
