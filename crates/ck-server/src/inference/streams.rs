@@ -269,6 +269,10 @@ pub struct Registry {
     #[cfg(any(test, feature = "testing"))]
     pub holds: crate::testing::Holds,
     tasks: tokio_util::task::TaskTracker,
+    /// Live-session tasks (`super::sessions`): shutdown cancels `sessions` and waits for them
+    /// before the store closes, so each publishes its final counters.
+    session_tasks: tokio_util::task::TaskTracker,
+    sessions: tokio_util::sync::CancellationToken,
     closed: AtomicBool,
 }
 
@@ -369,9 +373,24 @@ impl Registry {
         self.tasks.spawn(task)
     }
 
-    /// Refuses new registrations and stops every committed stream with `Shutdown`, which
-    /// attached readers deliver before the listener closes their connections.
+    /// Spawns a live session's task, built from the shutdown signal it must end on.
+    /// Shutdown cancels the signal and waits for the task before the store closes.
+    pub fn spawn_session<F>(
+        &self,
+        task: impl FnOnce(tokio_util::sync::CancellationToken) -> F,
+    ) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.session_tasks.spawn(task(self.sessions.clone()))
+    }
+
+    /// Refuses new registrations, stops every committed stream with `Shutdown`, which
+    /// attached readers deliver before the listener closes their connections, and ends every
+    /// live session.
     pub fn begin_shutdown(&self) {
+        self.sessions.cancel();
         let live = {
             let mut handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
             self.closed.store(true, Ordering::Release);
@@ -382,11 +401,15 @@ impl Registry {
         }
     }
 
-    /// After the listener closed: stops every remaining stream, including uncommitted
-    /// exchanges, waits for the stream tasks and joins the store's maintenance thread.
+    /// After the listener closed: ends every live session, stops every remaining stream,
+    /// including uncommitted exchanges, waits for the stream tasks and joins the store's maintenance thread.
     /// Leases still held keep their mapping until they drop.
     pub async fn finish_shutdown(&self) -> std::io::Result<()> {
         self.begin_shutdown();
+        // Cancelled sessions finish while the store still accepts records; each ends within
+        // `sessions::CLOSE_WITHIN` of the cancellation.
+        self.session_tasks.close();
+        self.session_tasks.wait().await;
         let store = self.store.write().unwrap_or_else(PoisonError::into_inner).take();
         // The listener closed, so no request handler holds the store any more; stream tasks
         // hold writers, never the store. A holder left over shuts it down when it drops.

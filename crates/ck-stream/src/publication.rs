@@ -22,6 +22,16 @@ use wakeup::Wakeup;
 pub use writer::{Reservation, Writer};
 
 pub(crate) const READER_BYTES: usize = std::mem::size_of::<Reader>();
+/// Table room the final record takes: a frame entry and a run index entry.
+pub(crate) const FINAL_METADATA: usize = std::mem::size_of::<Frame>() + std::mem::size_of::<Index>();
+
+/// A pool frame held for the producer's final record (`Writer::reserve_final`), charged to the
+/// exchange quota with [`FINAL_METADATA`], and prefaulted for its first `len` bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct FinalRoom {
+    pub(crate) frame: u32,
+    pub(crate) len: usize,
+}
 
 /// A stream's reference to a pool frame; readers' leases hold their own references.
 pub(crate) struct Frame {
@@ -135,6 +145,11 @@ pub(crate) struct State {
     /// Whether this dependent stream still holds its request (`Stream::request`); released
     /// when it is invalidated or dropped.
     holding: bool,
+    /// Room for the producer's final record (`Writer::reserve_final`). While it is held, a
+    /// failed charge returns `StorageExhausted` without ending the stream; any terminal frees it.
+    final_room: Option<FinalRoom>,
+    /// The next record is the final one and goes into `final_room` (`Writer::release_final`).
+    final_next: bool,
 }
 
 impl State {
@@ -154,6 +169,8 @@ impl State {
             slot: None,
             failure_frames: None,
             holding: false,
+            final_room: None,
+            final_next: false,
         }
     }
 
@@ -200,6 +217,8 @@ pub(crate) struct Stream {
     limits: Limits,
     pub state: Mutex<State>,
     invalidated: AtomicBool,
+    /// Neither evicted nor expired; `Writer::finish(Gone)` removes it (`Writer::keep_cached`).
+    kept: AtomicBool,
     /// Clock milliseconds of the last read. Acknowledgements raise it without the state lock.
     last_read: AtomicU64,
     /// Frames the stream gave up while leases still pin them; they still count as live.
@@ -232,6 +251,7 @@ impl Stream {
             notify: Wakeup::new(),
             stopped: Wakeup::new(),
             invalidated: AtomicBool::new(false),
+            kept: AtomicBool::new(false),
             last_read: AtomicU64::new(millis(now)),
             detached: AtomicU64::new(0),
             held: AtomicUsize::new(0),
@@ -247,6 +267,10 @@ impl Stream {
 
     pub(crate) fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_kept(&self) -> bool {
+        self.kept.load(Ordering::Acquire)
     }
 
     /// Whether a dependent stream holds this one.
@@ -459,6 +483,7 @@ impl Stream {
             return;
         }
         state.terminal = Some(terminal);
+        self.free_final(&mut state);
         if terminal == Terminal::StorageExhausted {
             // Every failing path rolls back its partial reservation before it gets here, so this
             // is what the stream still holds, by the formula its frame limit uses. Frame counts
@@ -472,6 +497,24 @@ impl Stream {
         self.stopped.wake();
     }
 
+    /// A charge failed: the stream ends with `StorageExhausted`, unless its producer holds
+    /// room for a final record and ends it itself.
+    pub(crate) fn exhausted(&self) {
+        if self.state.lock().final_room.is_none() {
+            self.finish(Terminal::StorageExhausted);
+        }
+    }
+
+    /// Returns the final room's frame to the pool and its charges to the exchange quota.
+    pub(crate) fn free_final(&self, state: &mut State) {
+        state.final_next = false;
+        if let Some(room) = state.final_room.take() {
+            self.pool.release(room.frame);
+            self.release_frames(1);
+            self.release_metadata(FINAL_METADATA);
+        }
+    }
+
     pub(crate) fn invalidate(&self) {
         let (mut state, _fence) = self.retention.lock_stable(self);
         self.invalidate_locked(&mut state);
@@ -480,6 +523,7 @@ impl Stream {
     pub(crate) fn invalidate_locked(&self, state: &mut State) {
         self.invalidated.store(true, Ordering::Release);
         state.terminal = Some(Terminal::Gone);
+        self.free_final(state);
         for frame in &mut state.frames {
             self.detach(frame);
         }

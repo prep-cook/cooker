@@ -126,6 +126,9 @@ pub(crate) struct Inner {
     /// Runs once in a tick, after expiry and before decay.
     #[cfg(test)]
     tick_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once when a reservation asks for a frame, before it takes one.
+    #[cfg(test)]
+    allocate_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 pub(crate) struct Retention {
@@ -224,8 +227,8 @@ impl Inner {
                     continue;
                 }
                 // A held request stays while a dependent is cached, and expires on the first
-                // tick after the last one leaves.
-                if stream.is_held() {
+                // tick after the last one leaves. A kept stream stays until its owner ends it.
+                if stream.is_held() || stream.is_kept() {
                     cursor = Some((read, id));
                     continue;
                 }
@@ -281,6 +284,13 @@ impl Inner {
     /// Allocate one of the `remaining` frames a pending reservation still needs, with its
     /// first `needed` bytes populated.
     pub(crate) fn allocate(&self, exclude: u64, remaining: usize, needed: usize) -> Result<u32, Error> {
+        // The hook may allocate itself, so its lock is released before it runs.
+        #[cfg(test)]
+        let hook = self.allocate_hook.lock().take();
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook();
+        }
         let mut evicted_for_tmpfs = false;
         loop {
             match self.pool.allocate(needed) {
@@ -351,6 +361,8 @@ impl Store {
             evict_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             tick_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            allocate_hook: parking_lot::Mutex::new(None),
         });
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let weak: Weak<Inner> = Arc::downgrade(&inner);

@@ -77,6 +77,53 @@ async fn producer_cancellation_wakes_on_eviction_shutdown_expiry_and_explicit_ca
 }
 
 #[test]
+fn a_kept_stream_is_neither_evicted_nor_expired_until_it_is_gone() {
+    // (kept, pressure: another exchange's allocation or a tick past the TTL, stream survives)
+    let cases = [
+        (false, "evict", false),
+        (true, "evict", true),
+        (false, "expire", false),
+        (true, "expire", true),
+    ];
+    for (kept, pressure, survives) in cases {
+        let label = format!("kept={kept} {pressure}");
+        let (_dir, store, clock) = store(4);
+        let mut writer = store.create().unwrap();
+        if kept {
+            writer.keep_cached();
+        }
+        writer.append(&[1; FRAME_BYTES]).unwrap();
+        writer.finish(Terminal::Shutdown);
+        match pressure {
+            "evict" => {
+                let mut other = store.create().unwrap();
+                let allocated = other.append(&[2; 4 * FRAME_BYTES]);
+                assert_eq!(allocated.is_ok(), !survives, "{label}: {allocated:?}");
+            }
+            _ => {
+                clock.advance(Duration::from_secs(3601));
+                store.tick().unwrap();
+            }
+        }
+        let survived = store
+            .reader(writer.id(), 0)
+            .is_ok_and(|mut reader| matches!(reader.try_next(), Poll::Ready(Some(Read::Record(_)))));
+        assert_eq!(survived, survives, "{label}");
+        // Its owner ends it; then it leaves the cache like any other.
+        let used = store.used_frames();
+        writer.finish(Terminal::Gone);
+        assert_eq!(
+            store.used_frames(),
+            used - u32::from(survives),
+            "{label}: Gone frees it"
+        );
+        clock.advance(Duration::from_secs(3601));
+        store.tick().unwrap();
+        assert_eq!(store.stats().cached_streams, 0, "{label}: then it expires");
+    }
+}
+
+#[test]
 fn concurrent_readers_keep_distinct_cursors_and_independent_pins() {
     let (_dir, store, _) = store(4);
     let mut writer = store.create().unwrap();

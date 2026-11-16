@@ -1,4 +1,4 @@
-use super::{Error, FRAME_BYTES, Ordering, Stream, Terminal, Writer};
+use super::{Error, FRAME_BYTES, Ordering, Stream, Writer};
 use std::sync::Arc;
 
 /// Owns a reservation for external metadata capacity, not payload storage.
@@ -41,7 +41,7 @@ impl MetadataPermit {
             let extra = bytes - self.bytes;
             if let Err(error) = self.stream.charge_metadata(extra) {
                 drop(state);
-                self.stream.finish(Terminal::StorageExhausted);
+                self.stream.exhausted();
                 return Err(error);
             }
             state.external_metadata += extra;
@@ -93,7 +93,7 @@ impl Writer {
     pub fn begin_scratch(&mut self, len: usize) -> Result<ScratchReservation, Error> {
         let result = self.reserve_scratch(len);
         if matches!(result, Err(Error::StorageExhausted | Error::Io(_))) {
-            self.stream.finish(Terminal::StorageExhausted);
+            self.stream.exhausted();
         }
         result
     }

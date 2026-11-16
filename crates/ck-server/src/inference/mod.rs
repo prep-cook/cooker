@@ -15,6 +15,7 @@ pub(crate) mod models;
 pub(crate) mod openai;
 pub mod responses_state;
 pub(crate) mod sanitize;
+pub mod sessions;
 pub(crate) mod speech;
 pub mod streams;
 pub(crate) mod videos;

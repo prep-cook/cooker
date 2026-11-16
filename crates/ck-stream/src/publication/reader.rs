@@ -36,7 +36,7 @@ impl Reader {
             (Ok(()), true)
         });
         if matches!(result, Err(Error::StorageExhausted)) {
-            stream.finish(Terminal::StorageExhausted);
+            stream.exhausted();
         }
         result?;
         Ok(Self {
