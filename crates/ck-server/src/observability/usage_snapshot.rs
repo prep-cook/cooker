@@ -6,8 +6,8 @@ use ck_translate::codec::encode::{self, Encoder};
 use ck_translate::codec::event::Kind;
 use ck_translate::codec::{self, RequestView, internal};
 
-/// The counts `usage_record::Tracker` records: one attempt's latest canonical `x_ck.usage`
-/// snapshot (`docs/INTERNAL-STREAM.md` §3.5), read from the attempt's stream by a
+/// The counts `usage_record::Tracker` records: one usage scope's latest canonical `x_ck.usage`
+/// snapshot (`docs/INTERNAL-STREAM.md` §3.5, [`Usage`]), read from the attempt's stream by a
 /// runtime-owned reader, independently of client delivery and resume. A later snapshot
 /// replaces the whole value; snapshots are never summed. `None` is an absent count, never zero.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -207,6 +207,9 @@ const DIMENSIONS: &[(&str, &[&str], &str, Unit)] = &[
         "codex_rollout_budget_units",
         Unit::Decimal,
     ),
+    // xAI images and video jobs: the charge, the one billed unit a video job reports.
+    ("xai-images", &["cost_in_usd_ticks"], "cost_in_usd_ticks", Unit::Count),
+    ("xai", &["cost_in_usd_ticks"], "cost_in_usd_ticks", Unit::Count),
 ];
 
 /// The service tier inside a source's native usage: `(protocol, member)`.
@@ -238,16 +241,59 @@ pub struct ResponseFacts {
     pub service_tier: Option<String>,
 }
 
+/// One attempt's usage by scope (E-Q13): the attempt's own, and one per upstream response, tool
+/// model or video job a codec reported apart from it (`scope` beside `usage`, such as
+/// `tool:<model>` or `job:<id>`). A snapshot replaces only its own scope's; scopes are never
+/// summed or merged. Every published scope is kept: each needs its own usage record in the
+/// attempt's stream, so the stream's storage limit bounds the map, and no reported usage is
+/// dropped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// `(scope, last snapshot)` in first-reported order; `None` is the attempt's own scope.
+    scopes: Vec<(Option<String>, CanonicalUsage)>,
+    /// Each scope's slot in `scopes`.
+    slots: std::collections::HashMap<Option<String>, usize>,
+}
+
+impl Usage {
+    /// The attempt's own last snapshot.
+    pub fn attempt(&self) -> Option<&CanonicalUsage> {
+        self.slots.get(&None).map(|&slot| &self.scopes[slot].1)
+    }
+
+    /// The last snapshot of every named scope, in first-reported order.
+    pub fn scoped(&self) -> impl Iterator<Item = (&str, &CanonicalUsage)> {
+        self.scopes
+            .iter()
+            .filter_map(|(scope, usage)| scope.as_deref().map(|scope| (scope, usage)))
+    }
+
+    /// Replaces `scope`'s snapshot, or opens the scope.
+    pub(crate) fn replace(&mut self, scope: Option<String>, usage: CanonicalUsage) {
+        match self.slots.get(&scope) {
+            Some(&slot) => self.scopes[slot].1 = usage,
+            None => {
+                self.slots.insert(scope.clone(), self.scopes.len());
+                self.scopes.push((scope, usage));
+            }
+        }
+    }
+}
+
 /// Reads one attempt's response stream from its first record to its terminal: the last
-/// usage snapshot, if any, and the response facts. `stream` is an allocation handle on the
-/// stream and `reader` attaches at its start. The runtime runs this once per attempt
+/// usage snapshot of each scope, and the response facts. `stream` is an allocation handle on
+/// the stream and `reader` attaches at its start. The runtime runs this once per attempt
 /// (`Registry::spawn`), so no client delivery or resume accounts usage.
-pub async fn read(mut stream: Writer, mut reader: Reader) -> (Option<CanonicalUsage>, ResponseFacts) {
-    let mut usage = None;
+pub async fn read(mut stream: Writer, mut reader: Reader) -> (Usage, ResponseFacts) {
+    let mut usage = Usage::default();
     let mut facts = ResponseFacts::default();
     while let Some(Read::Record(lease)) = reader.next().await {
         let observed = internal::decode(&mut stream, lease).and_then(|(kind, doc)| match kind {
-            Kind::Usage => snapshot(&doc).map(|snapshot| usage = Some(snapshot)),
+            Kind::Usage => snapshot(&doc).and_then(|snapshot| {
+                let scope = text(&doc, "scope")?.flatten();
+                usage.replace(scope, snapshot);
+                Ok(())
+            }),
             Kind::ResponseStart => text(&doc, "model").map(|model| {
                 if let Some(model) = model {
                     facts.model = model;

@@ -426,53 +426,39 @@ fn video_options_a_destination_lacks_are_refused_not_dropped() {
 }
 
 #[test]
-fn video_usage_is_recorded_from_the_first_poll_that_reports_it_and_never_twice() {
+fn video_usage_is_what_the_body_reports_whatever_the_job_status() {
     let usage = |ticks, input, output, total| Usage {
         cost_in_usd_ticks: ticks,
         input_tokens: input,
         output_tokens: output,
         total_tokens: total,
     };
-    // (wire, job already charged, expected). xAI's `usage` has no status condition, so a pending
-    // poll may be the first to report it (E-Q13); absent, null or empty usage reports nothing.
+    // (wire, expected). xAI's `usage` has no status condition, so a pending poll may report it
+    // (E-Q13); absent, null or empty usage reports nothing. The job table decides the charge.
     let cases = [
         (
             json!({"status": "done", "usage": {"cost_in_usd_ticks": 120000000}}),
-            false,
             Some(usage(Some(120000000), None, None, None)),
         ),
         (
             json!({"status": "done", "usage": {"cost_in_usd_ticks": 5, "input_tokens": 1, "output_tokens": 2, "total_tokens": 3}}),
-            false,
             Some(usage(Some(5), Some(1), Some(2), Some(3))),
         ),
         (
             json!({"status": "failed", "usage": {"cost_in_usd_ticks": 0}}),
-            false,
             Some(usage(Some(0), None, None, None)),
         ),
         (
             json!({"status": "pending", "usage": {"cost_in_usd_ticks": 7}}),
-            false,
             Some(usage(Some(7), None, None, None)),
         ),
-        (
-            json!({"status": "pending", "usage": {"cost_in_usd_ticks": 7}}),
-            true,
-            None,
-        ),
-        (json!({"status": "done", "usage": {"cost_in_usd_ticks": 7}}), true, None),
-        (json!({"status": "done"}), false, None),
-        (json!({"status": "done", "usage": null}), false, None),
-        (json!({"status": "done", "usage": {}}), false, None),
-        (
-            json!({"status": "done", "usage": {"cost_in_usd_ticks": null}}),
-            false,
-            None,
-        ),
-        (json!({"status": "pending"}), false, None),
+        (json!({"status": "done"}), None),
+        (json!({"status": "done", "usage": null}), None),
+        (json!({"status": "done", "usage": {}}), None),
+        (json!({"status": "done", "usage": {"cost_in_usd_ticks": null}}), None),
+        (json!({"status": "pending"}), None),
     ];
-    for (wire, charged, expected) in cases {
+    for (wire, expected) in cases {
         let mut mapped = Mapped::new();
         let mut decoder = Decoder::new(
             &mut mapped.writer,
@@ -481,13 +467,12 @@ fn video_usage_is_recorded_from_the_first_poll_that_reports_it_and_never_twice()
             Some("r"),
             serde_json::to_vec(&wire).unwrap().len() as u64,
         )
-        .unwrap()
-        .usage_charged(charged);
+        .unwrap();
         decoder
             .advance(&mut mapped.writer, &serde_json::to_vec(&wire).unwrap())
             .unwrap();
         let decoded = decoder.finish(&mut mapped.writer).unwrap();
-        assert_eq!(decoded.usage, expected, "{wire} charged={charged}");
+        assert_eq!(decoded.usage, expected, "{wire}");
     }
 }
 

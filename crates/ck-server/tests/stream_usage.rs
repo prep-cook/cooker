@@ -5,7 +5,7 @@
 mod stream_fixture;
 
 use ck_server::http::egress::Framing;
-use ck_server::observability::usage_snapshot::{self, CanonicalUsage, ResponseFacts};
+use ck_server::observability::usage_snapshot::{self, ResponseFacts, Usage};
 use stream_fixture::*;
 
 fn usage_chunk(usage: &str, tier: &str) -> bytes::Bytes {
@@ -15,7 +15,7 @@ fn usage_chunk(usage: &str, tier: &str) -> bytes::Bytes {
 }
 
 /// Spawns the runtime-owned usage reader on `live`'s response stream.
-fn usage_reader(fixture: &Fixture, live: &Live) -> tokio::task::JoinHandle<(Option<CanonicalUsage>, ResponseFacts)> {
+fn usage_reader(fixture: &Fixture, live: &Live) -> tokio::task::JoinHandle<(Usage, ResponseFacts)> {
     let streams = fixture.rt.streams();
     let reader = streams
         .with_store(|store| store.reader(live.response.id(), 0))
@@ -50,7 +50,7 @@ async fn the_last_snapshot_is_the_usage_once_however_often_the_stream_is_read() 
     live.end();
 
     let (usage, facts) = accounting.await.unwrap();
-    let usage = usage.expect("the stream reported usage");
+    let usage = usage.attempt().cloned().expect("the stream reported usage");
     assert_eq!(
         (
             usage.input_tokens,
@@ -87,7 +87,7 @@ async fn the_last_snapshot_is_the_usage_once_however_often_the_stream_is_read() 
     assert!(fixture.rt.usage_queue().pop_oldest(10).is_empty());
     // A second reader of the same stream sees the same snapshot, not an increment.
     let (again, _) = usage_reader(&fixture, &live).await.unwrap();
-    assert_eq!(again, Some(usage));
+    assert_eq!(again.attempt(), Some(&usage));
 }
 
 #[tokio::test]
@@ -97,7 +97,7 @@ async fn a_stream_without_usage_reports_none_not_zero() {
     let accounting = usage_reader(&fixture, &live);
     answer(&mut live);
     let (usage, facts) = accounting.await.unwrap();
-    assert_eq!(usage, None);
+    assert_eq!(usage, Usage::default());
     assert_eq!(facts.model.as_deref(), Some("m"));
 }
 

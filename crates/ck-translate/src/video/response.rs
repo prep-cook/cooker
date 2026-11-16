@@ -8,7 +8,8 @@
 //! Usage is read once per body and never invented: absent, null or empty `usage` publishes no
 //! snapshot. It carries the `job:<id>` scope (E-Q13), so accounting keeps it apart from the
 //! attempt's own usage, and it is `final` only once the job is no longer pending: a queued or
-//! running job's report may still change.
+//! running job's report may still change. The job table ([`Ledger`]) decides whether a report is
+//! the job's charge; a report it refuses publishes no snapshot.
 
 use ck_stream::Writer;
 
@@ -23,18 +24,33 @@ use crate::{
     },
 };
 
+/// The job table a video response settles against (E-Q13): a job's usage is charged at the
+/// first report and never again, whichever request carries it.
+pub trait Ledger: Send {
+    /// A create, edit or extension was accepted as `job`.
+    fn accepted(&mut self, job: &str);
+    /// Whether this report of `job`'s usage is its charge: true only for the job's first. The
+    /// claim excludes every other report until it is published or released.
+    fn charge(&mut self, job: &str) -> bool;
+    /// The usage this ledger claimed for `job` was not published, so the job is uncharged again
+    /// and a later report charges it.
+    fn release(&mut self, job: &str);
+}
+
 pub struct Ingress {
     owner: u64,
     emitter: Emitter,
     decoder: Option<Decoder>,
     dialect: Dialect,
+    phase: Phase,
+    ledger: Box<dyn Ledger>,
     closed: bool,
 }
 
 impl Ingress {
     /// Called only for a successful HTTP response. `phase` is [`Phase::Accepted`] for a create,
     /// edit or extend answer and [`Phase::Job`] for a poll; `job_id` is the job a poll asked for.
-    /// `limit` bounds the body.
+    /// `limit` bounds the body; `ledger` settles the job's usage.
     pub fn new(
         owner: &mut Writer,
         identity: Identity,
@@ -42,6 +58,7 @@ impl Ingress {
         phase: Phase,
         job_id: Option<&str>,
         limit: u64,
+        ledger: Box<dyn Ledger>,
     ) -> Result<Self> {
         if identity.direction != Direction::Response || matches!(phase, Phase::Request(_)) {
             return Err(Error::Schema);
@@ -60,6 +77,8 @@ impl Ingress {
             emitter,
             decoder: Some(decoder),
             dialect,
+            phase,
+            ledger,
             closed: false,
         })
     }
@@ -68,12 +87,16 @@ impl Ingress {
         let root = operation.root();
         let (kind, value) = (operation.required(root, "kind")?, operation.required(root, "value")?);
         let job = operation.required(value, "job_id")?;
-        if let Some(usage) = usage {
-            let pending = ["queued", "running"].iter().try_fold(false, |found, status| {
-                Ok::<_, Error>(found || boundary::is(operation, value, "status", status)?)
-            })?;
+        let id = text(operation, job)?;
+        if self.phase == Phase::Accepted {
+            self.ledger.accepted(&id);
+        }
+        let pending = ["queued", "running"].iter().try_fold(false, |found, status| {
+            Ok::<_, Error>(found || boundary::is(operation, value, "status", status)?)
+        })?;
+        if let Some(usage) = usage.filter(|_| self.ledger.charge(&id)) {
             let protocol = self.dialect.name();
-            self.emitter.emit(
+            let published = self.emitter.emit(
                 owner,
                 Kind::Usage,
                 Scope::default(),
@@ -90,7 +113,12 @@ impl Ingress {
                     e.bytes(b"}")
                 },
                 |_| Ok(()),
-            )?;
+            );
+            // A snapshot that never reached the stream charged nothing.
+            if let Err(error) = published {
+                self.ledger.release(&id);
+                return Err(error);
+            }
         }
         let x = operation.required(root, "x_ck")?;
         self.emitter.emit(
@@ -176,4 +204,13 @@ impl ResponseIngress for Ingress {
         self.closed = true;
         codec::upstream_failure(&mut self.emitter, owner, status, scope)
     }
+}
+
+fn text(doc: &Document, node: usize) -> Result<String> {
+    let mut text = String::new();
+    let mut chars = doc.chars(node)?;
+    while let Some(c) = chars.next_scalar()? {
+        text.push(c);
+    }
+    Ok(text)
 }

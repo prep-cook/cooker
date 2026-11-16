@@ -120,7 +120,7 @@ impl XaiExecutor {
         method: wreq::Method,
         path: &str,
         payload: Vec<u8>,
-        video: Option<VideoJob<'_>>,
+        video: Option<VideoJob>,
     ) -> Result<ExecResponse, ExecError> {
         let logged = payload.as_slice();
         let body = (method == wreq::Method::POST).then(|| payload.clone());
@@ -210,9 +210,9 @@ const JOB_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// What a video request is to its job: a create, whose response names the job, or a poll
 /// admitted against it.
-pub(crate) enum VideoJob<'a> {
+pub(crate) enum VideoJob {
     Create,
-    Poll(Admission<'a>),
+    Poll(Admission),
 }
 
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
@@ -235,8 +235,9 @@ struct Job {
 // No store on this path outlives the process: the usage queue is in memory, and SQLite holds
 // configuration and credentials only. A durable job ledger (F06-1) lifts this; its store awaits
 // an owner decision.
+#[derive(Clone)]
 pub(crate) struct VideoJobs {
-    jobs: Mutex<HashMap<String, Job>>,
+    jobs: Arc<Mutex<HashMap<String, Job>>>,
     clock: Clock,
 }
 
@@ -249,7 +250,7 @@ impl Default for VideoJobs {
 impl VideoJobs {
     pub(crate) fn with_clock(clock: Clock) -> Self {
         Self {
-            jobs: Mutex::default(),
+            jobs: Arc::default(),
             clock,
         }
     }
@@ -260,7 +261,7 @@ impl VideoJobs {
 
     /// An admission to `job`, or `None` for a job without an ID. A create records the job if it
     /// is new, keeping a charge it already has; a poll needs a record younger than [`JOB_TTL`].
-    fn enter(&self, job: &str, create: bool) -> Option<Admission<'_>> {
+    fn enter(&self, job: &str, create: bool) -> Option<Admission> {
         let job = job.trim();
         if job.is_empty() {
             return None;
@@ -280,31 +281,31 @@ impl VideoJobs {
         };
         record.in_flight += 1;
         Some(Admission {
-            jobs: self,
+            jobs: self.clone(),
             job: job.to_owned(),
         })
     }
 
     /// Records a job this process created; its admission settles a usage the create reported.
-    pub(crate) fn created(&self, job: &str) -> Option<Admission<'_>> {
+    pub(crate) fn created(&self, job: &str) -> Option<Admission> {
         self.enter(job, true)
     }
 
     /// A poll's admission, or `None` when this process neither created nor charged the job, or
     /// its record expired.
-    pub(crate) fn admit(&self, job: &str) -> Option<Admission<'_>> {
+    pub(crate) fn admit(&self, job: &str) -> Option<Admission> {
         self.enter(job, false)
     }
 }
 
 /// One request's hold on a job's record: the record outlives expiry until every admission to it
 /// is dropped.
-pub(crate) struct Admission<'a> {
-    jobs: &'a VideoJobs,
+pub(crate) struct Admission {
+    jobs: VideoJobs,
     job: String,
 }
 
-impl Admission<'_> {
+impl Admission {
     /// Claims the job's charge: true only for the first settlement that finds the job uncharged,
     /// which marks it charged and refreshes its record.
     pub(crate) fn settle(&self) -> bool {
@@ -321,12 +322,46 @@ impl Admission<'_> {
         record.at = now;
         true
     }
+
+    /// Undoes this admission's [`Admission::settle`]: the job is uncharged again.
+    pub(crate) fn release(&self) {
+        if let Some(record) = self.jobs.lock().get_mut(&self.job) {
+            record.charged = false;
+        }
+    }
 }
 
-impl Drop for Admission<'_> {
+impl Drop for Admission {
     fn drop(&mut self) {
         if let Some(record) = self.jobs.lock().get_mut(&self.job) {
             record.in_flight = record.in_flight.saturating_sub(1);
+        }
+    }
+}
+
+/// The job table as a video response's [`video::Ledger`]: an accepted job is recorded, and a
+/// reported usage is the job's charge only when its admission settles it first. Both routes settle
+/// against the same [`VideoJobs`], so one job is charged once whichever route polls it.
+struct JobLedger {
+    jobs: VideoJobs,
+    /// The poll's admission, or the accepted job's.
+    admission: Option<Admission>,
+}
+
+impl video::Ledger for JobLedger {
+    fn accepted(&mut self, job: &str) {
+        self.admission = self.jobs.created(job);
+    }
+
+    /// The codec binds a poll's answer to the polled job, so the admission is the job's.
+    fn charge(&mut self, _: &str) -> bool {
+        self.admission.as_ref().is_some_and(Admission::settle)
+    }
+
+    /// Called only after this ledger's own [`video::Ledger::charge`] claimed the job.
+    fn release(&mut self, _: &str) {
+        if let Some(admission) = &self.admission {
+            admission.release();
         }
     }
 }
@@ -615,6 +650,12 @@ impl XaiExecutor {
             video::Dialect::Xai,
             streams.request,
         )?;
+        // A poll is admitted against the job table before anything is sent: a job this process
+        // neither created nor charged is refused, as on the buffered route.
+        let admission = match (media, &job) {
+            (Media::VideoRetrieve, Some(job)) => Some(self.jobs.admit(job).ok_or_else(|| unknown_job(job))?),
+            _ => None,
+        };
         let (method, path, phase) = match (media, &job) {
             (Media::VideoCreate, None) => (
                 wreq::Method::POST,
@@ -644,6 +685,10 @@ impl XaiExecutor {
             phase,
             polled,
             VIDEO_LIMIT,
+            Box::new(JobLedger {
+                jobs: self.jobs.clone(),
+                admission,
+            }),
         )
         .map_err(xai_exec::encoding)?;
         Ok((

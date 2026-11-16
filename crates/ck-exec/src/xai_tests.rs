@@ -1007,7 +1007,7 @@ fn video_job_charge_is_claimed_once_across_interleavings() {
         let base = std::time::Instant::now();
         let now = time.clone();
         let jobs = VideoJobs::with_clock(Arc::new(move || base + *now.lock().unwrap()));
-        let mut held: [Option<crate::xai_media::Admission<'_>>; 3] = [None, None, None];
+        let mut held: [Option<crate::xai_media::Admission>; 3] = [None, None, None];
         for (i, step) in steps.into_iter().enumerate() {
             match step {
                 Clock(seconds) => *time.lock().unwrap() = Duration::from_secs(seconds),

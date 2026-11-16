@@ -397,7 +397,7 @@ fn settle_spawn(
         // Every outcome above left the stream with a terminal, so the reader ends.
         let (usage, facts) = usage_snapshot::read(response, reader).await;
         if let Some(mut tracker) = tracker {
-            tracker.canonical(usage.as_ref(), &facts);
+            tracker.usage(&usage, &facts);
             match &outcome {
                 Ok(()) => tracker.succeed(),
                 Err(error) => tracker.fail(error),
