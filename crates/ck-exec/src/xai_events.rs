@@ -32,17 +32,19 @@ use ck_translate::responses::response::Ingress;
 use ck_wire::gostr::trim_space;
 use ck_wire::json::{self as gj, Kind};
 
+use crate::media_exec::MediaIngress;
 use crate::xai::MAX_LINE;
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_replay_items;
 use crate::xai_request::Prepared;
 use crate::xai_response::{self as response, NamespaceRefs, NamespaceRestorer, XSearchFilter, text};
 
-/// The response decoder of one xAI attempt: generation through the xAI line rules, or a
-/// buffered compact whose success clears the session's replay.
+/// The response decoder of one xAI attempt: generation through the xAI line rules, a
+/// buffered compact whose success clears the session's replay, or a media operation.
 pub enum XaiIngress {
     Generate(Box<Events>),
     Compact(Box<Compaction>),
+    Media(MediaIngress),
 }
 
 /// A compact's ingress and the replay its success clears.
@@ -56,6 +58,7 @@ impl ResponseIngress for XaiIngress {
         match self {
             Self::Generate(events) => events.inner.flush_deadline(),
             Self::Compact(compact) => compact.ingress.flush_deadline(),
+            Self::Media(media) => media.flush_deadline(),
         }
     }
 
@@ -63,6 +66,7 @@ impl ResponseIngress for XaiIngress {
         match self {
             Self::Generate(events) => events.inner.flush(owner),
             Self::Compact(compact) => compact.ingress.flush(owner),
+            Self::Media(media) => media.flush(owner),
         }
     }
 
@@ -70,6 +74,7 @@ impl ResponseIngress for XaiIngress {
         match self {
             Self::Generate(events) => events.advance(owner, bytes),
             Self::Compact(compact) => compact.ingress.advance(owner, bytes),
+            Self::Media(media) => media.advance(owner, bytes),
         }
     }
 
@@ -84,6 +89,7 @@ impl ResponseIngress for XaiIngress {
                 }
                 Ok(())
             }
+            Self::Media(media) => media.finish(owner),
         }
     }
 
@@ -91,6 +97,7 @@ impl ResponseIngress for XaiIngress {
         match self {
             Self::Generate(events) => events.fail(owner, status, scope),
             Self::Compact(compact) => compact.ingress.fail(owner, status, scope),
+            Self::Media(media) => media.fail(owner, status, scope),
         }
     }
 }

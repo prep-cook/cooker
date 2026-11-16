@@ -34,12 +34,20 @@ use crate::xai_shape::{self as shape, Inbound};
 /// The capability key of xAI credentials.
 pub const DESTINATION: &str = "xai";
 
-/// Responses generation, its token count, and the Responses native compact.
+/// Responses generation, its token count, the Responses native compact, and images, speech and
+/// video jobs (`xai_media`).
 pub struct XaiCapability;
 
 impl Capability for XaiCapability {
     fn destination(&self) -> &'static str {
         DESTINATION
+    }
+
+    fn admits(&self, operation: Operation) -> bool {
+        match operation {
+            Operation::Media(media) => crate::xai_media::admits(media),
+            operation => operation.is_text(),
+        }
     }
 
     fn validate(&self, view: RequestView<'_>) -> codec::Result<()> {
@@ -50,7 +58,8 @@ impl Capability for XaiCapability {
                 operation: Operation::Generate,
                 ..view
             }),
-            Operation::Media(_) | Operation::AlphaSearch => Err(codec::Error::Unsupported),
+            Operation::Media(media) => crate::xai_media::check(view, media),
+            Operation::AlphaSearch => Err(codec::Error::Unsupported),
         }
     }
 }
@@ -77,6 +86,9 @@ impl Execute for XaiExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<XaiIngress>, ExecError> {
+        if let Operation::Media(media) = request.validated.view().operation {
+            return self.serve_media(attempt, request, streams, media).await;
+        }
         let upload = encode(&request.validated, true, streams.request)?;
         let call = Call::new(attempt, request)?;
         let mut prepared = call.shape(&upload, &self.replay, true, Format::Codex)?;

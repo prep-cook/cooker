@@ -390,6 +390,27 @@ fn canonical(doc: &Document) -> Result<Canonical> {
     })
 }
 
+/// The checks [`encode`] runs before writing, without writing: a destination's capability runs
+/// them at the fence, so a request it cannot express is refused before any attempt sends.
+pub fn check(doc: &Document, destination: Destination<'_>) -> Result<()> {
+    expressible(doc, &canonical(doc)?, destination)
+}
+
+fn expressible(doc: &Document, c: &Canonical, destination: Destination<'_>) -> Result<()> {
+    for (key, _) in CONTROLS {
+        if present(doc, c.controls, key)?.is_some() && !destination.allows(key, c.mode) {
+            return Err(Error::Unsupported);
+        }
+    }
+    // The image tool makes one image per call.
+    if present(doc, c.root, "n")?.is_some_and(|n| doc.unsigned(n).is_ok_and(|n| n > 1))
+        && matches!(destination, Destination::Codex(_))
+    {
+        return Err(Error::Unsupported);
+    }
+    Ok(())
+}
+
 /// Writes one upstream body from a canonical image request. Every control the destination cannot
 /// express is refused here, before bytes exist, rather than dropped (L16); members of another
 /// protocol's source stay out of the body (§3.7).
@@ -400,16 +421,7 @@ pub fn encode(
 ) -> Result<ScratchLease, RequestFailure> {
     doc.check_owner(owner)?;
     let c = canonical(doc)?;
-    for (key, _) in CONTROLS {
-        if present(doc, c.controls, key)?.is_some() && !destination.allows(key, c.mode) {
-            return Err(Error::Unsupported.into());
-        }
-    }
-    if present(doc, c.root, "n")?.is_some_and(|n| doc.unsigned(n).is_ok_and(|n| n > 1))
-        && matches!(destination, Destination::Codex(_))
-    {
-        return Err(Error::Unsupported.into());
-    }
+    expressible(doc, &c, destination)?;
     let owner_protocol = boundary::is(doc, c.x, "original_protocol", PROTOCOL)?;
     Ok(match destination {
         Destination::OpenAi => encode::scratch(owner, |e| json_body(doc, &c, owner_protocol, e))?,

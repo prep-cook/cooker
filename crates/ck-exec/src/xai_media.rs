@@ -1,4 +1,6 @@
-//! xAI images, videos and speech, moved out of `xai.rs` (Phase D, P6; Phase E owns it).
+//! xAI images, videos and speech. `XaiExecutor::serve_media` runs them under the execution
+//! contract; `images`, `videos` and `speech` are the old routes' entry points until E7 moves
+//! the routes onto it.
 
 use bytes::Bytes;
 use ck_core::config::Config;
@@ -9,11 +11,19 @@ use ck_wire::gostr::GoStr;
 use ck_wire::json as gj;
 use http::HeaderMap;
 
+use ck_translate::codec::{self, BodyMode, Media, RequestView};
+use ck_translate::{audio, images, video};
+use ck_wire::thinking::parse_suffix;
+
+use crate::media_exec::{self, MediaIngress};
 use crate::openai_compat_http::{self as wire, GoHeaders};
+use crate::types::{Attempt, Request, Streams, Upstream};
 use crate::xai::{
     PROVIDER, XaiExecutor, capture_request, chat_base_url, compact_base_url, creds, endpoint, fail_if_canceled,
-    path_escape, plain_headers, scoped, track_first_byte,
+    path_escape, plain_headers, request_headers, scoped, track_first_byte,
 };
+use crate::xai_events::XaiIngress;
+use crate::xai_exec;
 use crate::xai_request as request;
 use crate::xai_response::{self as response, text};
 
@@ -288,4 +298,307 @@ fn speech_model_unavailable(body: &[u8]) -> bool {
     ]
     .iter()
     .any(|path| names(&gj::get(body, path).str()))
+}
+
+/// The limit of one speech body: the audio file itself.
+const SPEECH_LIMIT: u64 = 64 << 20;
+/// The limit of one video job body; the video itself is a separate download.
+const VIDEO_LIMIT: u64 = 1 << 20;
+
+/// Whether xAI serves `media`. A finished video's bytes are fetched from the URL its job names,
+/// which the job table holds (E7), not through an xAI endpoint.
+pub(crate) const fn admits(media: Media) -> bool {
+    !matches!(media, Media::VideoContent)
+}
+
+/// The fence check of an xAI media request.
+pub(crate) fn check(view: RequestView<'_>, media: Media) -> codec::Result<()> {
+    match media {
+        Media::ImageGenerate | Media::ImageEdit => media_exec::check_images(view, images::Destination::Xai),
+        Media::Speech => media_exec::check_speech(view, audio::Destination::Xai),
+        media => match media_exec::video_action(media) {
+            Some(action) => video::check_request(view.document, action, video::Dialect::Xai),
+            None => Err(codec::Error::Unsupported),
+        },
+    }
+}
+
+impl XaiExecutor {
+    /// Images, speech and video jobs under the execution contract: the fenced upload in xAI's
+    /// shape with the payload rules last, sent with the plain xAI headers, and the answer
+    /// streamed through the media codec's ingress, created only after xAI answered.
+    pub(crate) async fn serve_media(
+        &self,
+        attempt: &Attempt<'_>,
+        request: &Request<'_>,
+        streams: Streams<'_>,
+        media: Media,
+    ) -> Result<Upstream<XaiIngress>, ExecError> {
+        let cfg = scoped(attempt.credential, attempt.cfg);
+        let call = MediaCall {
+            attempt,
+            request,
+            cfg: cfg.as_ref(),
+        };
+        let (status, headers, body, ingress) = match media {
+            Media::ImageGenerate | Media::ImageEdit => {
+                let upload = media_exec::images_upload(
+                    request,
+                    xai_exec::DESTINATION,
+                    images::Destination::Xai,
+                    streams.request,
+                )?;
+                let path = if media == Media::ImageEdit {
+                    IMAGES_EDITS
+                } else {
+                    IMAGES_GENERATIONS
+                };
+                let upstream = self
+                    .media_send(
+                        &call,
+                        wreq::Method::POST,
+                        path,
+                        Some(call.rules("openai", upload)),
+                        false,
+                    )
+                    .await?;
+                let ingress = images::Ingress::new(
+                    streams.response,
+                    attempt.identity,
+                    images::Wire::Xai,
+                    BodyMode::Buffered,
+                    media_exec::IMAGES_LIMIT,
+                )
+                .map_err(xai_exec::encoding)?;
+                (
+                    upstream.status,
+                    upstream.headers,
+                    upstream.body,
+                    MediaIngress::Images(Box::new(ingress)),
+                )
+            }
+            Media::Speech => {
+                let upload = media_exec::speech_upload(
+                    request,
+                    xai_exec::DESTINATION,
+                    audio::Destination::Xai,
+                    streams.request,
+                )?;
+                let upstream = self
+                    .media_send(
+                        &call,
+                        wreq::Method::POST,
+                        "/tts",
+                        Some(call.rules(SPEECH_SOURCE, upload)),
+                        true,
+                    )
+                    .await?;
+                let (content_type, length) = media_exec::entity(&upstream.headers);
+                let ingress =
+                    audio::Ingress::new(streams.response, attempt.identity, content_type, length, SPEECH_LIMIT)
+                        .map_err(xai_exec::encoding)?;
+                (
+                    upstream.status,
+                    upstream.headers,
+                    upstream.body,
+                    MediaIngress::Speech(Box::new(ingress)),
+                )
+            }
+            media => self.video(&call, streams, media).await?,
+        };
+        Ok(Upstream {
+            status,
+            headers,
+            body,
+            ingress: XaiIngress::Media(ingress),
+        })
+    }
+
+    /// A video job: create, edit and extend post the request; retrieve polls the job it names.
+    async fn video(
+        &self,
+        call: &MediaCall<'_>,
+        streams: Streams<'_>,
+        media: Media,
+    ) -> Result<(u16, HeaderMap, crate::types::Body, MediaIngress), ExecError> {
+        let (upload, job) = media_exec::video_upload(
+            call.request,
+            xai_exec::DESTINATION,
+            video::Dialect::Xai,
+            streams.request,
+        )?;
+        let (method, path, phase) = match (media, &job) {
+            (Media::VideoCreate, None) => (
+                wreq::Method::POST,
+                VIDEOS_GENERATIONS.to_owned(),
+                video::Phase::Accepted,
+            ),
+            (Media::VideoEdit, _) => (wreq::Method::POST, VIDEOS_EDITS.to_owned(), video::Phase::Accepted),
+            (Media::VideoExtend, _) => (wreq::Method::POST, VIDEOS_EXTENSIONS.to_owned(), video::Phase::Accepted),
+            (Media::VideoRetrieve, Some(job)) => (
+                wreq::Method::GET,
+                format!("/videos/{}", path_escape(job)),
+                video::Phase::Job,
+            ),
+            _ => return Err(xai_exec::encoding(codec::Error::Schema)),
+        };
+        // A poll sends no body; a POST is the request with the payload rules.
+        let body = match upload {
+            Some(upload) if method == wreq::Method::POST => Some(call.rules("openai", upload)),
+            _ => None,
+        };
+        let upstream = self.media_send(call, method, &path, body, false).await?;
+        let polled = (phase == video::Phase::Job).then_some(job.as_deref()).flatten();
+        let ingress = video::Ingress::new(
+            streams.response,
+            call.attempt.identity,
+            video::Dialect::Xai,
+            phase,
+            polled,
+            VIDEO_LIMIT,
+        )
+        .map_err(xai_exec::encoding)?;
+        Ok((
+            upstream.status,
+            upstream.headers,
+            upstream.body,
+            MediaIngress::Video(Box::new(ingress)),
+        ))
+    }
+
+    /// One media request on the chat base URL (speech: the compact base URL, as
+    /// `xaiSpeechRequestURL` picks it) with the plain xAI headers. A non-2xx answer is the
+    /// attempt's failure as `xaiStatusErr` reads it; an unknown voice (`xaiSpeechRequestError`)
+    /// is the request's fault and neither rotates nor cools the credential.
+    async fn media_send(
+        &self,
+        call: &MediaCall<'_>,
+        method: wreq::Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        speech: bool,
+    ) -> Result<wire::Upstream, ExecError> {
+        let credential = call.attempt.credential;
+        let base = if speech {
+            compact_base_url(credential)
+        } else {
+            chat_base_url(credential)
+        };
+        let url = self.url(endpoint(&base, path));
+        crate::xai_url::new_request(&url)?;
+        if let Some(error) = crate::xai_url::transport_refusal(&url) {
+            return Err(error);
+        }
+        let headers = call.headers(&method, speech);
+        let client = self.clients.for_credential(credential, call.cfg);
+        let usage = call.request.client.usage;
+        let capture = wire::Capture::on(
+            usage.capture().clone(),
+            credential,
+            PROVIDER,
+            &url,
+            method.as_str(),
+            headers.pairs(),
+            body.as_deref().unwrap_or_default(),
+        );
+        let route = |_: &url::Url| {
+            Ok(crate::proxy::Route {
+                client: client.clone(),
+                order: None,
+            })
+        };
+        usage.round_trip_started();
+        let upstream = crate::proxy::send_request(&route, method, &url, headers, body.map(Bytes::from), None).await;
+        capture.sent(&upstream);
+        let mut upstream = track_first_byte(upstream?, usage);
+        if (200..300).contains(&upstream.status) {
+            upstream.body = capture.stream(upstream.body);
+            return Ok(upstream);
+        }
+        let (status, headers, data) = wire::read_error_body(upstream).await;
+        capture.chunk(&data);
+        let mut error = response::status_error(status, &data);
+        if speech && error.status == 404 && !speech_model_unavailable(&data) {
+            // A request scope without upstream headers is the explicit marker
+            // (classify::explicit_request_scoped); Go's xAI status errors carry none.
+            error.scope = FailureScope::Request;
+        } else {
+            error.headers = Box::new(headers);
+        }
+        Err(error)
+    }
+}
+
+/// One media attempt's facts the upload rules and headers read.
+struct MediaCall<'r> {
+    attempt: &'r Attempt<'r>,
+    request: &'r Request<'r>,
+    /// The attempt's config, as Go binds it for the credential (`cfg.ForAPIKey()`).
+    cfg: &'r Config,
+}
+
+impl MediaCall<'_> {
+    /// The upload with the upstream model, then the configured payload rules, the last change to
+    /// the body (Go's media finalizer: protocol `openai`, the encoded upload as the baseline).
+    fn rules(&self, from: &str, mut upload: Vec<u8>) -> Vec<u8> {
+        let model = parse_suffix(self.attempt.model).model_name;
+        let original = upload.clone();
+        // The upstream model the route resolved, where the request names one (speech does not).
+        if !model.is_empty() && gj::get(&upload, "model").exists() {
+            crate::openai_compat_payload::set_str_if_different(&mut upload, "model", &model);
+        }
+        let requested = media_exec::requested_model(self.request.validated.view().document).unwrap_or_default();
+        let requested = if requested.is_empty() {
+            model.as_str()
+        } else {
+            requested.as_str()
+        };
+        ck_wire::payload::apply(
+            &ck_wire::payload::Rules::of(self.cfg),
+            &ck_wire::payload::Request {
+                target_executor: PROVIDER,
+                model: &model,
+                requested_model: requested,
+                protocol: "openai",
+                from_protocol: from,
+                root: "",
+                original: &original,
+                request_path: self.request.client.route,
+                headers: Some(self.request.client.headers),
+            },
+            upload,
+        )
+    }
+
+    /// `applyXAIHeaders`; speech asks for any type, since TTS answers with raw audio, and a POST
+    /// carries the client's idempotency key.
+    fn headers(&self, method: &wreq::Method, speech: bool) -> GoHeaders {
+        let (token, _) = creds(self.attempt.credential);
+        let client = &self.request.client;
+        let mut headers = request_headers(
+            self.attempt.credential,
+            (&token, false, ""),
+            (client.headers, client.session),
+            false,
+        );
+        if speech {
+            headers.set("Accept", "*/*");
+        } else if *method == wreq::Method::POST {
+            let header = |name: &str| {
+                client
+                    .headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .unwrap_or_default()
+            };
+            let key = Some(header("Idempotency-Key"))
+                .filter(|k| !k.is_empty())
+                .unwrap_or_else(|| header("x-idempotency-key"));
+            if !key.is_empty() {
+                headers.set("x-idempotency-key", key.to_owned());
+            }
+        }
+        headers
+    }
 }
