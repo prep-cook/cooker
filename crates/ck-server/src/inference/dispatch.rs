@@ -1529,9 +1529,6 @@ async fn attempt<X: Arms>(
         if let Some(on_selected) = call.on_selected() {
             on_selected(&lease.credential);
         }
-        // ponytail: a force-mapped alias takes the old arm once it passed admission and its
-        // fence, because only the old arm rewrites the response model to the client's alias;
-        // the contract arm needs the alias in its response egress first.
         let forced_alias = target.alias.force_mapping && !target.alias.original_alias.is_empty();
         let fault = 'arm: {
             let ran = match arm.as_deref_mut() {
@@ -1546,7 +1543,7 @@ async fn attempt<X: Arms>(
                         usage,
                         &mut lease,
                         upstream,
-                        forced_alias,
+                        forced_alias.then_some(target.alias.original_alias.as_str()),
                     )
                     .await;
                     // Go `tryRefreshAfterUnauthorized`, once per credential, after the failed
@@ -1563,17 +1560,6 @@ async fn attempt<X: Arms>(
                     break ran;
                 },
                 None => Ran::Old,
-            };
-            // D2-PLAN §3.3: an old-arm compact runs only where the provider's compact is
-            // native; nothing is sent to any other.
-            // C2 (Claude native compaction) plugs in here: once it lands, a Claude candidate
-            // reaches the new arm and never gets this far; the old arm keeps only the
-            // providers listed in `attempt::native_compact` until D9 deletes it.
-            let ran = match ran {
-                Ran::Old if target.compact && !attempt::native_compact(&lease.credential.provider) => {
-                    Ran::Skip(attempt::no_native_compact(trace, &lease.credential, upstream))
-                }
-                ran => ran,
             };
             match ran {
                 Ran::Old => {}

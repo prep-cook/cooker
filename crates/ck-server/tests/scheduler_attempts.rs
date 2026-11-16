@@ -396,8 +396,9 @@ async fn postcommit_stream_fault_is_terminal_and_never_replayed() {
 }
 
 /// Go conductor_stream.go and conductor_execution.go: a bootstrap failure that a
-/// request-scoped rule stops comes back as an error, not as a stream, so the handler's
-/// `bootstrap-retries` never re-run it; an unstopped one is re-run.
+/// request-scoped rule stops comes back as an error, not as a stream, so
+/// `bootstrap-retries` never re-run it; an unstopped one is re-run. The Responses
+/// WebSocket turns run this path; the HTTP codec routes have no bootstrap retries.
 #[tokio::test]
 async fn stopped_bootstrap_failure_skips_bootstrap_retries() {
     let calls = Arc::new(Mutex::new(0));
@@ -441,18 +442,33 @@ async fn stopped_bootstrap_failure_skips_bootstrap_retries() {
                 google: Default::default(),
             },
         ));
-        let (url, proxy) = serve(router(rt)).await;
-        let response = wreq::Client::new()
-            .post(format!("{url}/v1/responses"))
-            .body(r#"{"model":"gpt-5.5","stream":true,"input":"hi"}"#)
-            .send()
-            .await
-            .unwrap();
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap();
-        assert_eq!(status, 503, "{text}");
+        let call = ck_server::inference::dispatch::Call {
+            entry: ck_core::format::Format::OpenAIResponse,
+            response: ck_core::format::Format::OpenAIResponse,
+            operation: ck_core::exec::Operation::Generate,
+            model: "gpt-5.5".into(),
+            body: Bytes::from_static(br#"{"model":"gpt-5.5","stream":true,"input":"hi"}"#),
+            stream: true,
+            alt: None,
+            headers: Default::default(),
+            caller: ck_core::exec::Caller {
+                principal: "client-key".into(),
+                source: "authorization",
+                provider: String::new(),
+            },
+            forced_provider: None,
+            selection_model: None,
+            execution_session: None,
+            request_path: "/v1/responses".into(),
+            peer: None,
+            turn: None,
+            media: None,
+        };
+        let trace = ck_server::inference::dispatch::Trace::default();
+        let result = ck_server::inference::dispatch::run_with_bootstrap_retries(&rt, call, &trace).await;
+        let status = result.err().expect("the upstream failed").status();
+        assert_eq!(status, 503, "rules {rules:?}");
         assert_eq!(*calls.lock().unwrap(), expected_calls, "rules {rules:?}");
-        proxy.abort();
     }
     upstream.abort();
 }

@@ -45,6 +45,8 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     owed: bool,
     /// Sources without native Responses lifecycle events need a synthesized progress event.
     synthesize_progress: bool,
+    /// The model the client sees instead of the source's, a force-mapped alias.
+    model: Option<String>,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     /// The egress for one exchange, live or resumed alike. `id` is the exchange's response id,
@@ -92,6 +94,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             pending: None,
             owed: false,
             synthesize_progress: false,
+            model: None,
         })
     }
     /// The account whose opaque items this response carries.
@@ -169,7 +172,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         match kind {
             Kind::Data | Kind::MediaEnd => return self.image_media(owner, kind, node, output),
             Kind::Usage => return self.usage(node),
-            Kind::Compact => return self.compact(node),
+            Kind::Compact => return self.compact(owner, node),
             Kind::ItemStart => return self.item_start(owner, node, output),
             _ => {}
         }
@@ -393,7 +396,7 @@ fn write_item(doc: &Document, item: usize, e: &mut Encoder<'_, '_>) -> Result<()
 }
 /// Writes the response object without members under the reserved `x_ck` prefix, which no
 /// client sees.
-fn write_response(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
+fn write_response(doc: &Document, model: Option<&str>, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"{")?;
     let mut first = true;
     for field in doc.children(doc.root())? {
@@ -407,7 +410,11 @@ fn write_response(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
         first = false;
         doc.write_name(name, e)?;
         e.bytes(b":")?;
-        if doc.name_is(name, "output")? {
+        if let Some(model) = model
+            && doc.name_is(name, "model")?
+        {
+            e.string(model)?;
+        } else if doc.name_is(name, "output")? {
             e.bytes(b"[")?;
             for (j, item) in doc.children(field)?.enumerate() {
                 if j > 0 {

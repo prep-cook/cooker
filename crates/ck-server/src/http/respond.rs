@@ -50,18 +50,6 @@ pub fn sse(body: Body) -> Response {
     res
 }
 
-/// `requests.streaming.keepalive-seconds` (0 or absent disables heartbeats).
-pub fn keepalive(cfg: &Config) -> Option<Duration> {
-    let seconds = cfg
-        .document
-        .get("requests")
-        .and_then(|r| r.get("streaming"))
-        .and_then(|s| s.get("keepalive-seconds"))
-        .and_then(serde_yaml_ng::Value::as_i64)
-        .unwrap_or(0);
-    (seconds > 0).then(|| Duration::from_secs(seconds as u64))
-}
-
 /// `requests.passthrough-headers` (Go `PassthroughHeadersEnabled`): upstream response
 /// headers reach the client. Off by default.
 pub fn passthrough_headers(cfg: &Config) -> bool {

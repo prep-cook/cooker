@@ -795,6 +795,8 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         cooled: &'static [&'static str],
         /// The call is a `responses/compact` request.
         compact: bool,
+        /// The client speaks Responses: the old arm serves none of its candidates.
+        responses: bool,
         /// Attempts, on either arm, that went ahead without another account's reasoning.
         withheld: usize,
     }
@@ -813,6 +815,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -828,6 +831,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -843,6 +847,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -858,6 +863,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -873,6 +879,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -888,6 +895,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -906,6 +914,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -921,6 +930,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -939,6 +949,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -957,6 +968,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -972,6 +984,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -990,6 +1003,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -1008,6 +1022,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -1026,6 +1041,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -1041,6 +1057,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -1056,6 +1073,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -1071,6 +1089,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -1086,6 +1105,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 1,
             cooled: &["a"],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -1101,6 +1121,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -1116,6 +1137,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
         Row {
@@ -1131,6 +1153,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: true,
+            responses: false,
             withheld: 0,
         },
     ];
@@ -1148,6 +1171,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 1,
         },
         Row {
@@ -1163,6 +1187,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 1,
             cooled: &["a"],
             compact: false,
+            responses: false,
             withheld: 1,
         },
         Row {
@@ -1178,6 +1203,23 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
+            withheld: 0,
+        },
+        Row {
+            case: "a Responses client skips a candidate only the old arm serves",
+            history: None,
+            scripts: [Script::Old, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["b"],
+            settled: &[0],
+            failed: &[false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            responses: true,
             withheld: 0,
         },
         Row {
@@ -1193,6 +1235,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             old: 0,
             cooled: &[],
             compact: false,
+            responses: false,
             withheld: 0,
         },
     ]);
@@ -1210,7 +1253,12 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             records: Mutex::default(),
             release: Mutex::new(Some(released)),
         };
-        let mut exchange = exchange(&fixture, owner(KEY), output(Protocol::Chat, Framing::Sse), CLIENT);
+        let protocol = if row.responses {
+            Protocol::Responses
+        } else {
+            Protocol::Chat
+        };
+        let mut exchange = exchange(&fixture, owner(KEY), output(protocol, Framing::Sse), CLIENT);
         let (mut document, media) = request_view(&fixture, &mut exchange);
         if let Some((opaque, by)) = row.history {
             project_history(&fixture, &mut exchange, &mut document, opaque, by);
@@ -1274,7 +1322,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
                     assert!(text.contains("hel"), "{case}: {text}");
                     if clean {
                         assert!(
-                            ended && text.contains("lo") && !text.contains("error"),
+                            ended && text.contains("lo") && !text.contains("\"error\":{"),
                             "{case}: only the committed attempt reaches the client: {text}"
                         );
                     }

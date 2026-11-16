@@ -23,7 +23,7 @@ fn assert_local_error(text: &str, kind: &str) {
 
 /// Requests seen, the compact answers by arrival order (`(status, body)`; the first key to
 /// send a compact is entry 0, the next entry 1, and a key without an entry answers
-/// `{"ok":true}`; status 0 resets the connection), the SSE body to stream (`None` streams
+/// `COMPACTION`; status 0 resets the connection), the SSE body to stream (`None` streams
 /// `CHUNK` and `[DONE]`), and the keys in the order their first compact arrived.
 #[derive(Default)]
 struct Seen(
@@ -34,6 +34,7 @@ struct Seen(
 );
 
 const CHAT: &str = r#"{"id":"c1","object":"chat.completion","created":1,"model":"up-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+const COMPACTION: &str = r#"{"id":"c","object":"response.compaction","created_at":4,"model":"up-model","output":[{"id":"i","type":"compaction","encrypted_content":"secret"}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}"#;
 const CHUNK: &str = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"up-model","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}"#;
 
 async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
@@ -73,7 +74,7 @@ async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
                 body,
             )
                 .into_response(),
-            None => ([("content-type", "application/json")], r#"{"ok":true}"#).into_response(),
+            None => ([("content-type", "application/json")], COMPACTION).into_response(),
         };
     }
     if stream {
@@ -255,6 +256,14 @@ async fn send(url: &str, path: &str, headers: &[(&str, &str)], body: Vec<u8>) ->
     (res.status().as_u16(), res.text().await.unwrap())
 }
 
+/// The upstream's compaction, shown under the response id cooker issued (Q-E).
+fn assert_compaction(text: &str) {
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["object"], "response.compaction", "{text}");
+    assert_eq!(value["output"][0]["encrypted_content"], "secret", "{text}");
+    assert!(value["id"].as_str().is_some_and(|id| id.starts_with("resp_")), "{text}");
+}
+
 fn compact_calls(seen: &Seen) -> usize {
     seen.0
         .lock()
@@ -278,11 +287,11 @@ async fn compact_decodes_zstd_request_body() {
     )
     .await;
     assert_eq!(status, 200, "{text}");
-    assert_eq!(text, r#"{"ok":true}"#);
+    assert_compaction(&text);
     assert_eq!(compact_calls(&seen), 1);
     let body = seen.0.lock().unwrap()[0].2.clone();
     assert!(
-        body.contains(r#""input":"hello""#) && body.contains(r#""model":"up-model""#),
+        body.contains(r#""content":"hello""#) && body.contains(r#""model":"up-model""#),
         "{body}"
     );
 
@@ -326,12 +335,16 @@ async fn compact_execute() {
     let body = br#"{"model":"fast","input":"hello"}"#.to_vec();
     let (status, text) = send(&url, "/v1/responses/compact", &[], body).await;
     assert_eq!(status, 200, "{text}");
-    assert_eq!(text, r#"{"ok":true}"#);
+    assert_compaction(&text);
     let seen = seen.0.lock().unwrap().clone();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].0, "/v1/responses/compact", "the compact alt");
-    // A chat-format source would have been translated to `messages`.
-    assert_eq!(seen[0].2, r#"{"model":"up-model","input":"hello"}"#);
+    // The Responses request egress writes the input; a chat-format source would have been
+    // translated to `messages`.
+    assert_eq!(
+        seen[0].2,
+        r#"{"input":[{"type":"message","role":"user","content":"hello"}],"model":"up-model"}"#
+    );
 }
 
 /// Compact calls each key received, in the order the keys first sent one.
@@ -353,7 +366,6 @@ fn compact_sends(seen: &Seen) -> Vec<usize> {
 /// the next credential.
 #[tokio::test]
 async fn compact_failures_are_routed_by_class() {
-    const OK: &str = r#"{"ok":true}"#;
     let quota = r#"{"error":{"message":"quota","type":"insufficient_quota"}}"#;
     struct Row {
         case: &'static str,
@@ -361,13 +373,13 @@ async fn compact_failures_are_routed_by_class() {
         /// what the next one (`b`) answers.
         a: (u16, &'static str),
         b: (u16, &'static str),
-        /// The first compact's status and its text when it differs from `OK`.
+        /// The first compact's status; a 200 carries `b`'s compaction.
         status: u16,
         /// Compact sends to `(a, b)` after the first and after a second compact.
         first: (usize, usize),
         second: (usize, usize),
     }
-    let ok = (200, OK);
+    let ok = (200, COMPACTION);
     let mut rows = vec![];
     for status in [404, 405, 501] {
         rows.push(Row {
@@ -439,7 +451,7 @@ async fn compact_failures_are_routed_by_class() {
         let (status, text) = send(&url, "/v1/responses/compact", &[], body.clone()).await;
         assert_eq!(status, row.status, "{case}: {text}");
         if row.status == 200 {
-            assert_eq!(text, OK, "{case}");
+            assert_compaction(&text);
         }
         assert_eq!(sends(&seen), row.first, "{case}: first compact");
         send(&url, "/v1/responses/compact", &[], body.clone()).await;

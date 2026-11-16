@@ -213,8 +213,8 @@ async fn compact_then_replay_sends_the_block_first_and_unchanged() {
     }
 }
 
-/// A credential thinking replay serves answers its capability key; only its generations
-/// without a compaction block stay on the old arm (D2 plan §2.7, part 1).
+/// A credential thinking replay serves answers its capability key; only an Anthropic client's
+/// generations without a compaction block stay on the old arm (D2 plan §2.7, part 1).
 #[tokio::test]
 async fn replay_eligible_compaction_takes_new_arm() {
     let upstream = StreamUpstream::start([]).await;
@@ -248,6 +248,12 @@ async fn replay_eligible_compaction_takes_new_arm() {
         "start keeps the old arm's generation off the contract path"
     );
     assert_eq!(upstream.requests(), 0);
+    // Replay serves Anthropic clients only, so another client's generation runs here.
+    let mut request = fixture.streams.request();
+    let mut ingress = responses_ingress(&fixture, &mut request, Operation::Generate);
+    let other = br#"{"model":"m","max_output_tokens":64,"input":"hi"}"#;
+    let verdict = run(&fixture, &attempt, &mut ingress, &mut request, other).await;
+    assert!(!matches!(verdict.err(), Some(codec::Error::Destination)));
 }
 
 /// Every other destination refuses a request carrying the block (Q3, Q-C): it is skipped,
@@ -297,10 +303,10 @@ async fn streamed_and_unlimited_compactions_are_refused() {
     assert_eq!(upstream.requests(), 0);
 }
 
-/// A Responses client receives the block only inside the cooker envelope (unit D2-6a); until
-/// that exists, its egress refuses the item instead of writing the native block.
+/// A Responses client receives the block inside a `compaction` item's carrier, never as the
+/// native block (Settled 71).
 #[tokio::test]
-async fn responses_egress_refuses_the_block_until_the_envelope_exists() {
+async fn responses_egress_carries_the_block_in_a_compaction_item() {
     let upstream = StreamUpstream::start([Reply::json(compacted())]).await;
     let fixture = Fixture::new(&upstream, SONNET);
     let attempt = fixture.exchange.attempt(&fixture.streams.store);
@@ -313,19 +319,17 @@ async fn responses_egress_refuses_the_block_until_the_envelope_exists() {
     (&mut started.producer).await.unwrap().unwrap();
     let mut egress = support::responses_egress(&mut started.stream, Operation::Compact, BodyMode::Buffered).unwrap();
     let mut reader = fixture.streams.reader(id);
-    let mut refused = false;
+    let mut output = Vec::new();
     while let Some(Read::Record(lease)) = reader.next().await {
-        let mut output = Vec::new();
-        let step = egress.advance(&mut started.stream, lease, |bytes| {
-            output.extend_from_slice(&lease_bytes(&bytes));
-            Ok(())
-        });
-        assert!(!String::from_utf8_lossy(&output).contains(SIGNATURE));
-        if matches!(step, Err(codec::Error::Unsupported)) {
-            refused = true;
-            break;
-        }
-        step.unwrap();
+        egress
+            .advance(&mut started.stream, lease, |bytes| {
+                output.extend_from_slice(&lease_bytes(&bytes));
+                Ok(())
+            })
+            .unwrap();
     }
-    assert!(refused);
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains(r#""type":"compaction""#), "{output}");
+    assert!(output.contains("ck.anthropic-compaction.v1."), "{output}");
+    assert!(!output.contains(SIGNATURE), "{output}");
 }

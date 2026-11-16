@@ -70,7 +70,7 @@ pub struct Prepared(codec::Result<(Writer, ProtocolEgress)>);
 /// response identity and `request` the client's request view.
 pub fn prepare(exchange: &Exchange, response: &Writer, identity: Identity, request: RequestView<'_>) -> Prepared {
     let mut egress = response.allocator();
-    let shown = exchange.turn.map(|turn| turn.id.text());
+    let shown = (exchange.turn.map(|turn| turn.id.text()), exchange.model.as_deref());
     let protocol = ProtocolEgress::new(exchange.output, &mut egress, identity, request, shown);
     Prepared(protocol.map(|protocol| (egress, protocol)))
 }

@@ -1,8 +1,16 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ck_stream::{ScratchLease, Writer};
+
 use crate::codec::{
     Error, Result,
     document::{Document, Name, Value},
-    encode::Encoder,
+    encode::{self, Encoder},
 };
+
+/// The prefix of an `encrypted_content` that carries an Anthropic compaction block (Settled 71).
+/// Standard and URL-safe base64 have no `.`, so it cannot open an OpenAI value.
+const CARRIER: &str = "ck.anthropic-compaction.v1.";
 
 /// Writes a Responses source's unknown event as that native event. A JSON object event carries
 /// `sequence` as its `sequence_number`, so the client's numbering stays contiguous.
@@ -99,4 +107,42 @@ pub(super) fn preserve_carrier_collision(doc: &mut Document, incoming: usize) ->
     let source = doc.set(entry, "source", Value::Object)?;
     doc.set(source, "protocol", Value::Text("responses"))?;
     Ok(())
+}
+
+/// Writes the carrier of `block`, the serialized native compaction block: [`CARRIER`] and the
+/// block's bytes in unpadded URL-safe base64, so the block returns byte for byte.
+pub(super) fn write_carrier(block: &ScratchLease, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let mut bytes = Vec::with_capacity(block.len());
+    let mut offset = 0;
+    while offset < block.len() {
+        let chunk = block.chunk(offset)?;
+        bytes.extend_from_slice(chunk);
+        offset += chunk.len();
+    }
+    e.bytes(CARRIER.as_bytes())?;
+    e.bytes(URL_SAFE_NO_PAD.encode(bytes).as_bytes())
+}
+
+/// The native block a carrier string `value` holds, imported into `doc`; `None` for any value
+/// without the carrier prefix. A carrier that does not decode to a compaction block is refused.
+pub(super) fn read_carrier(doc: &mut Document, owner: &mut Writer, value: usize) -> Result<Option<usize>> {
+    let mut chars = doc.chars(value)?;
+    for expected in CARRIER.chars() {
+        if chars.next_scalar()? != Some(expected) {
+            return Ok(None);
+        }
+    }
+    let mut encoded = String::new();
+    while let Some(c) = chars.next_scalar()? {
+        encoded.push(c);
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| Error::Schema)?;
+    let lease = encode::scratch(owner, |e| e.bytes(&bytes))?;
+    let block = doc.import_json(owner, lease)?;
+    if !matches!(doc.node(block)?.value, Value::Object) || !super::is(doc, block, "type", "compaction")? {
+        return Err(Error::Schema);
+    }
+    super::string(doc, doc.required(block, "content")?)?;
+    super::string(doc, doc.required(block, "signature")?)?;
+    Ok(Some(block))
 }

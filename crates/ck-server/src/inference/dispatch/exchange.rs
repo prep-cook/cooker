@@ -1,8 +1,10 @@
-//! Routes whose client protocol has a request codec: Chat Completions, Anthropic Messages
-//! and Gemini (D2-PLAN D2-3a). The route's request ingress decodes the body into the
-//! exchange's request stream and closes it against the `"client"` capability before any
-//! selection (§3.1), so a malformed request sends nothing. Each candidate then takes the
-//! contract arm or the old arm (§3.2, §4).
+//! Routes whose client protocol has a request codec: Chat Completions, Anthropic Messages,
+//! Gemini (D2-PLAN D2-3a), and Responses with its compact operation (D2-3b). The route's
+//! request ingress decodes the body into the exchange's request stream and closes it against
+//! the `"client"` capability before any selection (§3.1), so a malformed request sends
+//! nothing. A Responses request then gets its response id and, for a `previous_response_id`,
+//! the expanded history (§2.3). Each candidate then takes the contract arm or the old arm
+//! (§3.2, §4).
 //!
 //! Nothing reaches the client before commitment (§5.1): these routes have no pre-commit
 //! SSE keepalive, no non-stream keepalive and no bootstrap retry rounds. A contract-arm
@@ -16,7 +18,7 @@ use axum::response::Response;
 use ck_core::exec::{ExecError, FailureScope};
 use ck_stream::{Store, Writer};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
-use ck_translate::codec::{self, ClientCapability, RequestIngress};
+use ck_translate::codec::{self, ClientCapability, OwnedRequest, RequestIngress};
 
 use super::attempt::{Codec, stored};
 use super::{Call, Done, Failure, Served, Trace, run_exchange, traced, upstream_headers};
@@ -47,7 +49,7 @@ where
 pub(crate) async fn run(rt: &Arc<Runtime>, call: Call, output: Output, trace: &Trace) -> Result<Served, Failure> {
     let store = rt.streams().store().map_err(|error| Failure::Exec(stored(&error)))?;
     // Client errors answer before selection, and before a router's judge, with nothing sent.
-    let mut fenced = Some(Decoded::new(&store, &call, output)?.codec()?);
+    let mut fenced = Some(Decoded::new(&store, &call, output)?.codec(rt)?);
     let mut call = call;
     let mut picked = None;
     if call.forced_provider.is_none()
@@ -61,7 +63,7 @@ pub(crate) async fn run(rt: &Arc<Runtime>, call: Call, output: Output, trace: &T
     loop {
         let codec = match fenced.take() {
             Some(codec) => codec,
-            None => Decoded::new(&store, &call, output)?.codec()?,
+            None => Decoded::new(&store, &call, output)?.codec(rt)?,
         };
         if call.operation == ck_core::exec::Operation::Generate && rt.usage_queue().accepts() {
             trace.prompt_prefix(call.entry, &call.body);
@@ -104,6 +106,7 @@ enum Ingress {
     Chat(codec::chat::request::Ingress),
     Anthropic(ck_translate::anthropic::request::Ingress),
     Gemini(ck_translate::gemini::request::Ingress),
+    Responses(ck_translate::responses::request::Ingress),
 }
 
 impl Decoded {
@@ -138,7 +141,13 @@ impl Decoded {
                 ck_translate::gemini::request::Ingress::new(request, store, identity, operation, &call.model, limit)
                     .map(Ingress::Gemini)
             }
-            Protocol::Responses | Protocol::Speech | Protocol::Images(_) => Err(codec::Error::Unsupported),
+            Protocol::Responses => {
+                ck_translate::responses::request::Ingress::new(request, store, identity, operation, limit)
+                    .map(Ingress::Responses)
+            }
+            Protocol::Speech | Protocol::Images(_) | Protocol::Search | Protocol::Video(_) => {
+                Err(codec::Error::Unsupported)
+            }
         };
         let mut decoded = Self {
             exchange: Some(exchange),
@@ -155,20 +164,42 @@ impl Decoded {
             Ingress::Chat(ingress) => ingress.advance(request, body),
             Ingress::Anthropic(ingress) => ingress.advance(request, body),
             Ingress::Gemini(ingress) => ingress.advance(request, body),
+            Ingress::Responses(ingress) => ingress.advance(request, body),
         }
     }
 
     /// Closes the client fence (contract G8) and hands the exchange and the closed document
-    /// to the selection loop; the parser state goes with the ingress.
-    fn codec(mut self) -> Result<Codec, Failure> {
+    /// to the selection loop; the parser state goes with the ingress. A Responses request
+    /// continuing a stored turn hands over the expanded document instead.
+    fn codec(mut self, rt: &Runtime) -> Result<Codec, Failure> {
         let mut exchange = self.exchange.take().ok_or_else(|| refused(codec::Error::Closed))?;
         let request = &mut exchange.request;
         let request = match self.ingress {
             Ingress::Chat(mut ingress) => fence(&mut ingress, request).and_then(|()| ingress.into_request()),
             Ingress::Anthropic(mut ingress) => fence(&mut ingress, request).and_then(|()| ingress.into_request()),
             Ingress::Gemini(mut ingress) => fence(&mut ingress, request).and_then(|()| ingress.into_request()),
+            Ingress::Responses(mut ingress) => fence(&mut ingress, request).and_then(|()| ingress.into_request()),
         }
         .map_err(refused)?;
+        let request = match exchange.output.protocol {
+            Protocol::Responses => {
+                match crate::inference::responses_state::begin(
+                    rt.streams(),
+                    &mut exchange,
+                    request.view(),
+                    self.request_id,
+                ) {
+                    Ok(Some((document, media))) => OwnedRequest {
+                        document,
+                        media,
+                        operation: request.operation,
+                    },
+                    Ok(None) => request,
+                    Err(refused) => return Err(Failure::Exec(refused.error())),
+                }
+            }
+            _ => request,
+        };
         Ok(Codec {
             exchange,
             request,

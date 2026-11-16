@@ -196,7 +196,13 @@ impl Replay {
                 media: &media,
                 operation: output.operation,
             };
-            ProtocolEgress::new(output, &mut response, identity, view, shown.id)?
+            ProtocolEgress::new(
+                output,
+                &mut response,
+                identity,
+                view,
+                (shown.id, shown.model.as_deref()),
+            )?
         };
         Ok(Self {
             response,

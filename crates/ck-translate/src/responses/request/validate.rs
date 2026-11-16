@@ -12,15 +12,25 @@ use std::collections::hash_map::RandomState;
 /// Tool call IDs by hash, then message ordinal, then ID node: one sorted index replaces a
 /// history rescan for every tool output.
 type CallIndex = Table<(u64, u64, usize)>;
-/// The call index and the ordinal of the message being validated.
+/// The call index, the ordinal of the message being validated, and whether another
+/// protocol's opaque part may pass.
 #[derive(Clone, Copy)]
 struct Calls<'a> {
+    foreign_opaque: bool,
     index: &'a CallIndex,
     hasher: &'a RandomState,
     ordinal: u64,
 }
 
 pub(super) fn validate(view: RequestView<'_>, destination: &str) -> Result<()> {
+    check(view, destination, false)
+}
+/// Parses the known Codex controls of a client request. Another protocol's opaque part, such as
+/// a carried Anthropic compaction, passes: the destination fence decides where it may go.
+pub(super) fn ingress(view: RequestView<'_>) -> Result<()> {
+    check(view, "codex", true)
+}
+fn check(view: RequestView<'_>, destination: &str, foreign_opaque: bool) -> Result<()> {
     if view.operation == Operation::CountTokens {
         return Err(Error::Unsupported);
     }
@@ -91,6 +101,7 @@ pub(super) fn validate(view: RequestView<'_>, destination: &str) -> Result<()> {
         index_calls(doc, messages, index, &hasher)?;
         for (ordinal, message) in doc.children(messages)?.enumerate() {
             let calls = Calls {
+                foreign_opaque,
                 index,
                 hasher: &hasher,
                 ordinal: ordinal as u64,
@@ -240,7 +251,7 @@ fn validate_message(view: RequestView<'_>, message: usize, calls: Calls<'_>, con
                     if is(doc, part, "type", "tool_result")? {
                         tool_result(view, part, calls, continued)?;
                     } else {
-                        validate_part(view, part)?;
+                        validate_part(view, part, calls.foreign_opaque)?;
                     }
                 }
             }
@@ -274,14 +285,14 @@ fn tool_result(view: RequestView<'_>, part: usize, calls: Calls<'_>, continued: 
                     return Err(Error::Schema);
                 }
                 for item in doc.children(content)? {
-                    validate_part(view, item)?;
+                    validate_part(view, item, calls.foreign_opaque)?;
                 }
             }
             Ok(())
         }
     }
 }
-fn validate_part(view: RequestView<'_>, part: usize) -> Result<()> {
+fn validate_part(view: RequestView<'_>, part: usize, foreign_opaque: bool) -> Result<()> {
     let doc = view.document;
     let kind = doc.required(part, "type")?;
     let mut supported = false;
@@ -318,7 +329,7 @@ fn validate_part(view: RequestView<'_>, part: usize) -> Result<()> {
     }
     // Another protocol's opaque block, such as an Anthropic compaction, never goes to Responses
     // (owner ruling Q3).
-    if !supported || (doc.string_is(kind, "opaque")? && !is(doc, part, "protocol", "responses")?) {
+    if !supported || (!foreign_opaque && doc.string_is(kind, "opaque")? && !is(doc, part, "protocol", "responses")?) {
         return Err(Error::Unsupported);
     }
     if doc.string_is(kind, "document")? {

@@ -281,9 +281,9 @@ routing:
 
 `X-Ck-Routed-Provider` names the serving credential's selector. It is sent only when `routing.providers` sets `exclude` or `order`, or a model router served the request.
 
-### Settings that do not apply to Chat, Anthropic and Gemini routes
+### Settings that do not apply to Chat, Anthropic, Gemini and Responses routes
 
-`/v1/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens` and the Gemini `/v1beta/models/...` routes send nothing before the first byte of the answer, so `requests.nonstream-keepalive-interval`, `requests.streaming.keepalive-seconds` and `requests.streaming.bootstrap-retries` have no effect on them. A failure before that byte fails over to the next candidate instead. The settings still apply to the Responses, image, video and speech routes.
+`/v1/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, the Gemini `/v1beta/models/...` routes, `POST /v1/responses` and `/v1/responses/compact` (with their `/backend-api/codex/` paths) send nothing before the first byte of the answer, so `requests.nonstream-keepalive-interval`, `requests.streaming.keepalive-seconds` and `requests.streaming.bootstrap-retries` have no effect on them. A failure before that byte fails over to the next candidate instead. The settings still apply to the Responses WebSocket, image, video and speech routes.
 
 ### Optional preset: fail over only on 429
 

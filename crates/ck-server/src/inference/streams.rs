@@ -103,6 +103,9 @@ pub struct Exchange {
     /// A Responses exchange's response id and whether it is indexed
     /// (`responses_state::begin`).
     pub turn: Option<Turn>,
+    /// The model a Responses client sees instead of the upstream's: the force-mapped alias
+    /// of the in-flight attempt's candidate.
+    pub model: Option<Arc<str>>,
     /// The in-flight attempt's index publication, which delivery reserves at commitment.
     pub(crate) publication: Option<Arc<Publication>>,
 }
@@ -153,6 +156,7 @@ impl Exchange {
             attempt: None,
             committed: false,
             turn: None,
+            model: None,
             publication: None,
         })
     }
@@ -182,6 +186,7 @@ impl Exchange {
             request: self.request.allocator(),
             shown: Shown {
                 id: self.turn.map(|turn| turn.id.text()),
+                model: self.model.clone(),
                 gate: self.publication.as_ref().map(|publication| publication.gate()),
             },
         }
@@ -233,10 +238,12 @@ pub struct StreamHandle {
 }
 
 /// What every delivery of a committed response shows alike, live or resumed: the Responses id
-/// the exchange issued, and the index publication's gate its `done` waits for.
+/// the exchange issued, the model alias it shows, and the index publication's gate its `done`
+/// waits for.
 #[derive(Clone, Default)]
 pub(crate) struct Shown {
     pub id: Option<ck_translate::codec::event::LocalId>,
+    pub model: Option<Arc<str>>,
     pub gate: Option<tokio::sync::watch::Receiver<bool>>,
 }
 

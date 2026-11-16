@@ -183,13 +183,15 @@ fn snap_effort(attempt: &Attempt<'_>, mut body: Vec<u8>) -> Vec<u8> {
 impl ClaudeExecutor {
     /// Whether the fenced `view` runs on the contract path for `attempt`; the selector's fence,
     /// re-fence and start refuse it with `Destination` otherwise, and the server keeps the old
-    /// `claude` arm. A request on a credential thinking replay serves stays on the old arm:
-    /// replay stores a response only once it is known complete, which `Execute` cannot see,
-    /// because the producer validates the body after the executor returned (Q1). A compact and
-    /// a request carrying a compaction block run here anyway, since the old arm has no native
-    /// compaction and drops the block; thinking replay does not record their turns.
+    /// `claude` arm. An Anthropic client's request on a credential thinking replay serves stays
+    /// on the old arm: replay stores a response only once it is known complete, which `Execute`
+    /// cannot see, because the producer validates the body after the executor returned (Q1).
+    /// Replay serves Anthropic clients only (`replay::prepare`), so any other client runs here.
+    /// A compact and a request carrying a compaction block run here anyway, since the old arm
+    /// has no native compaction and drops the block; thinking replay does not record their turns.
     pub fn contract_path(&self, attempt: &Attempt<'_>, view: RequestView<'_>) -> bool {
         ck_translate::anthropic::compaction::requested(view).unwrap_or(false)
+            || Facts::of(view.document).map_or(true, |facts| facts.client_format != Format::Claude)
             || !replay::eligible(&gate(&attempt_ctx(self, attempt, &scoped(attempt))))
     }
 

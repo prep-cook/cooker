@@ -297,6 +297,17 @@ pub enum Refused {
 impl Refused {
     /// The client's answer, in the Responses error shape.
     pub fn response(&self) -> Response {
+        let (status, body) = self.parts();
+        crate::http::respond::gin_json(status, body)
+    }
+
+    /// The same answer as a request-scoped error, for the route's error writer.
+    pub fn error(&self) -> ck_core::exec::ExecError {
+        let (status, body) = self.parts();
+        ck_core::exec::ExecError::local(status, ck_core::exec::FailureScope::Request, body)
+    }
+
+    fn parts(&self) -> (u16, String) {
         let (status, message, kind, param, code) = match self {
             Self::Conversation => (
                 400,
@@ -343,7 +354,7 @@ impl Refused {
             detail.str("param", param)
         };
         let detail = detail.str("code", code).finish();
-        crate::http::respond::gin_json(status, crate::http::gojson::Obj::new().raw("error", &detail).finish())
+        (status, crate::http::gojson::Obj::new().raw("error", &detail).finish())
     }
 }
 
