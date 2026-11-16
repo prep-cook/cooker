@@ -158,30 +158,45 @@ pub fn encode(owner: &mut Writer, doc: &Document, destination: Destination) -> R
             e.bytes(b"\"model\":")?;
             doc.write(doc.required(root, "model")?, e)?;
             e.bytes(b",\"input\":")?;
-        } else {
-            e.bytes(b"\"text\":")?;
-        }
-        doc.write(doc.required(root, "text")?, e)?;
-        if destination == Destination::OpenAi {
+            doc.write(doc.required(root, "text")?, e)?;
             for name in OPTIONS {
                 boundary::member(doc, audio, name, e)?;
             }
             originals(doc, x, e)?;
-        } else {
-            e.bytes(b",\"voice_id\":")?;
-            voice(doc, doc.required(audio, "voice")?, e)?;
-            boundary::member(doc, audio, "language", e)?;
-            boundary::member(doc, audio, "speed", e)?;
-            if doc.member(audio, "output_format")?.is_some() {
-                boundary::member(doc, audio, "output_format", e)?;
-            } else if let Some(format) = doc.member(audio, "response_format")?
-                && !doc.string_is(format, "mp3")?
-            {
-                e.bytes(b",\"output_format\":{\"codec\":")?;
-                doc.write(format, e)?;
-                e.bytes(b",\"sample_rate\":24000}")?;
-            }
+            return e.bytes(b"}");
         }
+        // xAI members in key order, as Go's `json.Marshal` writes the `/tts` body map.
+        let mut first = true;
+        let mut key = |e: &mut Encoder<'_, '_>, name: &str| {
+            if !std::mem::take(&mut first) {
+                e.bytes(b",")?;
+            }
+            e.string(name)?;
+            e.bytes(b":")
+        };
+        if let Some(language) = doc.member(audio, "language")? {
+            key(e, "language")?;
+            doc.write(language, e)?;
+        }
+        if let Some(output) = doc.member(audio, "output_format")? {
+            key(e, "output_format")?;
+            doc.write(output, e)?;
+        } else if let Some(format) = doc.member(audio, "response_format")?
+            && !doc.string_is(format, "mp3")?
+        {
+            key(e, "output_format")?;
+            e.bytes(b"{\"codec\":")?;
+            doc.write(format, e)?;
+            e.bytes(b",\"sample_rate\":24000}")?;
+        }
+        if let Some(speed) = doc.member(audio, "speed")? {
+            key(e, "speed")?;
+            doc.write(speed, e)?;
+        }
+        key(e, "text")?;
+        doc.write(doc.required(root, "text")?, e)?;
+        key(e, "voice_id")?;
+        voice(doc, doc.required(audio, "voice")?, e)?;
         e.bytes(b"}")
     })?)
 }

@@ -620,7 +620,7 @@ async fn native(r: Request, body: Vec<u8>, model: &str, create: bool) -> Respons
     } else {
         pinned_and_model(&r, &video_id(&body), model)
     };
-    execute(&r, &routing(&model), body, pinned, |result| async move {
+    execute(&r, routing(&model), body, pinned, |result| async move {
         match result {
             Ok(payload) => json_body(payload),
             Err(failure) => errors::openai(&failure),

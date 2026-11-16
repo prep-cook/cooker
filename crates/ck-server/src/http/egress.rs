@@ -23,15 +23,19 @@ pub enum Protocol {
     Chat,
     Responses,
     Gemini,
+    /// OpenAI speech: the audio file itself.
+    Speech,
 }
 
 /// Client body framing. `Json` is a buffered body; `Sse` and `JsonArray` stream, the latter
-/// as Gemini's `streamGenerateContent` without `alt=sse`.
+/// as Gemini's `streamGenerateContent` without `alt=sse`. `Raw` is a media file streamed as
+/// it arrives, with the upstream's media type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Framing {
     Json,
     Sse,
     JsonArray,
+    Raw,
 }
 
 /// What response egress encodes with. Fixed when the exchange starts; a resume reuses it

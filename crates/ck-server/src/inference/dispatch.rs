@@ -26,6 +26,7 @@ use crate::scheduling::{classify, lcp};
 
 mod attempt;
 
+pub(crate) use attempt::stored;
 use attempt::{Arm, Ran};
 pub use attempt::{Arms, Codec};
 
@@ -514,33 +515,7 @@ where
     // committed the headers they are lost, as in Go.
     let traced = {
         let (trace, rt) = (trace.clone(), rt.clone());
-        move |mut response: axum::response::Response, upstream: Option<Upstream>| {
-            // The same config snapshot decides passthrough for both header sources.
-            match upstream {
-                Some(Upstream::Success(headers)) => respond::write_upstream_headers(response.headers_mut(), &headers),
-                Some(Upstream::Error(headers)) => respond::write_error_headers(response.headers_mut(), &headers),
-                None => {}
-            }
-            if let Some(value) = trace.header() {
-                response.headers_mut().insert("x-ck-trace-id", value);
-            }
-            // The model a model router chose, and the provider that served (cooker only).
-            // Both are sent only when a router or `routing.providers` is in play, so a config
-            // without them answers exactly as Go does.
-            let routed_model = trace.routed_model();
-            let routed = routed_model.is_some() || rt.policy().providers.is_set();
-            if let Some(value) = routed_model.and_then(|m| axum::http::HeaderValue::from_str(&m).ok()) {
-                response.headers_mut().insert("x-ck-routed-model", value);
-            }
-            if let Some(value) = trace
-                .routed_provider(&rt)
-                .filter(|_| routed)
-                .and_then(|p| axum::http::HeaderValue::from_str(&p).ok())
-            {
-                response.headers_mut().insert("x-ck-routed-provider", value);
-            }
-            response
-        }
+        move |response, upstream| traced(&rt, &trace, response, upstream)
     };
     let Some(interval) = interval else {
         let (result, upstream) = run.await;
@@ -598,6 +573,63 @@ where
     // Go cpa_trace.go applies the trace ID when the first keep-alive commits headers.
     if let Some(value) = trace.header() {
         headers.insert("x-ck-trace-id", value);
+    }
+    response
+}
+
+/// Serves a media request its route decoded into `codec` (E-PLAN §2.3). Nothing reaches the
+/// client before commitment: no keep-alive and no bootstrap retry rounds. A contract-arm answer
+/// is the client's response as it committed; `render` answers an old-arm result or a failure.
+pub async fn serve_exchange<F, Fut>(
+    rt: &Arc<Runtime>,
+    call: Call,
+    codec: Codec<'_>,
+    render: F,
+) -> axum::response::Response
+where
+    F: FnOnce(Result<Done, Failure>) -> Fut,
+    Fut: std::future::Future<Output = axum::response::Response>,
+{
+    let trace = Trace::with_request_id(crate::observability::api::current_request_id());
+    let result = match run_exchange(rt, &rt.executors, call, &trace, codec).await {
+        Ok(Served::Committed(response)) => return traced(rt, &trace, response, None),
+        Ok(Served::Old(done)) => Ok(done),
+        Err(error) => Err(error.failure),
+    };
+    let upstream = upstream_headers(&rt.config(), &result, trace.served_by_kimi(rt));
+    traced(rt, &trace, render(result).await, upstream)
+}
+
+/// Adds the upstream headers, the trace ID and the routing headers to a response.
+fn traced(
+    rt: &Runtime,
+    trace: &Trace,
+    mut response: axum::response::Response,
+    upstream: Option<Upstream>,
+) -> axum::response::Response {
+    // The same config snapshot decides passthrough for both header sources.
+    match upstream {
+        Some(Upstream::Success(headers)) => respond::write_upstream_headers(response.headers_mut(), &headers),
+        Some(Upstream::Error(headers)) => respond::write_error_headers(response.headers_mut(), &headers),
+        None => {}
+    }
+    if let Some(value) = trace.header() {
+        response.headers_mut().insert("x-ck-trace-id", value);
+    }
+    // The model a model router chose, and the provider that served (cooker only).
+    // Both are sent only when a router or `routing.providers` is in play, so a config
+    // without them answers exactly as Go does.
+    let routed_model = trace.routed_model();
+    let routed = routed_model.is_some() || rt.policy().providers.is_set();
+    if let Some(value) = routed_model.and_then(|m| axum::http::HeaderValue::from_str(&m).ok()) {
+        response.headers_mut().insert("x-ck-routed-model", value);
+    }
+    if let Some(value) = trace
+        .routed_provider(rt)
+        .filter(|_| routed)
+        .and_then(|p| axum::http::HeaderValue::from_str(&p).ok())
+    {
+        response.headers_mut().insert("x-ck-routed-provider", value);
     }
     response
 }
