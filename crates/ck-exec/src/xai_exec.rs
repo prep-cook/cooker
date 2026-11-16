@@ -216,12 +216,13 @@ impl XaiExecutor {
     }
 }
 
-/// One attempt's facts the upload shaping and the send read.
-struct Call<'r> {
-    attempt: &'r Attempt<'r>,
+/// One attempt's facts the upload shaping and the send read; also the WebSocket turn's
+/// (`xai_ws`).
+pub(crate) struct Call<'r> {
+    pub(crate) attempt: &'r Attempt<'r>,
     request: &'r Request<'r>,
     /// The attempt's config, as Go binds it for the credential (`cfg.ForAPIKey()`).
-    cfg: Cow<'r, Config>,
+    pub(crate) cfg: Cow<'r, Config>,
     /// The client's protocol.
     source: Format,
     /// The model the client asked for, as payload rules match it.
@@ -229,7 +230,7 @@ struct Call<'r> {
 }
 
 impl<'r> Call<'r> {
-    fn new(attempt: &'r Attempt<'r>, request: &'r Request<'r>) -> Result<Self, ExecError> {
+    pub(crate) fn new(attempt: &'r Attempt<'r>, request: &'r Request<'r>) -> Result<Self, ExecError> {
         let document = request.validated.view().document;
         Ok(Self {
             attempt,
@@ -242,7 +243,7 @@ impl<'r> Call<'r> {
 
     /// The upload shaped for xAI. The upload is already Responses, so it is also the payload,
     /// the original and the apply_patch declarations.
-    fn shape(
+    pub(crate) fn shape(
         &self,
         upload: &[u8],
         store: &crate::xai_replay::Store,
@@ -269,14 +270,14 @@ impl<'r> Call<'r> {
 
     /// The request-side usage facts (contract G4): the shaped body before the payload rules,
     /// for the reasoning effort, as the old path reports it, and the model xAI should serve.
-    fn report(&self, body: &[u8]) {
+    pub(crate) fn report(&self, body: &[u8]) {
         let usage = self.request.client.usage;
         usage.request_for(xai::PROVIDER, body);
         usage.upstream_model(&parse_suffix(self.attempt.model).model_name);
     }
 
     /// The configured payload rules, the last change to the body (Go `finalizePayload`).
-    fn rules(&self, protocol: Format, original: &[u8], body: Vec<u8>) -> Vec<u8> {
+    pub(crate) fn rules(&self, protocol: Format, original: &[u8], body: Vec<u8>) -> Vec<u8> {
         let rules = ck_wire::payload::Rules::of(&self.cfg);
         ck_wire::payload::apply(
             &rules,
@@ -339,7 +340,7 @@ fn required_members(upload: &[u8]) -> Vec<u8> {
 
 /// Encodes the fenced request with the Responses request egress; the HTTP client takes the
 /// encoded upload as one body.
-fn encode(
+pub(crate) fn encode(
     request: &codec::ValidatedRequest<'_>,
     stream: bool,
     owner: &mut ck_stream::Writer,
@@ -391,7 +392,7 @@ fn copy(lease: &ScratchLease) -> Result<Vec<u8>, ExecError> {
 
 /// A failure before anything was sent (contract §9): storage rows by the inner error;
 /// anything else is a gateway defect, since the request passed this destination's fence.
-fn encoding(error: codec::Error) -> ExecError {
+pub(crate) fn encoding(error: codec::Error) -> ExecError {
     match error {
         codec::Error::Storage(ck_stream::Error::StorageExhausted | ck_stream::Error::Io(_)) => {
             ExecError::local(503, FailureScope::Request, "stream.storage_exhausted")

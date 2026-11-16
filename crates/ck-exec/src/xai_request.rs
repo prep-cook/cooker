@@ -244,11 +244,6 @@ pub(crate) fn shape_input(mut body: Vec<u8>, tools: &Tools) -> Vec<u8> {
     normalize_image_refs(body)
 }
 
-/// `xaiExecutionSessionID`.
-pub(crate) fn execution_session_id(req: &ExecRequest) -> String {
-    Inbound::of(req).execution_session_id()
-}
-
 /// Grok version prefix of a model name (`xaiParseGrokVersionPrefix`).
 fn grok_version(rest: &str) -> Option<(i64, i64)> {
     let bytes = rest.as_bytes();

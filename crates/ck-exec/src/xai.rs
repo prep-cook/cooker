@@ -411,6 +411,29 @@ impl XaiExecutor {
         xai_auth::refresh(&auth, credential).await
     }
 
+    /// A downstream Responses WebSocket turn on the old session path: HTTP generation,
+    /// which keeps no upstream state, so a continuation must be replayed. The upstream
+    /// socket is [`crate::session::Turns`] (`xai_ws`).
+    pub async fn execute_in_session(
+        &self,
+        credential: &Credential,
+        req: ExecRequest,
+        cfg: &Config,
+        session: &ck_core::exec::ExecSession,
+    ) -> Result<ExecResponse, ExecError> {
+        if session.continuation {
+            // Go's auto executor answers before any reporter exists.
+            req.usage.discard();
+            return Err(ExecError::replay_required());
+        }
+        self.execute(credential, req, cfg, true).await
+    }
+
+    /// Closes the upstream socket the client connection `id` holds.
+    pub fn close_session(&self, id: &str) {
+        self.ws.close(id);
+    }
+
     /// Execute / ExecuteStream / CountTokens. `downstream_websocket` marks a turn of a
     /// downstream Responses WebSocket (Go `DownstreamWebsocket(ctx)`).
     pub async fn execute(

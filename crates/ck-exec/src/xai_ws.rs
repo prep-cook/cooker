@@ -1,46 +1,49 @@
-//! xAI upstream Responses WebSocket (xai_websockets_executor.go): the transport a
-//! downstream Responses WebSocket turn uses when its credential sets `websockets`
-//! (`XAIAutoExecutor`).
+//! xAI upstream Responses WebSocket (`docs/EXECUTION-CONTRACT.md` §12, [`Turns`]): one turn
+//! of a downstream Responses WebSocket on the client connection's pooled upstream socket,
+//! when the credential sets `websockets`.
 //!
-//! Sockets live in the Codex executor's pool type ([`codex_ws::Pool`]), as Go shares
-//! `codexWebsocketSession` between both executors; xAI keeps its own pool instance. On top
-//! of that, every session has an [`IdState`] (`xaiWebsocketIDState`): xAI reuses response
-//! IDs and loses upstream state when the socket's target changes, so downstream response
-//! IDs are rewritten to stay unique and the conversation transcript is kept to replay it
-//! on a fresh target. Compaction triggers follow the ordinary upstream WebSocket path.
-// ponytail: Go's branch for a WebSocket turn without a downstream WebSocket (SSE encoding
-// and client translation) is unreachable through `XAIAutoExecutor` and not ported, nor
-// are the sessionless ephemeral sockets or `CloseXAIWebsocketSessionsForAuthID`.
+//! - The turn is an ordinary attempt. Its request carries the expanded history, so the frame
+//!   is the upload HTTP generation would send (shaped without `previous_response_id`, with
+//!   `store: false`) as one `response.create`. The connection keeps no transcript and no
+//!   response-id map; the reasoning replay cache applies exactly as for HTTP generation. A
+//!   `compaction_trigger` input item reaches xAI as received; xAI compacts.
+//! - Every upstream text frame goes to the attempt's ingress unchanged as one SSE `data:`
+//!   event, through the same xAI line rules (`xai_events`) as HTTP generation. The one
+//!   exception is the WebSocket mode's own terminal, `response.done`, which goes in as the
+//!   `response.completed` the ingress ends a response on.
+//! - A lost socket is the attempt's failure. xAI ends every connection after 59 minutes; a
+//!   close or drop during a turn ends its body with a transport-scope error, which fails over
+//!   before the client commit and is an error after it. The transport never dials or sends
+//!   again within a turn; the next turn dials a fresh socket.
+//! - A warmup turn (`generate: false`) gets the `response.completed` xAI never sends for it.
+//!
+//! Sockets live in the Codex executor's pool type ([`codex_ws::Pool`]); xAI keeps its own
+//! pool instance, keyed by the client connection's execution session.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ck_core::config::Config;
 use ck_core::credential::Credential;
-use ck_core::exec::{
-    CaptureEvent, CaptureSink, ExecError, ExecRequest, ExecResponse, ExecSession, FailureScope, ResponseBody,
-    UpstreamRequest,
-};
+use ck_core::exec::{CaptureEvent, CaptureSink, ExecError, FailureScope, UpstreamRequest, UsageSink};
 use ck_core::format::Format;
-use ck_wire::json::{self as gj, GoValue};
+use ck_translate::codec::{BodyMode, Operation};
+use ck_translate::responses::response::Ingress;
+use ck_wire::json as gj;
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
 use crate::codex_ws::{self, Pool, Read, Session, Target, Upstream};
-use crate::openai_compat::status_err;
 use crate::openai_compat_payload::ensure_responses_usage_details;
-use crate::xai::{XaiExecutor, apply_patch_error, creds};
+use crate::session::{CancelTurn, Turn, Turns};
+use crate::types::{self, Attempt, Client, Request, Streams};
+use crate::xai::{MAX_LINE, XaiExecutor, creds};
 use crate::xai_auth::DEFAULT_API_BASE_URL;
-use crate::xai_replay::{self as replay, ReplayScope};
-use crate::xai_request as request;
-use crate::xai_response::{self as response, NamespaceRestorer, OutputItems, XSearchFilter, text};
-use ck_translate::apply_patch_responses as apply_patch;
-
-/// The terminal events whose usage Go's WebSocket turn observes (completed and done).
-const WS_USAGE_EVENTS: [&str; 2] = ["response.completed", "response.done"];
+use crate::xai_events::{Events, XaiIngress};
+use crate::xai_exec::{Call, encode, encoding};
+use crate::xai_response::{self as response, text};
 
 /// `codexResponsesWebsocketHandshakeTO`.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -53,373 +56,28 @@ const EMPTY_USAGE: &str = r#"{"input_tokens":0,"input_tokens_details":{"cached_t
 /// reader's deadline is set past any session.
 const NO_READ_DEADLINE: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 
-/// The executor's sockets and per-session ID state (`globalXAIWebsocketSessionStore`,
-/// `globalXAIWebsocketIDStates`).
+/// The executor's sockets (`globalXAIWebsocketSessionStore`).
 pub(crate) struct Ws {
     pool: Pool,
-    states: Mutex<HashMap<String, Arc<IdState>>>,
-    /// Test hook: the next turn signals once it holds its session and waits before it
-    /// takes the ID state.
-    #[cfg(test)]
-    pause: Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
 }
 
 impl Default for Ws {
     fn default() -> Self {
         let mut pool = Pool::default();
         pool.idle = NO_READ_DEADLINE;
-        Self {
-            pool,
-            states: Mutex::default(),
-            #[cfg(test)]
-            pause: Mutex::default(),
-        }
+        Self { pool }
     }
 }
 
 impl Ws {
-    /// `getXAIWebsocketIDState`.
-    fn state(&self, id: &str) -> Option<Arc<IdState>> {
-        let id = id.trim();
-        if id.is_empty() {
-            return None;
-        }
-        let mut states = self.states.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        Some(states.entry(id.to_owned()).or_default().clone())
-    }
-
     /// `CloseExecutionSession`: the downstream connection ended.
     pub(crate) fn close(&self, id: &str) {
-        let id = id.trim();
-        self.pool.close(id);
-        self.states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(id);
+        self.pool.close(id.trim());
     }
 
-    /// `closeXAIWebsocketSessionsInStoreForAuthID`: ends a removed credential's sessions
-    /// and drops their ID state.
+    /// `closeXAIWebsocketSessionsInStoreForAuthID`: ends a removed credential's sessions.
     pub(crate) fn close_credential(&self, credential: &str) {
-        self.pool.close_credential_with(credential, |id| {
-            self.states
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(id);
-        });
-    }
-
-    #[cfg(test)]
-    async fn paused(&self) {
-        let pause = self
-            .pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some((reached, resume)) = pause {
-            let _ = reached.send(());
-            let _ = resume.await;
-        }
-    }
-
-    /// `UpstreamDisconnectChan`.
-    pub(crate) fn closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        self.pool.closed(id.trim())
-    }
-
-    pub(crate) fn clear_loss(&self, id: &str) {
-        self.pool.clear_loss(id.trim());
-    }
-}
-
-// --- per-session ID state (xaiWebsocketIDState) --------------------------------------------
-
-#[derive(Default)]
-struct IdState(Mutex<IdInner>);
-
-#[derive(Default)]
-struct IdInner {
-    downstream_to_upstream: HashMap<String, String>,
-    sequence: u64,
-    transcript: Vec<Vec<u8>>,
-    /// The target of the session's last socket (Go keeps `sess.authID`, `wsURL` and
-    /// `proxyURL` after the socket is gone).
-    last_target: Option<Target>,
-}
-
-impl IdState {
-    fn lock(&self) -> std::sync::MutexGuard<'_, IdInner> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// `upstreamIDForDownstream`.
-    fn upstream_id(&self, downstream: &str) -> String {
-        let downstream = downstream.trim();
-        if downstream.is_empty() {
-            return String::new();
-        }
-        match self.lock().downstream_to_upstream.get(downstream) {
-            Some(upstream) => upstream.trim().to_owned(),
-            None => downstream.to_owned(),
-        }
-    }
-
-    /// The transcript prepended to `payload`'s input.
-    fn prepend(&self, payload: Vec<u8>) -> Vec<u8> {
-        let prefix = {
-            let inner = self.lock();
-            inner.transcript.clone()
-        };
-        if prefix.is_empty() {
-            return payload;
-        }
-        let mut merged = prefix;
-        merged.extend(raw_items(&gj::get(&payload, "input")));
-        let mut out = payload;
-        gj::set_raw(&mut out, "input", raw_array(&merged));
-        out
-    }
-
-    /// `recordTranscriptTurn`.
-    fn record(&self, request: &[u8], completed: &[u8], reset: bool) {
-        if request.is_empty() || completed.is_empty() {
-            return;
-        }
-        let input = raw_items(&gj::get(request, "input"));
-        let output = raw_items(&gj::get(completed, "response.output"));
-        let mut inner = self.lock();
-        if reset {
-            inner.transcript.clear();
-        }
-        inner.transcript.extend(input);
-        inner.transcript.extend(output);
-    }
-
-    /// `websocketSessionTargetChanged`; `live` when the session's socket for the same
-    /// credential is still open, which keeps its dial-time global proxy (`effectiveConfig`).
-    fn target_changed(&self, target: &Target, live: bool) -> bool {
-        self.lock()
-            .last_target
-            .as_ref()
-            .is_some_and(|last| !if live { last.serves(target) } else { last.same(target) })
-    }
-
-    fn set_target(&self, target: &Target) {
-        self.lock().last_target = Some(target.clone());
-    }
-}
-
-/// `xaiJSONRawMessages`: the valid elements of an array, trimmed.
-fn raw_items(value: &gj::Res<'_>) -> Vec<Vec<u8>> {
-    if !value.exists() || !value.is_array() {
-        return Vec::new();
-    }
-    value
-        .array()
-        .iter()
-        .map(|item| ck_wire::gostr::trim_space(item.raw()).to_vec())
-        .filter(|raw| !raw.is_empty() && gj::std_valid(raw))
-        .collect()
-}
-
-/// `xaiMarshalRawMessages`.
-fn raw_array(items: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = vec![b'['];
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            out.push(b',');
-        }
-        out.extend_from_slice(ck_wire::gostr::trim_space(item));
-    }
-    out.push(b']');
-    out
-}
-
-/// `xaiWebsocketRequestIDMapper`: one turn's view of the session's ID mapping.
-struct IdMapper {
-    state: Arc<IdState>,
-    downstream_previous: String,
-    upstream_previous: String,
-    upstream_response: String,
-    downstream_response: String,
-}
-
-impl IdMapper {
-    /// `newXAIWebsocketRequestIDMapper`.
-    fn new(state: Arc<IdState>, downstream_request: &[u8]) -> Self {
-        let downstream_previous = text(&gj::get(downstream_request, "previous_response_id"))
-            .trim()
-            .to_owned();
-        let upstream_previous = if downstream_previous.is_empty() {
-            String::new()
-        } else {
-            state.upstream_id(&downstream_previous)
-        };
-        Self {
-            state,
-            downstream_previous,
-            upstream_previous,
-            upstream_response: String::new(),
-            downstream_response: String::new(),
-        }
-    }
-
-    /// `upstreamRequestPayload`.
-    fn upstream_request(&mut self, payload: Vec<u8>) -> Vec<u8> {
-        if payload.is_empty() {
-            return payload;
-        }
-        if self.downstream_previous == self.upstream_previous {
-            return payload;
-        }
-        let mut out = payload;
-        if self.upstream_previous.is_empty() {
-            gj::delete(&mut out, "previous_response_id");
-            if !self.downstream_previous.is_empty() {
-                out = self.state.prepend(out);
-            }
-            return out;
-        }
-        gj::set_str(&mut out, "previous_response_id", &self.upstream_previous);
-        out
-    }
-
-    /// `downstreamResponsePayload`.
-    fn downstream_response(&mut self, payload: Vec<u8>) -> Vec<u8> {
-        if payload.is_empty() {
-            return payload;
-        }
-        let upstream = text(&gj::get(&payload, "response.id")).trim().to_owned();
-        let downstream = self.downstream_id(&upstream);
-        if downstream.is_empty() {
-            return payload;
-        }
-        rewrite_ids(
-            payload,
-            &self.upstream_response,
-            &downstream,
-            &self.upstream_previous,
-            &self.downstream_previous,
-        )
-    }
-
-    /// `downstreamIDForUpstreamResponse`: a response ID xAI repeats gets a `-xai-N` suffix
-    /// downstream.
-    fn downstream_id(&mut self, upstream: &str) -> String {
-        if !self.upstream_response.is_empty() {
-            return self.downstream_response.clone();
-        }
-        if upstream.is_empty() {
-            return String::new();
-        }
-        let mut inner = self.state.lock();
-        self.upstream_response = upstream.to_owned();
-        self.downstream_response = upstream.to_owned();
-        let seen = inner.downstream_to_upstream.contains_key(upstream);
-        if (!self.downstream_previous.is_empty()
-            && !self.upstream_previous.is_empty()
-            && upstream == self.upstream_previous)
-            || seen
-        {
-            inner.sequence += 1;
-            self.downstream_response = format!("{upstream}-xai-{}", inner.sequence);
-        }
-        inner
-            .downstream_to_upstream
-            .insert(upstream.to_owned(), upstream.to_owned());
-        inner
-            .downstream_to_upstream
-            .insert(self.downstream_response.clone(), upstream.to_owned());
-        self.downstream_response.clone()
-    }
-}
-
-/// `rewriteXAIWebsocketDownstreamIDs`: `id`/`item_id` strings containing the upstream
-/// response ID and an exact `previous_response_id`, re-marshalled like Go's
-/// `map[string]any` (sorted keys) when anything changed.
-fn rewrite_ids(
-    payload: Vec<u8>,
-    upstream: &str,
-    downstream: &str,
-    upstream_previous: &str,
-    downstream_previous: &str,
-) -> Vec<u8> {
-    let (upstream, downstream) = (upstream.trim(), downstream.trim());
-    let (upstream_previous, downstream_previous) = (upstream_previous.trim(), downstream_previous.trim());
-    if upstream == downstream && upstream_previous == downstream_previous {
-        return payload;
-    }
-    let Some(mut value) = GoValue::parse(&payload) else {
-        return payload;
-    };
-    let ids = Ids {
-        upstream,
-        downstream,
-        upstream_previous,
-        downstream_previous,
-    };
-    if !ids.rewrite(&mut value) {
-        return payload;
-    }
-    value.marshal()
-}
-
-struct Ids<'a> {
-    upstream: &'a str,
-    downstream: &'a str,
-    upstream_previous: &'a str,
-    downstream_previous: &'a str,
-}
-
-impl Ids<'_> {
-    fn rewrite(&self, value: &mut GoValue) -> bool {
-        match value {
-            GoValue::Object(map) => {
-                let mut changed = false;
-                for (key, child) in map.iter_mut() {
-                    if let GoValue::String(s) = child {
-                        if let Some(replaced) = self.string(key, s) {
-                            *s = replaced;
-                            changed = true;
-                        }
-                        continue;
-                    }
-                    changed |= self.rewrite(child);
-                }
-                changed
-            }
-            GoValue::Array(items) => {
-                let mut changed = false;
-                for item in items {
-                    changed |= self.rewrite(item);
-                }
-                changed
-            }
-            _ => false,
-        }
-    }
-
-    /// `rewriteXAIWebsocketDownstreamIDString`; `None` when unchanged.
-    fn string(&self, key: &str, value: &str) -> Option<String> {
-        match key {
-            "id" | "item_id"
-                if !self.upstream.is_empty()
-                    && !self.downstream.is_empty()
-                    && self.downstream != self.upstream
-                    && value.contains(self.upstream) =>
-            {
-                Some(value.replace(self.upstream, self.downstream)).filter(|r| r != value)
-            }
-            "previous_response_id"
-                if !self.upstream_previous.is_empty()
-                    && !self.downstream_previous.is_empty()
-                    && value == self.upstream_previous
-                    && self.downstream_previous != value =>
-            {
-                Some(self.downstream_previous.to_owned())
-            }
-            _ => None,
-        }
+        self.pool.close_credential(credential);
     }
 }
 
@@ -472,22 +130,17 @@ fn ws_url(http_url: &str) -> Result<String, ExecError> {
     Ok(crate::xai_url::string(&parsed))
 }
 
-/// `buildXAIWebsocketRequestBody`: every turn is a stored `response.create`; the
-/// payload rules (`finalize`) see the WebSocket fields, then the type is fixed again.
-fn request_frame(body: &[u8], finalize: impl FnOnce(Vec<u8>) -> Vec<u8>) -> Vec<u8> {
-    if body.is_empty() {
-        return Vec::new();
-    }
-    let mut out = body.to_vec();
+/// `buildXAIWebsocketRequestBody`: every turn is a `response.create`; the payload rules
+/// (`rules`) see the WebSocket fields, then the type is fixed again. The shaped body's
+/// `store: false` stays (owner ruling E9c-1, 2026-11-16): no turn continues from a response
+/// stored at xAI, so Go's `store: true` would only keep the turn's data there.
+fn request_frame(body: Vec<u8>, rules: impl FnOnce(Vec<u8>) -> Vec<u8>) -> Vec<u8> {
+    let mut out = body;
     gj::set_str(&mut out, "type", "response.create");
     for key in ["stream", "stream_options", "background"] {
         gj::delete(&mut out, key);
     }
-    gj::set_bool(&mut out, "store", true);
-    if !text(&gj::get(&out, "previous_response_id")).trim().is_empty() {
-        gj::delete(&mut out, "instructions");
-    }
-    let mut out = finalize(out);
+    let mut out = rules(out);
     gj::set_str(&mut out, "type", "response.create");
     out
 }
@@ -585,7 +238,8 @@ fn go_atoi(s: &str) -> Option<i64> {
 
 /// A socket failure from the shared pool, as Go's xAI executor reports it: a close 1009
 /// is the request-scoped 413 with `mapCodexWebsocketReadError`'s fixed body, and every
-/// other read or write failure is a plain Go error (500) under the xAI executor's name.
+/// other read or write failure is a plain Go error (500) under the xAI executor's name,
+/// whose transport scope lets the attempt fail over.
 // ponytail: Go's message for other closes is gorilla's ("websocket: close 1011 (internal
 // server error): internal"); the shared reader keeps no close details, so the text is
 // the pool's.
@@ -606,13 +260,8 @@ fn pool_error(mut error: ExecError) -> ExecError {
     error
 }
 
-/// `shouldRetryXAIWebsocketSend`: a request-scoped failure (413) never retries.
-fn should_retry_send(error: &ExecError) -> bool {
-    error.scope != FailureScope::Request
-}
-
 /// `applyXAIWebsocketHeaders`.
-fn handshake_headers(credential: &Credential, token: &str, session_id: &str, req: &ExecRequest) -> HeaderMap {
+fn handshake_headers(credential: &Credential, token: &str, session_id: &str, client: &Client<'_>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let mut set = |name: &str, value: &str| {
         if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
@@ -626,8 +275,8 @@ fn handshake_headers(credential: &Credential, token: &str, session_id: &str, req
     if !session_id.is_empty() {
         set("x-grok-conv-id", session_id);
     }
-    let session = ck_wire::session::cpa_session_id(req.session.as_deref());
-    for (name, value) in ck_wire::headers::custom_headers(&credential.attributes, &req.headers, session.as_deref()) {
+    let session = ck_wire::session::cpa_session_id(client.session);
+    for (name, value) in ck_wire::headers::custom_headers(&credential.attributes, client.headers, session.as_deref()) {
         set(&name, &value);
     }
     if ck_core::registry::dynamic::is_api_key(credential) {
@@ -652,8 +301,8 @@ struct WsCapture {
 }
 
 impl WsCapture {
-    fn new(req: &ExecRequest, credential: &Credential, url: &str, headers: &HeaderMap, frame: &[u8]) -> Self {
-        let sink = req.capture().clone();
+    fn new(usage: &UsageSink, credential: &Credential, url: &str, headers: &HeaderMap, frame: &[u8]) -> Self {
+        let sink = usage.capture().clone();
         if !sink.enabled() {
             // Nothing reads the fields without an observer: keep no copy of the frame.
             return Self {
@@ -770,413 +419,230 @@ fn upgrade_url(raw: &str) -> String {
 
 // --- the turn --------------------------------------------------------------------------
 
-/// One turn on the session's socket, as a stream of downstream payloads. Dropping it
-/// releases the turn lock and the reader.
-struct Turn {
+/// One turn's upstream frames as the attempt's body. Dropping it ends the turn: the socket
+/// stays pooled for the next turn and the session's turn lock is released.
+struct Frames {
     rx: mpsc::Receiver<Read>,
     conn: Arc<Upstream>,
     session: Arc<Session>,
-    _turn: Option<OwnedMutexGuard<()>>,
-    apply_patch: apply_patch::State,
-    restorer: NamespaceRestorer,
-    filter: XSearchFilter,
-    alias: String,
-    items: OutputItems,
-    store: Arc<replay::Store>,
-    scope: ReplayScope,
-    mapper: Option<IdMapper>,
-    /// The frame sent upstream, recorded in the transcript.
-    frame: Vec<u8>,
-    transcript_reset: bool,
+    _turn: OwnedMutexGuard<()>,
+    /// Shared with the turn's [`Cancel`]; cleared once the body is dropped.
+    in_flight: Arc<AtomicBool>,
     warmup: bool,
-    recorded: bool,
-    usage: ck_core::exec::UsageSink,
-    /// A completed or done event carried usage (`StreamUsageBuffer.ok`).
-    usage_seen: bool,
-    capture: Arc<WsCapture>,
-    ready: VecDeque<Result<Bytes, ExecError>>,
+    /// The synthesized warmup completion, after its `response.created`.
+    pending: Option<Bytes>,
+    usage: UsageSink,
+    capture: WsCapture,
     done: bool,
 }
 
-impl Drop for Turn {
+impl Drop for Frames {
     fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::Release);
         self.conn.deactivate();
-        drop(self._turn.take());
     }
 }
 
-impl Turn {
-    /// The validation that ends the upstream attempt before delivery or reuse
-    /// (`invalidatePatchAttempt`).
-    fn fail_patch(&mut self, events: Vec<Vec<u8>>) {
-        let error = apply_patch_error();
-        crate::openai_compat_http::publish_failure(&self.usage, &error);
-        self.session.invalidate(&self.conn, &error, false);
-        self.ready.extend(events.into_iter().map(|e| Ok(Bytes::from(e))));
-        self.ready.push_back(Err(error));
-        self.done = true;
-    }
+/// One SSE event whose data is `payload` as received.
+fn event(payload: &[u8]) -> Bytes {
+    Bytes::from([&b"data: "[..], payload, b"\n\n"].concat())
+}
 
-    fn record(&mut self, completed: &[u8]) {
-        if self.recorded {
-            return;
-        }
-        if let Some(mapper) = &self.mapper {
-            mapper.state.record(&self.frame, completed, self.transcript_reset);
-            self.recorded = true;
-        }
-    }
-
-    /// The socket failed: a pending apply_patch call fails first.
-    fn read_failed(&mut self, error: ExecError) {
-        if let Err(finish) = self.apply_patch.finish() {
-            let (events, _) = self.apply_patch.bridge.fail(&finish);
-            return self.fail_patch(events);
-        }
-        let error = pool_error(error);
-        // Every socket here has a session, whose reader hands a binary message over as a
-        // read error: Go logs it at the `read` stage (`unexpected_binary` is its
-        // sessionless reader's).
-        self.capture.error("read", &error);
-        crate::openai_compat_http::publish_failure(&self.usage, &error);
-        self.ready.push_back(Err(error));
-        self.done = true;
-    }
-
-    /// One upstream text message.
-    async fn message(&mut self, message: &str) {
-        let payload = ck_wire::gostr::trim_space(message.as_bytes());
-        if payload.is_empty() {
-            return;
-        }
-        self.usage.first_byte();
-        self.capture.response(payload);
-        if let Some(error) = ws_error(payload) {
-            self.capture.error("upstream_error", &error);
-            crate::openai_compat_http::publish_failure(&self.usage, &error);
-            self.session.invalidate(&self.conn, &error, false);
-            self.ready.push_back(Err(error));
-            self.done = true;
-            return;
-        }
-        for event in response::normalize_summary_data_events(payload.to_vec()) {
-            self.apply_patch.remember_dispatcher_event(&event);
-            let mut event = self.restorer.restore(event);
-            if !self.alias.is_empty() {
-                event = response::restore_web_search_name(event, &self.alias);
-            }
-            let Some(event) = self.filter.apply(event).filter(|e| !e.is_empty()) else {
-                continue;
-            };
-            let (events, bridge_error) = self.apply_patch.transform(&event);
-            if bridge_error.is_some() {
-                return self.fail_patch(events);
-            }
-            for event in events {
-                if self.event(event) {
-                    self.done = true;
-                    // The goroutine's deferred `streamUsage.Publish`.
-                    if self.usage_seen {
-                        self.usage.publish();
-                    }
-                    return;
-                }
-            }
-        }
-    }
-
-    /// One event for the client; true ends the turn.
-    fn event(&mut self, mut event: Vec<u8>) -> bool {
-        let kind = text(&gj::get(&event, "type"));
-        let patch_terminal =
-            self.apply_patch.active() && matches!(kind.as_str(), "response.incomplete" | "response.failed");
-        let terminal = matches!(kind.as_str(), "response.completed" | "response.done" | "error") || patch_terminal;
-        if self.usage.enabled() {
-            // ObserveResponseModel, and StreamUsageBuffer.Observe on completed and done.
-            self.usage
-                .response_line(Format::Codex, &response::usage_line(&event, &WS_USAGE_EVENTS));
-            if WS_USAGE_EVENTS.contains(&kind.as_str()) && response::codex_usage_ok(&event) {
-                self.usage_seen = true;
-            }
-        }
-        let mut warmup_completed_event = None;
-        match kind.as_str() {
-            "response.created" if self.warmup => {
-                let completed = warmup_completed(&event);
-                self.record(&completed);
-                warmup_completed_event = Some(completed);
-            }
-            "response.output_item.done" => self.items.collect(&event),
-            "response.completed" => {
-                event = response::normalize_summary_data(self.items.patch(&event));
-                replay::cache_completed(&self.store, &self.scope, &event);
-                if !self.warmup {
-                    self.record(&event);
-                }
-            }
-            "response.done" if !self.warmup => self.record(&event),
-            _ => {}
-        }
-        let mut downstream = ensure_responses_usage_details(&event);
-        if let Some(mapper) = &mut self.mapper {
-            downstream = mapper.downstream_response(downstream);
-        }
-        self.ready.push_back(Ok(Bytes::from(downstream)));
-        if let Some(completed) = warmup_completed_event {
-            let mut completed = ensure_responses_usage_details(&completed);
-            if let Some(mapper) = &mut self.mapper {
-                completed = mapper.downstream_response(completed);
-            }
-            self.ready.push_back(Ok(Bytes::from(completed)));
-            return true;
-        }
-        terminal
-    }
-
+impl Frames {
     async fn next(&mut self) -> Option<Result<Bytes, ExecError>> {
-        loop {
-            if let Some(item) = self.ready.pop_front() {
-                if item.is_err() {
-                    self.ready.clear();
-                    self.done = true;
-                }
-                return Some(item);
-            }
-            if self.done {
-                return None;
-            }
-            match self.rx.recv().await {
-                Some(Read::Text(message)) => self.message(&message).await,
-                Some(Read::Failed(error)) => self.read_failed(error),
+        if let Some(completed) = self.pending.take() {
+            self.done = true;
+            return Some(Ok(completed));
+        }
+        while !self.done {
+            let read = match self.rx.recv().await {
+                Some(read) => read,
                 // The reader's terminal error did not fit a full queue (Go's
                 // `sendTerminalWebsocketRead` waits for room); it is kept on the socket.
                 None => {
                     let lost = self.conn.link.lock().expect("link").lost.clone();
-                    self.read_failed(
-                        lost.unwrap_or_else(|| plain("xai websockets executor: session read channel closed")),
-                    );
+                    Read::Failed(lost.unwrap_or_else(|| plain("xai websockets executor: session read channel closed")))
                 }
+            };
+            let message = match read {
+                Read::Text(message) => message,
+                Read::Failed(error) => return Some(Err(self.lost(error))),
+            };
+            let payload = message.as_bytes();
+            if ck_wire::gostr::trim_space(payload).is_empty() {
+                continue;
             }
+            self.usage.first_byte();
+            self.capture.response(payload);
+            if let Some(error) = ws_error(payload) {
+                self.capture.error("upstream_error", &error);
+                self.session.invalidate(&self.conn, &error, false);
+                self.done = true;
+                return Some(Err(error));
+            }
+            let kind = text(&gj::get(payload, "type"));
+            if self.warmup && kind == "response.created" {
+                self.pending = Some(event(&warmup_completed(payload)));
+            }
+            if kind == "response.done" {
+                // xAI's WebSocket mode may end a response with `response.done` alone, which
+                // HTTP streams never send and the Responses ingress does not know. As the
+                // completion, its `response.status` still decides how the response ends.
+                let mut completed = payload.to_vec();
+                gj::set_str(&mut completed, "type", "response.completed");
+                return Some(Ok(event(&completed)));
+            }
+            return Some(Ok(event(payload)));
+        }
+        None
+    }
+
+    /// The socket failed during the turn: the attempt's upstream loss.
+    fn lost(&mut self, error: ExecError) -> ExecError {
+        let error = pool_error(error);
+        // Every socket here has a session, whose reader hands a binary message over as a
+        // read error: Go logs it at the `read` stage.
+        self.capture.error("read", &error);
+        self.done = true;
+        error
+    }
+}
+
+/// Cancels an xAI turn: xAI's WebSocket mode has no cancel command, so the turn's socket
+/// closes unless the turn already ended.
+pub struct Cancel {
+    session: Arc<Session>,
+    conn: Arc<Upstream>,
+    in_flight: Arc<AtomicBool>,
+}
+
+impl CancelTurn for Cancel {
+    async fn cancel(self) {
+        if self.in_flight.load(Ordering::Acquire) {
+            let error = plain("xai websockets executor: turn cancelled");
+            self.session.invalidate(&self.conn, &error, false);
         }
     }
 }
 
-impl XaiExecutor {
-    /// `XAIAutoExecutor.ExecuteStream` for a downstream WebSocket turn: the upstream
-    /// socket when the credential enables `websockets`, else HTTP (which cannot continue
-    /// upstream state).
-    pub async fn execute_in_session(
+impl Turns for XaiExecutor {
+    type Cancel = Cancel;
+
+    async fn turn(
         &self,
-        credential: &Credential,
-        req: ExecRequest,
-        cfg: &Config,
-        session: &ExecSession,
-    ) -> Result<ExecResponse, ExecError> {
-        if websockets_enabled(credential) {
-            let cfg = crate::xai::scoped(credential, cfg);
-            return self.stream_ws(credential, req, cfg.as_ref(), session).await;
-        }
-        if session.continuation {
-            // Go's auto executor answers before any reporter exists.
-            req.usage.discard();
-            return Err(ExecError::replay_required());
-        }
-        self.execute(credential, req, cfg, true).await
-    }
-
-    /// Whether this credential keeps upstream state on the session's socket.
-    pub fn session_upstream(credential: &Credential) -> bool {
-        websockets_enabled(credential)
-    }
-
-    pub fn session_closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        self.ws.closed(id)
-    }
-
-    pub fn close_session(&self, id: &str) {
-        self.ws.close(id);
-    }
-
-    /// `XAIWebsocketsExecutor.ExecuteStream`.
-    async fn stream_ws(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        cfg: &Config,
-        exec_session: &ExecSession,
-    ) -> Result<ExecResponse, ExecError> {
-        if req.alt.as_deref() == Some(crate::xai::COMPACT_ALT) {
-            req.usage.discard();
-            return Err(status_err(400, "streaming not supported for /responses/compact"));
-        }
-        let exec_id = exec_session.id.trim().to_owned();
-        let mut state_id = request::execution_session_id(&req);
-        if state_id.is_empty() {
-            state_id.clone_from(&exec_id);
-        }
+        attempt: &Attempt<'_>,
+        request: &Request<'_>,
+        streams: Streams<'_>,
+    ) -> Result<Turn<XaiIngress, Cancel>, ExecError> {
+        let session_id = request
+            .client
+            .execution_session
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ExecError::local(
+                    500,
+                    FailureScope::Request,
+                    "xai websockets executor: a turn needs its connection's execution session",
+                )
+            })?;
+        let credential = attempt.credential;
+        let upload = encode(&request.validated, true, streams.request)?;
+        let call = Call::new(attempt, request)?;
+        let mut prepared = call.shape(&upload, &self.replay, true, Format::Codex)?;
+        call.report(&prepared.body);
+        let frame = request_frame(std::mem::take(&mut prepared.body), |body| {
+            call.rules(Format::Codex, &upload, body)
+        });
         // The official API (or an explicit base_url): cli-chat-proxy refuses upgrades.
         let (token, mut base) = creds(credential);
         if base.is_empty() {
             base = DEFAULT_API_BASE_URL.to_owned();
         }
-        let mut prepared = crate::xai::before_reporter(
-            &req.usage,
-            request::prepare(&req, cfg, true, Format::Codex, &self.replay, true),
-        )?;
-        let previous = text(&gj::get(&req.body, "previous_response_id")).trim().to_owned();
-        if !previous.is_empty() {
-            gj::set_str(&mut prepared.body, "previous_response_id", &previous);
-        }
         let http_url = format!("{}/responses", base.strip_suffix('/').unwrap_or(&base));
-        let target = Target::new(credential, self.url(ws_url(&http_url)?), cfg);
-
-        let session = self.ws.pool.session(&exec_id);
-        let guard = session.turn.clone().lock_owned().await;
-        #[cfg(test)]
-        self.ws.paused().await;
-        let state = self.ws.state(&state_id);
-        let mut mapper = state.clone().map(|s| IdMapper::new(s, &req.body));
-        if let Some(m) = &mut mapper {
-            let live = session
-                .current()
-                .is_some_and(|c| c.target.credential == target.credential);
-            if m.state.target_changed(&target, live) {
-                m.upstream_previous.clear();
-            }
-            prepared.body = m.upstream_request(std::mem::take(&mut prepared.body));
-        }
-        // The turn publishes only usage it parsed (no EnsurePublished).
-        req.usage.usage_required();
-        req.usage.request_for(crate::xai::PROVIDER, &prepared.body);
-        let headers = handshake_headers(credential, &token, &prepared.session_id, &req);
-        let frame = request_frame(&prepared.body, |b| prepared.finalize(cfg, &req, b));
-        let request_type = text(&gj::get(&req.body, "type"));
-        let transcript_reset = text(&gj::get(&frame, "previous_response_id")).trim().is_empty()
-            && request_type.trim() != "response.append";
+        let target = Target::new(credential, self.url(ws_url(&http_url)?), &call.cfg);
+        let headers = handshake_headers(credential, &token, &prepared.session_id, &request.client);
+        let usage = request.client.usage.clone();
+        let capture = WsCapture::new(&usage, credential, &target.url, &headers, &frame);
         let warmup = generate_false(&frame);
-        let message = String::from_utf8_lossy(&frame).into_owned();
-        let capture = Arc::new(WsCapture::new(&req, credential, &target.url, &headers, &frame));
-        capture.request();
+        let ingress = Ingress::new(
+            streams.response,
+            attempt.identity,
+            Operation::Generate,
+            BodyMode::Streaming,
+            MAX_LINE as u64,
+        )
+        .map_err(encoding)?;
+        let events = Events::new(ingress, prepared, self.replay.clone());
 
-        let (mut conn, mut handshake) = if exec_session.continuation {
-            match session.current().filter(|c| c.target.serves(&target)) {
-                Some(conn) => (conn, None),
-                None => return Err(ExecError::replay_required()),
-            }
-        } else {
-            self.ws_ensure(
-                &session,
-                &target,
-                &headers,
-                cfg,
-                credential,
-                state.as_deref(),
-                &capture,
-                false,
-            )
-            .await?
-        };
+        let session = self.ws.pool.session(session_id);
+        let guard = session.turn.clone().lock_owned().await;
+        capture.request();
+        let (conn, handshake) = self
+            .socket(&session, (&target, &headers), (credential, &call.cfg), &capture)
+            .await?;
         if let Some(handshake) = &handshake {
             capture.handshake(handshake);
         }
-        req.usage.round_trip_started();
-        let mut rx = conn.activate();
-        if let Err(error) = conn.send(message.clone()).await {
+        usage.round_trip_started();
+        let rx = conn.activate();
+        if let Err(error) = conn.send(String::from_utf8_lossy(&frame).into_owned()).await {
             let error = pool_error(error);
             capture.error("send", &error);
-            // `shouldRetryCodexWebsocketSend`: a request-scoped failure (413) never retries.
-            let retry = should_retry_send(&error);
-            if exec_session.continuation {
-                session.invalidate(&conn, &error, false);
-                return Err(if retry { ExecError::replay_required() } else { error });
-            }
-            session.invalidate(&conn, &error, true);
-            if !retry {
-                return Err(error);
-            }
-            let (fresh, fresh_handshake) = self
-                .ws_ensure(
-                    &session,
-                    &target,
-                    &headers,
-                    cfg,
-                    credential,
-                    state.as_deref(),
-                    &capture,
-                    true,
-                )
-                .await?;
-            capture.request();
-            if let Some(handshake) = &fresh_handshake {
-                capture.handshake(handshake);
-            }
-            req.usage.round_trip_started();
-            rx = fresh.activate();
-            if let Err(error) = fresh.send(message).await {
-                let error = pool_error(error);
-                capture.error("send_retry", &error);
-                session.invalidate(&fresh, &error, true);
-                return Err(error);
-            }
-            conn = fresh;
-            handshake = fresh_handshake;
+            session.invalidate(&conn, &error, false);
+            return Err(error);
         }
-
-        let turn = Turn {
+        let in_flight = Arc::new(AtomicBool::new(true));
+        let cancel = Cancel {
+            session: session.clone(),
+            conn: conn.clone(),
+            in_flight: in_flight.clone(),
+        };
+        let frames = Frames {
             rx,
             conn,
             session,
-            _turn: Some(guard),
-            apply_patch: prepared.apply_patch,
-            restorer: NamespaceRestorer::new(prepared.namespace_tools),
-            filter: XSearchFilter::new(prepared.filter_internal_x_search, prepared.client_declared_tools),
-            alias: prepared.web_search_alias,
-            items: OutputItems::default(),
-            store: self.replay.clone(),
-            scope: prepared.replay_scope.clone(),
-            mapper,
-            frame,
-            transcript_reset,
+            _turn: guard,
+            in_flight,
             warmup,
-            recorded: false,
-            usage: req.usage.clone(),
-            usage_seen: false,
+            pending: None,
+            usage,
             capture,
-            ready: VecDeque::new(),
             done: false,
         };
-        let stream = futures_util::stream::unfold(turn, |mut turn| async move {
-            let item = turn.next().await?;
-            Some((item, turn))
+        let body = futures_util::stream::unfold(frames, |mut frames| async move {
+            let item = frames.next().await?;
+            Some((item, frames))
         })
         .boxed();
-        Ok(ExecResponse {
-            status: 200,
-            headers: handshake.unwrap_or_default(),
-            body: ResponseBody::Stream(stream),
+        Ok(Turn {
+            upstream: types::Upstream {
+                status: 200,
+                headers: handshake.unwrap_or_default(),
+                body,
+                ingress: XaiIngress::Generate(Box::new(events)),
+            },
+            cancel,
         })
     }
+}
 
-    /// `ensureUpstreamConn`: the session's socket for `target`, dialing a new one (and
-    /// closing one for another target) when needed. Returns the handshake headers of a
-    /// new socket.
-    #[allow(clippy::too_many_arguments)]
-    async fn ws_ensure(
+impl XaiExecutor {
+    /// `ensureUpstreamConn`: the session's socket when it still serves `target`, else a new
+    /// one (closing a socket for another target) with its handshake headers. A socket xAI
+    /// closed is already gone from the session, so this dials.
+    async fn socket(
         &self,
         session: &Arc<Session>,
-        target: &Target,
-        headers: &HeaderMap,
-        cfg: &Config,
-        credential: &Credential,
-        state: Option<&IdState>,
+        (target, headers): (&Target, &HeaderMap),
+        (credential, cfg): (&Credential, &ck_core::config::Config),
         capture: &WsCapture,
-        retry: bool,
     ) -> Result<(Arc<Upstream>, Option<HeaderMap>), ExecError> {
         if let Some(current) = session.current() {
             if current.target.serves(target) {
                 return Ok((current, None));
             }
-            // target_changed: another credential, URL or proxy now serves this session.
+            // Another credential, URL or proxy now serves this session.
             let mut slot = session.conn.lock().expect("session conn");
             if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, &current)) {
                 *slot = None;
@@ -1185,7 +651,7 @@ impl XaiExecutor {
             current.shutdown();
         }
         let client = self.clients.for_credential(credential, cfg);
-        let (socket, handshake) = dial(&client, target, headers, capture, retry).await?;
+        let (socket, handshake) = dial(&client, target, headers, capture).await?;
         let (sink, stream) = socket.split();
         let conn = Upstream::new(target.clone(), sink, self.ws.pool.write);
         // Publish before the reader runs, as the Codex executor does.
@@ -1199,18 +665,13 @@ impl XaiExecutor {
         ));
         *reader = Some(task.abort_handle());
         drop(reader);
-        if let Some(state) = state {
-            state.set_target(target);
-        }
         Ok((conn, Some(handshake)))
     }
 }
 
-/// `dialXAIWebsocket`: a rejected upgrade is `xaiStatusErr(status, body)`.
-///
-/// Capture: the first dial records a rejected upgrade (any handshake response, including
-/// a 101 gorilla refuses) as an HTTP attempt and any other failure as a `dial` error; a
-/// retry dial records every failure as `dial_retry`, with gorilla's text for a rejection.
+/// `dialXAIWebsocket`: a rejected upgrade is `xaiStatusErr(status, body)`. The capture
+/// records a rejected upgrade (any handshake response, including a 101 gorilla refuses) as
+/// an HTTP attempt and any other failure as a `dial` error.
 // ponytail: Go returns `xaiStatusErr(101, body)` for a 101 gorilla refuses; this keeps the
 // plain handshake error, since a 101 status error has no sensible client response.
 async fn dial(
@@ -1218,9 +679,7 @@ async fn dial(
     target: &Target,
     headers: &HeaderMap,
     capture: &WsCapture,
-    retry: bool,
 ) -> Result<(codex_ws::WebSocket, HeaderMap), ExecError> {
-    let stage = if retry { "dial_retry" } else { "dial" };
     match dial_once(client, target, headers).await {
         Ok(socket) => Ok(socket),
         Err(Dial::Rejected(rejected)) => {
@@ -1229,17 +688,12 @@ async fn dial(
                 status,
                 headers,
                 body,
-                reason,
             } = *rejected;
-            if retry {
-                capture.error(stage, &plain(reason));
-            } else {
-                capture.rejection(status, &headers, &body);
-            }
+            capture.rejection(status, &headers, &body);
             Err(error)
         }
         Err(Dial::Failed(error)) => {
-            capture.error(stage, &error);
+            capture.error("dial", &error);
             Err(error)
         }
     }
@@ -1251,17 +705,13 @@ enum Dial {
     Failed(ExecError),
 }
 
-/// A handshake response gorilla rejects: the returned error, the response, and gorilla's
-/// error text.
+/// A handshake response gorilla rejects: the returned error and the response.
 struct Rejection {
     error: ExecError,
     status: u16,
     headers: HeaderMap,
     body: Vec<u8>,
-    reason: &'static str,
 }
-
-const BAD_HANDSHAKE: &str = "websocket: bad handshake";
 
 async fn dial_once(
     client: &wreq::Client,
@@ -1301,26 +751,20 @@ async fn dial_once(
                 status,
                 headers: handshake,
                 body,
-                reason: BAD_HANDSHAKE,
             })));
         }
         let socket = codex_ws::upgrade(&mut res, &key, &handshake).await.map_err(|e| {
-            let (error, reason) = match e {
-                codex_ws::UpgradeError::Handshake => (
-                    plain("xai websockets executor: websocket handshake failed"),
-                    BAD_HANDSHAKE,
-                ),
-                codex_ws::UpgradeError::Compression => (
-                    plain("xai websockets executor: websocket: invalid compression negotiation"),
-                    "websocket: invalid compression negotiation",
-                ),
+            let error = match e {
+                codex_ws::UpgradeError::Handshake => plain("xai websockets executor: websocket handshake failed"),
+                codex_ws::UpgradeError::Compression => {
+                    plain("xai websockets executor: websocket: invalid compression negotiation")
+                }
             };
             Dial::Rejected(Box::new(Rejection {
                 error,
                 status,
                 headers: handshake.clone(),
                 body: Vec::new(),
-                reason,
             }))
         })?;
         Ok((socket, handshake))
