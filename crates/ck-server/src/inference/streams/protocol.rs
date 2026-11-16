@@ -19,12 +19,14 @@ pub enum ProtocolEgress {
 impl ProtocolEgress {
     /// The egress for `output` on the response stream `stream`. `identity` is the attempt's
     /// response identity ([`response_identity`]); `request` is the client's request view,
-    /// whose Chat `stream_options.include_usage` decides the usage chunk.
+    /// whose Chat `stream_options.include_usage` decides the usage chunk. `id` is the response
+    /// id a Responses exchange issued (`responses_state`), the only id its client sees.
     pub fn new(
         output: Output,
         stream: &mut Writer,
         identity: Identity,
         request: RequestView<'_>,
+        id: Option<LocalId>,
     ) -> codec::Result<Self> {
         let mode = match output.framing {
             Framing::Json => BodyMode::Buffered,
@@ -52,13 +54,15 @@ impl ProtocolEgress {
                 |_| {},
             )?)),
             Protocol::Responses => {
-                // ponytail: the id derives from the committed response stream, the same for live
-                // delivery and resume, and the producer is a placeholder nothing reads. The state
-                // store (D2-6b) needs one id across attempts and envelopes (D2-6a) need the real
-                // producer; each passes it through `StreamHandle` and `Attached`.
-                let id = codec::identity::ResponseId::new("resp_", stream.id())?
-                    .issued()
-                    .ok_or(codec::Error::Schema)?;
+                // An exchange `responses_state::begin` did not prepare shows an id derived from
+                // its response stream. The producer is a placeholder nothing reads: provenance
+                // is tagged in the request history (D2-6a), not in the client's response.
+                let id = match id {
+                    Some(id) => id,
+                    None => codec::identity::ResponseId::new("resp_", stream.id())?
+                        .issued()
+                        .ok_or(codec::Error::Schema)?,
+                };
                 let producer = codec::identity::Producer {
                     provider: LocalId::new("unknown")?,
                     credential: [0; 32],

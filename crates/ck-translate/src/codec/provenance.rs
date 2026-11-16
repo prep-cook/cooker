@@ -64,8 +64,11 @@ pub fn bound_lists(doc: &Document, x: usize) -> Result<[Option<usize>; BOUND_LIS
     for (slot, key) in lists.iter_mut().zip(BOUND_LISTS) {
         *slot = doc.member(x, key)?;
     }
+    let map = doc.member(x, "isolated")?;
     for (slot, (provider, key)) in lists[BOUND_LISTS.len()..].iter_mut().zip(ISOLATED_LISTS) {
-        *slot = isolated(doc, provider, key)?;
+        if let Some(own) = map.map(|map| doc.member(map, provider)).transpose()?.flatten() {
+            *slot = doc.member(own, key)?;
+        }
     }
     Ok(lists)
 }
@@ -275,12 +278,12 @@ pub fn write_segment(mut name: Segment<'_>, e: &mut Encoder<'_, '_>) -> Result<(
 
 /// The node a pointer names; the empty pointer is the root.
 pub fn resolve(doc: &Document, pointer: usize) -> Result<usize> {
-    resolve_to(doc, doc.chars(pointer)?, false, &mut |_, _| Ok(None))
+    resolve_to(doc, doc.root(), doc.chars(pointer)?, false, &mut |_, _| Ok(None))
 }
 
 /// The container that holds the node a pointer names.
 pub fn resolve_parent(doc: &Document, pointer: usize) -> Result<usize> {
-    resolve_to(doc, doc.chars(pointer)?, true, &mut |_, _| Ok(None))
+    resolve_to(doc, doc.root(), doc.chars(pointer)?, true, &mut |_, _| Ok(None))
 }
 
 /// Like [`resolve_parent`]; `child(container, segment)` may name the child a segment selects
@@ -290,21 +293,23 @@ pub(crate) fn resolve_parent_indexed(
     pointer: Characters<'_>,
     child: &mut dyn FnMut(usize, &Segment<'_>) -> Result<Option<usize>>,
 ) -> Result<usize> {
-    resolve_to(doc, pointer, true, child)
+    resolve_to(doc, doc.root(), pointer, true, child)
 }
 
+/// Resolves `chars` from `base`, the root of the document the pointer was written for.
 fn resolve_to(
     doc: &Document,
+    base: usize,
     mut chars: Characters<'_>,
     parent_only: bool,
     child: &mut dyn FnMut(usize, &Segment<'_>) -> Result<Option<usize>>,
 ) -> Result<usize> {
     match chars.next_scalar()? {
-        None => return Ok(doc.root()),
+        None => return Ok(base),
         Some('/') => (),
         _ => return Err(Error::Schema),
     }
-    let mut parent = doc.root();
+    let mut parent = base;
     loop {
         let (name, last) = segment(&mut chars)?;
         if last && parent_only {
@@ -364,6 +369,12 @@ pub fn bindings(doc: &mut Document, owner: &mut Writer) -> Result<()> {
 /// Re-bind serialized bindings. Call only on a trusted reconstructed canonical document.
 pub fn restore_bindings(doc: &mut Document) -> Result<()> {
     let x = doc.required(doc.root(), "x_ck")?;
+    restore_bindings_from(doc, doc.root(), x)
+}
+
+/// [`restore_bindings`] for a canonical request imported as the subtree `base`, whose `x_ck` is
+/// `x`: each binding resolves inside that subtree.
+pub(crate) fn restore_bindings_from(doc: &mut Document, base: usize, x: usize) -> Result<()> {
     for list in bound_lists(doc, x)?.into_iter().flatten() {
         let mut next = doc.node(list)?.first;
         while let Some(entry) = next {
@@ -371,7 +382,7 @@ pub fn restore_bindings(doc: &mut Document) -> Result<()> {
             let Some(binding) = doc.member(entry, "binding")? else {
                 continue;
             };
-            let parent = resolve(doc, binding)?;
+            let parent = resolve_to(doc, base, doc.chars(binding)?, false, &mut |_, _| Ok(None))?;
             let carrier = match doc.member(entry, "carrier")? {
                 Some(carrier) => Some(carrier_name(doc, carrier)?),
                 None => None,

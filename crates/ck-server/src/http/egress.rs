@@ -74,9 +74,11 @@ pub async fn deliver(
         .and_then(|reader| reader)
         .map_err(codec::Error::Storage);
     let mut egress = response.allocator();
+    let shown = exchange.turn.map(|turn| turn.id.text());
+    let publication = exchange.publication.clone();
     let replay = reader.and_then(|reader| {
-        let protocol = ProtocolEgress::new(output, &mut egress, identity, request)?;
-        Ok(Replay::live(egress, reader, protocol, output.framing))
+        let protocol = ProtocolEgress::new(output, &mut egress, identity, request, shown)?;
+        Ok(Replay::live(egress, reader, protocol, output.framing, publication))
     });
     let mut replay = match replay {
         Ok(replay) => replay,
@@ -98,6 +100,10 @@ pub async fn deliver(
     {
         let reason = Uncommitted::Terminal(terminal);
         return Err(Box::new(Failed { exchange, reason }));
+    }
+    // A Responses turn's index slot is reserved at commitment (D2-PLAN §5.1 step 2).
+    if let Some(publication) = &exchange.publication {
+        publication.reserve();
     }
     let id = exchange.commit(streams, response.allocator());
     let mut delivered = delivery(replay, first, output.framing, &id, Cursor::start(output.framing));

@@ -540,3 +540,37 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+/// A point an attempt's finalizer passes only while it is open, so a test can hold one step of
+/// it: the index publication or the usage reader ([`crate::inference::streams::Registry`]).
+pub struct Hold(tokio::sync::watch::Sender<bool>);
+
+impl Default for Hold {
+    fn default() -> Self {
+        Self(tokio::sync::watch::Sender::new(true))
+    }
+}
+
+impl Hold {
+    /// Finalizers stop here until [`Hold::open`].
+    pub fn close(&self) {
+        self.0.send_replace(false);
+    }
+
+    pub fn open(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub(crate) async fn pass(&self) {
+        let _ = self.0.subscribe().wait_for(|open| *open).await;
+    }
+}
+
+/// The finalizer steps a test can hold.
+#[derive(Default)]
+pub struct Holds {
+    /// Before the finalizer reports the response stream's end to the index publication.
+    pub publication: Hold,
+    /// Before the usage reader drains the response stream.
+    pub usage: Hold,
+}

@@ -469,6 +469,9 @@ impl Reduction {
 
 mod splice;
 
+mod expand;
+pub use expand::{Stored, expand};
+
 /// The first choice's `delta` of a chunk, if any.
 fn delta(event: &Document) -> Result<Option<usize>> {
     let Some(choices) = event.member(event.root(), "choices")? else {

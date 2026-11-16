@@ -49,6 +49,15 @@ impl Fixture {
         Self::build("", credentials, claude, |_| {})
     }
 
+    /// [`Fixture::with_credentials`] with the store's settings adjusted by `configure`.
+    pub fn with_credentials_and(
+        credentials: Vec<ck_core::credential::Credential>,
+        claude: &str,
+        configure: impl FnOnce(&mut ck_stream::Config),
+    ) -> Self {
+        Self::build("", credentials, claude, configure)
+    }
+
     fn build(
         yaml: &str,
         credentials: Vec<ck_core::credential::Credential>,
