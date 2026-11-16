@@ -151,6 +151,12 @@ pub(crate) struct Link {
     // ponytail: grows by one ID per finished response for the socket's life, as Go's
     // does; bound it if sockets ever outlive thousands of turns.
     terminal: std::collections::HashSet<String>,
+    /// The response live on the socket: the last `response.created` the reader read whose
+    /// terminal it has not read. The reader records it before delivering the frame, so it
+    /// holds whether or not a turn has consumed that frame yet.
+    pub(crate) live: Option<String>,
+    /// A `response.create` was written and the reader has read no `response.created` since.
+    pub(crate) awaiting: bool,
 }
 
 /// A provider-recognized terminal with a non-empty response ID.

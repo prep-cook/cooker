@@ -9,9 +9,10 @@ use bytes::Bytes;
 use ck_core::credential::Credential;
 use ck_core::exec::{CaptureSink, ExecRequest, ExecSession, FailureScope, Operation as ExecOperation, UsageSink};
 use ck_core::format::Format;
-use ck_exec::codex::{CodexExecutor, Next};
+use ck_exec::codex::{CodexExecutor, Next, Successor, TurnControl};
 use ck_exec::session::CancelTurn;
-use ck_stream::Terminal;
+use ck_exec::types::Body;
+use ck_stream::{Terminal, Writer};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
@@ -212,17 +213,8 @@ async fn steering_reaches_the_socket_and_each_response_is_its_own_stream() {
     let Some(Next::Response(successor)) = control.next().await else {
         panic!("the successor follows");
     };
-    let mut response = streams.response(&request);
-    let attempt = exchange.attempt(&streams.store);
-    let mut scratch = streams.request();
-    let opened = successor.open(
-        &attempt,
-        ck_exec::types::Streams {
-            request: &mut scratch,
-            response: &mut response,
-        },
-    );
-    let (outcome, published) = produce(&streams, opened.unwrap(), response).await;
+    let (opened, response) = open(successor, &streams, &exchange, &request);
+    let (outcome, published) = produce(&streams, opened, response).await;
     outcome.unwrap();
     let r2 = text(&published);
     assert!(r2.contains(r#""r2""#) && r2.contains("707"), "{r2}");
@@ -408,28 +400,21 @@ async fn error_frames_and_socket_loss_fail_the_attempt() {
 #[derive(Debug, Clone, Copy)]
 enum Ending {
     Cancel,
-    /// Cancel while holding, unpolled, the response the upstream started after the turn's own.
-    CancelSuccessor,
     DropBody,
 }
 
-/// Cancel sends `response.interrupt` for the response in flight, the turn's own or a successor
-/// the upstream started (as after accepted steering), and closes the socket; before
+/// Cancel sends `response.interrupt` for the response in flight and closes the socket; before
 /// `response.created` it only closes. A body dropped in flight closes it too. A turn whose
 /// response finished leaves the socket to the next turn.
 #[tokio::test]
 async fn ending_a_turn_in_flight_closes_its_socket() {
     const INTERRUPT: &str = r#"{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}"#;
-    const INTERRUPT_R2: &str = r#"{"type":"response.interrupt","response_id":"r2","mode":"discard_partial_items"}"#;
-    let mut successor = answer("r1", 3);
-    successor.push(created("r2"));
     // (frames before the ending, read until, ending, frame sent after, socket closed)
     let rows = [
         (vec![], 0, Ending::Cancel, None, true),
         (vec![created("r1")], 1, Ending::Cancel, Some(INTERRUPT), true),
         (vec![created("r1")], 1, Ending::DropBody, None, true),
         (answer("r1", 3), usize::MAX, Ending::Cancel, None, false),
-        (successor, usize::MAX, Ending::CancelSuccessor, Some(INTERRUPT_R2), true),
     ];
     for (send, read, ending, after, closed) in rows {
         let mut acts = vec![act(send)];
@@ -453,18 +438,11 @@ async fn ending_a_turn_in_flight_closes_its_socket() {
         let held = match ending {
             Ending::Cancel => {
                 control.cancel().await;
-                (Some(frames), None)
-            }
-            Ending::CancelSuccessor => {
-                let Some(Next::Response(successor)) = control.next().await else {
-                    panic!("the successor follows");
-                };
-                control.cancel().await;
-                (Some(frames), Some(successor))
+                Some(frames)
             }
             Ending::DropBody => {
                 drop((control, frames));
-                (None, None)
+                None
             }
         };
         if let Some(after) = after {
@@ -482,4 +460,120 @@ async fn ending_a_turn_in_flight_closes_its_socket() {
         assert_eq!(upstream.upgrades().len(), dials, "{ending:?} after {read:?}");
         assert_eq!(upstream.frames().len(), 2 + usize::from(after.is_some()), "{ending:?}");
     }
+}
+
+/// How far a test reads before it cancels a steered turn.
+#[derive(Debug, Clone, Copy)]
+enum Progress {
+    Nothing,
+    /// The turn's body to its end.
+    Body,
+    /// Then one [`Next::Event`].
+    Event,
+    /// Then the successor from [`TurnControl::next`], held unopened.
+    Successor,
+    /// Then the successor's body, opened and read this many frames.
+    Output(usize),
+}
+
+/// Cancel interrupts the response live on the socket, whichever it is when cancel runs: the
+/// turn's own, or the successor accepted steering started, whether or not the turn has read its
+/// `response.created`. The upstream sees one interrupt for a live response and none when none
+/// is live, and the socket closes, since a successor may still be on its way.
+#[tokio::test]
+async fn cancel_interrupts_the_response_live_on_the_socket() {
+    let interrupt =
+        |id: &str| format!(r#"{{"type":"response.interrupt","response_id":"{id}","mode":"discard_partial_items"}}"#);
+    let mut r1 = answer("r1", 3);
+    let end = r1
+        .pop()
+        .unwrap()
+        .replace(r#""type":"response.completed""#, r#""type":"response.incomplete""#);
+    r1.push(end);
+    let (r1c, r1_rest) = (r1[0].clone(), r1[1..].to_vec());
+    let r2 = answer("r2", 7);
+    // r1's rest, then the steering acknowledgement, then the first `upto` frames of r2.
+    let steered = |upto: usize| {
+        let mut frames = r1_rest.clone();
+        frames.push(ACCEPTED.to_owned());
+        frames.extend(r2.iter().take(upto).cloned());
+        frames
+    };
+    // (frames answering the create, frames answering the steer (none: no steer), progress,
+    // the response cancel interrupts)
+    let rows = [
+        (vec![], None, Progress::Nothing, None),
+        (
+            vec![r1c.clone()],
+            Some(vec![ACCEPTED.into()]),
+            Progress::Nothing,
+            Some("r1"),
+        ),
+        (vec![r1c.clone()], Some(steered(0)), Progress::Body, None),
+        (vec![r1c.clone()], Some(steered(1)), Progress::Body, Some("r2")),
+        (vec![r1c.clone()], Some(steered(1)), Progress::Event, Some("r2")),
+        (vec![r1c.clone()], Some(steered(1)), Progress::Successor, Some("r2")),
+        (vec![r1c.clone()], Some(steered(3)), Progress::Output(2), Some("r2")),
+        (vec![r1c], Some(steered(r2.len())), Progress::Output(usize::MAX), None),
+    ];
+    for (i, (create, steer, progress, live)) in rows.into_iter().enumerate() {
+        let steering = steer.is_some();
+        let mut acts = vec![act(create).then(End::Sync)];
+        acts.extend(steer.map(|frames| act(frames).then(End::Sync)));
+        let upstream = CodexSocket::start(acts).await;
+        let (streams, executor) = (Streams::new(), executor());
+        let exchange = Exchange::new(upstream.api_key(), MODEL, "/v1/responses");
+        let (turn, _response, request) = start(&streams, &exchange, &executor, &request(json!([user("hi")]))).await;
+        let (upstream_body, control) = turn.unwrap();
+        upstream.synced(1).await;
+        if steering {
+            control.steer(STEER.as_bytes()).await.unwrap();
+            upstream.synced(2).await;
+        }
+        let mut body = upstream_body.body;
+        let held = read_to(progress, &mut body, &control, (&streams, &exchange, &request)).await;
+        control.cancel().await;
+        upstream.ended(1).await;
+        let mut interrupts = upstream.frames();
+        interrupts.retain(|frame| frame.contains(r#""type":"response.interrupt""#));
+        assert_eq!(interrupts, Vec::from_iter(live.map(interrupt)), "row {i}: {progress:?}");
+        drop((body, held));
+    }
+}
+
+/// Reads a steered turn as far as `progress` goes. What it returns is held across cancel:
+/// dropping a successor or its body would close the socket on its own.
+async fn read_to(
+    progress: Progress,
+    body: &mut Body,
+    control: &TurnControl,
+    (streams, exchange, request): (&Streams, &Exchange, &Writer),
+) -> (Option<Successor>, Option<(Body, Writer)>) {
+    if !matches!(progress, Progress::Nothing) {
+        while tokio::time::timeout(WAIT, body.next()).await.unwrap().is_some() {}
+    }
+    if matches!(progress, Progress::Nothing | Progress::Body) {
+        return (None, None);
+    }
+    let Some(Next::Event(event)) = control.next().await else {
+        panic!("{progress:?}: the acknowledgement follows");
+    };
+    assert_eq!(event, ACCEPTED.as_bytes(), "{progress:?}");
+    if let Progress::Event = progress {
+        return (None, None);
+    }
+    let Some(Next::Response(successor)) = control.next().await else {
+        panic!("{progress:?}: the successor follows");
+    };
+    let Progress::Output(frames) = progress else {
+        return (Some(successor), None);
+    };
+    let (opened, response) = open(successor, streams, exchange, request);
+    let mut opened = opened.body;
+    for _ in 0..frames {
+        if tokio::time::timeout(WAIT, opened.next()).await.unwrap().is_none() {
+            break;
+        }
+    }
+    (None, Some((opened, response)))
 }

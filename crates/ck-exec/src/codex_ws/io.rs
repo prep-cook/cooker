@@ -52,12 +52,19 @@ pub(crate) async fn read_loop(
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
             }
         };
-        // Terminal IDs are recorded before delivery: the handler may still be forwarding
-        // the turn after its read channel was released.
+        // The live response and terminal IDs are recorded before delivery: the handler may
+        // still be forwarding the turn after its read channel was released, and a cancel
+        // must find a response the turn has not read yet.
         let terminal = terminal_response_id(text.trim(), conn.target.accepts_done);
+        let created = created_response_id(text.trim());
         let active = {
             let mut link = conn.link.lock().expect("link");
+            if let Some(id) = created {
+                link.live = Some(id);
+                link.awaiting = false;
+            }
             if let Some(id) = terminal {
+                link.live = None;
                 link.terminal.insert(id);
             }
             link.active.clone()
@@ -140,4 +147,10 @@ fn token_list_contains(headers: &HeaderMap, name: http::HeaderName, value: &str)
                 .any(|t| t.trim_matches([' ', '\t']).eq_ignore_ascii_case(value))
         })
     })
+}
+
+/// The id of a `response.created`.
+fn created_response_id(payload: &str) -> Option<String> {
+    (gjson::get(payload, "type").str() == "response.created")
+        .then(|| gjson::get(payload, "response.id").str().to_owned())
 }

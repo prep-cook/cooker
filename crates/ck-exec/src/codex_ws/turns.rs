@@ -22,7 +22,8 @@
 //! The turn holds its connection's socket until its control and bodies are dropped; the next
 //! turn on the connection waits for that.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use ck_core::exec::{ExecError, FailureScope, UsageSink};
@@ -94,7 +95,8 @@ impl Turns for CodexExecutor {
         usage.round_trip_started();
         let line = Arc::new(Line {
             reads: Arc::new(tokio::sync::Mutex::new(conn.activate())),
-            state: Mutex::new(State::sent(handshake.clone().unwrap_or_default())),
+            observed: Mutex::new(handshake.clone().unwrap_or_default()),
+            steered: AtomicBool::new(false),
             session,
             conn,
             credential: attempt.credential.id.clone(),
@@ -106,17 +108,13 @@ impl Turns for CodexExecutor {
             steer,
             _turn: guard,
         });
+        line.conn.link.lock().expect("link").awaiting = true;
         if let Err(error) = line.conn.send(frame).await {
             line.wire.ws_exec_error("send", &error);
             line.close(&error);
             return Err(error);
         }
-        let reads = line
-            .reads
-            .clone()
-            .try_lock_owned()
-            .expect("a new turn's frames are free");
-        let frames = Frames::new(line.clone(), reads, None, Some(usage.clone()));
+        let frames = Frames::turn(&line, usage.clone());
         Ok(Turn {
             upstream: types::Upstream {
                 status: 200,
@@ -208,7 +206,10 @@ struct Line {
     conn: Arc<Upstream>,
     /// The socket's frames for this turn. A response body holds the lock while it reads.
     reads: Arc<tokio::sync::Mutex<mpsc::Receiver<Read>>>,
-    state: Mutex<State>,
+    /// Handshake headers plus the quota headers of the socket's events.
+    observed: Mutex<HeaderMap>,
+    /// The turn wrote a steer: a successor may start on the socket at any time.
+    steered: AtomicBool,
     credential: String,
     /// The upstream base model, the key of per-model quota snapshots.
     model: String,
@@ -222,53 +223,19 @@ struct Line {
     _turn: OwnedMutexGuard<()>,
 }
 
-struct State {
-    /// A response is in flight: the turn's create was sent or a response started, and no
-    /// terminal has been read since.
-    open: bool,
-    /// The id of the last response that started; it is the in-flight one while `open`.
-    response: Option<String>,
-    /// Handshake headers plus the quota headers of the socket's events.
-    observed: HeaderMap,
-}
-
-impl State {
-    /// The turn's create was sent on a socket that answered `observed`.
-    fn sent(observed: HeaderMap) -> Self {
-        Self {
-            open: true,
-            response: None,
-            observed,
-        }
-    }
-}
-
 impl Line {
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().expect("turn state")
-    }
-
     /// Captures one upstream event and its quota headers, before names are restored.
     fn observe(&self, payload: &str) {
         self.wire.ws_response(payload);
         if let Some(headers) = codex_quota::event_headers(payload) {
-            let mut state = self.state();
-            codex_quota::merge(&mut state.observed, &headers);
-            self.quota.observe(&self.credential, &self.model, &state.observed);
+            let mut observed = self.observed.lock().expect("observed headers");
+            codex_quota::merge(&mut observed, &headers);
+            self.quota.observe(&self.credential, &self.model, &observed);
         }
-    }
-
-    /// A response started on the socket (`response.created`): it is the one in flight, which
-    /// cancel interrupts, from here on, whether or not its body was polled yet.
-    fn started(&self, created: &str) {
-        let mut state = self.state();
-        state.open = true;
-        state.response = Some(gjson::get(created, "response.id").str().to_owned());
     }
 
     /// Ends the socket: what it still carries cannot be told apart from a later turn's.
     fn close(&self, error: &ExecError) {
-        self.state().open = false;
         self.session.invalidate(&self.conn, error, false);
     }
 
@@ -303,6 +270,16 @@ impl Drop for Frames {
 }
 
 impl Frames {
+    /// The turn's own response, read from the turn's first frame.
+    fn turn(line: &Arc<Line>, usage: UsageSink) -> Self {
+        let reads = line
+            .reads
+            .clone()
+            .try_lock_owned()
+            .expect("a new turn's frames are free");
+        Self::new(line.clone(), reads, None, Some(usage))
+    }
+
     fn new(
         line: Arc<Line>,
         reads: OwnedMutexGuard<mpsc::Receiver<Read>>,
@@ -360,11 +337,7 @@ impl Frames {
                 return Some(Err(error));
             }
             match gjson::get(payload, "type").str() {
-                "response.created" => self.line.started(payload),
-                "response.completed" | "response.incomplete" => {
-                    self.done = true;
-                    self.line.state().open = false;
-                }
+                "response.completed" | "response.incomplete" => self.done = true,
                 // The event rules fail the attempt; the old path drops the socket with it.
                 "response.failed" | "error" => {
                     self.done = true;
@@ -385,7 +358,6 @@ impl Frames {
             .wire
             .ws_exec_error(if binary { "unexpected_binary" } else { "read" }, &error);
         self.done = true;
-        self.line.state().open = false;
         error
     }
 }
@@ -432,6 +404,7 @@ impl TurnControl {
     /// `response-steering`.
     pub async fn steer(&self, frame: &[u8]) -> Result<(), ExecError> {
         let payload = self.line.steer.apply(frame);
+        self.line.steered.store(true, Ordering::Release);
         self.line.wire.ws_frame(&self.line.conn.target.url, payload.as_bytes());
         self.written(self.line.conn.send(payload).await)
     }
@@ -468,7 +441,6 @@ impl TurnControl {
                 continue;
             }
             if gjson::get(payload, "type").str() == "response.created" {
-                self.line.started(payload);
                 let frames = Frames::new(self.line.clone(), reads, Some(text), None);
                 return Some(Next::Response(Successor { frames }));
             }
@@ -479,18 +451,21 @@ impl TurnControl {
 }
 
 impl CancelTurn for TurnControl {
-    /// The client went away. A response in flight gets the transport's cancel command,
-    /// `response.interrupt` discarding partial items, and the socket closes; before its
-    /// `response.created` there is no id to interrupt, and the socket only closes.
+    /// The client went away. The response live on the socket, as its reader last read it
+    /// (the turn's own or a successor, consumed or not), gets the transport's cancel
+    /// command, `response.interrupt` discarding partial items, and the socket closes. With
+    /// none live the socket still closes while the turn's create awaits its
+    /// `response.created`, or after the turn steered, since a successor may yet start; an
+    /// idle socket stays for the next turn.
     async fn cancel(self) {
-        let (open, response) = {
-            let state = self.line.state();
-            (state.open, state.response.clone())
+        let (live, awaiting) = {
+            let link = self.line.conn.link.lock().expect("link");
+            (link.live.clone(), link.awaiting)
         };
-        if !open {
+        if live.is_none() && !awaiting && !self.line.steered.load(Ordering::Acquire) {
             return;
         }
-        if let Some(id) = response {
+        if let Some(id) = live {
             let frame = set_str(r#"{"type":"response.interrupt"}"#, "response_id", &id);
             let _ = self
                 .line

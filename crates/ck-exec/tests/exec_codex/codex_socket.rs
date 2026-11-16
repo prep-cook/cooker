@@ -9,9 +9,10 @@ use std::time::Duration;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, State};
 use axum::response::Response;
+use bytes::Bytes;
 use ck_core::credential::Credential;
 use ck_core::exec::ExecError;
-use ck_exec::codex::{CodexExecutor, TurnControl};
+use ck_exec::codex::{CodexExecutor, Successor, TurnControl};
 use ck_exec::codex_exec::CodexIngress;
 use ck_exec::session::Turns;
 use ck_exec::types::{Execute, Upstream};
@@ -45,6 +46,8 @@ pub(crate) enum End {
     /// The connection ends without a close frame.
     Drop,
     Binary,
+    /// A ping, answered only once the client's reader read every frame before it; then open.
+    Sync,
 }
 
 pub(crate) fn act(send: Vec<String>) -> Act {
@@ -74,6 +77,8 @@ struct Shared {
     /// Frames received, and connections ended, so far.
     received: watch::Sender<usize>,
     ended: watch::Sender<usize>,
+    /// Pings answered so far ([`End::Sync`]).
+    synced: watch::Sender<usize>,
 }
 
 /// A loopback Codex backend answering upgrades on any path.
@@ -92,6 +97,7 @@ impl CodexSocket {
             })),
             received: watch::channel(0).0,
             ended: watch::channel(0).0,
+            synced: watch::channel(0).0,
         };
         let app = axum::Router::new().fallback(upgrade).with_state(shared.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -152,6 +158,16 @@ impl CodexSocket {
             .unwrap();
     }
 
+    /// Waits until the client's socket reader answered `count` sync pings: it has read every
+    /// frame sent before them.
+    pub(crate) async fn synced(&self, count: usize) {
+        let mut synced = self.shared.synced.subscribe();
+        tokio::time::timeout(WAIT, synced.wait_for(|n| *n >= count))
+            .await
+            .expect("the client's reader answers the ping")
+            .unwrap();
+    }
+
     pub(crate) async fn ended(&self, count: usize) {
         let mut ended = self.shared.ended.subscribe();
         tokio::time::timeout(WAIT, ended.wait_for(|n| *n >= count))
@@ -203,6 +219,19 @@ async fn serve(mut socket: WebSocket, shared: &Shared) {
         }
         match act.end {
             End::Open => {}
+            End::Sync => {
+                if socket.send(Message::Ping(Bytes::from_static(b"sync"))).await.is_err() {
+                    return;
+                }
+                loop {
+                    match socket.recv().await {
+                        Some(Ok(Message::Pong(_))) => break,
+                        Some(Ok(_)) => {}
+                        _ => return,
+                    }
+                }
+                shared.synced.send_modify(|n| *n += 1);
+            }
             End::Drop => return,
             End::Binary => {
                 let _ = socket.send(Message::Binary(vec![1u8, 2, 3].into())).await;
@@ -314,6 +343,24 @@ pub(crate) async fn produce(
         }
     };
     (outcome, streams.read_to_end(id).await)
+}
+
+/// Opens `successor` on its own attempt and response stream, which depends on `request`.
+pub(crate) fn open(
+    successor: Successor,
+    streams: &Streams,
+    exchange: &Exchange,
+    request: &Writer,
+) -> (Upstream<CodexIngress>, Writer) {
+    let mut response = streams.response(request);
+    let attempt = exchange.attempt(&streams.store);
+    let mut scratch = streams.request();
+    let streams = ck_exec::types::Streams {
+        request: &mut scratch,
+        response: &mut response,
+    };
+    let opened = successor.open(&attempt, streams).expect("the successor opens");
+    (opened, response)
 }
 
 pub(crate) fn text(published: &Published) -> String {
