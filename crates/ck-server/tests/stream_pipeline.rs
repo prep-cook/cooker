@@ -681,6 +681,8 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         /// Credentials cooling down for the model afterwards; a skip or a resource failure
         /// is neutral and cools nothing.
         cooled: &'static [&'static str],
+        /// The call is a `responses/compact` request.
+        compact: bool,
     }
     let unsupported = || codec::Error::Unsupported;
     let rows = [
@@ -695,6 +697,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a usage snapshot before an executor error is kept",
@@ -707,6 +710,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: Some(7),
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a producer error before commitment fails over",
@@ -719,6 +723,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "every candidate refuses",
@@ -731,6 +736,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "an unsupported request skips to the next candidate",
@@ -743,6 +749,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a missing max_tokens skips only that candidate",
@@ -755,6 +762,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "every candidate lacking max_tokens answers the client with that",
@@ -770,6 +778,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a schema refusal skips to the next candidate",
@@ -782,6 +791,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "exhausted storage at the fence stops",
@@ -797,6 +807,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a gone stream at the fence stops",
@@ -812,6 +823,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a codec defect at the fence stops",
@@ -824,6 +836,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a cancelled request stops",
@@ -839,6 +852,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a request ended by shutdown stops",
@@ -854,6 +868,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a request ended by exhausted storage stops",
@@ -869,6 +884,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "an executor resource error stops",
@@ -881,6 +897,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a failure after commitment does not retry",
@@ -893,6 +910,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "an old-arm failure fails over to the contract arm",
@@ -905,6 +923,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 1,
             cooled: &["a"],
+            compact: false,
         },
         Row {
             case: "a producer failure ready with the first output does not commit",
@@ -917,6 +936,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: None,
             old: 0,
             cooled: &[],
+            compact: false,
         },
         Row {
             case: "a client gone before the first byte still accounts the final usage",
@@ -929,6 +949,20 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             input_tokens: Some(7),
             old: 0,
             cooled: &[],
+            compact: false,
+        },
+        Row {
+            case: "a compact the destination refuses sends nothing",
+            scripts: [Script::Refence(unsupported), Script::Refence(unsupported)],
+            request: None,
+            ends: Ends::Status(400),
+            started: &[],
+            settled: &[],
+            failed: &[],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: true,
         },
     ];
     let (upstream, sends) = refusing_upstream().await;
@@ -956,10 +990,18 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             view: RequestView {
                 document: &document,
                 media: &media,
-                operation: Operation::Generate,
+                operation: if row.compact {
+                    Operation::Compact
+                } else {
+                    Operation::Generate
+                },
             },
             request_id: LocalId::new("request").unwrap(),
         };
+        let mut call = call();
+        if row.compact {
+            call.alt = Some("responses/compact".into());
+        }
         let sent = sends.load(Ordering::SeqCst);
         let trace = Trace::with_request_id(Some("trace".into()));
         let log = Capture::default();
@@ -971,7 +1013,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             .with_writer(move || writer.clone())
             .finish();
         let mut run =
-            Box::pin(dispatch::run_exchange(&fixture.rt, &fake, call(), &trace, codec).with_subscriber(subscriber));
+            Box::pin(dispatch::run_exchange(&fixture.rt, &fake, call, &trace, codec).with_subscriber(subscriber));
         if let Ends::Gone = row.ends {
             let started = async {
                 while fake.begun.lock().unwrap().is_empty() {

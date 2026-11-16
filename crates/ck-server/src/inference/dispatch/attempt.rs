@@ -392,6 +392,31 @@ fn skip(attempt: &Attempt<'_>, trace: &Trace, destination: &str, error: codec::E
     fault(ExecError::local(400, FailureScope::Request, reason))
 }
 
+/// Whether the provider's old-arm `responses/compact` is a native upstream call. Every other
+/// provider's old arm would answer with a local summary, a refusal or an error.
+pub(super) fn native_compact(provider: &str) -> bool {
+    provider == "codex" || provider == ck_exec::xai::PROVIDER || ck_exec::openai_compat::handles(provider)
+}
+
+/// The client's wording for a compact no candidate can serve natively.
+const NO_NATIVE_COMPACT: &str = "This model does not support compaction; choose a model that does.";
+
+/// An old-arm compact refused before any send: logged without content, neutral for the
+/// credential like a destination refusal.
+pub(super) fn no_native_compact(trace: &Trace, credential: &ck_core::credential::Credential, upstream: &str) -> Fault {
+    tracing::info!(
+        target: "ck_dispatch",
+        request_id = %trace.request_id(),
+        auth_index = %ck_core::config::credentials::auth_index(credential),
+        provider = %credential.provider,
+        upstream_model = %upstream,
+        destination = "old",
+        reason = "no native compact",
+        "candidate skipped"
+    );
+    fault(ExecError::local(400, FailureScope::Request, NO_NATIVE_COMPACT))
+}
+
 fn fault(error: ExecError) -> Fault {
     Fault { error, bootstrap: None }
 }

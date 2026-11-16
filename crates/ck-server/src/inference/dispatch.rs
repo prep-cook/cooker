@@ -19,6 +19,7 @@ use futures_util::StreamExt;
 use crate::http::gojson;
 use crate::http::respond;
 use crate::runtime::state::{AcquireError, Completing, Lease, Outcome, Runtime, Selection};
+use crate::scheduling::classify::CompactClass;
 use crate::scheduling::registry::{self, AliasResult, Registry};
 use crate::scheduling::scheduler::{Policy, canonical_model};
 use crate::scheduling::{classify, lcp};
@@ -1450,8 +1451,8 @@ async fn attempt<X: Arms>(
             on_selected(&lease.credential);
         }
         let fault = 'arm: {
-            if let Some(arm) = arm.as_deref_mut() {
-                let ran = loop {
+            let ran = match arm.as_deref_mut() {
+                Some(arm) => loop {
                     let ran = attempt::run(arm, rt, cfg, call, trace, &req, usage, &mut lease, upstream).await;
                     // Go `tryRefreshAfterUnauthorized`, once per credential, after the failed
                     // attempt was settled and discarded.
@@ -1465,24 +1466,36 @@ async fn attempt<X: Arms>(
                         continue;
                     }
                     break ran;
-                };
-                match ran {
-                    Ran::Old => {}
-                    Ran::Failed(fault) => break 'arm fault,
-                    Ran::Committed(committed) => return Attempt::Committed(committed.spawn(rt, lease)),
-                    Ran::Stop(fault) => {
-                        lease.complete(Outcome::Neutral(fault.error.clone()));
-                        return Attempt::Stop(fault);
+                },
+                None => Ran::Old,
+            };
+            // D2-PLAN §3.3: an old-arm compact runs only where the provider's compact is
+            // native; nothing is sent to any other.
+            // C2 (Claude native compaction) plugs in here: once it lands, a Claude candidate
+            // reaches the new arm and never gets this far; the old arm keeps only the
+            // providers listed in `attempt::native_compact` until D9 deletes it.
+            let ran = match ran {
+                Ran::Old if target.compact && !attempt::native_compact(&lease.credential.provider) => {
+                    Ran::Skip(attempt::no_native_compact(trace, &lease.credential, upstream))
+                }
+                ran => ran,
+            };
+            match ran {
+                Ran::Old => {}
+                Ran::Failed(fault) => break 'arm fault,
+                Ran::Committed(committed) => return Attempt::Committed(committed.spawn(rt, lease)),
+                Ran::Stop(fault) => {
+                    lease.complete(Outcome::Neutral(fault.error.clone()));
+                    return Attempt::Stop(fault);
+                }
+                Ran::Skip(fault) => {
+                    let outcome = Outcome::Neutral(fault.error.clone());
+                    if i + 1 < target.models.len() {
+                        lease.note(&state, &outcome);
+                        continue 'models;
                     }
-                    Ran::Skip(fault) => {
-                        let outcome = Outcome::Neutral(fault.error.clone());
-                        if i + 1 < target.models.len() {
-                            lease.note(&state, &outcome);
-                            continue 'models;
-                        }
-                        lease.complete(outcome);
-                        return last.map_or(Attempt::Skip(fault), Attempt::Next);
-                    }
+                    lease.complete(outcome);
+                    return last.map_or(Attempt::Skip(fault), Attempt::Next);
                 }
             }
             let start = |credential: &ck_core::credential::Credential, req: &mut ExecRequest| {
@@ -1580,7 +1593,10 @@ async fn attempt<X: Arms>(
         };
         let error = &fault.error;
         let action = policy.error_action(&lease.credential, error);
-        let neutral = (target.compact && classify::is_compact_neutral(error) && !action.force_cooldown)
+        // D2-PLAN §3.3: a compact failure is routed by its class; a missing endpoint leaves
+        // the credential's availability alone, since the next compact is its own probe.
+        let compact = target.compact.then(|| classify::compact_class(error));
+        let neutral = (compact == Some(CompactClass::Unsupported) && !action.force_cooldown)
             || (call.operation == Operation::CountTokens
                 && classify::is_count_endpoint_missing(error, upstream)
                 && !action.force_cooldown);
@@ -1591,8 +1607,10 @@ async fn attempt<X: Arms>(
         };
         let stop = if action.matched {
             action.stop
+        } else if let Some(class) = compact {
+            class == CompactClass::ClientFault
         } else {
-            (target.compact && classify::is_compact_fault(error)) || classify::is_request_invalid(error)
+            classify::is_request_invalid(error)
         };
         // A credential-wide quota ends this credential's model pool.
         let last_here = stop || i + 1 == target.models.len() || classify::credential_scoped(error);
