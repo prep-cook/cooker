@@ -326,6 +326,17 @@ pub fn assert_same_request(name: &str, go: &Value, ours: &Captured) {
 /// The request the old path sends for `body` from a `source` client on `exchange`'s
 /// credential, config and model, at `upstream`.
 pub async fn old_upload(upstream: &StreamUpstream, exchange: &Exchange, source: &str, body: &[u8]) -> Captured {
+    old_upload_resolved(upstream, exchange, source, body, None).await
+}
+
+/// [`old_upload`] with the registry facts the server attaches to an attempt.
+pub async fn old_upload_resolved(
+    upstream: &StreamUpstream,
+    exchange: &Exchange,
+    source: &str,
+    body: &[u8],
+    resolved_model: Option<ck_core::exec::ResolvedModel>,
+) -> Captured {
     let format = ck_core::format::Format::parse(source).unwrap();
     let body = bytes::Bytes::copy_from_slice(body);
     let stream = serde_json::from_slice::<Value>(&body).unwrap()["stream"] == Value::Bool(true);
@@ -345,7 +356,7 @@ pub async fn old_upload(upstream: &StreamUpstream, exchange: &Exchange, source: 
         request_path: String::new(),
         headers: exchange.headers.clone(),
         caller: exchange.caller.clone(),
-        resolved_model: None,
+        resolved_model,
         usage: Default::default(),
     };
     let claude = ck_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap();

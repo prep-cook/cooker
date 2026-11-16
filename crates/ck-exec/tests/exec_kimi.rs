@@ -1,12 +1,11 @@
-//! The Kimi executor under the execution contract, against the DT local upstream: the upload
-//! each client protocol puts on the wire next to the old path's Go fixtures, the canonical
-//! response every client egress accepts, the requests that keep the old route, and failures
-//! before and after the upstream answered.
+//! Kimi execution-contract and loopback conformance tests.
 
 mod support;
 
 #[path = "exec_kimi/common.rs"]
 mod common;
+#[path = "exec_kimi/request_policy.rs"]
+mod request_policy;
 
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +14,7 @@ use ck_exec::Executors;
 use ck_stream::Terminal;
 use ck_translate::codec::{self, BodyMode, Operation};
 use common::{TOKEN, assert_same_request, egress, errors, exchange, finish, fixture, fixture_exchange, records};
-use common::{old_upload, protocol, replies, run, try_run};
+use common::{old_upload, old_upload_resolved, protocol, replies, run, try_run};
 use support::Streams;
 use support::upstream::{Reply, StreamUpstream};
 
@@ -74,17 +73,14 @@ async fn parity(name: &str, step: usize) {
 }
 
 #[tokio::test]
-async fn uploads_are_json_equal_to_the_old_path() {
+async fn unchanged_uploads_match_fixtures() {
     for name in [
-        "chat-stream-suffix",
         "chat-kimi-ai-metadata-base",
         "chat-payload-override-after-normalize",
         "chat-stream-usage-then-model",
         "transport-custom-headers",
-        "responses-nonstream-reorder-suffix",
         "responses-payload-rules",
         "responses-payload-override-after-normalize",
-        "responses-stream-clamp",
     ] {
         parity(name, usize::MAX).await;
     }
@@ -252,8 +248,8 @@ async fn payload_defaults_read_the_request_before_shaping() {
 
 #[tokio::test]
 async fn a_one_byte_fence_sends_the_same_upload() {
-    parity("chat-stream-suffix", 1).await;
-    parity("responses-nonstream-reorder-suffix", 1).await;
+    parity("chat-stream-usage-then-model", 1).await;
+    parity("responses-payload-rules", 1).await;
 }
 
 /// A Gemini client crosses protocols, so its upload is the shared Chat egress's: the same
@@ -484,27 +480,6 @@ async fn claude_clients_and_counts_keep_the_old_route() {
 }
 
 #[tokio::test]
-async fn custom_apply_patch_keeps_the_old_route() {
-    let patch = r#"{"type":"custom","name":" apply_patch ","description":"d","format":{"type":"grammar","syntax":"lark","definition":"x"}}"#;
-    let call = r#"{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch"}"#;
-    for body in [
-        format!(r#"{{"model":"kimi-k3","input":"hi","tools":[{patch}]}}"#),
-        format!(r#"{{"model":"kimi-k3","input":"hi","tools":[{{"type":"namespace","name":"ns","tools":[{patch}]}}]}}"#),
-        format!(
-            r#"{{"model":"kimi-k3","input":[{call},{{"type":"custom_tool_call_output","call_id":"c1","output":"ok"}}]}}"#
-        ),
-        format!(
-            r#"{{"model":"kimi-k3","input":[{{"type":"additional_tools","tools":[{patch}]}},{{"role":"user","content":"hi"}}]}}"#
-        ),
-        r#"{"model":"kimi-k3","input":"hi","tool_choice":{"type":"custom","name":"apply_patch"}}"#.to_owned(),
-        r#"{"model":"kimi-k3","input":"hi","tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"custom","name":"apply_patch"}]}}"#.to_owned(),
-    ] {
-        let error = refused("responses", Operation::Generate, body.as_bytes()).await;
-        assert!(matches!(error, codec::Error::Destination), "{body}");
-    }
-}
-
-#[tokio::test]
 async fn apply_patch_lookalikes_in_data_stay_on_the_contract() {
     let lookalike = r#"{"type":"custom","name":"apply_patch"}"#;
     let arguments = serde_json::to_string(lookalike).unwrap();
@@ -517,7 +492,7 @@ async fn apply_patch_lookalikes_in_data_stay_on_the_contract() {
         ),
         format!(r#"{{"model":"kimi-k3","input":"hi","metadata_extra":{lookalike}}}"#),
         format!(
-            r#"{{"model":"kimi-k3","input":"hi","tools":[{{"type":"custom","name":"lookup"}}],"tool_choice":{{"type":"custom","name":"lookup","tools":[{lookalike}]}}}}"#
+            r#"{{"model":"kimi-k3","input":"hi","tools":[{{"type":"custom","name":"lookup","format":{{"type":"grammar","syntax":"lark","definition":"x"}}}}],"tool_choice":{{"type":"custom","name":"lookup","tools":[{lookalike}]}}}}"#
         ),
         format!(
             r#"{{"model":"kimi-k3","input":"hi","tools":[{{"type":"function","name":"lookup","parameters":{{"type":"object"}}}}],"tool_choice":{{"type":"function","name":"lookup","tools":[{lookalike}]}}}}"#
