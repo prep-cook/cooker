@@ -76,13 +76,13 @@ async fn every_client_protocol_goes_out_as_meta_and_comes_back() {
     }
 }
 
-/// The old path's upload for a Responses client: request, then drain its response.
-async fn old_path(exchange: &Exchange, body: &[u8], stream: bool) {
-    old_path_from(exchange, body, stream, Format::OpenAIResponse).await;
+/// The old path's upload for a Responses client: request, then read its response, returned.
+async fn old_path(exchange: &Exchange, body: &[u8], stream: bool) -> Vec<u8> {
+    old_path_from(exchange, body, stream, Format::OpenAIResponse).await
 }
 
 /// [`old_path`] for a client of `source`.
-async fn old_path_from(exchange: &Exchange, body: &[u8], stream: bool, source: Format) {
+async fn old_path_from(exchange: &Exchange, body: &[u8], stream: bool, source: Format) -> Vec<u8> {
     let request = ExecRequest {
         operation: ExecOperation::Generate,
         source_format: source,
@@ -107,8 +107,15 @@ async fn old_path_from(exchange: &Exchange, body: &[u8], stream: bool, source: F
         .execute(&exchange.credential, request, &exchange.cfg)
         .await
         .unwrap();
-    if let ck_core::exec::ResponseBody::Stream(mut events) = response.body {
-        while events.next().await.is_some() {}
+    match response.body {
+        ck_core::exec::ResponseBody::Stream(mut events) => {
+            let mut out = Vec::new();
+            while let Some(Ok(chunk)) = events.next().await {
+                out.extend_from_slice(&chunk);
+            }
+            out
+        }
+        ck_core::exec::ResponseBody::Buffered(body) => body.to_vec(),
     }
 }
 
@@ -324,11 +331,11 @@ fn fenced(protocol: &str, operation: Operation, body: &[u8]) -> Result<(), Strin
     .map_err(|e| format!("{e:?}"))
 }
 
-/// Codex's freeform `apply_patch` tool, declared, nested in a namespace, or replayed, keeps the
-/// old route, whose bridge alone sends it as the JSON function Meta takes. Another custom tool,
-/// and Meta's lack of a native compact, are answered at the fence.
+/// Codex's freeform `apply_patch` tool, declared, nested in a namespace, or replayed, passes the
+/// fence for a Responses client; a Chat client's keeps the old route, whose translation prefers
+/// its ordinary `apply_patch` function. Meta's lack of a native compact is answered at the fence.
 #[test]
-fn apply_patch_keeps_the_old_route() {
+fn only_other_clients_keep_the_old_route_for_apply_patch() {
     let custom = r#"{"type":"custom","name":"NAME","description":"Patch","format":{"type":"grammar","syntax":"lark","definition":"start: x"}}"#;
     let declared = |name: &str| {
         format!(
@@ -342,24 +349,22 @@ fn apply_patch_keeps_the_old_route() {
     );
     let replayed = r#"{"model":"m","input":[{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch"},{"type":"custom_tool_call_output","call_id":"c1","output":"ok"},{"role":"user","content":"next"}]}"#;
     let chat = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"custom","custom":{"name":"apply_patch"}}]}"#;
-    let destination = Err("Destination".to_owned());
+    for body in [
+        declared("apply_patch"),
+        declared(" apply_patch\\n"),
+        declared("apply_patches"),
+        nested,
+        replayed.to_owned(),
+    ] {
+        assert_eq!(
+            fenced("responses", Operation::Generate, body.as_bytes()),
+            Ok(()),
+            "{body}"
+        );
+    }
     assert_eq!(
-        fenced("responses", Operation::Generate, declared("apply_patch").as_bytes()),
-        destination
-    );
-    assert_eq!(
-        fenced("responses", Operation::Generate, declared(" apply_patch\\n").as_bytes()),
-        destination
-    );
-    assert_eq!(fenced("responses", Operation::Generate, nested.as_bytes()), destination);
-    assert_eq!(
-        fenced("responses", Operation::Generate, replayed.as_bytes()),
-        destination
-    );
-    assert_eq!(fenced("chat", Operation::Generate, chat.as_bytes()), destination);
-    assert_eq!(
-        fenced("responses", Operation::Generate, declared("apply_patches").as_bytes()),
-        Ok(())
+        fenced("chat", Operation::Generate, chat.as_bytes()),
+        Err("Destination".to_owned())
     );
     let compact = br#"{"model":"m","input":"hi"}"#;
     assert_eq!(
@@ -406,6 +411,8 @@ fn apply_patch_is_found_only_where_it_is_declared_chosen_or_called() {
     }
 }
 
+/// Every carrier of the custom tool needs the bridge: a Responses client's request passes the
+/// fence for it, a Chat client's keeps the old route.
 #[test]
 fn apply_patch_carriers_require_the_bridge() {
     let patch = r#"{"type":"custom","name":"apply_patch"}"#;
@@ -453,11 +460,103 @@ fn apply_patch_carriers_require_the_bridge() {
         ),
     ];
     for (protocol, body) in &real {
+        let expected = match *protocol {
+            "responses" => Ok(()),
+            _ => Err("Destination".to_owned()),
+        };
         assert_eq!(
             fenced(protocol, Operation::Generate, body.as_bytes()),
-            Err("Destination".to_owned()),
+            expected,
             "{protocol}: {body}"
         );
+    }
+}
+
+/// The output items of a Responses answer, buffered or streamed.
+fn answered(text: &[u8]) -> Vec<Value> {
+    let completed = match serde_json::from_slice::<Value>(text) {
+        Ok(response) => response,
+        Err(_) => (text.split(|b| *b == b'\n'))
+            .filter_map(|line| line.strip_prefix(b"data: "))
+            .filter_map(|data| serde_json::from_slice::<Value>(data).ok())
+            .find(|event| event["type"] == "response.completed")
+            .map(|event| event["response"].clone())
+            .unwrap_or_else(|| panic!("no completion: {}", String::from_utf8_lossy(text))),
+    };
+    completed["output"].as_array().cloned().unwrap_or_default()
+}
+
+/// A Responses client's custom `apply_patch` reaches Meta as the old path sent it, the JSON
+/// function Meta takes, and the answer comes back with the old path's items, the call as the
+/// custom tool: declared at the top level or in a namespace, in a continuation that replays an
+/// earlier call (as a `previous_response_id` turn is expanded), and with the call's name only
+/// in its later events.
+#[tokio::test]
+async fn apply_patch_goes_out_as_a_function_and_comes_back_as_the_custom_tool() {
+    let custom = r#"{"type":"custom","name":"apply_patch","description":"Patch","format":{"type":"grammar","syntax":"lark","definition":"start: x"}}"#;
+    let replayed = r#"{"type":"custom_tool_call","call_id":"c0","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"},{"type":"custom_tool_call_output","call_id":"c0","output":"ok"},"#;
+    let patch = "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch";
+    let arguments = serde_json::json!({ "input": patch }).to_string();
+    let named = r#""name":"apply_patch""#;
+    let events = patch_events(&arguments);
+    let added = events
+        .iter()
+        .position(|e| e.contains("output_item.added") && e.contains(named))
+        .unwrap();
+    let mut late = events.clone();
+    late[added] = late[added].replace(&format!(",{named}"), "");
+    let namespaced = events.concat().replace(named, &format!(r#""namespace":"fs",{named}"#));
+    for (case, tools, history, sse) in [
+        ("declared", custom.to_owned(), "", events.concat()),
+        (
+            "namespace",
+            format!(r#"{{"type":"namespace","name":"fs","description":"files","tools":[{custom}]}}"#),
+            "",
+            namespaced,
+        ),
+        ("continuation", custom.to_owned(), replayed, events.concat()),
+        ("late name", custom.to_owned(), "", late.concat()),
+    ] {
+        for stream in [true, false] {
+            let body = format!(
+                r#"{{"model":"client-model","stream":{stream},"input":[{history}{{"role":"user","content":"patch it"}}],"tools":[{tools}]}}"#
+            );
+            let upstream = StreamUpstream::start([Reply::sse(sse.clone()), Reply::sse(sse.clone())]).await;
+            let (streams, exchange) = (Streams::new(), exchange(&upstream));
+            let (started, id, _request) = run(
+                &streams,
+                &exchange,
+                "responses",
+                Operation::Generate,
+                body.as_bytes(),
+                9,
+            )
+            .await;
+            let (outcome, _, mut out) = finish(&streams, started.unwrap(), id).await;
+            outcome.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            let new = egress(&streams, "responses", &mut out, id, BodyMode::Buffered).await;
+            let old = old_path(&exchange, body.as_bytes(), stream).await;
+            let captured = upstream.captured();
+            let sent = json_body(&captured[0]);
+            assert_eq!(sent, json_body(&captured[1]), "{case} stream {stream}");
+            let declared = &sent["tools"][0];
+            let declared = declared["tools"].get(0).unwrap_or(declared);
+            assert_eq!(declared["type"], "function", "{case}: {sent}");
+            let (new, old) = (answered(new.as_bytes()), answered(&old));
+            let kinds = |items: &[Value]| items.iter().map(|i| i["type"].clone()).collect::<Vec<_>>();
+            assert_eq!(
+                kinds(&new),
+                ["message", "custom_tool_call"],
+                "{case} stream {stream}: {new:?}"
+            );
+            assert_eq!(kinds(&new), kinds(&old), "{case} stream {stream}: {old:?}");
+            let call = |items: &[Value]| {
+                let call = &items[1];
+                (call["name"].clone(), call["call_id"].clone(), call["input"].clone())
+            };
+            assert_eq!(call(&new), call(&old), "{case} stream {stream}");
+            assert_eq!(call(&new).2, patch, "{case} stream {stream}");
+        }
     }
 }
 

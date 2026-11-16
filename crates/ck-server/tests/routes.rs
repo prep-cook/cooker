@@ -81,6 +81,42 @@ fn sse() -> String {
     .concat()
 }
 
+/// A Meta stream calling the `apply_patch` function the bridge declared; the completion lists
+/// no output.
+fn meta_patch_sse() -> String {
+    let arguments = serde_json::json!({"input": "*** Begin Patch\n*** End Patch"}).to_string();
+    let call = serde_json::json!({"id":"fc_1","type":"function_call","status":"completed","call_id":"call_p",
+        "name":"apply_patch","arguments":arguments});
+    let response = |status: &str| {
+        serde_json::json!({"id":"resp_up","object":"response","created_at":1,"status":status,"model":"muse-wonder-1.0",
+            "output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}})
+    };
+    [
+        event(
+            "response.created",
+            serde_json::json!({"type":"response.created","response":response("in_progress")}),
+        ),
+        event(
+            "response.output_item.added",
+            serde_json::json!({"type":"response.output_item.added","output_index":0,"item":call}),
+        ),
+        event(
+            "response.function_call_arguments.done",
+            serde_json::json!({"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,
+                "arguments":arguments}),
+        ),
+        event(
+            "response.output_item.done",
+            serde_json::json!({"type":"response.output_item.done","output_index":0,"item":call}),
+        ),
+        event(
+            "response.completed",
+            serde_json::json!({"type":"response.completed","response":response("completed")}),
+        ),
+    ]
+    .concat()
+}
+
 #[derive(Default)]
 struct Seen {
     requests: Mutex<Vec<(String, Value)>>,
@@ -150,6 +186,7 @@ async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
             )
                 .into_response()
         }
+        "Bearer fake-meta" => ([("content-type", "text/event-stream")], meta_patch_sse()).into_response(),
         "Bearer fake-prompt" => (
             [("content-type", "text/event-stream")],
             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_prompt\",\"model\":\"stored-model\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n",
@@ -656,6 +693,66 @@ async fn responses_continuation_resends_the_stored_turn_after_failover() {
         }
         assert!(!sent.contains("previous_response_id"), "{case}: {sent}");
     }
+}
+
+/// A Meta account serves a Responses client's custom `apply_patch` on the exchange path: the
+/// call comes back as the custom tool under a cooker id, and a `previous_response_id` turn
+/// resends the stored call to Meta as the function it takes.
+#[tokio::test]
+async fn meta_serves_apply_patch_and_its_continuation() {
+    let meta = Credential {
+        id: "meta:apikey:1".into(),
+        provider: "meta".into(),
+        source: Source::Config {
+            section: "meta-api-key".into(),
+            index: 0,
+        },
+        disabled: false,
+        label: "meta".into(),
+        attributes: [("api_key".to_owned(), "fake-meta".to_owned())].into_iter().collect(),
+        metadata: serde_json::Map::new(),
+        revision: 0,
+    };
+    let p = proxy("", vec![meta]).await;
+    let tool = r#"{"type":"custom","name":"apply_patch","description":"Patch","format":{"type":"grammar","syntax":"lark","definition":"start: x"}}"#;
+    let body = format!(r#"{{"model":"muse-wonder-1.0","input":"patch it","tools":[{tool}]}}"#);
+    let (status, _, text) = post(&p.url, "/v1/responses", &body).await;
+    assert_eq!(status, 200, "{text}");
+    let reply: Value = serde_json::from_str(&text).unwrap();
+    let call = &reply["output"][0];
+    assert_eq!(call["type"], "custom_tool_call", "{text}");
+    assert_eq!(call["name"], "apply_patch", "{text}");
+    assert_eq!(call["input"], "*** Begin Patch\n*** End Patch", "{text}");
+    let id = reply["id"].as_str().unwrap().to_owned();
+    assert!(id.starts_with("resp_") && id != "resp_up", "{id}");
+    p.seen.requests.lock().unwrap().clear();
+
+    let body = format!(
+        r#"{{"model":"muse-wonder-1.0","previous_response_id":"{id}","input":[{{"type":"custom_tool_call_output","call_id":"call_p","output":"done"}}],"tools":[{tool}]}}"#
+    );
+    let (status, _, text) = post(&p.url, "/v1/responses", &body).await;
+    assert_eq!(status, 200, "{text}");
+    let seen = std::mem::take(&mut *p.seen.requests.lock().unwrap());
+    let (token, sent) = seen.last().unwrap();
+    assert_eq!(token, "Bearer fake-meta");
+    assert_eq!(sent["tools"][0]["type"], "function", "{sent}");
+    let kinds: Vec<_> = sent["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["type"].clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["message", "function_call", "function_call_output"],
+        "the stored call resent as the function: {sent}"
+    );
+    assert_eq!(sent["input"][1]["name"], "apply_patch", "{sent}");
+    assert!(
+        sent["input"][1]["arguments"].as_str().unwrap().contains("Begin Patch"),
+        "{sent}"
+    );
+    assert!(sent.get("previous_response_id").is_none(), "{sent}");
 }
 
 #[tokio::test]

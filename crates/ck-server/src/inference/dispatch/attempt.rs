@@ -221,8 +221,8 @@ pub(super) async fn run<X: Arms>(
     // A Responses exchange shows only the response id it issued and resends its stored history
     // to every candidate (Settled 54); the old arm sends the client's body and shows the
     // upstream's id, so it serves no Responses candidate.
-    // ponytail: providers with no contract path for a request (Meta's custom `apply_patch`,
-    // Devin, AI Studio) are skipped for Responses clients until their executors move over.
+    // ponytail: providers with no contract path (Devin, AI Studio) are skipped for Responses
+    // clients until their executors move over.
     let responses = arm
         .exchange
         .as_ref()
