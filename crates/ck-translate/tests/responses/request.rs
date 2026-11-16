@@ -152,19 +152,11 @@ fn request_history_preserves_identity_encryption_and_structured_arguments() {
     );
 }
 
+/// A streamed compact or count is refused, and no Responses destination takes a count: the
+/// fence ends no request.
 #[test]
 fn compact_streaming_and_count_are_explicit_errors() {
     let mut m = Mapped::new();
-    assert!(matches!(
-        responses::request::Ingress::new(
-            &mut m.writer,
-            &m.store,
-            identity(Direction::Request),
-            Operation::CountTokens,
-            100
-        ),
-        Err(codec::Error::Unsupported)
-    ));
     assert!(matches!(
         responses::response::Ingress::new(
             &mut m.writer,
@@ -175,27 +167,35 @@ fn compact_streaming_and_count_are_explicit_errors() {
         ),
         Err(codec::Error::Unsupported)
     ));
-    let mut ingress = responses::request::Ingress::new(
-        &mut m.writer,
-        &m.store,
-        identity(Direction::Request),
-        Operation::Compact,
-        1000,
-    )
-    .unwrap();
-    ingress
-        .advance(&mut m.writer, br#"{"model":"m","input":[],"stream":true}"#)
-        .unwrap();
-    assert!(
-        ingress
-            .finish(&mut m.writer, &responses::request::ResponsesCapability)
-            .is_err()
-    );
-    assert!(
-        !String::from_utf8(m.output(&m.writer))
+    let rows: [(Operation, &[u8], bool); 4] = [
+        (Operation::Compact, br#"{"model":"m","input":[],"stream":true}"#, false),
+        (
+            Operation::CountTokens,
+            br#"{"model":"m","input":"hi","stream":true}"#,
+            false,
+        ),
+        (Operation::CountTokens, br#"{"model":"m","input":"hi"}"#, false),
+        (Operation::CountTokens, br#"{"model":"m","input":"hi"}"#, true),
+    ];
+    for (operation, body, client) in rows {
+        let mut m = Mapped::new();
+        let mut ingress =
+            responses::request::Ingress::new(&mut m.writer, &m.store, identity(Direction::Request), operation, 1000)
+                .unwrap();
+        ingress.advance(&mut m.writer, body).unwrap();
+        let fenced = if client {
+            ingress.finish(&mut m.writer, &codec::ClientCapability).is_ok()
+        } else {
+            ingress
+                .finish(&mut m.writer, &responses::request::ResponsesCapability)
+                .is_ok()
+        };
+        let ended = String::from_utf8(m.output(&m.writer))
             .unwrap()
-            .contains("x_ck.request.end")
-    );
+            .contains("x_ck.request.end");
+        let body = String::from_utf8_lossy(body);
+        assert_eq!((fenced, ended), (client, client), "{operation:?} {body}");
+    }
 }
 
 #[test]

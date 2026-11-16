@@ -74,6 +74,8 @@ pub struct Client<'a> {
 pub struct Request<'a> {
     pub(crate) validated: Validated<'a>,
     pub client: Client<'a>,
+    /// The client takes only the destination's own count: a local estimate is refused.
+    upstream_count: bool,
 }
 
 // One per attempt on the stack; boxing `Fenced` would add an allocation per attempt.
@@ -90,6 +92,7 @@ impl<'a> Request<'a> {
         Self {
             validated: Validated::Borrowed(validated),
             client,
+            upstream_count: false,
         }
     }
 
@@ -98,7 +101,20 @@ impl<'a> Request<'a> {
         Self {
             validated: Validated::Owned(fenced),
             client,
+            upstream_count: false,
         }
+    }
+
+    /// Refuses a local token count with [`crate::pipeline::LOCAL_COUNT`]: the client, such as
+    /// Responses `input_tokens`, presents the count as the destination's own.
+    #[must_use]
+    pub fn upstream_count(mut self) -> Self {
+        self.upstream_count = true;
+        self
+    }
+
+    pub(crate) fn upstream_count_only(&self) -> bool {
+        self.upstream_count
     }
 
     /// This attempt's fence.

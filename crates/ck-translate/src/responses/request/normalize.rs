@@ -36,15 +36,7 @@ pub(super) fn normalize(doc: &mut Document, owner: &mut Writer, operation: Opera
     let x = doc.set(root, "x_ck", Value::Object)?;
     doc.set(x, "v", Value::Unsigned(1))?;
     doc.set(x, "original_protocol", Value::Text("responses"))?;
-    doc.set(
-        x,
-        "operation",
-        Value::Text(if operation == Operation::Compact {
-            "compact"
-        } else {
-            "generate"
-        }),
-    )?;
+    doc.set(x, "operation", Value::Text(operation.name()))?;
     let original = doc.set(x, "original", Value::Array)?;
     if let Some(wire_x) = wire_x {
         preserve(doc, original, root, wire_x)?;

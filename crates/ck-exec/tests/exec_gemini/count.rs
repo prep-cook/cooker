@@ -79,15 +79,15 @@ async fn chat_has_no_count_to_receive() {
     assert!(matches!(egress.err(), Some(codec::Error::Unsupported)));
 }
 
-/// Responses has no count operation in the codec: its request ingress refuses one, and its
-/// response egress refuses to encode one.
+/// A Responses count is received (`input_tokens`), but the response egress refuses to encode
+/// one: `responses::count::CountEgress` answers it.
 #[tokio::test]
-async fn responses_has_no_count_to_receive() {
+async fn responses_count_is_not_a_response() {
     let streams = Streams::new();
     let mut writer = streams.request();
     let id = identity(Direction::Request);
     let ingress = responses::request::Ingress::new(&mut writer, &streams.store, id, Operation::CountTokens, LIMIT);
-    assert!(matches!(ingress.err(), Some(codec::Error::Unsupported)));
+    assert!(ingress.is_ok());
     let egress = crate::support::responses_egress(&mut writer, Operation::CountTokens, BodyMode::Buffered);
     assert!(matches!(egress.err(), Some(codec::Error::Unsupported)));
 }

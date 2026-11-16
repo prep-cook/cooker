@@ -1,5 +1,5 @@
-//! OpenAI routes: Chat Completions, legacy Completions (refused), Responses and compact
-//! (sdk/api/handlers/openai/openai_handlers.go, openai_responses_handlers.go).
+//! OpenAI routes: Chat Completions, legacy Completions (refused), Responses, compact and
+//! input_tokens (sdk/api/handlers/openai/openai_handlers.go, openai_responses_handlers.go).
 
 use ck_core::gostr::GoStr;
 use std::sync::Arc;
@@ -861,6 +861,53 @@ pub async fn compact(
     let output = Output {
         protocol: Protocol::Responses,
         operation: codec::Operation::Compact,
+        framing: Framing::Json,
+    };
+    dispatch::exchange::serve(&rt, call, output, |result| async move {
+        match result {
+            Err(failure) => errors::openai(&failure),
+            Ok(Done::Buffered { body, .. }) => respond::json(200, "application/json", body),
+            Ok(Done::Stream { .. }) => unreachable!("non-stream calls are buffered"),
+        }
+    })
+    .await
+}
+
+/// `POST /v1/responses/input_tokens`: the destination's own count of the request, with the
+/// stored history a `previous_response_id` names, as one `response.input_tokens` object.
+#[allow(clippy::too_many_arguments)]
+pub async fn input_tokens(
+    State(rt): State<Arc<Runtime>>,
+    Extension(caller): Extension<Caller>,
+    peer: dispatch::Peer,
+    matched: Option<MatchedPath>,
+    original: OriginalUri,
+    headers: HeaderMap,
+    limit: crate::http::body_limit::Limit,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let body = match body {
+        Ok(body) => match read_body(&headers, body, limit.0) {
+            Ok(body) => body,
+            Err(response) => return *response,
+        },
+        Err(rejection) => return read_failed(&rejection),
+    };
+    let model = gojson::gjson_string(peek(&body).get("model"));
+    let req = Request {
+        caller,
+        peer: dispatch::peer(peer),
+        query: String::new(),
+        headers,
+        path: dispatch::route_path(matched.as_ref(), &original.0),
+    };
+    let call = Call {
+        operation: Operation::CountTokens,
+        ..call(req, Format::OpenAIResponse, model, body, false, None)
+    };
+    let output = Output {
+        protocol: Protocol::Responses,
+        operation: codec::Operation::CountTokens,
         framing: Framing::Json,
     };
     dispatch::exchange::serve(&rt, call, output, |result| async move {

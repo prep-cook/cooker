@@ -91,6 +91,7 @@ fn api(rt: Arc<Runtime>) -> Router {
         .route("/v1/streams", get(inference::streams::resume))
         .route("/v1/responses", post(openai::responses))
         .route("/v1/responses/compact", post(openai::compact))
+        .route("/v1/responses/input_tokens", post(openai::input_tokens))
         .route("/backend-api/codex/responses", post(openai::responses))
         .route("/backend-api/codex/responses/compact", post(openai::compact))
         .route("/v1beta/models", get(models::gemini_list))

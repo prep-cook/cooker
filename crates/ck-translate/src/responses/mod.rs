@@ -2,6 +2,7 @@
 
 mod audio;
 mod content;
+pub mod count;
 pub mod egress;
 pub mod history;
 mod image;

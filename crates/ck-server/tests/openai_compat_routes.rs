@@ -327,6 +327,20 @@ async fn compact_rejects_stream() {
     assert!(seen.0.lock().unwrap().is_empty(), "the executor is never called");
 }
 
+/// An upstream without a token-counting endpoint is refused for
+/// `POST /v1/responses/input_tokens`: a local tokenizer estimate is not the official count.
+#[tokio::test]
+async fn responses_input_tokens_refuses_a_local_estimate() {
+    let (url, seen) = proxy().await;
+    let body = br#"{"model":"fast","input":"hello"}"#.to_vec();
+    let (status, text) = send(&url, "/v1/responses/input_tokens", &[], body).await;
+    assert_eq!(status, 400, "{text}");
+    assert_local_error(&text, "invalid_request_error");
+    assert!(text.contains("count"), "the refusal names the count: {text}");
+    assert!(!text.contains("input_tokens\":"), "no estimate is shown: {text}");
+    assert!(seen.0.lock().unwrap().is_empty(), "nothing reaches the upstream");
+}
+
 /// Go `TestOpenAIResponsesCompactExecute`: the `responses/compact` alt reaches the
 /// executor with the Responses source format, and its body is answered as is.
 #[tokio::test]
