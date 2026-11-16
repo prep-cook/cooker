@@ -430,6 +430,8 @@ const RULED: &[(&str, &[&str], &str)] = &[(
         "claude-antigravity/sig/empty-text@claude-opus-4-6-thinking",
         "claude-antigravity/sig/native@claude-sonnet-4-6",
         "claude-antigravity/sig/native@claude-opus-4-6-thinking",
+        "claude-antigravity/sig/gpt@claude-sonnet-4-6",
+        "claude-antigravity/sig/gpt@claude-opus-4-6-thinking",
         "antigravity-claude/thinking@claude-sonnet-4-6",
         "antigravity-claude/non-stream/0@claude-sonnet-4-6",
         "TestConvertClaudeRequestToAntigravity_ThinkingBlocks:973",
@@ -452,7 +454,7 @@ const RULED: &[(&str, &[&str], &str)] = &[(
         "TestConvertAntigravityResponseToClaude_PreservesClaudeThoughtAndToolSignatures:914:stream",
         "TestConvertAntigravityResponseToClaude_EmitsNativeSignaturesWithoutProviderPrefixes:1425:stream",
     ],
-    "Settled 66 (docs/OPEN-QUESTIONS.md): a Claude model's thinking signatures pass between client \
+    "Settled 66 (docs/OPEN-QUESTIONS.md): a Claude model's thinking and tool-call signatures pass between client \
      and upstream unchanged, and no cached signature fills an unsigned block; \
      ck-exec tests/exec_antigravity.rs pins the ruled behaviour",
 )];

@@ -377,17 +377,22 @@ fn provider(model: &str) -> Provider {
     sig::provider_from_model_name(model)
 }
 
-/// resolveProviderCompatibleSignature.
+/// resolveProviderCompatibleSignature, except that a valid Claude signature, on a thinking
+/// block or a tool call, goes upstream as the client holds it (ruling 66): only CLIProxyAPI's
+/// legacy `<group>#` prefix comes off, without its double-layer rewrite.
 fn provider_compatible(target: Provider, raw: &[u8], kind: BlockKind) -> Vec<u8> {
     if raw.is_empty() {
         return vec![];
     }
-    let signature = if target == Provider::Claude {
-        compatible_antigravity_claude_thinking_signature(raw)
-    } else {
-        sig::compatible_signature_for_provider_block(target, raw, kind)
-    };
-    signature.map(String::into_bytes).unwrap_or_default()
+    if target == Provider::Claude {
+        return match compatible_antigravity_claude_thinking_signature(raw) {
+            Some(_) => sig::payload_without_provider_prefix(raw).to_vec(),
+            None => vec![],
+        };
+    }
+    sig::compatible_signature_for_provider_block(target, raw, kind)
+        .map(String::into_bytes)
+        .unwrap_or_default()
 }
 
 /// resolveThinkingSignature: Gemini targets unwrap carriers; Claude targets keep a valid
@@ -402,15 +407,10 @@ fn resolve_thinking_signature(model: &str, text: &[u8], raw: &[u8]) -> Vec<u8> {
         }
         return provider_compatible(target, &carrier.signature, block_kind(carrier.marked, &carrier.target));
     }
-    // Owner ruling 66: a Claude model gets a valid client signature as the upstream minted it:
-    // only CLIProxyAPI's legacy `<group>#` prefix comes off, without its double-layer rewrite,
-    // and an unsigned block gets no cached signature. CLIProxyAPI and OmniRoute both drop
-    // unsigned and invalid blocks.
+    // Owner ruling 66: an unsigned block for a Claude model gets no cached signature.
+    // CLIProxyAPI and OmniRoute both drop unsigned and invalid blocks.
     if target == Provider::Claude {
-        return match compatible_antigravity_claude_thinking_signature(raw) {
-            Some(_) => sig::payload_without_provider_prefix(raw).to_vec(),
-            None => vec![],
-        };
+        return provider_compatible(target, raw, BlockKind::Unknown);
     }
     if replay_cache::signature_cache_enabled() {
         if !raw.is_empty() {
