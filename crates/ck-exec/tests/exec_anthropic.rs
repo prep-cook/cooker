@@ -442,6 +442,24 @@ async fn verdict(model: &str, body: Value) -> codec::Result<()> {
     verdict
 }
 
+/// The fence's verdict for a Chat request, whose client may omit the limit, under the config
+/// `yaml`.
+async fn chat_verdict(yaml: &str, model: &str, body: Value) -> codec::Result<()> {
+    let upstream = StreamUpstream::start([]).await;
+    let mut fixture = Fixture::new(&upstream, model);
+    fixture.exchange.cfg = ck_core::config::Config::parse(yaml).unwrap();
+    let mut request = fixture.streams.request();
+    let (store, id, op) = (
+        &fixture.streams.store,
+        identity(Direction::Request),
+        Operation::Generate,
+    );
+    let mut ingress = codec::chat::request::Ingress::new(&mut request, store, id, op, LIMIT).unwrap();
+    let verdict = fixture.fence(&mut ingress, &mut request, &serde_json::to_vec(&body).unwrap());
+    assert_eq!(upstream.requests(), 0);
+    verdict
+}
+
 #[tokio::test]
 async fn thinking_budgets_and_forced_tools_are_refused_never_adjusted() {
     let request = |thinking: Value, max_tokens: u64, tool_choice: Value| {
@@ -466,6 +484,73 @@ async fn thinking_budgets_and_forced_tools_are_refused_never_adjusted() {
     let any = json!({"type": "any"});
     assert!(unsupported(verdict(SONNET, request(manual(1024), 4096, any)).await));
     assert!(unsupported(verdict(SONNET, request(manual(1024), 4096, forced)).await));
+}
+
+const CATALOG: &str = r#"
+model-catalog:
+  - match: "claude-*"
+    overrides: {default-max-tokens: 8192}
+  - match: "claude-haiku-*"
+    overrides: {default-max-tokens: 4096}
+  - match: "claude-opus-*"
+    overrides: {default-max-tokens: null}
+"#;
+
+#[tokio::test]
+async fn a_request_without_max_tokens_needs_a_configured_default() {
+    let chat = |extra: Value| {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let kind = |verdict: &codec::Result<()>| match verdict {
+        Ok(()) => "accepted",
+        Err(codec::Error::MaxTokensRequired) => "max_tokens required",
+        Err(codec::Error::Schema) => "schema",
+        Err(codec::Error::Unsupported) => "unsupported",
+        Err(other) => panic!("{other:?}"),
+    };
+    // (config, upstream model, extra client members, refusal kind)
+    let rows = [
+        (CATALOG, SONNET, json!({}), "accepted"),
+        (CATALOG, "claude-haiku-4-5", json!({}), "accepted"),
+        // A null clears the earlier match: no value, no invented 1024.
+        (CATALOG, "claude-opus-4-7", json!({}), "max_tokens required"),
+        (CATALOG, "other-model", json!({}), "max_tokens required"),
+        ("", SONNET, json!({}), "max_tokens required"),
+        // An explicit client limit never needs a default, and other refusals keep their kind.
+        (CATALOG, "claude-opus-4-7", json!({"max_tokens": 64}), "accepted"),
+        ("", SONNET, json!({"max_completion_tokens": 64}), "accepted"),
+        ("", SONNET, json!({"max_tokens": 0}), "schema"),
+        ("", SONNET, json!({"max_tokens": 64, "n": 2}), "unsupported"),
+        ("", SONNET, json!({"max_completion_tokens": 64, "n": 2}), "unsupported"),
+    ];
+    for (yaml, model, extra, expected) in rows {
+        let verdict = chat_verdict(yaml, model, chat(extra.clone())).await;
+        assert_eq!(kind(&verdict), expected, "{model} {extra}: {verdict:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_configured_default_reaches_the_wire_as_max_tokens() {
+    let upstream = StreamUpstream::start([Reply::sse(SSE)]).await;
+    let mut fixture = Fixture::new(&upstream, "claude-haiku-4-5");
+    fixture.exchange.cfg = ck_core::config::Config::parse(CATALOG).unwrap();
+    let (store, mut request) = (&fixture.streams.store, fixture.streams.request());
+    let body =
+        serde_json::to_vec(&json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": "hi"}]}))
+            .unwrap();
+    let mut ingress = codec::chat::request::Ingress::new(
+        &mut request,
+        store,
+        identity(Direction::Request),
+        Operation::Generate,
+        LIMIT,
+    )
+    .unwrap();
+    let (started, _) = fixture.start(&mut ingress, &mut request, &body).await;
+    started.unwrap().producer.await.unwrap().unwrap();
+    assert_eq!(sent(&upstream).0["max_tokens"], 4096);
 }
 
 #[tokio::test]

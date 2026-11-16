@@ -14,6 +14,7 @@ mod binary;
 pub mod credentials;
 mod document;
 pub mod go_url;
+pub mod model_catalog;
 mod schema;
 mod timestamp;
 mod trusted;

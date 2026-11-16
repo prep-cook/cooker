@@ -346,6 +346,33 @@ service-name ports such as `:http` are not accepted.
 
 When a model lists supported reasoning levels, an unsupported standard level snaps to the nearest supported level in this order: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Ties choose the lower level. Requests below or above the supported range use its lowest or highest level. This applies within a provider family and across families; `none`, `auto`, budgets and models without a level list keep their existing handling. Unknown level strings are not snapped.
 
+## model-catalog
+
+`model-catalog` sets per-model values by glob over the upstream model name, without a thinking suffix. Only one value exists today: `default-max-tokens`, the `max_tokens` cooker sends to Anthropic Messages for a request that carries no limit (a Chat, Responses or Gemini client may omit it; an Anthropic client must send its own).
+
+```yaml
+model-catalog:
+  - match: "claude-*"
+    overrides: {default-max-tokens: 8192}
+  - match: "claude-haiku-*"
+    overrides: {default-max-tokens: 4096}
+  - match: "claude-opus-*"
+    overrides: {default-max-tokens: null}
+```
+
+| Field | What it does |
+|---|---|
+| `match` | A glob over the model name, case-sensitive. `*` matches within one `/`-separated segment, `**` also matches `/`; every other character is literal. |
+| `overrides.default-max-tokens` | A positive integer, or `null` to remove a value an earlier entry set. An entry without the key leaves the value alone. |
+
+Every matching entry applies in file order, and a later one replaces an earlier one (an RFC 7396 merge patch). The value for a model is the first of:
+
+1. the `model-catalog` override;
+2. the `max_completion_tokens` of the model in the registry;
+3. none. The destination refuses a request without a limit, the router skips that candidate, logs `candidate skipped` with `missing_setting=model-catalog default-max-tokens` at info level, and another candidate can still serve. When every candidate refuses, the client gets a 400 saying `max_tokens` is required. cooker never invents a value such as 1024.
+
+A limit the client sends is never changed, and token counts need none. A config change applies from the next request. A zero, negative or non-numeric value, or an empty `match`, refuses the config; a fractional number is truncated, as for every integer setting.
+
 ## worker-threads
 
 `worker-threads: 4` at the top level sets how many threads serve requests. Without it, cooker uses the smaller of the CPU count and two, which is plenty for one person: a coding-agent request with a 300 KB prompt costs about 20 to 30 ms of CPU (a small chat request about 1 ms), and most of a request's time is spent waiting on the provider. Each extra thread can keep its own pool of freed memory, so more threads mean a larger resident size. The `TOKIO_WORKER_THREADS` environment variable overrides it.

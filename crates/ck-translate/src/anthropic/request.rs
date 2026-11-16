@@ -135,7 +135,8 @@ impl codec::RequestIngress for Ingress {
 #[derive(Clone, Copy, Default)]
 pub struct AnthropicCapability {
     /// `max_tokens` for a generation request without one: the per-model setting, else the
-    /// model's output maximum (owner ruling 2026-11-15). `None` refuses such a request.
+    /// model's output maximum (owner ruling 2026-11-15). `None` refuses such a request with
+    /// [`Error::MaxTokensRequired`].
     pub default_max_tokens: Option<u64>,
     /// What the model accepts as `thinking.budget_tokens`, from the registry `thinking` data.
     pub budget: Budget,
@@ -203,7 +204,7 @@ impl Egress {
         e.bytes(b",\"max_tokens\":")?;
         match doc.member(root, "max_completion_tokens")? {
             Some(limit) => doc.write(limit, e),
-            None => e.unsigned(self.default_max_tokens.ok_or(Error::Schema)?),
+            None => e.unsigned(self.default_max_tokens.ok_or(Error::MaxTokensRequired)?),
         }
     }
 }

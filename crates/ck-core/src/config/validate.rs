@@ -115,6 +115,7 @@ fn text(section: Option<&Value>, key: &str, default: &str) -> String {
 /// enabled, and `Config.UnmarshalYAML` validates the model catalog sources.
 pub(super) fn decoded(doc: &Value) -> Result<()> {
     catalog_sources(doc.get("models"))?;
+    super::model_catalog::check(doc)?;
     let section = ["oauth", "providers", "codex", "live-media-relay"]
         .iter()
         .try_fold(doc, |node, part| node.get(*part));

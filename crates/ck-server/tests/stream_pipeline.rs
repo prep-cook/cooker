@@ -32,6 +32,7 @@ use futures_util::{FutureExt, StreamExt, stream};
 use serde_json::Value;
 use stream_fixture::*;
 use tokio::sync::oneshot;
+use tracing::instrument::WithSubscriber;
 
 /// Long enough for a published record to reach a waiting delivery.
 const SETTLE: Duration = Duration::from_millis(200);
@@ -318,6 +319,20 @@ enum Script {
     Panics,
 }
 
+/// Log lines of one exchange.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A usage-only Chat chunk: 7 input tokens.
 const USAGE: &str = "data: {\"id\":\"r\",\"model\":\"m\",\"created\":1,\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n";
 
@@ -584,6 +599,8 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         Commits { clean: bool },
         /// No candidate committed: the call's status.
         Status(u16),
+        /// Every candidate refused: a 400 whose message the client reads.
+        Rejects(&'static str),
         /// The client goes away while the egress waits for the first byte; the upstream
         /// then completes.
         Gone,
@@ -652,7 +669,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             case: "every candidate refuses",
             scripts: [Script::Refence(unsupported), Script::Refence(unsupported)],
             request: None,
-            ends: Ends::Status(400),
+            ends: Ends::Rejects("does not support the request"),
             started: &[],
             settled: &[],
             failed: &[],
@@ -668,6 +685,33 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             started: &["b"],
             settled: &[0],
             failed: &[false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "a missing max_tokens skips only that candidate",
+            scripts: [Script::Refence(|| codec::Error::MaxTokensRequired), Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["b"],
+            settled: &[0],
+            failed: &[false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+        },
+        Row {
+            case: "every candidate lacking max_tokens answers the client with that",
+            scripts: [
+                Script::Refence(|| codec::Error::MaxTokensRequired),
+                Script::Refence(|| codec::Error::MaxTokensRequired),
+            ],
+            request: None,
+            ends: Ends::Rejects("max_tokens is required"),
+            started: &[],
+            settled: &[],
+            failed: &[],
             input_tokens: None,
             old: 0,
             cooled: &[],
@@ -863,7 +907,16 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         };
         let sent = sends.load(Ordering::SeqCst);
         let trace = Trace::with_request_id(Some("trace".into()));
-        let mut run = Box::pin(dispatch::run_exchange(&fixture.rt, &fake, call(), &trace, codec));
+        let log = Capture::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let mut run =
+            Box::pin(dispatch::run_exchange(&fixture.rt, &fake, call(), &trace, codec).with_subscriber(subscriber));
         if let Ends::Gone = row.ends {
             let started = async {
                 while fake.begun.lock().unwrap().is_empty() {
@@ -896,6 +949,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
                     }
                 }
                 (Err(error), Ends::Status(status)) => assert_eq!(error.failure.status(), status, "{case}"),
+                (Err(error), Ends::Rejects(message)) => {
+                    assert_eq!(error.failure.status(), 400, "{case}");
+                    let text = error.failure.text();
+                    assert!(text.contains(message), "{case}: {text}");
+                }
                 (Ok(Served::Old(_)), _) => panic!("{case}: the old arm answered"),
                 (Ok(Served::Committed(_)), ends) => panic!("{case}: committed, expected {ends:?}"),
                 (Err(error), ends) => panic!("{case}: status {}, expected {ends:?}", error.failure.status()),
@@ -913,6 +971,20 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
                 "{case}: the record carries the attempt's last usage snapshot"
             );
         }
+        // Only a refusal for a missing limit names the missing setting, once per refusing candidate.
+        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let lacking = row
+            .scripts
+            .iter()
+            .filter(
+                |script| matches!(script, Script::Refence(error) if matches!(error(), codec::Error::MaxTokensRequired)),
+            )
+            .count();
+        assert_eq!(log.matches("missing_setting=").count(), lacking, "{case}: {log}");
+        assert!(
+            lacking == 0 || log.contains("missing_setting=\"model-catalog default-max-tokens\""),
+            "{case}: {log}"
+        );
         // An exchange that ends without commitment discards its request stream; a committed
         // one keeps it for resume.
         let kept = fixture
@@ -922,7 +994,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             .unwrap();
         match row.ends {
             Ends::Commits { .. } => assert!(kept.is_ok(), "{case}: the committed request stays"),
-            Ends::Status(_) | Ends::Gone => {
+            Ends::Status(_) | Ends::Rejects(_) | Ends::Gone => {
                 assert!(
                     matches!(kept, Err(ck_stream::Error::Gone)),
                     "{case}: the request stream is discarded"

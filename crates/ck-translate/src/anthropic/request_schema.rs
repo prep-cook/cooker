@@ -68,7 +68,7 @@ fn parameters(doc: &Document, root: usize, operation: Operation, default_max_tok
         // Encoding writes `max_completion_tokens` as `max_tokens` unless `max_tokens` is present.
         let max_tokens = match doc.member(root, "max_tokens")? {
             Some(max_tokens) => doc.unsigned(max_tokens)?,
-            None => completion.or(default_max_tokens).ok_or(Error::Schema)?,
+            None => completion.or(default_max_tokens).ok_or(Error::MaxTokensRequired)?,
         };
         if max_tokens == 0 {
             return Err(Error::Schema);
