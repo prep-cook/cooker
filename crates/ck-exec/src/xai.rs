@@ -57,7 +57,7 @@ pub struct XaiExecutor {
     rewrite: Option<UrlRewrite>,
     /// The upstream Responses WebSocket sessions (xai_ws.rs).
     pub(crate) ws: Arc<crate::xai_ws::Ws>,
-    /// Video jobs this process created or charged (xai_media.rs).
+    /// Media and deferred jobs this process created or charged (xai_media.rs).
     pub(crate) jobs: crate::xai_media::VideoJobs,
 }
 
@@ -95,7 +95,7 @@ pub(crate) fn parse_bool(raw: &str) -> Option<bool> {
 
 /// `xaiUsingAPI`: the official API path for chat and media. OAuth defaults to the Grok
 /// CLI chat proxy.
-fn using_api(c: &Credential) -> bool {
+pub(crate) fn using_api(c: &Credential) -> bool {
     if let Some(value) = parse_bool(attribute(c, "using_api")) {
         return value;
     }

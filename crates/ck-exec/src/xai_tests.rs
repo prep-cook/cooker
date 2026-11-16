@@ -1260,3 +1260,130 @@ fn json_reply(upstream: &serde_json::Value) -> bool {
             && h[1].as_str().is_some_and(|v| v.starts_with("application/json"))
     })
 }
+
+/// A deferred xAI Chat job (X11): its create returns xAI's request id, only the creator's
+/// polls are admitted and only as a Chat job, pending is an empty 202, a completion is the
+/// Chat response charged once however often it is polled, a failed job is an error, and an
+/// expired job is not found. Nothing is retried after a send.
+#[tokio::test]
+async fn deferred_chat_jobs_bind_to_their_caller_kind_and_charge_once() {
+    let cfg = Config::default();
+    let scenario = serde_json::json!({
+        "config_auth": -1, "metadata": {},
+        "attributes": {"api_key":"fake-upstream", "using_api":"true"},
+        "op":"execute", "source":"openai", "model":"grok-4(low)", "caller_key":"owner",
+        "payload":r#"{"model":"grok-4(low)","messages":[{"role":"user","content":"hi"}],"deferred":true}"#
+    });
+    let target: Arc<Mutex<String>> = Arc::default();
+    let sent = target.clone();
+    let mut executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &sent.lock().unwrap()));
+    let clock: Arc<Mutex<Duration>> = Arc::default();
+    let time = clock.clone();
+    let base = std::time::Instant::now();
+    executor.jobs = crate::xai_media::VideoJobs::with_clock(
+        Arc::new(move || base + *time.lock().unwrap()),
+        crate::xai_media::JOB_CAPACITY,
+    );
+    let complete = r#"{"id":"done","object":"chat.completion","created":1,"model":"grok-4","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#;
+    let mut job = String::new();
+    // (case, upstream status/body, expected status, upstream requests)
+    let rows = [
+        ("create", (200, r#"{"request_id":"job/1"}"#), Ok(200), true),
+        ("pending", (202, ""), Ok(202), true),
+        ("completed", (200, complete), Ok(200), true),
+        ("repeated", (200, complete), Ok(200), true),
+        ("failed poll", (500, r#"{"error":{"message":"boom"}}"#), Err(500), true),
+        (
+            "failed job",
+            (200, r#"{"error":{"message":"job failed"}}"#),
+            Err(502),
+            true,
+        ),
+        ("other caller", (200, ""), Err(404), false),
+        ("video id", (200, ""), Err(404), false),
+        ("missing id", (200, r#"{"choices":[]}"#), Err(502), true),
+        ("expired", (200, ""), Err(404), false),
+        ("oauth", (200, ""), Err(400), false),
+        ("stream", (200, ""), Err(400), false),
+    ];
+    for (case, (status, reply), expected, sends) in rows {
+        let mock = Mock::start(&serde_json::json!({"status": status, "body": reply})).await;
+        *target.lock().unwrap() = mock.addr.clone();
+        let (recorder, _capture, sink) = crate::openai_compat_usage::sinks();
+        let mut req = request(&scenario, sink);
+        let mut c = credential(&scenario, &cfg);
+        let poll = !matches!(case, "create" | "missing id" | "oauth" | "stream");
+        if poll {
+            req.alt = Some(crate::DEFERRED_CHAT_POLL.into());
+            req.body = Bytes::from(serde_json::json!({"request_id": &job}).to_string());
+        }
+        match case {
+            "pending" => *clock.lock().unwrap() = Duration::from_secs(10),
+            "completed" => *clock.lock().unwrap() = Duration::from_secs(20),
+            "repeated" => *clock.lock().unwrap() = Duration::from_secs(30),
+            "failed poll" | "failed job" => *clock.lock().unwrap() = Duration::from_secs(40),
+            "other caller" => req.caller.principal = "other".into(),
+            "video id" => {
+                drop(executor.jobs.created(&req.caller, "video"));
+                req.body = Bytes::from_static(br#"{"request_id":"video"}"#);
+            }
+            "expired" => *clock.lock().unwrap() = Duration::from_secs(40 + 3 * 3600 + 1),
+            "oauth" => {
+                c.attributes.insert("using_api".into(), "false".into());
+            }
+            "stream" => req.body = Bytes::from_static(br#"{"model":"grok-4","stream":true,"deferred":true}"#),
+            _ => {}
+        }
+        let result = executor.deferred_chat(&c, req, &cfg).await;
+        match result {
+            Ok(response) => {
+                assert_eq!(response.status, expected.unwrap(), "{case}");
+                let ResponseBody::Buffered(bytes) = response.body else {
+                    panic!("{case}: deferred Chat is buffered")
+                };
+                if case == "create" {
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    job = value["request_id"].as_str().expect("the job id").to_owned();
+                    assert_eq!(job, "job/1", "{case}");
+                } else if case == "pending" {
+                    assert!(bytes.is_empty(), "{case}: an empty 202, not keepalive bytes");
+                } else if matches!(case, "completed" | "repeated") {
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(value["choices"][0]["message"]["content"], "ok", "{case}");
+                }
+            }
+            Err(error) => assert_eq!(
+                (error.status, error.scope),
+                (expected.unwrap_err(), FailureScope::Request),
+                "{case}: {error}"
+            ),
+        }
+        let raw = mock.request();
+        assert_eq!(raw.is_some(), sends, "{case}: one request or none");
+        if let Some(raw) = raw {
+            let path = if matches!(case, "create" | "missing id") {
+                "POST /v1/chat/completions "
+            } else {
+                "GET /v1/chat/deferred-completion/job%2F1 "
+            };
+            assert!(raw.starts_with(path), "{case}: {raw}");
+            if matches!(case, "create" | "missing id") {
+                let sent: Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(sent["deferred"], true, "{case}");
+                assert_eq!(sent["model"], "grok-4", "{case}");
+            }
+        }
+        let reports = recorder.0.lock().unwrap();
+        let charges = reports
+            .iter()
+            .filter(|report| {
+                matches!(report, crate::openai_compat_usage::Report::Body(_, data) if gj::get(data, "usage").exists())
+            })
+            .count();
+        assert_eq!(
+            charges,
+            usize::from(case == "completed"),
+            "{case}: the completion is charged once"
+        );
+    }
+}

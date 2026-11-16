@@ -121,6 +121,7 @@ mod wire;
 pub mod wsrelay;
 pub mod xai;
 pub mod xai_auth;
+mod xai_deferred;
 mod xai_events;
 pub mod xai_exec;
 mod xai_media;
@@ -140,6 +141,9 @@ use ck_core::exec::{ExecError, ExecRequest, ExecResponse, ExecSession, FailureSc
 
 pub use xai_media::{JobBinding, JobKind};
 pub use xai_ws::websockets_enabled;
+
+/// The `alt` marker the deferred Chat route puts on a poll (X11).
+pub const DEFERRED_CHAT_POLL: &str = "chat/deferred-completion";
 
 /// What a credential needs before or around use. See the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,6 +369,12 @@ impl Executors {
         self.openai.xai.jobs.binding(caller, JobKind::Image, job)
     }
 
+    /// Where `caller`'s deferred Chat job `job` is polled, as [`Executors::video_binding`]
+    /// finds a video job's.
+    pub fn chat_binding(&self, caller: &ck_core::exec::Caller, job: &str) -> Option<JobBinding> {
+        self.openai.xai.jobs.binding(caller, JobKind::Chat, job)
+    }
+
     /// The OpenAI speech routes (`/v1/audio/speech`, `/v1/tts`): Go's `openai-speech`
     /// source, which only the xAI executor serves.
     pub async fn speech(
@@ -375,6 +385,19 @@ impl Executors {
     ) -> Result<ExecResponse, ExecError> {
         match credential.provider.as_str() {
             xai::PROVIDER => self.openai.xai.speech(credential, req, cfg).await,
+            other => Err(no_executor(other)),
+        }
+    }
+
+    /// A deferred xAI Chat create or poll (X11); only xAI serves it.
+    pub async fn deferred_chat(
+        &self,
+        credential: &Credential,
+        req: ExecRequest,
+        cfg: &Config,
+    ) -> Result<ExecResponse, ExecError> {
+        match credential.provider.as_str() {
+            xai::PROVIDER => self.openai.xai.deferred_chat(credential, req, cfg).await,
             other => Err(no_executor(other)),
         }
     }

@@ -428,3 +428,202 @@ async fn deferred_image_jobs_belong_to_their_caller_and_charge_once() {
     );
     assert_eq!(upstream.requests(), 5, "image generation off sends nothing");
 }
+
+/// A deferred xAI Chat job (X11): the create returns xAI's request id and no completion;
+/// only the creator's polls are admitted, they go to the credential that created it, a
+/// running job is an empty 202 (no keep-alive newline), a finished job is the Chat
+/// completion charged once however often it is polled, and a failed job is an error.
+#[tokio::test]
+async fn deferred_chat_jobs_belong_to_their_caller_and_charge_once() {
+    let completion = r#"{"id":"done","object":"chat.completion","created":1,"model":"grok-4.3","choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#;
+    let done: serde_json::Value = serde_json::from_str(completion).unwrap();
+    let upstream = StreamUpstream::start([
+        Reply::reset(),
+        Reply::json(r#"{"request_id":"job_1"}"#),
+        Reply::status(202, "application/json", "").first_byte_after(Duration::from_millis(1100)),
+        Reply::json(completion),
+        Reply::json(completion),
+        Reply::status(500, "application/json", r#"{"error":{"message":"upstream failed"}}"#),
+        Reply::json(r#"{"error":{"message":"job failed"}}"#),
+    ])
+    .await;
+    let proxy = proxy_with(&upstream, 1, "requests:\n  nonstream-keepalive-interval: 1\n").await;
+    let usage = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
+    proxy.rt.usage_queue().configure(true, &usage);
+    let create = r#"{"model":"grok-4.3","deferred":true,"messages":[{"role":"user","content":"hello"}]}"#;
+    // (case, client key, method, path, body, status, expected body, upstream requests after)
+    let steps = [
+        (
+            "a create whose connection resets",
+            "client-a",
+            "POST",
+            "/v1/chat/completions",
+            Some(create),
+            502,
+            None,
+            1,
+        ),
+        (
+            "a create",
+            "client-a",
+            "POST",
+            "/v1/chat/completions",
+            Some(create),
+            200,
+            Some(serde_json::json!({"request_id":"job_1"})),
+            2,
+        ),
+        (
+            "another caller's poll",
+            "client-b",
+            "GET",
+            "/v1/chat/deferred-completion/job_1",
+            None,
+            404,
+            None,
+            2,
+        ),
+        (
+            "an unknown job",
+            "client-a",
+            "GET",
+            "/v1/chat/deferred-completion/unknown",
+            None,
+            404,
+            None,
+            2,
+        ),
+        (
+            "a poll while pending",
+            "client-a",
+            "GET",
+            "/v1/chat/deferred-completion/job_1",
+            None,
+            202,
+            None,
+            3,
+        ),
+        (
+            "the creator's poll when done",
+            "client-a",
+            "GET",
+            "/v1/chat/deferred-completion/job_1",
+            None,
+            200,
+            Some(done.clone()),
+            4,
+        ),
+        (
+            "a second done poll",
+            "client-a",
+            "GET",
+            "/v1/chat/deferred-completion/job_1",
+            None,
+            200,
+            Some(done.clone()),
+            5,
+        ),
+        (
+            "a failed poll",
+            "client-a",
+            "GET",
+            "/v1/chat/deferred-completion/job_1",
+            None,
+            500,
+            None,
+            6,
+        ),
+        (
+            "a failed job",
+            "client-a",
+            "GET",
+            "/v1/chat/deferred-completion/job_1",
+            None,
+            502,
+            None,
+            7,
+        ),
+        (
+            "a streamed create",
+            "client-a",
+            "POST",
+            "/v1/chat/completions",
+            Some(
+                r#"{"model":"grok-4.3","deferred":true,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+            ),
+            400,
+            None,
+            7,
+        ),
+        (
+            "a create while the table is full",
+            "client-a",
+            "POST",
+            "/v1/chat/completions",
+            Some(create),
+            503,
+            None,
+            7,
+        ),
+    ];
+    for (case, key, method, path, body, status, expected, sends) in steps {
+        let mut request = proxy.request(
+            if method == "POST" {
+                wreq::Method::POST
+            } else {
+                wreq::Method::GET
+            },
+            key,
+            path,
+        );
+        if let Some(body) = body {
+            request = request.header("content-type", "application/json").body(body);
+        }
+        let response = request.send().await.unwrap();
+        let got = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(got, status, "{case}: {text}");
+        if let Some(expected) = expected {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                expected,
+                "{case}: {text}"
+            );
+        }
+        if status == 202 {
+            assert!(text.is_empty(), "{case}: an empty 202, not a keep-alive prefix");
+        }
+        if status >= 500 {
+            assert!(!text.is_empty(), "{case}: the failure is rendered");
+        }
+        assert_eq!(upstream.requests(), sends, "{case}: one request or none");
+    }
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 7, "only the planned requests were sent");
+    assert_eq!(
+        (captured[1].method.as_str(), captured[1].path.as_str()),
+        ("POST", "/v1/chat/completions")
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&captured[1].body).unwrap();
+    assert_eq!(sent["deferred"], true, "the create is deferred");
+    assert_eq!(sent["model"], "grok-4.3");
+    for poll in &captured[2..] {
+        assert_eq!(poll.path, "/v1/chat/deferred-completion/job_1");
+        assert_eq!(
+            poll.header("authorization"),
+            captured[1].header("authorization"),
+            "a poll goes to the job's credential"
+        );
+    }
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        records.extend(proxy.rt.usage_queue().pop_oldest(100));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let records: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| serde_json::from_slice::<serde_json::Value>(r).unwrap())
+        .collect();
+    let charged = records.iter().filter(|r| r["tokens"]["total_tokens"] == 3).count();
+    assert_eq!(charged, 1, "the completion is charged once: {records:?}");
+}
