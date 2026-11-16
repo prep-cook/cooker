@@ -6,12 +6,15 @@
 //! the Codex event layer with Meta's failure and completion rules. Credential enrichment,
 //! inline mint, headers and transport remain shared with the old path.
 //!
-//! A request carrying Codex's freeform `apply_patch` tool keeps the old route: only the old
-//! path's apply_patch bridge sends it as the JSON function Meta takes and turns the calls back.
+//! Codex's freeform `apply_patch` tool goes upstream as the JSON function Meta takes, and the
+//! apply_patch bridge in the event layer turns the calls back into the custom tool. Only a
+//! Responses client's request takes this path; any other client's keeps the old route, whose
+//! request translation prefers a Chat client's ordinary `apply_patch` function.
 
 use bytes::Bytes;
 use ck_core::exec::{ExecError, FailureScope, UsageSink};
 use ck_core::format::Format;
+use ck_translate::apply_patch_responses as apply_patch;
 use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::{self, BodyMode, Capability, Operation, RequestEgress, RequestFence, RequestView};
 use ck_translate::responses::request::Egress;
@@ -49,7 +52,7 @@ impl Capability for MetaCapability {
             Operation::Media(_) | Operation::AlphaSearch => return Err(codec::Error::Unsupported),
         };
         ck_translate::responses::request::validate_meta(generate)?;
-        if custom_apply_patch(view.document)? {
+        if custom_apply_patch(view.document)? && source(view.document)? != Format::OpenAIResponse {
             return Err(codec::Error::Destination);
         }
         Ok(())
@@ -75,7 +78,7 @@ impl Execute for MetaExecutor {
         // Go tracks only the round trip of a streaming client's response.
         let packet_only = streaming(doc).map_err(encoding)?;
         let upload = encode(&request.validated(), streams.request, true)?;
-        let body = shape(attempt, request, upload)?;
+        let (body, bridge) = shape(attempt, request, upload)?;
         let usage = request.client.usage;
         usage.request(Format::Codex, &body);
         let (base, token) = meta::creds(&enriched);
@@ -132,7 +135,7 @@ impl Execute for MetaExecutor {
             error.headers = Box::new(upstream.headers);
             return Err(error);
         }
-        let rules = Events::new(scratch, false, Backend::Meta, None);
+        let rules = Events::new(scratch, false, Backend::Meta, None).bridged(bridge);
         Ok(Upstream {
             status: upstream.status,
             headers: upstream.headers,
@@ -154,7 +157,7 @@ impl Execute for MetaExecutor {
         };
         let generate = RequestFence::default().end(view, &MetaCapability).map_err(encoding)?;
         let upload = encode(&generate, streams.request, false)?;
-        let body = shape(attempt, request, upload)?;
+        let (body, _) = shape(attempt, request, upload)?;
         let count =
             crate::codex_tokens::count_input_tokens(crate::tokenizer::Encoding::O200kBase, &body).map_err(|e| {
                 ExecError::local(
@@ -194,8 +197,12 @@ fn encode(
 
 /// `prepareResponsesRequest` on the encoded upload, whose `stream` the egress already wrote:
 /// true for generation, false for the body a count measures. The upload is the one body, edited
-/// in place.
-fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
+/// in place. The apply_patch bridge for the response comes with it.
+fn shape(
+    attempt: &Attempt<'_>,
+    request: &Request<'_>,
+    upload: Vec<u8>,
+) -> Result<(Vec<u8>, apply_patch::State), ExecError> {
     let document = request.validated().view().document;
     let source = source(document).map_err(encoding)?;
     let mut body = crate::codex_upload::normalize(upload);
@@ -213,6 +220,11 @@ fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Resul
     for key in ["generate", "stream_options", "client_metadata"] {
         gj::delete(&mut body, key);
     }
+    // The upload's tools decide the bridge; a Responses client declares no Chat function to
+    // prefer over the custom tool.
+    let bridge = apply_patch::State::new(Format::OpenAIResponse, &[], &body);
+    let mut body = apply_patch::normalize_executor_request(&body, None)
+        .map_err(|e| ExecError::local(500, FailureScope::Request, e))?;
     let client = &request.client;
     ck_wire::codex_client::normalize_codex_instructions(&mut body);
     body = crate::openai_compat_payload::sanitize_reasoning_encrypted_content(body);
@@ -223,7 +235,7 @@ fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Resul
         "" => attempt.model.trim(),
         requested => requested,
     };
-    Ok(ck_wire::payload::apply(
+    let body = ck_wire::payload::apply(
         &rules,
         &ck_wire::payload::Request {
             target_executor: "",
@@ -237,7 +249,8 @@ fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Resul
             headers: Some(client.headers),
         },
         body,
-    ))
+    );
+    Ok((body, bridge))
 }
 
 /// The model suffix's thinking on the upload, which is also the request it reads: the upload

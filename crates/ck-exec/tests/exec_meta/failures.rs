@@ -295,3 +295,51 @@ async fn request_side_facts_reach_the_usage_sink_and_response_usage_does_not() {
         assert!(!calls.iter().any(|c| c.starts_with("response_")), "{calls:?}");
     }
 }
+
+/// A Responses client's `apply_patch` call the bridge cannot turn back fails with the bridge's
+/// 502 after what was published, whether the arguments are refused or the body is cut or ends
+/// inside the call; a classified failure event keeps its own error.
+#[tokio::test]
+async fn an_apply_patch_call_the_bridge_refuses_fails_the_response() {
+    let request = br#"{"model":"client-model","stream":true,"input":"patch it","tools":[{"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: x"}}]}"#;
+    let valid = patch_events(r#"{"input":"*** Begin Patch\n*** End Patch"}"#);
+    let failure = r#"{"type":"error","error":{"code":429,"message":"slow down"}}"#;
+    // (case, upstream body, cut after byte, status)
+    for (case, body, cut, status) in [
+        ("refused arguments", patch_events(r#"{"input":1}"#).concat(), None, 502),
+        ("ends inside the call", valid[..valid.len() - 3].concat(), None, 502),
+        (
+            "cut inside the call",
+            valid.concat(),
+            Some(valid[..valid.len() - 3].concat().len() + 20),
+            502,
+        ),
+        (
+            "failure event",
+            valid[..valid.len() - 3].concat() + &event("error", failure),
+            None,
+            429,
+        ),
+    ] {
+        let reply = match cut {
+            Some(at) => Reply::sse(body).cut_after(at),
+            None => Reply::sse(body),
+        };
+        let upstream = StreamUpstream::start([reply]).await;
+        let (streams, exchange) = (Streams::new(), exchange(&upstream));
+        let (started, id, _request) = run(&streams, &exchange, "responses", Operation::Generate, request, 64).await;
+        let (outcome, published, _stream) = finish(&streams, started.unwrap(), id).await;
+        let error = outcome.expect_err(case);
+        assert_eq!(error.status, status, "{case}: {error:?}");
+        if status == 502 {
+            assert_eq!(
+                &error.body[..],
+                ck_translate::APPLY_PATCH_UPSTREAM_ERROR.as_bytes(),
+                "{case}"
+            );
+        }
+        assert_eq!(published.terminal, Some(Terminal::UpstreamError), "{case}");
+        let records = records(&published);
+        assert_eq!(errors(&records), 1, "{case}: {records:?}");
+    }
+}

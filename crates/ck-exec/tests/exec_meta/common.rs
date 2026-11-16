@@ -65,6 +65,51 @@ pub fn sse() -> String {
         )
 }
 
+/// A Meta stream saying "hello", then calling the `apply_patch` function the bridge declared
+/// with `arguments`: its events in order, the last one the completion, which lists no output.
+pub fn patch_events(arguments: &str) -> Vec<String> {
+    let arguments = serde_json::to_string(arguments).unwrap();
+    let item = |status: &str, arguments: &str| {
+        format!(
+            r#"{{"id":"fc_1","type":"function_call","status":"{status}","call_id":"call_p","name":"apply_patch","arguments":{arguments}}}"#
+        )
+    };
+    let mut events: Vec<String> = message_events().split_inclusive("\n\n").map(str::to_owned).collect();
+    events.extend([
+        event(
+            "response.output_item.added",
+            &format!(
+                r#"{{"type":"response.output_item.added","output_index":1,"item":{}}}"#,
+                item("in_progress", r#""""#)
+            ),
+        ),
+        event(
+            "response.function_call_arguments.delta",
+            &format!(
+                r#"{{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":{arguments}}}"#
+            ),
+        ),
+        event(
+            "response.function_call_arguments.done",
+            &format!(
+                r#"{{"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":1,"arguments":{arguments}}}"#
+            ),
+        ),
+        event(
+            "response.output_item.done",
+            &format!(
+                r#"{{"type":"response.output_item.done","output_index":1,"item":{}}}"#,
+                item("completed", &arguments)
+            ),
+        ),
+        event(
+            "response.completed",
+            r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"muse-spark","output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#,
+        ),
+    ]);
+    events
+}
+
 pub fn exchange(upstream: &StreamUpstream) -> Exchange {
     Exchange::new(credential("meta", &upstream.url(), "sk-up"), MODEL, "/v1/responses")
 }

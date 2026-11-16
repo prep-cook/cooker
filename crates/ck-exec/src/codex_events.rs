@@ -19,6 +19,12 @@
 //! Meta Muse speaks the same wire with its own rules ([`Backend::Meta`]): a failure event is
 //! classified as Meta's executor does, only `response.completed` and `response.incomplete`
 //! complete the response, and there is no empty-incomplete rule, rename or replay.
+//!
+//! When the request's custom `apply_patch` went upstream as a JSON function
+//! ([`Events::bridged`]), every data payload, after the failure check and the completion's
+//! items, goes through the apply_patch bridge, which turns the calls back into the client's
+//! custom tool. A refusal, or a body that fails or ends with a patch call still open, ends the
+//! response with the bridge's 502; a classified failure event keeps its own error.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -26,6 +32,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ck_core::exec::{ExecError, FailureScope};
 use ck_stream::{ScratchLease, Writer};
+use ck_translate::apply_patch_responses as apply_patch;
 use futures_util::StreamExt;
 use gjson::Kind;
 
@@ -49,6 +56,9 @@ pub(crate) struct Events {
     /// Processed output not yet passed on.
     out: VecDeque<Piece>,
     phase: Phase,
+    /// The apply_patch bridge of a request whose custom `apply_patch` went upstream as a
+    /// function.
+    bridge: Option<apply_patch::State>,
 }
 
 /// Whose rules the upstream events follow.
@@ -137,6 +147,49 @@ impl Events {
             replay,
             out: VecDeque::new(),
             phase: Phase::Reading,
+            bridge: None,
+        }
+    }
+
+    /// These events through `bridge` when a custom `apply_patch` won the request's tools.
+    pub(crate) fn bridged(mut self, bridge: apply_patch::State) -> Self {
+        self.bridge = bridge.active().then_some(bridge);
+        self
+    }
+
+    /// The error ending the body: the bridge's 502 when it cuts off a patch call, else `error`.
+    /// The bridge's failure event goes out first.
+    fn cut(&mut self, error: ExecError) -> ExecError {
+        let Some(bridge) = self.bridge.as_mut() else {
+            return error;
+        };
+        let (frames, refused) = bridge.finish_stream();
+        for frame in frames {
+            self.text(&frame);
+        }
+        if refused.is_some() { bridge_error() } else { error }
+    }
+
+    /// One processed data payload, through the bridge when there is one. Other lines pass as
+    /// read: the ingress classifies an event by its payload's `type`.
+    fn data_out(&mut self, payload: &[u8]) -> Result<(), ExecError> {
+        let Some(bridge) = self.bridge.as_mut() else {
+            self.text(b"data: ");
+            self.text(payload);
+            self.text(b"\n");
+            return Ok(());
+        };
+        let (lines, refused) = bridge.stream(&[b"data: ", payload].concat());
+        for line in lines {
+            self.text(&line);
+            // Converted payloads come as whole frames, the others as the line given.
+            if !line.ends_with(b"\n") {
+                self.text(b"\n");
+            }
+        }
+        match refused {
+            Some(_) => Err(bridge_error()),
+            None => Ok(()),
         }
     }
 
@@ -233,6 +286,8 @@ impl Events {
         };
         let kind = gjson::get(payload, "type");
         if let Some(error) = failure {
+            // The classified failure is the error, whatever patch call it cuts off.
+            self.bridge = None;
             // Only JSON the ingress can parse, so its decoding never replaces this error.
             if kind.str() == "response.failed" && gjson::valid(payload) {
                 self.text(b"data: ");
@@ -249,10 +304,7 @@ impl Events {
             }
             _ => {}
         }
-        self.text(b"data: ");
-        self.text(payload.as_bytes());
-        self.text(b"\n");
-        Ok(())
+        self.data_out(payload.as_bytes())
     }
 
     /// Classify Codex failure events without changing incomplete terminals.
@@ -293,24 +345,22 @@ impl Events {
     fn completion(&mut self, payload: String, incomplete: bool) -> Result<(), ExecError> {
         let output = gjson::get(&payload, "response.output");
         let listed = output.kind() == Kind::Array && !output.array().is_empty();
-        if listed || self.items.len() == 0 {
-            let payload = if listed { self.hydrate(payload) } else { payload };
+        if listed || self.items.len() == 0 || self.bridge.is_some() {
+            let payload = if listed {
+                self.hydrate(payload)
+            } else if self.items.len() > 0 {
+                self.inlined(payload)?
+            } else {
+                payload
+            };
             self.items = Items::default();
             let turn = (!incomplete)
                 .then(|| listed_turn(self.replay.as_ref(), &payload))
                 .flatten();
             self.phase = Phase::Ending(turn);
-            self.text(b"data: ");
-            self.text(payload.as_bytes());
-            self.text(b"\n");
-            return Ok(());
+            return self.data_out(payload.as_bytes());
         }
-        let payload = crate::codex_json::set_raw(&payload, "response.output", "[]");
-        let output = ck_wire::json::get(payload.as_bytes(), "response.output");
-        let open = output.index;
-        if payload.as_bytes().get(open..open + 2) != Some(b"[]".as_slice()) {
-            return Err(defect("completion output not found"));
-        }
+        let (payload, open) = emptied(&payload)?;
         let items = self.items.drain();
         let turn = match (&self.replay, incomplete) {
             (Some((_, scope)), false) => {
@@ -339,6 +389,23 @@ impl Events {
         self.text(&payload.as_bytes()[open + 1..]);
         self.text(b"\n");
         Ok(())
+    }
+
+    /// The completion with the announced items as its output, on the heap: the apply_patch
+    /// bridge converts whole payloads.
+    // ponytail: a bridged completion holds its items on the heap, as the old path did; a
+    // streaming bridge would keep them in their leases.
+    fn inlined(&mut self, payload: String) -> Result<String, ExecError> {
+        let (payload, open) = emptied(&payload)?;
+        let mut inlined = payload.as_bytes()[..=open].to_vec();
+        for (i, item) in self.items.drain().iter().enumerate() {
+            if i > 0 {
+                inlined.push(b',');
+            }
+            inlined.extend(copy(&item.json)?);
+        }
+        inlined.extend_from_slice(&payload.as_bytes()[open + 1..]);
+        String::from_utf8(inlined).map_err(|_| defect("announced item not UTF-8"))
     }
 
     /// Fills missing ids of a listed output from the items announced at the same index.
@@ -393,6 +460,21 @@ impl Events {
             }
         }
     }
+}
+
+/// The completion with an empty output, and the offset of that output's `[`.
+fn emptied(payload: &str) -> Result<(String, usize), ExecError> {
+    let payload = crate::codex_json::set_raw(payload, "response.output", "[]");
+    let open = ck_wire::json::get(payload.as_bytes(), "response.output").index;
+    if payload.as_bytes().get(open..open + 2) != Some(b"[]".as_slice()) {
+        return Err(defect("completion output not found"));
+    }
+    Ok((payload, open))
+}
+
+/// Go's 502 for apply_patch input the bridge refuses.
+fn bridge_error() -> ExecError {
+    ExecError::local(502, FailureScope::Request, ck_translate::APPLY_PATCH_UPSTREAM_ERROR)
 }
 
 /// The replay turn of a completion that lists its output.
@@ -486,7 +568,7 @@ pub(crate) fn body(upstream: Body, events: Events) -> Body {
             };
             st.ended |= st.events.completed();
             if let Err(error) = step {
-                st.failed = Some(error);
+                st.failed = Some(st.events.cut(error));
             }
         }
     })
