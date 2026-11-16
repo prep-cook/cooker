@@ -86,6 +86,10 @@ pub enum Error {
     Closed,
     Schema,
     Unsupported,
+    /// A generation request carries no output limit and the destination has no default to
+    /// send for it (Anthropic `max_tokens`). Refused like `Schema`, but the dispatch loop
+    /// names the missing setting and the client gets the destination's own wording.
+    MaxTokensRequired,
     Destination,
 }
 
@@ -108,6 +112,7 @@ impl std::fmt::Display for Error {
             Self::Closed => "codec is closed",
             Self::Schema => "invalid protocol schema",
             Self::Unsupported => "unsupported request semantics",
+            Self::MaxTokensRequired => "max_tokens is required",
             Self::Destination => "request validated for another destination",
         })
     }

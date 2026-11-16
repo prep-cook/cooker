@@ -15,6 +15,7 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
+use ck_core::config::Config;
 use ck_core::exec::{CaptureEvent, ExecError, FailureScope, ResolvedModel, ResponseBody, UsageSink};
 use ck_core::format::Format;
 use ck_stream::{ScratchLease, Writer};
@@ -44,7 +45,7 @@ impl Execute for ClaudeExecutor {
     type Ingress = ClaudeIngress;
 
     fn capability(&self, attempt: &Attempt<'_>) -> AnthropicCapability {
-        capability(attempt.model, attempt.resolved_model)
+        capability(attempt.cfg, attempt.model, attempt.resolved_model)
     }
 
     async fn execute(
@@ -77,28 +78,36 @@ impl Execute for ClaudeExecutor {
     }
 }
 
-/// The destination policy for `model`. `default_max_tokens` is Go's `ensureModelMaxTokens`:
-/// a model a Claude credential registered gets its completion limit, else 1024; any other
-/// model has none. The thinking budget follows the model's registry `thinking` data.
-pub(super) fn capability(model: &str, resolved: Option<&ResolvedModel>) -> AnthropicCapability {
+/// The `max_tokens` Messages gets for a request without one: the `model-catalog` override, else
+/// the `max_completion_tokens` of a model a Claude credential registered. `None` makes the fence
+/// refuse such a request, so the scheduler skips this candidate instead of sending a guessed
+/// value (owner ruling Q-H).
+fn default_max_tokens(cfg: &Config, model: &str) -> Option<u64> {
     let model = base_model(model);
-    let claude = |p: &String| p.eq_ignore_ascii_case("claude");
-    let default_max_tokens = ck_core::registry::model_providers(model.trim())
-        .iter()
-        .any(claude)
-        .then(|| {
-            ck_core::registry::registered_model(model.trim(), Some("claude"))
-                .and_then(|info| {
-                    info.raw
-                        .get("max_completion_tokens")
-                        .and_then(serde_json::Value::as_u64)
-                })
-                .filter(|n| *n > 0)
-                .unwrap_or(super::DEFAULT_MAX_TOKENS as u64)
-        });
+    let model = model.trim();
+    ck_core::config::model_catalog::default_max_tokens(cfg, model, || {
+        ck_core::registry::model_providers(model)
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("claude"))
+            .then(|| ck_core::registry::registered_model(model, Some("claude")))
+            .flatten()
+            .and_then(|info| {
+                info.raw
+                    .get("max_completion_tokens")
+                    .and_then(serde_json::Value::as_u64)
+            })
+    })
+}
+
+/// The destination policy for `model`. The thinking budget follows the model's registry
+/// `thinking` data.
+pub(super) fn capability(cfg: &Config, model: &str, resolved: Option<&ResolvedModel>) -> AnthropicCapability {
+    let default_max_tokens = default_max_tokens(cfg, model);
+    let model = base_model(model);
+    let model = model.trim();
     let thinking = match resolved {
         Some(resolved) => resolved.info.thinking.clone(),
-        None => ck_core::registry::lookup_model(&model, Some("claude")).and_then(|info| info.thinking),
+        None => ck_core::registry::lookup_model(model, Some("claude")).and_then(|info| info.thinking),
     };
     let budget = match thinking {
         Some(t) if t.min > 0 || t.max > 0 => Budget::Manual {
@@ -140,7 +149,8 @@ impl ClaudeExecutor {
                 (original, &translated)
             }
             None => {
-                let default_max_tokens = capability(attempt.model, attempt.resolved_model).default_max_tokens;
+                let default_max_tokens =
+                    capability(attempt.cfg, attempt.model, attempt.resolved_model).default_max_tokens;
                 encoded = encode(&request.validated, streams.request, stream, default_max_tokens)?;
                 (&encoded, &encoded)
             }
@@ -208,7 +218,7 @@ impl ClaudeExecutor {
                 ..request.validated.view()
             };
             // A count carries no `max_tokens`; the projection only needs one to pass the fence.
-            let mut capability = capability(attempt.model, attempt.resolved_model);
+            let mut capability = capability(attempt.cfg, attempt.model, attempt.resolved_model);
             capability.default_max_tokens = capability.default_max_tokens.or(Some(u64::MAX));
             let generate = RequestFence::default().end(view, &capability).map_err(encoding)?;
             let upload = encode(&generate, streams.request, false, capability.default_max_tokens)?;

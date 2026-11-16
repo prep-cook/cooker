@@ -1541,6 +1541,20 @@
         "cache-file": "string"
       }
     },
+    "model-catalog": {
+      "list": {
+        "fields": {
+          "match": "string",
+          "overrides": {
+            "fields": {
+              "default-max-tokens": {
+                "optional": "int"
+              }
+            }
+          }
+        }
+      }
+    },
     "model-routers": {
       "list": {
         "fields": {

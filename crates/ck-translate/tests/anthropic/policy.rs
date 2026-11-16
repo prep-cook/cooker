@@ -166,7 +166,7 @@ fn chat_max_tokens_reaches_anthropic_from_the_request_or_the_capability_default(
     );
     assert!(matches!(
         from_chat(&input(None), default(None)),
-        Err(codec::Error::Schema)
+        Err(codec::Error::MaxTokensRequired)
     ));
     assert!(matches!(
         from_chat(&input(None), default(Some(0))),

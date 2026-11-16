@@ -160,7 +160,7 @@ pub(super) async fn run<X: Arms>(
     let validated = match arm.arms.refence(&attempt, arm.view) {
         Ok(validated) => validated,
         Err(codec::Error::Destination) => return Ran::Old,
-        Err(error @ (codec::Error::Unsupported | codec::Error::Schema)) => {
+        Err(error @ (codec::Error::Unsupported | codec::Error::Schema | codec::Error::MaxTokensRequired)) => {
             return Ran::Skip(skip(&attempt, trace, destination, error));
         }
         Err(codec::Error::Storage(ck_stream::Error::Closed)) => {
@@ -366,10 +366,15 @@ fn uncommitted_error(
 /// A destination refusal: logged without content, neutral for the credential, which the
 /// selection already excluded for this request.
 fn skip(attempt: &Attempt<'_>, trace: &Trace, destination: &str, error: codec::Error) -> Fault {
+    // `MaxTokensRequired` is the destination's own refusal and the client reads it as is (Q-H).
     let reason = match error {
         codec::Error::Schema => "the destination's schema refused the request",
+        codec::Error::MaxTokensRequired => "max_tokens is required",
         _ => "the destination does not support the request",
     };
+    // Only a missing limit names the setting that would have supplied it.
+    let missing_setting =
+        matches!(error, codec::Error::MaxTokensRequired).then_some("model-catalog default-max-tokens");
     tracing::info!(
         target: "ck_dispatch",
         request_id = %trace.request_id(),
@@ -378,6 +383,7 @@ fn skip(attempt: &Attempt<'_>, trace: &Trace, destination: &str, error: codec::E
         upstream_model = %attempt.model,
         destination,
         reason,
+        missing_setting,
         "candidate skipped"
     );
     fault(ExecError::local(400, FailureScope::Request, reason))
