@@ -52,17 +52,20 @@ pub fn urls_in(text: &str) -> Cow<'_, str> {
 /// `text` (any bytes) redacted word by word, for errors, captures and logs (owner ruling
 /// Settled 60, 2026-11-16). A word is the bytes between whitespace and `"`; a byte after
 /// a `\` belongs to the word, so an escaped quote (`\"`) never ends one. A word prints
-/// as [`UNPRINTABLE`] whole when it holds `://`, an `@`, a `?` or a `#`, or a scheme (a
-/// letter, then letters, digits, `+`, `-` or `.`) and `:` with a byte after them
-/// (`https:key`, `example.com:443`), and when it is longer than 1 MiB. The value it
-/// belongs to may go on past it, so the text after it is dropped: inside a `"` string
-/// (an odd number of unescaped `"` before it on its line) up to the closing unescaped
-/// `"`, anywhere else up to the end of the line, whatever quotes or brackets follow. No
-/// URL structure is parsed, so an e-mail address, `user@host`, `mailto:…`, `name:port`
-/// and a word such as `what?` or `C#` print as the placeholder too, with the rest of
-/// their line.
+/// as [`UNPRINTABLE`] whole when it holds `://`, an `@`, a `?` or a `#`, a `//` at its
+/// start or after punctuation (`//user:key`), or a scheme (a letter, then letters,
+/// digits, `+`, `-` or `.`) and `:` with a byte after them (`https:key`,
+/// `example.com:443`), and when it is longer than 1 MiB. The value it belongs to may go
+/// on past it, so the text after it is dropped: inside a `"` string (an odd number of
+/// unescaped `"` before it on its line) up to the closing unescaped `"`, anywhere else
+/// up to the end of the line. A line that holds a `"`, `'`, backtick, `<` or `>` may leave
+/// a value open, so the following lines go too, up to one holding the same kind and no
+/// `:`, `@`, `?`, `#` or `/`; their line breaks print. Past 64 KiB of such lines the rest
+/// of the text goes. No URL structure is parsed, so an e-mail address, `user@host`,
+/// `mailto:…`, `name:port` and a word such as `what?` or `C#` print as the placeholder
+/// too, with the rest of their line.
 pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
-    if text.len() <= scan::HOLD && !text.iter().any(|b| matches!(b, b':' | b'@' | b'?' | b'#')) {
+    if text.len() <= scan::HOLD && !text.iter().any(|b| matches!(b, b':' | b'@' | b'?' | b'#' | b'/')) {
         return Cow::Borrowed(text);
     }
     let mut out = Vec::with_capacity(text.len());

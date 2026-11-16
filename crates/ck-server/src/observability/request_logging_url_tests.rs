@@ -182,13 +182,15 @@ async fn every_reference_shape_in_captured_errors_is_redacted() {
         let sink = log.capture_sink();
         sink.record(Request(upstream_request("http://127.0.0.1/v1", &[], b"")));
         for error in [
-            "Post 'http://127.0.0.1/?code=prefix sk-review-secret': EOF",
             "Post \" http://127.0.0.1/?code=prefix sk-review-secret\": EOF",
             "request failed: url=//user:sk-review-secret@127.0.0.1/?code=sk-review-secret",
             "request failed: /callback?code=sk-review-secret#sk-review-secret",
             "Post \"http://127.0.0.1/?code=prefix\r\nsk-review-secret\": EOF",
             "dial https://user:sk-review-secret://host: refused",
             "dial redis:sk-review-secret@host: refused",
+            // A redacted line left inside a `'` takes the following lines while none
+            // closes it, here the rest of the section.
+            "Post 'http://127.0.0.1/?code=prefix sk-review-secret': EOF",
         ] {
             sink.record(ResponseError(error));
         }
@@ -410,13 +412,19 @@ async fn relative_references_with_fragments_are_redacted() {
     .await;
     let content = String::from_utf8(content).unwrap();
     assert!(!content.contains(SECRET), "{content}");
-    for want in [
-        "Location: <redacted url>",
-        "Content-Location: <redacted url>",
+    for (want, count) in [
+        // Upstream sections list `Location` after `Link`, whose redacted line holds a
+        // `<` and a `"`: the following lines up to the next one holding either go too.
+        ("Location: <redacted url>", 2),
+        ("Content-Location: <redacted url>", 4),
         // The rest of the line goes with the redacted word.
-        "Link: <redacted url>",
+        ("Link: <redacted url>", 4),
     ] {
-        assert_eq!(content.lines().filter(|l| *l == want).count(), 4, "{want}: {content}");
+        assert_eq!(
+            content.lines().filter(|l| *l == want).count(),
+            count,
+            "{want}: {content}"
+        );
     }
     for (name, value) in HEADERS {
         assert_eq!(received[*name], *value, "{name}");

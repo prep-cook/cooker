@@ -222,7 +222,7 @@ fn words_that_may_hold_a_credential_print_as_the_placeholder() {
         ),
         (
             "Location: 'http://127.0.0.1/?code=\"sk-review-secret\"'\nnext",
-            "Location: <redacted url>\nnext",
+            "Location: <redacted url>\n",
         ),
         (
             r#"Link: <http://127.0.0.1/?code="sk-review-secret">; rel="next""#,
@@ -234,13 +234,37 @@ fn words_that_may_hold_a_credential_print_as_the_placeholder() {
         ),
         (
             "Post 'http://127.0.0.1/?code=prefix sk-review-secret': EOF\nnext",
-            "Post <redacted url>\nnext",
+            "Post <redacted url>\n",
         ),
         ("x <http://h.example/?code=a sk-review-secret> y", "x <redacted url>"),
         ("`//u:sk-review-secret@h/ b` c", "<redacted url>"),
+        // A redacted line that holds a quote, backtick or `<` takes the following lines up
+        // to one holding the same kind and no byte a trigger needs.
+        ("x\\\"http://h/?code=prefix sk-review-secret\" y\nz", "<redacted url>\n"),
         (
-            "x\\\"http://h/?code=prefix sk-review-secret\" y\nz",
-            "<redacted url>\nz",
+            "Error: Post 'http://127.0.0.1/?code=prefix\nsk-review-secret': EOF\nnext",
+            "Error: Post <redacted url>\n\n",
+        ),
+        (
+            "x <http://h/?a=b\nsk-review-secret\n> y\nnext",
+            "x <redacted url>\n\n\nnext",
+        ),
+        ("x `//h/\nsk-review-secret` y\nnext", "x <redacted url>\n\nnext"),
+        (
+            "can't reach http://h/?a\nsk-review-secret",
+            "can't reach <redacted url>\n",
+        ),
+        // A scheme-relative reference is a trigger before its `@`.
+        (
+            r#"{"url":"//sk-review-secret @127.0.0.1/"}"#,
+            r#"{"url":"<redacted url>"}"#,
+        ),
+        ("see //sk-review-secret @127.0.0.1/", "see <redacted url>"),
+        ("see x=//sk-review-secret/x", "see <redacted url>"),
+        // A closing quote that cannot end a JSON string did not end one.
+        (
+            r#"Location: "http://127.0.0.1/?code="sk-review-secret""#,
+            r#"Location: "<redacted url>""#,
         ),
         (
             "http://127.0.0.1/?k='http://127.0.0.1/'sk-review-secret end",
@@ -373,9 +397,9 @@ fn copied_text_is_redacted_wherever_reads_end() {
             Some("see <redacted url>\nx"),
         ),
         (
-            "see 'qqqqqqqqqqqqqqqqqqqqqqqq tail\nx",
+            "see 'qqqqqqqqqqqqqqqqqqqqqqqq tail\nx\n' y\nz",
             16,
-            Some("see <redacted url>\nx"),
+            Some("see <redacted url>\n\n\nz"),
         ),
     ] {
         let whole = urls_in(text).into_owned();
@@ -393,12 +417,25 @@ fn copied_text_is_redacted_wherever_reads_end() {
         "x".repeat(scan::HOLD + (64 << 10))
     );
     let plain = format!("a {} b\nc", "x".repeat(scan::HOLD + 1));
-    for (text, want) in [(&over, "<redacted url>"), (&plain, "a <redacted url>\nc")] {
-        assert_eq!(bytes(text.as_bytes()), want.as_bytes(), "bytes");
+    // A quote left open for more than 64 KiB of lines takes the rest of the text.
+    let open = format!("a 'http://h/?k\n{}'\nb", "x\n".repeat(40 << 10));
+    let closed = format!("a 'http://h/?k\n{}'\nb", "x\n".repeat(20 << 10));
+    // The dropped lines keep their line breaks; the comparison skips empty lines.
+    let lines = |out: &[u8]| {
+        let out = String::from_utf8_lossy(out);
+        out.split('\n').filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
+    };
+    for (text, want) in [
+        (&over, "<redacted url>"),
+        (&plain, "a <redacted url>\nc"),
+        (&open, "a <redacted url>"),
+        (&closed, "a <redacted url>\nb"),
+    ] {
+        assert_eq!(lines(&bytes(text.as_bytes())), want, "bytes");
         let mut out = Vec::new();
         write(text.as_bytes(), &mut out).unwrap();
-        assert_eq!(out, want.as_bytes(), "write");
-        assert_eq!(copied(&[text.as_bytes()], scan::HOLD), want, "copy");
+        assert_eq!(lines(&out), want, "write");
+        assert_eq!(lines(copied(&[text.as_bytes()], scan::HOLD).as_bytes()), want, "copy");
     }
 }
 
@@ -465,7 +502,12 @@ const SHAPES: &[&str] = &[
 ];
 
 /// Shapes holding a space, which only a quoted value keeps in one word.
-const SPACED: &[&str] = &["http://h.example/?code=prefix S", " //u:S@h.example/a b"];
+const SPACED: &[&str] = &[
+    "http://h.example/?code=prefix S",
+    " //u:S@h.example/a b",
+    "//S @h.example/",
+    "http://h.example/?code=prefix\nS",
+];
 
 /// Quotes first, then the other wrappings.
 const WRAPS: &[(&str, &str)] = &[
@@ -560,12 +602,13 @@ fn parts_fail_closed_where_a_credential_may_go_on() {
         ),
         (
             &["x <http://h.example/?code=a", " sk-review-secret> y\nz"],
-            "x <redacted url>||\nz",
+            "x <redacted url>||\n",
         ),
         // So does any word a part ends in, whatever its last byte.
         (&["total 12", "x y"], "total <redacted url>||"),
         (&["//sk-review-secret]", "@127.0.0.1/"], "<redacted url>||"),
         (&["//sk-review-secret\\", "@127.0.0.1/"], "<redacted url>||"),
+        (&["\"//sk-review-secret ", "@127.0.0.1/\""], "\"<redacted url>||\""),
         (&["total 12}", "x y\nz"], "total <redacted url>||\nz"),
         (&[r#"{"input":[]}"#, r#"{"type":"x"}"#], r#"{"input"<redacted url>||"#),
         // A part that ends between words ends nothing.
