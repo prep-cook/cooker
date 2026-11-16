@@ -137,13 +137,38 @@ mod xai_ws;
 
 use ck_core::config::Config;
 use ck_core::credential::{Credential, MetadataPatch};
-use ck_core::exec::{ExecError, ExecRequest, ExecResponse, ExecSession, FailureScope};
+use ck_core::exec::{ExecError, ExecRequest, ExecResponse, FailureScope};
 
 pub use xai_media::{JobBinding, JobKind};
 pub use xai_ws::websockets_enabled;
 
 /// The `alt` marker the deferred Chat route puts on a poll (X11).
 pub const DEFERRED_CHAT_POLL: &str = "chat/deferred-completion";
+
+/// The upstream-socket half of one Responses WebSocket turn ([`Executors::start_turn`]).
+pub enum TurnCancel {
+    Codex(codex::TurnControl),
+    Xai(xai_ws::Cancel),
+}
+
+impl TurnCancel {
+    /// The client went away with the turn in flight ([`session::CancelTurn`]).
+    pub async fn cancel(self) {
+        use session::CancelTurn;
+        match self {
+            Self::Codex(control) => control.cancel().await,
+            Self::Xai(cancel) => cancel.cancel().await,
+        }
+    }
+
+    /// The control a client's `response.interrupt` goes to; xAI's WebSocket mode has none.
+    pub fn control(&self) -> Option<codex::TurnControl> {
+        match self {
+            Self::Codex(control) => Some(control.clone()),
+            Self::Xai(_) => None,
+        }
+    }
+}
 
 /// What a credential needs before or around use. See the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +325,32 @@ impl Executors {
 }
 
 impl Executors {
+    /// [`Executors::start`] for one Responses WebSocket turn whose execution session is its
+    /// connection. A Codex or xAI credential with `websockets` runs it on its upstream socket
+    /// ([`session::Turns`]) and returns that transport's cancel; any other runs it as an
+    /// ordinary attempt, which its response stream's cancel stops.
+    pub async fn start_turn(
+        &self,
+        attempt: &types::Attempt<'_>,
+        request: &mut types::Request<'_>,
+        upload: &mut ck_stream::Writer,
+        response: ck_stream::Writer,
+    ) -> Result<(pipeline::Started, Option<TurnCancel>), ExecError> {
+        let credential = attempt.credential;
+        match credential.provider.as_str() {
+            "codex" if codex::CodexExecutor::upstream_websocket(credential) => {
+                let (started, cancel) = pipeline::start_turn(&self.codex, attempt, request, upload, response).await?;
+                Ok((started, Some(TurnCancel::Codex(cancel))))
+            }
+            xai::PROVIDER if xai_ws::websockets_enabled(credential) => {
+                let (started, cancel) =
+                    pipeline::start_turn(&self.openai.xai, attempt, request, upload, response).await?;
+                Ok((started, Some(TurnCancel::Xai(cancel))))
+            }
+            _ => Ok((self.start(attempt, request, upload, response).await?, None)),
+        }
+    }
+
     pub async fn execute(
         &self,
         credential: &Credential,
@@ -352,46 +403,6 @@ impl Executors {
             xai::PROVIDER => self.openai.xai.deferred_chat(credential, req, cfg).await,
             other => Err(no_executor(other)),
         }
-    }
-
-    /// One turn of a downstream Responses WebSocket session. Codex credentials with
-    /// `websockets` keep a pooled upstream socket per session; every other credential runs
-    /// an ordinary execution and cannot continue upstream state, so a continuation turn
-    /// fails with [`ExecError::replay_required`]. xAI's upstream socket runs only through
-    /// [`session::Turns`].
-    pub async fn execute_in_session(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        cfg: &Config,
-        session: &ExecSession,
-    ) -> Result<ExecResponse, ExecError> {
-        match credential.provider.as_str() {
-            "codex" => self.codex.execute_in_session(credential, req, cfg, session).await,
-            xai::PROVIDER => self.openai.xai.execute_in_session(credential, req, cfg, session).await,
-            _ if session.continuation => Err(ExecError::replay_required()),
-            _ => self.execute(credential, req, cfg).await,
-        }
-    }
-
-    /// Whether `credential` keeps upstream conversation state on a session socket, so
-    /// the next turn may be sent as an incremental continuation.
-    pub fn session_upstream(&self, credential: &Credential) -> bool {
-        match credential.provider.as_str() {
-            "codex" => codex::CodexExecutor::upstream_websocket(credential),
-            _ => false,
-        }
-    }
-
-    /// Starts another downstream session attempt without retaining its predecessor's loss.
-    pub fn clear_session_loss(&self, id: &str) {
-        self.codex.ws.clear_loss(id);
-    }
-
-    /// Resolves when an upstream socket held for session `id` is lost; pending forever
-    /// when no executor holds one.
-    pub fn session_closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        self.codex.session_closed(id)
     }
 
     /// Releases everything executors hold for session `id`.

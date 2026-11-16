@@ -45,8 +45,17 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     owed: bool,
     /// Sources without native Responses lifecycle events need a synthesized progress event.
     synthesize_progress: bool,
-    /// The model the client sees instead of the source's, a force-mapped alias.
+    /// What the client sees instead of the source's values.
+    shown: Shown,
+}
+
+/// Response fields the exchange decides instead of the source.
+#[derive(Default)]
+struct Shown {
+    /// A force-mapped alias.
     model: Option<String>,
+    /// The turn is stored for continuation: `store` is `true`.
+    stored: bool,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     /// The egress for one exchange, live or resumed alike. `id` is the exchange's response id,
@@ -94,7 +103,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             pending: None,
             owed: false,
             synthesize_progress: false,
-            model: None,
+            shown: Shown::default(),
         })
     }
     /// The account whose opaque items this response carries.
@@ -396,7 +405,7 @@ fn write_item(doc: &Document, item: usize, e: &mut Encoder<'_, '_>) -> Result<()
 }
 /// Writes the response object without members under the reserved `x_ck` prefix, which no
 /// client sees.
-fn write_response(doc: &Document, model: Option<&str>, e: &mut Encoder<'_, '_>) -> Result<()> {
+fn write_response(doc: &Document, shown: &Shown, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"{")?;
     let mut first = true;
     for field in doc.children(doc.root())? {
@@ -410,10 +419,12 @@ fn write_response(doc: &Document, model: Option<&str>, e: &mut Encoder<'_, '_>) 
         first = false;
         doc.write_name(name, e)?;
         e.bytes(b":")?;
-        if let Some(model) = model
+        if let Some(model) = &shown.model
             && doc.name_is(name, "model")?
         {
             e.string(model)?;
+        } else if shown.stored && doc.name_is(name, "store")? {
+            e.bytes(b"true")?;
         } else if doc.name_is(name, "output")? {
             e.bytes(b"[")?;
             for (j, item) in doc.children(field)?.enumerate() {
@@ -444,6 +455,9 @@ fn write_response(doc: &Document, model: Option<&str>, e: &mut Encoder<'_, '_>) 
                 e.bytes(default)?;
             }
         }
+    }
+    if shown.stored && doc.member(doc.root(), "store")?.is_none() {
+        e.bytes(b",\"store\":true")?;
     }
     e.bytes(b"}")
 }

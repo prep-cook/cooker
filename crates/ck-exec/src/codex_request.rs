@@ -25,7 +25,7 @@ mod tests;
 
 pub(crate) use body::{
     ensure_image_tool, ensure_web_search_for_history, explicit_instructions, normalize_parallel_tool_calls,
-    sanitize_reasoning, siwc_body, siwc_request_body,
+    sanitize_reasoning, siwc_body,
 };
 pub(crate) use headers::{custom_headers, http_headers, image_headers, ws_headers};
 pub(crate) use input_ids::sanitize_input_ids;
@@ -74,19 +74,10 @@ pub(crate) struct Settings {
     pub client: ck_wire::codex_client::Settings,
     /// The `models` of the `codex-api-key` entry the credential resolves to.
     pub key_models: Vec<serde_json::Value>,
-    /// `response-steering`: full-duplex WebSocket turns (codex_websockets_duplex.go).
-    pub response_steering: bool,
     /// `multimedia.gpt-image-2-base-model`, trimmed: the Images API's tool-call model.
     pub image_base_model: String,
     /// `codexSIWCUserAgent`, read from the whole config (Go uses `e.cfg`, never the API-key view).
     pub siwc_user_agent: String,
-}
-
-/// `upstream.codex.response-steering`; the older spellings are already moved there.
-pub(crate) fn response_steering(cfg: &Config) -> bool {
-    setting(cfg, &["upstream", "codex", "response-steering"])
-        .and_then(serde_yaml_ng::Value::as_bool)
-        .unwrap_or(false)
 }
 
 /// `oauth.providers.codex.chatgpt-keep-alive`, a cooker addition: off unless set to
@@ -176,7 +167,6 @@ impl Settings {
             payload: ck_wire::payload::Rules::from_config(cfg),
             client: ck_wire::codex_client::Settings::from_config(cfg),
             key_models: Vec::new(),
-            response_steering: response_steering(cfg),
             image_base_model: text(&["multimedia", "gpt-image-2-base-model"]),
             siwc_user_agent: crate::codex_siwc::user_agent(cfg),
         }
@@ -464,13 +454,8 @@ impl Finalizer {
     }
 }
 
-/// The payload rules on a `response.steer` frame: the frame is its own baseline, and
-/// its `type` stays `response.steer`.
-pub(crate) fn steer_rules(req: &ExecRequest, settings: &Settings, payload: String) -> String {
-    steer_rules_for(&Inbound::of(req), settings, payload)
-}
-
-/// [`steer_rules`] for the request `inbound` describes.
+/// The payload rules on a `response.steer` frame from the request `inbound` describes: the
+/// frame is its own baseline, and its `type` stays `response.steer`.
 pub(crate) fn steer_rules_for(inbound: &Inbound<'_>, settings: &Settings, payload: String) -> String {
     let original = settings.payload.baseline("", payload.as_bytes()).unwrap_or_default();
     let out = apply_payload(inbound, settings, Call::Websocket, payload, &original);
@@ -509,9 +494,6 @@ pub(crate) struct Shaped {
     /// The multi-agent v2 optimization renamed the `collaboration` namespace, so upstream
     /// payloads need `ck_wire::codex_client::restore_response`.
     pub optimized: bool,
-    /// `HasCodexMultiAgentV2NamespaceConflict` before the optimization: the client already
-    /// uses the optimized name, so nothing may be restored.
-    pub conflict: bool,
     /// The payload rules, which callers run last.
     pub finalize: Finalizer,
 }

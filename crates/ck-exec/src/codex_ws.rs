@@ -5,29 +5,28 @@
 //! single reader task per socket enforces the 5-minute idle deadline (pongs are answered
 //! while reading) and hands frames to the turn in progress through a bounded channel;
 //! frames that arrive between turns are dropped, as in Go. Turns on one session are
-//! serialised. The socket stays pooled after a completed response so the next turn can
-//! continue with `previous_response_id` and incremental input.
+//! serialised. The socket stays pooled after a completed response for the connection's next
+//! turn, which still sends its expanded history.
 //!
 //! Lifecycle: the reader task ends with the socket; [`Pool::close`] (downstream gone)
 //! aborts it and sends a close frame. No task outlives its session.
 //!
-//! [`turns`] runs a turn on the execution contract (`session::Turns`) over the same pool:
-//! expanded history every turn, one attempt per upstream response, no redial. The server's
-//! Responses WebSocket handler still drives the old turn path here until it moves to it.
+//! [`turns`] runs a turn on the execution contract (`session::Turns`) over the pool:
+//! expanded history every turn, one attempt per upstream response, no redial.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use ck_core::config::Config;
 use ck_core::credential::Credential;
-use ck_core::exec::{ExecError, ExecRequest, ExecResponse, ExecSession, ExecStream, FailureScope, ResponseBody};
+use ck_core::exec::{ExecError, FailureScope};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use gjson::Kind;
 use http::HeaderMap;
-use tokio::sync::{OwnedMutexGuard, mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
@@ -40,18 +39,14 @@ pub(crate) type WebSocket = WebSocketStream<Inflate<wreq::Upgraded>>;
 
 use crate::codex::CodexExecutor;
 use crate::codex_json::{set_raw, set_str};
-use crate::codex_quota::{self, QuotaSignals};
-use crate::codex_request::{self as request, Call, Settings, View};
-use crate::codex_response::{self as response, OutputItems};
+use crate::codex_response as response;
 use crate::proxy::Proxy;
 
 mod execute;
 mod io;
 mod session;
-mod turn;
 mod turns;
 pub(crate) use io::{UpgradeError, offer_compression, read_loop, upgrade};
-use turn::{bootstrap, rest};
 
 /// `codexResponsesWebsocketIdleTimeout`: read deadline renewed before every read.
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -173,36 +168,11 @@ fn terminal_response_id(payload: &str, accepts_done: bool) -> Option<String> {
     (id.kind() == Kind::String && !id.str().is_empty()).then(|| id.str().to_owned())
 }
 
-/// Go `ErrNoActiveUpstreamWebsocket`.
-pub const NO_ACTIVE_UPSTREAM: &str = "no active upstream websocket for response.interrupt";
-
-/// Why [`CodexExecutor::interrupt`] did not deliver a `response.interrupt`.
-#[derive(Debug, PartialEq, Eq)]
-pub enum InterruptError {
-    /// No turn is reading on the session's current socket ([`NO_ACTIVE_UPSTREAM`]): an
-    /// HTTP turn may still cancel locally.
-    NoActive,
-    /// The socket was lost, the credential is disabled, or the write failed.
-    Rejected(String),
-}
-
-impl std::fmt::Display for InterruptError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoActive => f.write_str(NO_ACTIVE_UPSTREAM),
-            Self::Rejected(text) => f.write_str(text),
-        }
-    }
-}
-
 pub(crate) struct Upstream {
     pub(crate) target: Target,
     pub(crate) sink: tokio::sync::Mutex<SplitSink<WebSocket, Message>>,
     pub(crate) link: Mutex<Link>,
     pub(crate) reader: Mutex<Option<tokio::task::AbortHandle>>,
-    /// The last request that touched the `collaboration` namespace on this socket renamed
-    /// it (`multiAgentV2OptimizedConn`): later continuations restore upstream names too.
-    multi_agent: std::sync::atomic::AtomicBool,
     write: WriteLimit,
 }
 
@@ -210,13 +180,6 @@ pub(crate) struct Session {
     /// Serialises turns (`reqMu`).
     pub(crate) turn: Arc<tokio::sync::Mutex<()>>,
     pub(crate) conn: Mutex<Option<Arc<Upstream>>>,
-    /// The current attempt's socket loss; cleared when another credential is selected.
-    closed: watch::Sender<Option<ExecError>>,
-    /// Pauses a test's disconnect immediately before it is published.
-    #[cfg(test)]
-    before_notify: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
-    /// The downstream connection's client frames when response steering is configured.
-    steering: Mutex<Option<Arc<SteeringInput>>>,
     /// The credential of the last socket dialed (Go keeps `sess.authID` after the socket
     /// is gone, and removing that credential still ends the session).
     credential: Mutex<String>,
@@ -329,23 +292,6 @@ fn ws_url(http_url: &str) -> Result<String, ExecError> {
     Ok(crate::xai_url::string(&parsed))
 }
 
-/// A WebSocket turn's body after the prompt cache key, in Go's order:
-/// `SanitizeCodexInputItemIDs`, `applyCodexSIWCWebsocketBodyRules` (the id pass sees
-/// the `configuration_update` items the SIWC rules then drop), then the payload rules.
-pub(crate) fn turn_body(
-    view: &View<'_>,
-    req: &ExecRequest,
-    settings: &Settings,
-    finalize: &request::Finalizer,
-    body: String,
-) -> String {
-    let mut body = request::sanitize_input_ids(body);
-    if view.siwc {
-        body = request::siwc_request_body(body, req, Call::Websocket);
-    }
-    finalize.apply(req, settings, body)
-}
-
 /// `frameCodexWebsocketRequestBody`: every turn is a `response.create`.
 fn request_frame(body: String) -> String {
     set_str(&body, "type", "response.create")
@@ -383,46 +329,6 @@ fn ws_error_body(payload: &str) -> Option<(u16, String)> {
         out = set_str(&out, "error.message", response::go_status_text(status));
     }
     Some((status, out))
-}
-
-/// A request's reasoning replay (Claude clients only): the executor's cache and the
-/// request's scope.
-#[derive(Clone, Default)]
-pub(super) struct Replay {
-    cache: Arc<crate::codex_replay::Cache>,
-    scope: crate::codex_replay::Scope,
-}
-
-impl Replay {
-    /// `applyCodexReasoningReplayCacheRequired`: cached turns inserted into `body`.
-    fn apply(
-        cache: &Arc<crate::codex_replay::Cache>,
-        req: &ExecRequest,
-        credential: &str,
-        body: String,
-    ) -> (String, Self) {
-        let (body, scope) = crate::codex_replay::apply(cache, req, credential, body);
-        let replay = Self {
-            cache: cache.clone(),
-            scope,
-        };
-        (body, replay)
-    }
-
-    /// `clearCodexReasoningReplayOnWebsocketError` or `...OnInvalidSignature` for a
-    /// rejection event: an invalid thinking signature drops the cached reasoning.
-    fn clear(&self, payload: &str, cooling: bool) {
-        if let Some((status, body)) = ws_error_body(payload) {
-            crate::codex_replay::clear_on_invalid_signature(&self.cache, &self.scope, status, body.as_bytes());
-        } else if let Some((error, body)) = response::terminal_failure(payload, cooling) {
-            crate::codex_replay::clear_on_invalid_signature(&self.cache, &self.scope, error.status, body.as_bytes());
-        }
-    }
-
-    /// `cacheCodexReasoningReplayFromCompleted`.
-    fn completed(&self, payload: &str) {
-        crate::codex_replay::cache_completed(&self.cache, &self.scope, payload.as_bytes());
-    }
 }
 
 /// `parseCodexWebsocketErrorWithCooling`: an `error` frame that carries an HTTP status.
@@ -467,61 +373,8 @@ pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecE
     Some(error)
 }
 
-/// One upstream message, classified.
-enum Frame {
-    /// Empty text frame (heartbeat).
-    Skip,
-    Event {
-        out: Bytes,
-        raw_len: usize,
-        bufferable: bool,
-        terminal: bool,
-    },
-    /// The response failed. `read` means the reader already dropped the socket;
-    /// `overload` is a transient capacity rejection another credential may serve.
-    Failed {
-        error: ExecError,
-        overload: bool,
-        read: bool,
-    },
-}
-
-/// One turn on a pooled socket. Dropping it releases the turn lock and the reader.
-struct Turn {
-    rx: mpsc::Receiver<Read>,
-    conn: Arc<Upstream>,
-    session: Arc<Session>,
-    _turn: Option<OwnedMutexGuard<()>>,
-    items: OutputItems,
-    native: bool,
-    cooling: bool,
-    quota: Arc<QuotaSignals>,
-    credential: String,
-    /// Handshake headers plus quota headers from this turn's events.
-    observed: HeaderMap,
-    /// The request renamed the `collaboration` namespace (multi-agent v2).
-    restore: bool,
-    /// The attempt's usage record.
-    usage: ck_core::exec::UsageSink,
-    /// The upstream model, for per-model quota snapshots.
-    model: String,
-    replay: Replay,
-    /// The attempt's wire capture (Go's `api.websocket.*` timeline events).
-    wire: crate::codex_capture::Wire,
-}
-
-impl Drop for Turn {
-    fn drop(&mut self) {
-        self.conn.deactivate();
-        drop(self._turn.take());
-    }
-}
-
 #[path = "codex_ws_deflate.rs"]
 pub(crate) mod deflate;
-#[path = "codex_duplex.rs"]
-mod duplex;
-pub use duplex::{ClientFrames, SteeringInput};
 pub use turns::{Next, Successor, TurnControl};
 
 #[cfg(test)]

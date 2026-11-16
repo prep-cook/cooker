@@ -27,13 +27,14 @@ impl ProtocolEgress {
     /// response identity ([`response_identity`]); `request` is the client's request view,
     /// whose Chat `stream_options.include_usage` decides the usage chunk and whose Responses
     /// fields seed the response echo. `id` is the response id a Responses exchange issued
-    /// (`responses_state`), the only id its client sees, and `model` the alias it shows.
+    /// (`responses_state`), the only id its client sees, `model` the alias it shows, and
+    /// `stored` whether the turn is stored for continuation, which shows `store: true`.
     pub fn new(
         output: Output,
         stream: &mut Writer,
         identity: Identity,
         request: RequestView<'_>,
-        (id, model): (Option<LocalId>, Option<&str>),
+        (id, model, stored): (Option<LocalId>, Option<&str>, bool),
     ) -> codec::Result<Self> {
         let mode = match output.framing {
             Framing::Json | Framing::Raw => BodyMode::Buffered,
@@ -81,6 +82,9 @@ impl ProtocolEgress {
                 }
                 if let Some(model) = model {
                     egress.show_model(model);
+                }
+                if stored {
+                    egress.show_stored();
                 }
                 Self::Responses(egress)
             }

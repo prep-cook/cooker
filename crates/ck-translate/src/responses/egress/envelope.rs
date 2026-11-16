@@ -27,7 +27,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         doc.set(error, "code", Value::Text("server_error"))?;
         doc.set(error, "message", Value::Text("Response failed"))?;
         order_array(doc, doc.required(root, "output")?, "output_index", owner)?;
-        let response = encode::scratch(owner, |e| write_response(doc, self.model.as_deref(), e))?;
+        let response = encode::scratch(owner, |e| write_response(doc, &self.shown, e))?;
         if self.mode == BodyMode::Buffered {
             return output(response);
         }
@@ -45,7 +45,13 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     /// Shows `model` as the response's model whatever the source reports: the alias a
     /// force-mapped client model names.
     pub fn show_model(&mut self, model: &str) {
-        self.model = Some(model.to_owned());
+        self.shown.model = Some(model.to_owned());
+    }
+
+    /// Shows `store: true` whatever the source reports: cooker stores the turn for continuation
+    /// (E-Q16).
+    pub fn show_stored(&mut self) {
+        self.shown.stored = true;
     }
 
     /// Repeats request-derived response fields when the source does not supply them.
@@ -111,7 +117,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             return Ok(());
         }
         self.owed = false;
-        let response = encode::scratch(owner, |e| write_response(&self.document, self.model.as_deref(), e))?;
+        let response = encode::scratch(owner, |e| write_response(&self.document, &self.shown, e))?;
         for name in ["response.created", "response.in_progress"] {
             if name == "response.in_progress" && !self.synthesize_progress {
                 break;
@@ -146,7 +152,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             doc.set(root, "status", Value::Text("completed"))?;
         }
         order_array(doc, doc.required(root, "output")?, "output_index", owner)?;
-        let response = encode::scratch(owner, |e| write_response(doc, self.model.as_deref(), e))?;
+        let response = encode::scratch(owner, |e| write_response(doc, &self.shown, e))?;
         if self.mode == BodyMode::Buffered {
             return output(response);
         }
@@ -197,7 +203,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 return Ok(());
             }
             let doc = &self.document;
-            let response = encode::scratch(owner, |e| write_response(doc, self.model.as_deref(), e))?;
+            let response = encode::scratch(owner, |e| write_response(doc, &self.shown, e))?;
             return self.emit(
                 owner,
                 "response.in_progress",

@@ -201,7 +201,7 @@ impl Replay {
                 &mut response,
                 identity,
                 view,
-                (shown.id, shown.model.as_deref()),
+                (shown.id, shown.model.as_deref(), shown.stored),
             )?
         };
         Ok(Self {

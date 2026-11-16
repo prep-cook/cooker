@@ -17,8 +17,7 @@ success-output = 'final'
 # too, right after the heap gate, so other tests cannot starve their workloads.
 [[profile.default.overrides]]
 filter = '''
-    binary_id(ck-server::duplex_dispatch)
-    | (binary_id(ck-exec) & (test(/^codex_ws::tests::duplex::/)
+    (binary_id(ck-exec) & (test(/^codex_ws::tests::duplex::/)
         | test(=codex_live::tests::redact_sdp_scans_many_markers_in_one_pass)
         | test(=antigravity_request::tests::tool_schemas_are_cleaned_in_one_pass)))
     | (binary_id(ck-server) & test(/^realtime::websocket::tests::/))

@@ -31,7 +31,7 @@ impl Execute for Probe {
             streams.request.id(),
             streams.response.id(),
         );
-        Err(ExecError::replay_required())
+        Err(ExecError::local(500, ck_core::exec::FailureScope::Request, "unused"))
     }
 
     async fn count_tokens(

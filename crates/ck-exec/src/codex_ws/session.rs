@@ -9,21 +9,7 @@ impl Upstream {
             sink: tokio::sync::Mutex::new(sink),
             link: Mutex::default(),
             reader: Mutex::default(),
-            multi_agent: Default::default(),
         })
-    }
-
-    /// `!conflict && (optimized || isMultiAgentV2Optimized(conn))`.
-    pub(super) fn restores(&self, optimized: bool, conflict: bool) -> bool {
-        !conflict && (optimized || self.multi_agent.load(std::sync::atomic::Ordering::Acquire))
-    }
-
-    /// `setMultiAgentV2Optimized` after a request that optimized or conflicted.
-    pub(super) fn note_multi_agent(&self, optimized: bool, conflict: bool) {
-        if optimized || conflict {
-            self.multi_agent
-                .store(optimized && !conflict, std::sync::atomic::Ordering::Release);
-        }
     }
 
     pub(crate) fn activate(&self) -> mpsc::Receiver<Read> {
@@ -114,33 +100,15 @@ impl Session {
         self.conn.lock().expect("session conn").clone()
     }
 
-    pub(super) fn steering(&self) -> Option<Arc<SteeringInput>> {
-        self.steering.lock().expect("session steering").clone()
-    }
-
     /// `invalidateUpstreamConn`: only the session's current socket is dropped, so a stale
-    /// reader cannot tear down its replacement. `notify` tells the downstream handler.
-    pub(crate) fn invalidate(&self, conn: &Arc<Upstream>, error: &ExecError, notify: bool) {
+    /// reader cannot tear down its replacement.
+    pub(crate) fn invalidate(&self, conn: &Arc<Upstream>) {
         {
             let mut current = self.conn.lock().expect("session conn");
             if !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
                 return;
             }
             *current = None;
-            if notify {
-                #[cfg(test)]
-                if let Some((entered, resume)) = self.before_notify.lock().expect("notify hook").take() {
-                    let _ = entered.send(());
-                    let _ = resume.recv();
-                }
-                self.closed.send_if_modified(|slot| {
-                    let first = slot.is_none();
-                    if first {
-                        *slot = Some(error.clone());
-                    }
-                    first
-                });
-            }
         }
         conn.shutdown();
     }
@@ -156,22 +124,6 @@ impl Default for Pool {
 }
 
 impl Pool {
-    #[cfg(test)]
-    pub fn with_idle(idle: Duration) -> Self {
-        Self {
-            idle,
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_write(write: WriteLimit) -> Self {
-        Self {
-            write,
-            ..Self::default()
-        }
-    }
-
     pub(crate) fn session(&self, id: &str) -> Arc<Session> {
         self.sessions
             .lock()
@@ -181,24 +133,10 @@ impl Pool {
                 Arc::new(Session {
                     turn: Arc::default(),
                     conn: Mutex::default(),
-                    closed: watch::channel(None).0,
-                    #[cfg(test)]
-                    before_notify: Mutex::default(),
-                    steering: Mutex::default(),
                     credential: Mutex::default(),
                 })
             })
             .clone()
-    }
-
-    /// The session, without creating one.
-    fn get(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions.lock().expect("sessions").get(id).cloned()
-    }
-
-    /// `WithWebsocketInput`: binds the downstream connection's frames to its session.
-    pub fn attach_steering(&self, id: &str, input: SteeringInput) {
-        *self.session(id).steering.lock().expect("session steering") = Some(Arc::new(input));
     }
 
     /// `CloseExecutionSession`: the downstream connection ended.
@@ -247,94 +185,5 @@ impl Pool {
                 conn.shutdown();
             }
         }
-    }
-
-    /// The error that lost the session's upstream socket, if it was lost.
-    pub fn loss(&self, id: &str) -> Option<ExecError> {
-        let session = self.get(id)?;
-        session.closed.borrow().clone()
-    }
-
-    /// A failed attempt must not close the next credential's downstream connection.
-    pub(crate) fn clear_loss(&self, id: &str) {
-        if let Some(session) = self.get(id) {
-            // Pair with invalidate: a retired reader must publish before this reset.
-            let _current = session.conn.lock().expect("session conn");
-            session.closed.send_if_modified(|loss| loss.take().is_some());
-        }
-    }
-
-    /// `InterruptExecutionSession`: writes the client's `response.interrupt` unchanged
-    /// to the socket of the session's turn in progress. It never dials, replays or
-    /// selects another credential. `enabled(credential_id)` is the live account check,
-    /// called without holding a session lock.
-    pub async fn interrupt(
-        &self,
-        id: &str,
-        payload: &[u8],
-        enabled: impl FnOnce(&str) -> bool,
-    ) -> Result<(), InterruptError> {
-        let session = Some(id.trim())
-            .filter(|id| !id.is_empty())
-            .and_then(|id| self.get(id))
-            .ok_or(InterruptError::NoActive)?;
-        let conn = session.current().ok_or(InterruptError::NoActive)?;
-        let auth_enabled = enabled(&conn.target.credential);
-        let response_id = ck_wire::json::get(payload, "response_id").bytes();
-        {
-            // One snapshot of the socket's state: a completion landing between the
-            // checks would otherwise turn a late interrupt into a stale error.
-            let current = session.conn.lock().expect("session conn");
-            if !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)) {
-                return Err(InterruptError::NoActive);
-            }
-            let link = conn.link.lock().expect("link");
-            if let Some(lost) = &link.lost {
-                return Err(InterruptError::Rejected(
-                    String::from_utf8_lossy(&lost.body).into_owned(),
-                ));
-            }
-            if std::str::from_utf8(&response_id).is_ok_and(|id| link.terminal.contains(id)) {
-                return Ok(());
-            }
-            // A socket kept from an earlier turn is not the current upstream.
-            if link.active.is_none() {
-                return Err(InterruptError::NoActive);
-            }
-        }
-        if !auth_enabled {
-            return Err(InterruptError::Rejected(
-                "websocket credential is no longer enabled".into(),
-            ));
-        }
-        // A failed or timed-out write may leave a partial frame: the socket is dropped
-        // like after any failed turn write (Go leaves that to its reader).
-        if let Err(error) = conn.send_raw(Bytes::copy_from_slice(payload)).await {
-            session.invalidate(&conn, &error, true);
-            return Err(InterruptError::Rejected(
-                String::from_utf8_lossy(&error.body).into_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Resolves with the error that lost the session's upstream socket.
-    pub fn closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        let mut rx = self.session(id).closed.subscribe();
-        async move {
-            loop {
-                if let Some(error) = rx.borrow_and_update().clone() {
-                    return error;
-                }
-                if rx.changed().await.is_err() {
-                    return std::future::pending().await;
-                }
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.sessions.lock().expect("sessions").len()
     }
 }

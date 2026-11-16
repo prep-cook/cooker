@@ -57,6 +57,18 @@ pub trait Arms: Send + Sync {
         upload: &mut Writer,
         response: Writer,
     ) -> impl Future<Output = Result<Started, ExecError>> + Send;
+    /// [`Arms::start`] for a Responses WebSocket turn, on the provider's upstream socket when
+    /// the credential has one; the cancel is that transport's (`ck_exec::pipeline::start_turn`).
+    fn start_turn(
+        &self,
+        attempt: &Attempt<'_>,
+        request: &mut Request<'_>,
+        upload: &mut Writer,
+        response: Writer,
+    ) -> impl Future<Output = Result<(Started, Option<ck_exec::TurnCancel>), ExecError>> + Send {
+        let started = self.start(attempt, request, upload, response);
+        async move { started.await.map(|started| (started, None)) }
+    }
 }
 
 impl Arms for ck_exec::Executors {
@@ -76,6 +88,16 @@ impl Arms for ck_exec::Executors {
         response: Writer,
     ) -> impl Future<Output = Result<Started, ExecError>> + Send {
         ck_exec::Executors::start(self, attempt, request, upload, response)
+    }
+
+    fn start_turn(
+        &self,
+        attempt: &Attempt<'_>,
+        request: &mut Request<'_>,
+        upload: &mut Writer,
+        response: Writer,
+    ) -> impl Future<Output = Result<(Started, Option<ck_exec::TurnCancel>), ExecError>> + Send {
+        ck_exec::Executors::start_turn(self, attempt, request, upload, response)
     }
 }
 
@@ -318,10 +340,21 @@ pub(super) async fn run<X: Arms>(
         .map_or_else(|| request.validated().view(), OwnedRequest::view);
     let egress = egress::prepare(&exchange, &response, identity, shown);
     lease.redispatch();
-    let started = arm
-        .arms
-        .start(&attempt, &mut request, &mut exchange.request, response)
-        .await;
+    let started = match &call.socket {
+        Some(socket) => arm
+            .arms
+            .start_turn(&attempt, &mut request, &mut exchange.request, response)
+            .await
+            .map(|(started, cancel)| {
+                socket.started(started.stream.allocator(), cancel);
+                started
+            }),
+        None => {
+            arm.arms
+                .start(&attempt, &mut request, &mut exchange.request, response)
+                .await
+        }
+    };
     // A document the executor kept serves the next attempt, unless this one's was withheld.
     arm.request = kept.or_else(|| request.into_request());
     let Started {
