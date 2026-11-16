@@ -412,14 +412,78 @@ pub(crate) fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
     })
 }
 
+/// The counts of one upstream usage object, each only when the upstream sent it.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct Sent {
+    prompt: Option<i64>,
+    cached: Option<i64>,
+    candidates: Option<i64>,
+    thoughts: Option<i64>,
+}
+
+impl Sent {
+    /// The line's usage object: terminal (`usageMetadata`) or non-terminal (`cpaUsageMetadata`).
+    fn of(raw: &[u8]) -> Option<Self> {
+        let usage = ["response.usageMetadata", "response.cpaUsageMetadata"]
+            .into_iter()
+            .map(|path| gj::get(raw, path))
+            .find(|usage| usage.exists())?;
+        let count = |key: &str| {
+            let value = usage.get(key);
+            value.exists().then(|| value.int())
+        };
+        Some(Self {
+            prompt: count("promptTokenCount"),
+            cached: count("cachedContentTokenCount"),
+            candidates: count("candidatesTokenCount"),
+            thoughts: count("thoughtsTokenCount"),
+        })
+    }
+
+    /// The Anthropic usage object of these counts: input leaves the cache out (Go 912a038b)
+    /// and output is candidates plus thoughts. A count the upstream did not send stays out,
+    /// and nothing is derived from the total.
+    fn usage(&self) -> Vec<u8> {
+        let mut usage = b"{}".to_vec();
+        if let Some(prompt) = self.prompt {
+            let input = prompt.wrapping_sub(self.cached.unwrap_or(0)).max(0);
+            gj::set_int(&mut usage, "input_tokens", input);
+        }
+        if let Some(cached) = self.cached {
+            gj::set_int(&mut usage, "cache_read_input_tokens", cached);
+        }
+        if self.candidates.is_some() || self.thoughts.is_some() {
+            let output = self.candidates.unwrap_or(0).wrapping_add(self.thoughts.unwrap_or(0));
+            gj::set_int(&mut usage, "output_tokens", output);
+        }
+        usage
+    }
+}
+
+/// The two Anthropic usage objects hold the same token counts, each present in both or neither.
+fn same_counts(a: &[u8], b: &[u8]) -> bool {
+    ["input_tokens", "output_tokens", "cache_read_input_tokens"]
+        .iter()
+        .all(|key| {
+            let (a, b) = (gj::get(a, key), gj::get(b, key));
+            a.exists() == b.exists() && a.int() == b.int()
+        })
+}
+
 /// Params of ConvertAntigravityResponseToClaude.
 #[derive(Default)]
 struct Stream {
     model: String,
     names: HashMap<Vec<u8>, Vec<u8>>,
     web_search_mode: bool,
-    /// `message_start` usage holds only the counts the upstream sent (`report_usage_only`).
+    /// Usage events hold only the counts the upstream sent (`report_usage_only`).
     reported_usage: bool,
+    /// The latest usage object the upstream sent, in reported-only mode.
+    sent: Sent,
+    /// What the last usage event carried, in reported-only mode.
+    emitted: Option<Sent>,
+    /// Go's final usage, written after the reported one when a stream completes.
+    derived: Option<Vec<u8>>,
     out: Vec<u8>,
     has_first_response: bool,
     response_type: u8,
@@ -689,8 +753,32 @@ impl Stream {
         if self.cached_tokens > 0 {
             gj::set_int(&mut delta, "usage.cache_read_input_tokens", self.cached_tokens);
         }
+        if self.reported_usage {
+            // The reported counts go out now; Go's follow once the stream completes, so a
+            // stream cut before that accounts only what the upstream sent.
+            let go = gj::get(&delta, "usage").bytes().into_owned();
+            let mut usage = self.sent.usage();
+            if self.web_search_requests > 0 {
+                gj::set_int(
+                    &mut usage,
+                    "server_tool_use.web_search_requests",
+                    self.web_search_requests,
+                );
+            }
+            gj::set_raw(&mut delta, "usage", &usage);
+            self.derived = Some(go);
+            self.emitted = Some(self.sent);
+        }
         self.event("message_delta", &delta);
         self.sent_final = true;
+    }
+
+    /// A usage-only `message_delta`: `stop_reason` stays null, so the message goes on or
+    /// keeps the reason it ended with.
+    fn usage_delta(&mut self, usage: &[u8]) {
+        let mut delta = br#"{"type":"message_delta","delta":{"stop_reason":null,"stop_sequence":null}}"#.to_vec();
+        gj::set_raw(&mut delta, "usage", usage);
+        self.event("message_delta", &delta);
     }
 
     fn translate(&mut self, raw: &[u8]) -> Vec<Vec<u8>> {
@@ -704,22 +792,35 @@ impl Stream {
                 return vec![];
             }
             self.final_events(true);
+            // A completed stream accounts Go's final usage (owner question P7-4-1).
+            if let Some(go) = self.derived.take()
+                && !same_counts(&go, &self.sent.usage())
+            {
+                self.usage_delta(&go);
+            }
             self.event("message_stop", br#"{"type":"message_stop"}"#);
             return vec![std::mem::take(&mut self.out)];
         }
         let root = gj::parse(raw);
+        if self.reported_usage
+            && let Some(sent) = Sent::of(raw)
+        {
+            self.sent = sent;
+        }
         if !self.has_first_response {
             let mut start = br#"{"type": "message_start", "message": {"id": "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY", "type": "message", "role": "assistant", "content": [], "model": "claude-3-5-sonnet-20241022", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}"#.to_vec();
             if self.reported_usage {
-                gj::set_raw(&mut start, "message.usage", "{}");
-            }
-            let prompt = gj::get(raw, "response.cpaUsageMetadata.promptTokenCount");
-            if prompt.exists() {
-                gj::set_int(&mut start, "message.usage.input_tokens", prompt.int());
-            }
-            let candidates = gj::get(raw, "response.cpaUsageMetadata.candidatesTokenCount");
-            if candidates.exists() && !self.web_search_mode {
-                gj::set_int(&mut start, "message.usage.output_tokens", candidates.int());
+                gj::set_raw(&mut start, "message.usage", self.sent.usage());
+                self.emitted = Some(self.sent);
+            } else {
+                let prompt = gj::get(raw, "response.cpaUsageMetadata.promptTokenCount");
+                if prompt.exists() {
+                    gj::set_int(&mut start, "message.usage.input_tokens", prompt.int());
+                }
+                let candidates = gj::get(raw, "response.cpaUsageMetadata.candidatesTokenCount");
+                if candidates.exists() && !self.web_search_mode {
+                    gj::set_int(&mut start, "message.usage.output_tokens", candidates.int());
+                }
             }
             let version = gj::get(raw, "response.modelVersion");
             if version.exists() {
@@ -809,6 +910,16 @@ impl Stream {
 impl GoStream for Stream {
     fn report_usage_only(&mut self) {
         self.reported_usage = true;
+    }
+
+    /// Usage the upstream reported since the last usage event, so a cut stream accounts it.
+    fn flush_before_error(&mut self) -> Vec<Vec<u8>> {
+        if !self.reported_usage || !self.has_first_response || self.emitted == Some(self.sent) {
+            return vec![];
+        }
+        self.emitted = Some(self.sent);
+        self.usage_delta(&self.sent.usage());
+        vec![std::mem::take(&mut self.out)]
     }
 
     fn line(&mut self, line: &[u8]) -> Result<Vec<Vec<u8>>, Error> {

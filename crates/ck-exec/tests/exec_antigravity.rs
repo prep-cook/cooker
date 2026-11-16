@@ -983,96 +983,168 @@ async fn response_usage_reaches_accounting_only_through_the_canonical_stream() {
     }
 }
 
-/// Where an upstream answer ends before its body does.
+/// How an upstream answer ends.
 #[derive(Clone, Copy, Debug)]
-enum Early {
-    /// A chunked body closed after its first event, with no terminating chunk.
-    AfterFirstEvent,
+enum End {
+    /// The whole body and its terminating chunk.
+    Complete,
+    /// A chunked body closed after this many events, with no terminating chunk.
+    AfterEvents(usize),
     /// A chunked body closed inside its last line, which holds whole JSON but no newline.
     InLastLine,
     /// A `content-length` body closed after its first event with bytes still owed.
     Short,
 }
 
-/// The first event of a Claude-model answer whose usage object is `counts`.
-fn first_event(counts: &str) -> String {
+/// An event of a Claude-model answer whose usage object is `counts`, with a finish reason
+/// when `finished`.
+fn usage_event(counts: &str, finished: bool) -> String {
+    let finish = if finished { r#","finishReason":"STOP""# } else { "" };
     format!(
-        r#"data: {{"response":{{"candidates":[{{"content":{{"role":"model","parts":[{{"text":"hi"}}]}}}}],"usageMetadata":{counts},"modelVersion":"gemini-3-flash","responseId":"resp-early"}},"traceId":"early"}}"#
+        r#"data: {{"response":{{"candidates":[{{"content":{{"role":"model","parts":[{{"text":"hi"}}]}}{finish}}}],"usageMetadata":{counts},"modelVersion":"gemini-3-flash","responseId":"resp-early"}},"traceId":"early"}}"#
     )
 }
 
 /// An answer that ends before its body does fails the attempt with exactly one error on
-/// every client protocol. Rows: scenario, cut, the usage object replacing the first event's
-/// (`None` keeps the recording), and the input and output counts the canonical stream holds
-/// afterwards. A count is present exactly when the upstream sent it in a complete line
-/// before the cut, zero included; no estimate or default fills the gap.
+/// every client protocol; a complete one completes. Rows: scenario; end; the events replacing
+/// the scenario's body, as (usage object, finish reason) (`None` keeps the recording); and the
+/// input, output and cache-read counts the canonical stream holds afterwards. After a cut, a
+/// count is present exactly when the upstream sent it in a complete line, zero included, and
+/// holds the latest such report; no estimate, default or derivation fills the gap. A complete
+/// answer keeps Go's final usage (owner question P7-4-1).
 #[tokio::test]
-async fn an_upstream_body_that_ends_early_fails_the_attempt() {
-    type Row = (&'static str, Early, Option<&'static str>, (Option<u64>, Option<u64>));
-    let rows: [Row; 11] = [
-        ("gemini_stream", Early::InLastLine, None, (Some(5), None)),
-        ("openai_stream", Early::InLastLine, None, (None, None)),
-        ("responses_stream", Early::InLastLine, None, (None, None)),
-        ("claude_stream_claude_model", Early::InLastLine, None, (None, None)),
-        ("claude_stream_claude_model", Early::AfterFirstEvent, None, (None, None)),
-        ("claude_stream_gemini_model", Early::InLastLine, None, (Some(5), None)),
+async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
+    type Counts = (Option<u64>, Option<u64>, Option<u64>);
+    type Row = (&'static str, End, Option<&'static [(&'static str, bool)]>, Counts);
+    let rows: [Row; 16] = [
+        ("gemini_stream", End::InLastLine, None, (Some(5), None, None)),
+        ("openai_stream", End::InLastLine, None, (None, None, None)),
+        ("responses_stream", End::InLastLine, None, (None, None, None)),
+        ("claude_stream_claude_model", End::InLastLine, None, (None, None, None)),
         (
-            "claude_stream_gemini_model",
-            Early::AfterFirstEvent,
-            Some(r#"{"promptTokenCount":0,"candidatesTokenCount":3}"#),
-            (Some(0), Some(3)),
+            "claude_stream_claude_model",
+            End::AfterEvents(1),
+            None,
+            (None, None, None),
         ),
         (
             "claude_stream_gemini_model",
-            Early::AfterFirstEvent,
-            Some(r#"{"candidatesTokenCount":0}"#),
-            (None, Some(0)),
+            End::InLastLine,
+            None,
+            (Some(5), None, None),
         ),
         (
             "claude_stream_gemini_model",
-            Early::AfterFirstEvent,
-            Some(r#"{"promptTokenCount":5}"#),
-            (Some(5), None),
+            End::AfterEvents(1),
+            Some(&[(r#"{"promptTokenCount":0,"candidatesTokenCount":3}"#, false)]),
+            (Some(0), Some(3), None),
         ),
-        ("gemini_stream", Early::AfterFirstEvent, None, (Some(5), None)),
-        ("gemini_stream", Early::Short, None, (Some(5), None)),
+        (
+            "claude_stream_gemini_model",
+            End::AfterEvents(1),
+            Some(&[(r#"{"candidatesTokenCount":0}"#, false)]),
+            (None, Some(0), None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::AfterEvents(1),
+            Some(&[(r#"{"promptTokenCount":5}"#, false)]),
+            (Some(5), None, None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::AfterEvents(1),
+            Some(&[(r#"{"promptTokenCount":5}"#, true)]),
+            (Some(5), None, None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::AfterEvents(1),
+            Some(&[(
+                r#"{"promptTokenCount":5,"candidatesTokenCount":0,"totalTokenCount":9}"#,
+                true,
+            )]),
+            (Some(5), Some(0), None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::AfterEvents(2),
+            Some(&[
+                ("{}", false),
+                (r#"{"promptTokenCount":5,"candidatesTokenCount":3}"#, false),
+            ]),
+            (Some(5), Some(3), None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::AfterEvents(1),
+            Some(&[(
+                r#"{"promptTokenCount":5,"candidatesTokenCount":3,"cachedContentTokenCount":2}"#,
+                false,
+            )]),
+            (Some(5), Some(3), Some(2)),
+        ),
+        ("gemini_stream", End::AfterEvents(1), None, (Some(5), None, None)),
+        ("gemini_stream", End::Short, None, (Some(5), None, None)),
+        (
+            "claude_stream_gemini_model",
+            End::Complete,
+            Some(&[(r#"{"promptTokenCount":5,"totalTokenCount":9}"#, true)]),
+            (Some(5), Some(4), None),
+        ),
     ];
-    for (name, early, counts, want) in rows {
+    for (name, end, events, want) in rows {
         let s = scenario(name);
         let mut body = s["upstream"]["body"].as_str().unwrap().to_owned();
-        if let Some(counts) = counts {
-            let line = body.find("\r\n").unwrap();
-            body.replace_range(..line, &first_event(counts));
+        if let Some(events) = events {
+            let events: Vec<String> = events.iter().map(|(c, f)| usage_event(c, *f)).collect();
+            let mut replaced = events.join("\r\n\r\n") + "\r\n\r\n";
+            // A cut needs bytes after it; the recording's later events supply them unsent.
+            if !matches!(end, End::Complete) {
+                replaced.push_str(&body[body.find("\r\n\r\n").unwrap() + 4..]);
+            }
+            body = replaced;
         }
-        let first = body.find("\r\n\r\n").unwrap() + 4;
-        let reply = match early {
-            Early::AfterFirstEvent => Reply::sse(body).cut_after(first),
-            Early::InLastLine => {
+        let after = |n: usize| body.match_indices("\r\n\r\n").nth(n - 1).unwrap().0 + 4;
+        let reply = match end {
+            End::Complete => Reply::sse(body),
+            End::AfterEvents(n) => Reply::sse(body.clone()).cut_after(after(n)),
+            End::InLastLine => {
                 let last = body.trim_end().len();
                 Reply::sse(body).cut_after(last)
             }
-            Early::Short => Reply::sse(body[..first].to_owned()).short_by(body.len() - first),
+            End::Short => {
+                let first = after(1);
+                Reply::sse(body[..first].to_owned()).short_by(body.len() - first)
+            }
         };
-        let row = format!("{name} {early:?} {counts:?}");
+        let row = format!("{name} {end:?} {events:?}");
         let streams = Streams::new();
         let upstream = StreamUpstream::start([reply]).await;
         let run = run_on(&streams, &s, &upstream, UsageSink::default()).await;
         let started = run.started.unwrap_or_else(|e| panic!("{row}: {}", e.status));
         let (outcome, published, _) = produce(&streams, started).await;
-        assert!(outcome.is_err(), "{row}: an early end fails the attempt");
-        assert_eq!(published.terminal, Some(Terminal::UpstreamError), "{row}");
+        let complete = matches!(end, End::Complete);
+        assert_eq!(outcome.is_ok(), complete, "{row}: only a complete answer completes");
+        let terminal = if complete {
+            Terminal::Done
+        } else {
+            Terminal::UpstreamError
+        };
+        assert_eq!(published.terminal, Some(terminal), "{row}");
         let errors = published
             .records
             .iter()
             .filter(|r| r.starts_with(b"event: x_ck.error\n"))
             .count();
-        assert_eq!(errors, 1, "{row}: one error record");
+        assert_eq!(errors, usize::from(!complete), "{row}: error records");
         let usage = usage(&published);
         let count = |key: &str| usage.as_ref().and_then(|u| u[key].as_u64());
-        assert_eq!(
-            (count("input_tokens"), count("output_tokens")),
-            want,
-            "{row}: published usage"
+        let got = (
+            count("input_tokens"),
+            count("output_tokens"),
+            count("cache_read_tokens"),
         );
+        assert_eq!(got, want, "{row}: published usage");
     }
 }

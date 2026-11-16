@@ -28,9 +28,14 @@ pub trait GoStream: Send {
     fn can_finalize_response_stream(&self) -> bool {
         false
     }
-    /// Leave out the usage counts Go fills with defaults; only counts the upstream sent stay.
-    /// Translators whose usage objects hold no defaults ignore it.
+    /// Leave out the usage counts Go fills with defaults or derives; only counts the upstream
+    /// sent stay. Translators whose usage objects hold no defaults ignore it.
     fn report_usage_only(&mut self) {}
+    /// Before a terminal error: chunks a translator held back from a normal stream, such as
+    /// usage reported since its last usage event under [`GoStream::report_usage_only`].
+    fn flush_before_error(&mut self) -> Vec<Vec<u8>> {
+        vec![]
+    }
 }
 
 /// bufio.ScanLines over one event: split on `\n`, drop one trailing `\r` per line, and
@@ -382,7 +387,10 @@ impl Framed {
 
 impl StreamTranslator for Framed {
     fn flush_frames(&mut self) -> Vec<Bytes> {
-        self.responses.flush()
+        let chunks = self.inner.flush_before_error();
+        let mut out = self.framed(chunks);
+        out.extend(self.responses.flush());
+        out
     }
 
     fn event(&mut self, event: &[u8]) -> Result<Vec<Bytes>, Error> {
