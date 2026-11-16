@@ -1011,13 +1011,13 @@ fn usage_event(counts: &str, finished: bool) -> String {
 /// input, output and cache-read counts the canonical stream holds afterwards. After a cut, a
 /// count is present exactly when the upstream sent it in a complete line, zero included, and
 /// holds the latest report of that field, even when a later usage object leaves it out; no
-/// estimate, default or derivation fills the gap. A complete
-/// answer keeps Go's final usage (owner question P7-4-1).
+/// estimate, default or derivation fills the gap. A complete answer follows the same rule
+/// (owner ruling P7-4-1, 2026-11-16).
 #[tokio::test]
 async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
     type Counts = (Option<u64>, Option<u64>, Option<u64>);
     type Row = (&'static str, End, Option<&'static [(&'static str, bool)]>, Counts);
-    let rows: [Row; 19] = [
+    let rows: [Row; 22] = [
         ("gemini_stream", End::InLastLine, None, (Some(5), None, None)),
         ("openai_stream", End::InLastLine, None, (None, None, None)),
         ("responses_stream", End::InLastLine, None, (None, None, None)),
@@ -1120,7 +1120,25 @@ async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
             "claude_stream_gemini_model",
             End::Complete,
             Some(&[(r#"{"promptTokenCount":5,"totalTokenCount":9}"#, true)]),
-            (Some(5), Some(4), None),
+            (Some(5), None, None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::Complete,
+            Some(&[(r#"{"promptTokenCount":5}"#, true)]),
+            (Some(5), None, None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::Complete,
+            Some(&[(r#"{"candidatesTokenCount":0}"#, true)]),
+            (None, Some(0), None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::Complete,
+            Some(&[(r#"{"cachedContentTokenCount":2}"#, true)]),
+            (None, None, Some(2)),
         ),
     ];
     for (name, end, events, want) in rows {

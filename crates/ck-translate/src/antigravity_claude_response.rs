@@ -466,16 +466,6 @@ impl Sent {
     }
 }
 
-/// The two Anthropic usage objects hold the same token counts, each present in both or neither.
-fn same_counts(a: &[u8], b: &[u8]) -> bool {
-    ["input_tokens", "output_tokens", "cache_read_input_tokens"]
-        .iter()
-        .all(|key| {
-            let (a, b) = (gj::get(a, key), gj::get(b, key));
-            a.exists() == b.exists() && a.int() == b.int()
-        })
-}
-
 /// Params of ConvertAntigravityResponseToClaude.
 #[derive(Default)]
 struct Stream {
@@ -488,8 +478,6 @@ struct Stream {
     sent: Sent,
     /// What the last usage event carried, in reported-only mode.
     emitted: Option<Sent>,
-    /// Go's final usage, written after the reported one when a stream completes.
-    derived: Option<Vec<u8>>,
     out: Vec<u8>,
     has_first_response: bool,
     response_type: u8,
@@ -760,9 +748,8 @@ impl Stream {
             gj::set_int(&mut delta, "usage.cache_read_input_tokens", self.cached_tokens);
         }
         if self.reported_usage {
-            // The reported counts go out now; Go's follow once the stream completes, so a
-            // stream cut before that accounts only what the upstream sent.
-            let go = gj::get(&delta, "usage").bytes().into_owned();
+            // Only the counts the upstream sent, whether the stream completes or is cut
+            // (owner ruling P7-4-1, 2026-11-16).
             let mut usage = self.sent.usage();
             if self.web_search_requests > 0 {
                 gj::set_int(
@@ -772,7 +759,6 @@ impl Stream {
                 );
             }
             gj::set_raw(&mut delta, "usage", &usage);
-            self.derived = Some(go);
             self.emitted = Some(self.sent);
         }
         self.event("message_delta", &delta);
@@ -798,12 +784,6 @@ impl Stream {
                 return vec![];
             }
             self.final_events(true);
-            // A completed stream accounts Go's final usage (owner question P7-4-1).
-            if let Some(go) = self.derived.take()
-                && !same_counts(&go, &self.sent.usage())
-            {
-                self.usage_delta(&go);
-            }
             self.event("message_stop", br#"{"type":"message_stop"}"#);
             return vec![std::mem::take(&mut self.out)];
         }
