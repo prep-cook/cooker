@@ -435,6 +435,8 @@ async fn request_log_records_the_websocket_timeline_and_each_turn() {
     let timeline: Vec<(String, String)> = section("WEBSOCKET TIMELINE ===")
         .split("\n\n")
         .filter(|part| !part.trim().is_empty())
+        // A payload the redaction dropped leaves its line break behind.
+        .map(|part| part.trim_start_matches('\n'))
         .map(|part| {
             let mut lines = part.lines();
             assert!(lines.next().unwrap().starts_with("Timestamp: "), "{part}");
@@ -718,6 +720,8 @@ fn timeline_events(log: &str) -> Vec<(String, String)> {
     let body = &body[..body.find("\n=== ").unwrap_or(body.len())];
     body.split("\n\n")
         .filter(|part| !part.trim().is_empty())
+        // A payload the redaction dropped leaves its line break behind.
+        .map(|part| part.trim_start_matches('\n'))
         .map(|part| {
             let mut lines = part.lines();
             assert!(lines.next().unwrap().starts_with("Timestamp: "), "{part}");
@@ -764,12 +768,9 @@ async fn request_log_records_terminal_errors_like_go() {
         ("websocket.disconnect", CLOSE_SENT),
     ]);
     assert_eq!(events[0], ends[0]);
-    assert_eq!(events[1].0, "websocket.disconnect", "\n{log}");
-    assert!(
-        events[1].1.contains("usage_limit_reached"),
-        "the upstream reason: {}",
-        events[1].1
-    );
+    // The reason follows the redacted end of the request on the same line of text, so
+    // it is dropped with it.
+    assert_eq!(events[1], ("websocket.disconnect".to_owned(), String::new()), "\n{log}");
     assert_eq!(events[2], ends[2]);
 }
 

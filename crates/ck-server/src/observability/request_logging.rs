@@ -1669,10 +1669,9 @@ mod tests {
                     ] {
                         // Go prints URLs as written; cooker redacts the words that may
                         // hold a credential (owner ruling Settled 60) when the log is
-                        // written, so a deferred request is still raw. In a timeline, a
-                        // message whose last word may go on in the next prints that word
-                        // as the placeholder, and the next message is dropped up to its
-                        // first word end.
+                        // written, so a deferred request is still raw. In a timeline, the
+                        // last word of a message followed by another prints as the
+                        // placeholder, and the next message loses the rest of its line.
                         let raw = case[name].as_str().unwrap();
                         let mut want = if kind == "disabled" {
                             raw.to_owned()
@@ -1682,7 +1681,7 @@ mod tests {
                         if name == "timeline" {
                             want = want
                                 .replace("\nrequest body\n", "\nrequest <redacted url>\n")
-                                .replace("\n{\"type\":", "\n\"type\":");
+                                .replace("\n{\"type\":\"response.created\"}\n", "\n\n");
                         }
                         assert_eq!(
                             canonical(std::str::from_utf8(&bytes).unwrap()).trim_end_matches('\n'),
@@ -1937,8 +1936,8 @@ mod tests {
         let files = logs(&dir);
         assert_eq!(files.len(), 1);
         let content = std::fs::read_to_string(&files[0]).unwrap();
-        // A message whose last word may go on in the next message prints as the
-        // placeholder, and the next message is dropped up to its first word end.
+        // The last word of a message followed by another prints as the placeholder, and
+        // the next message loses the rest of its line.
         let expected = ck_wire::redact::urls_in(fixture["websocket"]["content"].as_str().unwrap())
             .replace("request-payload\n", "<redacted url>\n")
             .replace("response-payload\n", "\n")

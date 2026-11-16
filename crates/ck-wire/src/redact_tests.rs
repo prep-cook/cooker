@@ -130,79 +130,17 @@ fn malformed_urls_print_the_placeholder() {
 }
 
 /// Free text is redacted word by word: a word that may hold a credential prints as the
-/// placeholder whole, and a quoted value that goes on past whitespace is dropped up to
-/// its closing `"` or the line end. The cost is that e-mail addresses, `user@host`,
-/// `mailto:`, words holding `?` or `#`, and `word:word` print as the placeholder too.
+/// placeholder, and so does the rest of its `"` string, or anywhere else the rest of its
+/// line. The cost is that e-mail addresses, `user@host`, `mailto:`, words holding `?` or
+/// `#`, `name:port` and what follows them on the line print as the placeholder too.
 #[test]
 fn words_that_may_hold_a_credential_print_as_the_placeholder() {
     for (text, want) in [
+        // Inside a `"` string, the rest of the string.
         (
             r#"Post "http://u:sk-review-secret@127.0.0.1:1/v1?key=sk-review-secret": EOF"#,
             r#"Post "<redacted url>": EOF"#,
         ),
-        (
-            "see http://u:sk-review-secret@127.0.0.1/p?k=sk-review-secret end",
-            "see <redacted url> end",
-        ),
-        (
-            "retry ftp://sk-review-secret@h/ see ://sk-review-secret@h",
-            "retry <redacted url> see <redacted url>",
-        ),
-        (
-            "error sending request for uri (http://h/?api_key=sk-review-secret/x): client error",
-            "error sending request for uri <redacted url> client error",
-        ),
-        (
-            "request failed: url=//user:sk-review-secret@127.0.0.1/",
-            "request failed: <redacted url>",
-        ),
-        (
-            "request failed: /callback?code=sk-review-secret#x",
-            "request failed: <redacted url>",
-        ),
-        (
-            "Location: http://127.0.0.1/?co=sk-review-secret\nnext",
-            "Location: <redacted url>\nnext",
-        ),
-        (
-            "x_https://user:sk-review-secret@host.example/ end",
-            "<redacted url> end",
-        ),
-        ("see foo//user:sk-review-secret@host end", "see <redacted url> end"),
-        ("dsn=redis:sk-review-secret@host end", "<redacted url> end"),
-        ("go https:sk-review-secret@relay.example", "go <redacted url>"),
-        // A `?` or `#` anywhere, and an opaque URL, whatever follows.
-        ("go next#sk-review-secret", "go <redacted url>"),
-        ("go callback?sk-review-secret", "go <redacted url>"),
-        ("go https:sk-review-secret", "go <redacted url>"),
-        ("go a1:sk-review-secret", "go <redacted url>"),
-        // An escaped quote or backslash is part of the word.
-        (
-            r#"Post "http://127.0.0.1/?code=a\"sk-review-secret": EOF"#,
-            r#"Post "<redacted url>": EOF"#,
-        ),
-        (
-            r#"{"url":"http://127.0.0.1/?code=a\"sk-review-secret"}"#,
-            r#"{"url":"<redacted url>"}"#,
-        ),
-        (r#""http://h/?a=b\\" tail"#, r#""<redacted url>" tail"#),
-        // Inside a string, a redacted word drops the rest of the string.
-        (
-            r#"{"m":"see http://h/?a=b more \"x\" sk-review-secret"} tail"#,
-            r#"{"m":"see <redacted url>"} tail"#,
-        ),
-        (
-            "x\\\"http://h/?code=prefix sk-review-secret\" y\nz",
-            "<redacted url>\" y\nz",
-        ),
-        ("go 1-https:sk-review-secret} x", "go <redacted url> x"),
-        ("go 0.9+redis:sk-review-secret", "go <redacted url>"),
-        ("go 1a,b+c:sk-review-secret", "go <redacted url>"),
-        ("dial 9://sk-review-secret/x", "dial <redacted url>"),
-        ("open https:relay.example//sk-review-secret", "open <redacted url>"),
-        ("see x<http://h/>what?yes tail", "see <redacted url>"),
-        ("中文http://127.0.0.1/?k=sk-review-secret 。", "<redacted url> 。"),
-        // A quoted value runs to its closing `"`, however it starts.
         (
             r#"Post "http://127.0.0.1/?code=prefix sk-review-secret": EOF"#,
             r#"Post "<redacted url>": EOF"#,
@@ -220,30 +158,116 @@ fn words_that_may_hold_a_credential_print_as_the_placeholder() {
             "Post \"http://127.0.0.1/?code=prefix\r\nsk-review-secret\": EOF",
             "Post \"<redacted url>\": EOF",
         ),
+        (
+            "Post \"http://127.0.0.1/?code=prefix\nsk-review-secret\": EOF",
+            "Post \"<redacted url>\": EOF",
+        ),
         // With no closing `"`, the rest of the text.
         ("\"http://h/?a=b c\nd", "\"<redacted url>"),
-        // `'`, a backtick and `<` are URL bytes, so they open a quoted value inside the
-        // word; it runs to the next `"` or line end.
+        // An escaped quote or backslash is part of the word.
+        (
+            r#"Post "http://127.0.0.1/?code=a\"sk-review-secret": EOF"#,
+            r#"Post "<redacted url>": EOF"#,
+        ),
+        (
+            r#"{"url":"http://127.0.0.1/?code=a\"sk-review-secret"}"#,
+            r#"{"url":"<redacted url>"}"#,
+        ),
+        (r#""http://h/?a=b\\" tail"#, r#""<redacted url>" tail"#),
+        (
+            r#"{"m":"see http://h/?a=b more \"x\" sk-review-secret"} tail"#,
+            r#"{"m":"see <redacted url>"} tail"#,
+        ),
+        // A quote on an earlier line does not decide where this line's string is.
+        (
+            "Headers:\nX-Note: \"\n\nBody:\n{\"m\":\"see http://127.0.0.1/?code=a sk-review-secret\"}",
+            "Headers:\nX-Note: \"\n\nBody:\n{\"m\":\"see <redacted url>\"}",
+        ),
+        (
+            r#"X-Note: " {"m":"see http://127.0.0.1/?code=a sk-review-secret"}"#,
+            r#"X-Note: " {"m":"see <redacted url>"#,
+        ),
+        // Anywhere else, the rest of the line, whatever quotes or brackets follow.
+        (
+            "see http://u:sk-review-secret@127.0.0.1/p?k=sk-review-secret end",
+            "see <redacted url>",
+        ),
+        (
+            "retry ftp://sk-review-secret@h/ see ://sk-review-secret@h",
+            "retry <redacted url>",
+        ),
+        (
+            "error sending request for uri (http://h/?api_key=sk-review-secret/x): client error",
+            "error sending request for uri <redacted url>",
+        ),
+        (
+            "request failed: url=//user:sk-review-secret@127.0.0.1/",
+            "request failed: <redacted url>",
+        ),
+        (
+            "request failed: /callback?code=sk-review-secret#x",
+            "request failed: <redacted url>",
+        ),
+        (
+            "Location: http://127.0.0.1/?co=sk-review-secret\nnext",
+            "Location: <redacted url>\nnext",
+        ),
+        (
+            "Location: next?key=sk-review-secret\nContent-Location: https://u:sk-review-secret@h.example/x\nLocation: #sk-review-secret\nContent-Location: next#sk-review-secret",
+            "Location: <redacted url>\nContent-Location: <redacted url>\nLocation: <redacted url>\nContent-Location: <redacted url>",
+        ),
+        (
+            r#"Error: Post 'http://127.0.0.1/?code="sk-review-secret"': EOF"#,
+            "Error: Post <redacted url>",
+        ),
+        (
+            "Location: 'http://127.0.0.1/?code=\"sk-review-secret\"'\nnext",
+            "Location: <redacted url>\nnext",
+        ),
+        (
+            r#"Link: <http://127.0.0.1/?code="sk-review-secret">; rel="next""#,
+            "Link: <redacted url>",
+        ),
+        (
+            r#"Link: <https://h.example/p?key=sk-review-secret>; rel="next", </p?page=2>; rel="last""#,
+            "Link: <redacted url>",
+        ),
         (
             "Post 'http://127.0.0.1/?code=prefix sk-review-secret': EOF\nnext",
             "Post <redacted url>\nnext",
         ),
         ("x <http://h.example/?code=a sk-review-secret> y", "x <redacted url>"),
         ("`//u:sk-review-secret@h/ b` c", "<redacted url>"),
-        // A URL whose query value opens a quote: the whole word, and the rest of the line.
+        (
+            "x\\\"http://h/?code=prefix sk-review-secret\" y\nz",
+            "<redacted url>\nz",
+        ),
         (
             "http://127.0.0.1/?k='http://127.0.0.1/'sk-review-secret end",
             "<redacted url>",
         ),
+        ("x_https://user:sk-review-secret@host.example/ end", "<redacted url>"),
+        ("see foo//user:sk-review-secret@host end", "see <redacted url>"),
+        ("dsn=redis:sk-review-secret@host end", "<redacted url>"),
+        ("go 1-https:sk-review-secret} x", "go <redacted url>"),
+        ("see x<http://h/>what?yes tail", "see <redacted url>"),
+        ("中文http://127.0.0.1/?k=sk-review-secret 。", "<redacted url>"),
+        // A `?` or `#` anywhere, an opaque URL, and a scheme inside a run.
+        ("go https:sk-review-secret@relay.example", "go <redacted url>"),
+        ("go next#sk-review-secret", "go <redacted url>"),
+        ("go callback?sk-review-secret", "go <redacted url>"),
+        ("go https:sk-review-secret", "go <redacted url>"),
+        ("go a1:sk-review-secret", "go <redacted url>"),
+        ("go 0.9+redis:sk-review-secret", "go <redacted url>"),
+        ("go 1a,b+c:sk-review-secret", "go <redacted url>"),
+        ("dial 9://sk-review-secret/x", "dial <redacted url>"),
+        ("open https:relay.example//sk-review-secret", "open <redacted url>"),
         // Accepted over-redaction.
-        ("write to a@b.example now", "write to <redacted url> now"),
+        ("write to a@b.example now", "write to <redacted url>"),
         ("ssh user@host", "ssh <redacted url>"),
         ("mailto:a@b.example", "<redacted url>"),
         ("try ?a=b", "try <redacted url>"),
-        (
-            "and/or what? C# ## heading what?yes",
-            "and/or <redacted url> <redacted url> <redacted url> heading <redacted url>",
-        ),
+        ("and/or what? C# ## heading what?yes", "and/or <redacted url>"),
         ("listen example.com:443", "listen <redacted url>"),
         ("dsn redis:key", "dsn <redacted url>"),
         ("models/claude@001:rawPredict", "<redacted url>"),
@@ -336,14 +360,18 @@ fn copied_text_is_redacted_wherever_reads_end() {
         (
             "see http://127.0.0.1/?code=xxxxxxxxsk-review-secret tail",
             16,
-            Some("see <redacted url> tail"),
+            Some("see <redacted url>"),
         ),
         (
             "see \"http://127.0.0.1/?code=xx sk-review-secret\" tail",
             16,
             Some("see \"<redacted url>\" tail"),
         ),
-        ("see qqqqqqqqqqqqqqqqqqqqqqqq tail", 16, Some("see <redacted url> tail")),
+        (
+            "see qqqqqqqqqqqqqqqqqqqqqqqq tail\nx",
+            16,
+            Some("see <redacted url>\nx"),
+        ),
         (
             "see 'qqqqqqqqqqqqqqqqqqqqqqqq tail\nx",
             16,
@@ -359,13 +387,13 @@ fn copied_text_is_redacted_wherever_reads_end() {
             assert_eq!(got, want, "{text} cut at {cut}");
         }
     }
-    // A word over the hold limit: the URL that a quote inside it opens runs on past it.
+    // A word over the hold limit, and the rest of its line.
     let over = format!(
         "http://127.0.0.1/?k={}'http://127.0.0.1/'sk-review-secret end",
         "x".repeat(scan::HOLD + (64 << 10))
     );
-    let plain = format!("a {} b", "x".repeat(scan::HOLD + 1));
-    for (text, want) in [(&over, "<redacted url>"), (&plain, "a <redacted url> b")] {
+    let plain = format!("a {} b\nc", "x".repeat(scan::HOLD + 1));
+    for (text, want) in [(&over, "<redacted url>"), (&plain, "a <redacted url>\nc")] {
         assert_eq!(bytes(text.as_bytes()), want.as_bytes(), "bytes");
         let mut out = Vec::new();
         write(text.as_bytes(), &mut out).unwrap();
@@ -517,15 +545,15 @@ fn parted(parts: &[&[u8]], hold: usize) -> String {
 fn parts_fail_closed_where_a_credential_may_go_on() {
     const HEADER: &str = "\n\ntimestamp: t\nevent: x\n";
     for (parts, want) in [
-        (&["wss://user:", "sk-review-secret@host/ x"][..], "<redacted url>|| x"),
+        // The next part goes on with the redacted word, and loses the rest of its line.
+        (&["wss://user:", "sk-review-secret@host/ x"][..], "<redacted url>||"),
         (
             &["see https://h.example/?k=", "sk-review-secret end"],
-            "see <redacted url>|| end",
+            "see <redacted url>||",
         ),
-        (&["dsn=redis:sk-rev", "iew-secret@host end"], "<redacted url>|| end"),
+        (&["dsn=redis:sk-rev", "iew-secret@host end"], "<redacted url>||"),
         (&["callback?code=", "sk-review-secret"], "<redacted url>||"),
-        (&["a//user", ":sk-review-secret@h b"], "<redacted url>|| b"),
-        // A quote in the next part opens a value that runs to the line end.
+        (&["a//user", ":sk-review-secret@h b\nc"], "<redacted url>||\nc"),
         (
             &["http://127.0.0.1/?k=", "'http://127.0.0.1/'sk-review-secret end"],
             "<redacted url>||",
@@ -535,16 +563,13 @@ fn parts_fail_closed_where_a_credential_may_go_on() {
             "x <redacted url>||\nz",
         ),
         // So does any word a part ends in, whatever its last byte.
-        (&["total 12", "x y"], "total <redacted url>|| y"),
+        (&["total 12", "x y"], "total <redacted url>||"),
         (&["//sk-review-secret]", "@127.0.0.1/"], "<redacted url>||"),
         (&["//sk-review-secret\\", "@127.0.0.1/"], "<redacted url>||"),
-        (&["total 12}", "x y"], "total <redacted url>|| y"),
-        (
-            &[r#"{"input":[]}"#, r#"{"type":"x"}"#],
-            r#"{"input"<redacted url>||"type":"x"}"#,
-        ),
+        (&["total 12}", "x y\nz"], "total <redacted url>||\nz"),
+        (&[r#"{"input":[]}"#, r#"{"type":"x"}"#], r#"{"input"<redacted url>||"#),
         // A part that ends between words ends nothing.
-        (&["see http://h.example/ ", "x"], "see <redacted url> ||x"),
+        (&["see a.example ", "x"], "see a.example ||x"),
         (&["a \"b\"", "c"], "a \"b\"||c"),
     ] {
         let parts: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();

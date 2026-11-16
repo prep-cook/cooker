@@ -54,13 +54,13 @@ pub fn urls_in(text: &str) -> Cow<'_, str> {
 /// a `\` belongs to the word, so an escaped quote (`\"`) never ends one. A word prints
 /// as [`UNPRINTABLE`] whole when it holds `://`, an `@`, a `?` or a `#`, or a scheme (a
 /// letter, then letters, digits, `+`, `-` or `.`) and `:` with a byte after them
-/// (`https:key`, `example.com:443`), and when it is longer than 1 MiB. Such
-/// a word may be part of a quoted value with spaces in it, so when it is inside a `"`
-/// string or follows a `"`, and ends at whitespace, the text up to the next unescaped `"`
-/// is dropped; when it holds `'`, a backtick, `<` or an escaped `"`, the text up to the
-/// next unescaped `"` or line break. No URL structure is
-/// parsed, so an e-mail address, `user@host`, `mailto:…`, `name:port` and a word such as
-/// `what?` or `C#` print as the placeholder too.
+/// (`https:key`, `example.com:443`), and when it is longer than 1 MiB. The value it
+/// belongs to may go on past it, so the text after it is dropped: inside a `"` string
+/// (an odd number of unescaped `"` before it on its line) up to the closing unescaped
+/// `"`, anywhere else up to the end of the line, whatever quotes or brackets follow. No
+/// URL structure is parsed, so an e-mail address, `user@host`, `mailto:…`, `name:port`
+/// and a word such as `what?` or `C#` print as the placeholder too, with the rest of
+/// their line.
 pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
     if text.len() <= scan::HOLD && !text.iter().any(|b| matches!(b, b':' | b'@' | b'?' | b'#')) {
         return Cow::Borrowed(text);
@@ -92,8 +92,8 @@ pub fn write(text: &[u8], out: &mut dyn std::io::Write) -> std::io::Result<()> {
 /// the messages of a WebSocket timeline between their event headers. The pieces are
 /// redacted as one text, as [`copy`] redacts it, except at each [`Pieces::cut`]: the
 /// next piece may go on with the word a piece ends in, whatever its last byte, so that
-/// word prints as [`UNPRINTABLE`] and the next piece is dropped up to the end of its
-/// first word. The text between pieces is redacted on its own,
+/// word prints as [`UNPRINTABLE`] and the next piece is dropped as the rest of a redacted
+/// word is. The text between pieces is redacted on its own,
 /// with [`write`].
 pub struct Pieces {
     words: scan::Words,

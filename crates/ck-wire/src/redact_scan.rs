@@ -51,22 +51,16 @@ pub(super) fn write(text: &[u8], out: &mut dyn Write, hold: usize) -> io::Result
 /// Text split into words at whitespace and `"`, each held until its end. A `\` makes
 /// the byte after it part of the word, so an escaped quote or space (`\"`) never ends
 /// one, across reads and cuts too. A [`suspect`] word, and a word longer than `hold`,
-/// prints as [`UNPRINTABLE`]. Such a word may start a quoted value with spaces in it
-/// (`"callback?code=a key"`, `<https://h/?q=a key>`). When the word is inside a `"`
-/// string or follows a `"`, and ends at whitespace, the text is dropped up to the next
-/// unescaped `"`, line breaks included. When it holds `'`, a backtick, `<` or an escaped
-/// `"`, and ends at
-/// whitespace other than a line break, the text is dropped up to the next unescaped `"`
-/// or line break.
+/// prints as [`UNPRINTABLE`], and so does the text after it that may still belong to
+/// the same value. Inside a `"` string, where every inner quote of JSON is escaped, that
+/// is the text up to the closing unescaped `"`. Anywhere else it is the rest of the
+/// line, whatever quotes or brackets follow.
 pub(super) struct Words {
     word: Vec<u8>,
     state: State,
-    /// The word follows a `"`, with or without whitespace between.
-    quoted: bool,
-    /// An odd number of unescaped `"` came before the word: it is inside a string.
+    /// An odd number of unescaped `"` came before the word on its line: it is inside a
+    /// string. A JSON string holds no raw line break, so each line starts outside.
     string: bool,
-    /// The word, its dropped part included, holds `'`, a backtick, `<` or an escaped `"`.
-    opens: bool,
     /// The last byte read is a `\` that escapes the next one.
     escaped: bool,
     hold: usize,
@@ -80,7 +74,7 @@ enum State {
     Long,
     /// Dropped up to the next unescaped `"`.
     Quote,
-    /// Dropped up to the next unescaped `"` or line break.
+    /// Dropped up to the next unescaped line break.
     Line,
 }
 
@@ -89,9 +83,7 @@ impl Words {
         Self {
             word: Vec::new(),
             state: State::Word,
-            quoted: false,
             string: false,
-            opens: false,
             escaped: false,
             hold,
         }
@@ -101,7 +93,7 @@ impl Words {
         while !bytes.is_empty() {
             let ends: &[u8] = match self.state {
                 State::Quote => b"\"",
-                State::Line => b"\"\n",
+                State::Line => b"\n",
                 _ => b"",
             };
             if !ends.is_empty() {
@@ -142,8 +134,6 @@ impl Words {
     }
 
     fn extend(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
-        // A `"` inside a word is escaped.
-        self.opens |= bytes.iter().any(|b| matches!(b, b'\'' | b'`' | b'<' | b'"'));
         if self.state == State::Long || bytes.is_empty() {
             return;
         }
@@ -165,21 +155,15 @@ impl Words {
         } else if !long {
             out.extend_from_slice(UNPRINTABLE.as_bytes());
         }
-        let empty = self.word.is_empty() && !long;
-        let quoted = self.quoted || self.string;
-        let opens = std::mem::take(&mut self.opens);
         self.word.clear();
         self.state = State::Word;
-        self.quoted = match stop {
-            Some(b'"') => true,
-            Some(b'\n') | None => false,
-            Some(_) => empty && self.quoted,
-        };
         match stop {
-            Some(b) if redacted && quoted && b != b'"' => self.state = State::Quote,
-            Some(b) if redacted && opens && !matches!(b, b'"' | b'\n') => self.state = State::Line,
+            // Inside a string, up to its closing quote, line breaks included; anywhere
+            // else, up to the line end.
+            Some(b) if redacted && self.string && b != b'"' => self.state = State::Quote,
+            Some(b) if redacted && !self.string && b != b'\n' => self.state = State::Line,
             Some(b) => {
-                self.string ^= b == b'"';
+                self.string = b != b'\n' && (self.string != (b == b'"'));
                 out.push(b);
             }
             None => {}
@@ -195,7 +179,7 @@ impl Words {
     /// Ends a piece of a text whose pieces reach the log with other text between them
     /// ([`super::Pieces`]). The next piece may go on with the word this one ends in,
     /// whatever its last byte, so that word prints as the placeholder and the next piece
-    /// is dropped up to the end of its first word.
+    /// is dropped as the rest of a redacted word is.
     pub(super) fn cut(&mut self, out: &mut Vec<u8>) {
         if self.state != State::Word || self.word.is_empty() {
             return;

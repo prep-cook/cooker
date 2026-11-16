@@ -150,7 +150,7 @@ async fn call_and_hangup_are_captured_like_go() {
     assert!(request.contains("HTTP Method: POST\n"), "{request}");
     // AccountInfo: OAuth; the e-mail label prints as the placeholder.
     assert!(
-        request.contains("Auth: provider=codex, auth_id=codex-voice.json, <redacted url> type=oauth\n"),
+        request.contains("Auth: provider=codex, auth_id=codex-voice.json, <redacted url>\n"),
         "{request}"
     );
     // headersForLogging keeps the header and hides its value; the bearer is masked.
@@ -272,13 +272,13 @@ async fn sdp_ice_credentials_stay_out_of_the_whole_log() {
     for secret in ["offerufrag", "offer+pwd", "answerufrag", "answer+pwd", "pwd/secret"] {
         assert!(!log.contains(secret), "{secret} in {log}");
     }
-    // Every SDP attribute line holds `name:value`, so it prints as the placeholder; the
-    // JSON-quoted offer is one word.
+    // Every SDP attribute line holds `name:value`, so it prints as the placeholder and its
+    // `\r` goes with the rest of the line; the JSON-quoted offer is one word.
     for (name, line) in [
         ("REQUEST BODY", r#""sdp":"<redacted url>""#),
         ("API REQUEST 1", r#""sdp":"<redacted url>""#),
-        ("API RESPONSE 1", "<redacted url>\r\n<redacted url>"),
-        ("RESPONSE", "<redacted url>\r\n<redacted url>\r\n"),
+        ("API RESPONSE 1", "<redacted url>\n<redacted url>"),
+        ("RESPONSE", "<redacted url>\n<redacted url>\n"),
     ] {
         let text = section(&log, name);
         assert!(text.contains(line), "{name}: {text}");
@@ -326,10 +326,7 @@ async fn sdp_ice_credentials_stay_out_of_spooled_sections() {
     for name in ["API REQUEST 1", "API RESPONSE 1"] {
         let text = section(&log, name);
         // Each attribute line, `name:value`, prints as the placeholder.
-        assert!(
-            text.matches("<redacted url>\r\n").count() > 2048,
-            "{name} logged in full"
-        );
+        assert!(text.matches("<redacted url>\n").count() > 2048, "{name} logged in full");
     }
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -368,7 +365,7 @@ async fn sdp_ice_credentials_stay_out_of_a_spooled_downstream_response() {
     }
     let downstream = section(&log, "RESPONSE");
     assert!(
-        downstream.contains("v=0\r\n<redacted url>\r\n<redacted url>\r\n"),
+        downstream.contains("v=0\r\n<redacted url>\n<redacted url>\n"),
         "{downstream}"
     );
     let _ = std::fs::remove_dir_all(dir);

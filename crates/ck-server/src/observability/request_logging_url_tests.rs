@@ -113,7 +113,7 @@ async fn url_headers_are_redacted_in_logs_only() {
             "Content-Location: <redacted url>",
             "Referer: <redacted url>",
             "Link: <redacted url>",
-            "Refresh: <redacted url> url=/next",
+            "Refresh: <redacted url>",
             "Reporting-Endpoints: default=\"<redacted url>\"",
         ] {
             assert_eq!(
@@ -153,7 +153,7 @@ async fn urls_in_captured_errors_are_redacted() {
     assert_eq!(content.matches(quoted).count(), 2, "{content}");
     line(
         &content,
-        "Error: dial failed: error sending request for uri <redacted url> EOF",
+        "Error: dial failed: error sending request for uri <redacted url>",
     );
 }
 
@@ -204,7 +204,7 @@ async fn every_reference_shape_in_captured_errors_is_redacted() {
         "Error: Post <redacted url>",
         "Error: Post \" <redacted url>\": EOF",
         "Error: request failed: <redacted url>",
-        "Error: dial <redacted url> refused",
+        "Error: dial <redacted url>",
     ] {
         line(&content, want);
     }
@@ -259,7 +259,7 @@ fn spooled_sections_redact_urls_after_long_tokens() {
         let mut out = Vec::new();
         section.write_to(&mut out).unwrap();
         let out = String::from_utf8(out).unwrap();
-        assert_eq!(out, "<redacted url> end", "{ending}");
+        assert_eq!(out, "<redacted url>", "{ending}");
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -306,7 +306,7 @@ fn urls_split_across_timeline_messages_are_redacted() {
     // The last message has no next one to go on into.
     for (messages, want) in [
         (["wss://user:", "APIKEY@host/"], "t: 1\n<redacted url>\n\nt: 2\n"),
-        (["{}", "a b"], "t: 1\n<redacted url>\n\nt: 2\n b"),
+        (["{}", "a\nb"], "t: 1\n<redacted url>\n\nt: 2\n\nb"),
     ] {
         let mut section = super::Section::framed("timeline");
         super::upstream_timeline(&mut section, &dir, b"t: 1\n", messages[0].as_bytes());
@@ -342,12 +342,12 @@ async fn captured_response_sections_are_redacted_whole() {
                 b"/u:sk-review-secret@127.0.0.1/path end".to_vec(),
             ],
             None,
-            "see <redacted url> end",
+            "see <redacted url>\n",
         ),
         (
             vec![filler(b" http:/"), b"/u:sk-review-secret@127.0.0.1/path end".to_vec()],
             None,
-            "x <redacted url> end",
+            "x <redacted url>\n",
         ),
         (
             vec![
@@ -364,7 +364,7 @@ async fn captured_response_sections_are_redacted_whole() {
         ),
         // A spooled section is redacted as it is copied into the log; a reference
         // longer than the copy's hold limit prints as the placeholder.
-        (vec![long.into_bytes()], None, "\n<redacted url> tail"),
+        (vec![long.into_bytes()], None, "\n<redacted url>\n"),
     ];
     for (chunks, fail, want) in rows {
         let content = persisted(true, StatusCode::BAD_GATEWAY, move |log| {
@@ -413,8 +413,8 @@ async fn relative_references_with_fragments_are_redacted() {
     for want in [
         "Location: <redacted url>",
         "Content-Location: <redacted url>",
-        // `<` opens a quoted value, dropped up to the next `"`.
-        "Link: <redacted url>\"next\"",
+        // The rest of the line goes with the redacted word.
+        "Link: <redacted url>",
     ] {
         assert_eq!(content.lines().filter(|l| *l == want).count(), 4, "{want}: {content}");
     }
