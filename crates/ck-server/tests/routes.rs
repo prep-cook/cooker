@@ -453,6 +453,15 @@ async fn codec_routes_decode_before_selection_and_commit_on_the_contract_arm() {
             upstream: r#""signature":"sig-1""#,
             ..ok(messages_path(), signed, "event: message_stop")
         },
+        // `max_tokens: 0` pre-warms Anthropic's prompt cache and reaches the upstream as sent.
+        Row {
+            upstream: r#""max_tokens":0"#,
+            ..ok(
+                messages_path(),
+                format!(r#"{{"model":"{MODEL}","max_tokens":0,"messages":[{user}]}}"#),
+                r#""text":"hi""#,
+            )
+        },
         refused(chat_path(), "{".into(), 400, "invalid_request_error"),
         refused(messages_path(), "{".into(), 400, r#""type":"error""#),
         refused(gemini("generateContent"), "{".into(), 400, "INVALID_ARGUMENT"),
@@ -487,7 +496,7 @@ async fn codec_routes_decode_before_selection_and_commit_on_the_contract_arm() {
             "/v1beta/interactions".into(),
             format!(r#"{{"model":"{MODEL}","input":"hi"}}"#),
             501,
-            "UNIMPLEMENTED",
+            r#"{"error":{"code":"unimplemented","message":"#,
         ),
     ];
     for row in rows {
@@ -677,7 +686,7 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
         revision: 0,
     };
     key.attributes.insert("prefix".into(), "team".into());
-    let p = proxy("", vec![key]).await;
+    let p = proxy("", vec![key.clone()]).await;
     // Chat Completions so the request translator writes the resolved model; the Claude
     // identity path does not rewrite `model` yet (Go's registry fallback does).
     let (status, _, text) = post(
@@ -691,6 +700,19 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
     assert_eq!(seen[0].1["model"], MODEL, "alias resolved to the upstream name");
     let reply: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(reply["model"], "friendly", "force-mapping rewrites the response model");
+    // The alias still passes the candidate's fence before the old arm serves it, and nothing
+    // invents a `max_tokens` (Q-H): the catalog default is sent, and without one the only
+    // candidate is refused before any upstream request.
+    let catalog = format!("model-catalog: [{{match: {MODEL}, overrides: {{default-max-tokens: 777}}}}]\n");
+    let unlimited = r#"{"model":"team/friendly","messages":[{"role":"user","content":"x"}]}"#;
+    for (config, status, sent) in [(String::new(), 400, None), (catalog, 200, Some(777))] {
+        let p = proxy(&config, vec![key.clone()]).await;
+        let (got, _, text) = post(&p.url, "/v1/chat/completions", unlimited).await;
+        assert_eq!(got, status, "{config}: {text}");
+        let seen = p.seen.requests.lock().unwrap().clone();
+        let max_tokens = seen.first().map(|request| request.1["max_tokens"].clone());
+        assert_eq!(max_tokens, sent.map(Value::from), "{config}");
+    }
     // The registry lists the alias and its prefixed copy, not the upstream name.
     let models: Value = wreq::Client::new()
         .get(format!("{}/v1/models", p.url))

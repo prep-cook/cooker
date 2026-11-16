@@ -120,9 +120,10 @@ impl Writer for GeminiSse {
     }
 }
 
-/// Q8: S1 has no Interactions codec, so the route refuses every request visibly.
+/// Q8: S1 has no Interactions codec, so the route refuses every request visibly, in the
+/// Interactions error shape.
 pub async fn interactions() -> Response {
-    crate::http::errors::gemini(
+    crate::http::errors::interactions(
         501,
         "The Interactions API is not supported. Use generateContent or streamGenerateContent.",
     )

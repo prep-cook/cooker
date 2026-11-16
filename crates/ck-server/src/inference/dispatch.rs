@@ -1570,14 +1570,26 @@ async fn attempt<X: Arms>(
         if let Some(on_selected) = call.on_selected() {
             on_selected(&lease.credential);
         }
-        // ponytail: a force-mapped alias takes the old arm, the only one that rewrites the
-        // response model to the client's alias; the contract arm needs the alias in its
-        // response egress first.
+        // ponytail: a force-mapped alias takes the old arm once it passed admission and its
+        // fence, because only the old arm rewrites the response model to the client's alias;
+        // the contract arm needs the alias in its response egress first.
         let forced_alias = target.alias.force_mapping && !target.alias.original_alias.is_empty();
         let fault = 'arm: {
-            let ran = match arm.as_deref_mut().filter(|_| !forced_alias) {
+            let ran = match arm.as_deref_mut() {
                 Some(arm) => loop {
-                    let ran = attempt::run(arm, rt, cfg, call, trace, &req, usage, &mut lease, upstream).await;
+                    let ran = attempt::run(
+                        arm,
+                        rt,
+                        cfg,
+                        call,
+                        trace,
+                        &req,
+                        usage,
+                        &mut lease,
+                        upstream,
+                        forced_alias,
+                    )
+                    .await;
                     // Go `tryRefreshAfterUnauthorized`, once per credential, after the failed
                     // attempt was settled and discarded.
                     if let Ran::Failed(fault) = &ran

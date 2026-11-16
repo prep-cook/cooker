@@ -117,6 +117,16 @@ fn assert_inference_error(path: &str, status: u16, body: &str, request_id: Optio
         let id = value["request_id"].as_str().expect("local request_id");
         assert!(!id.is_empty());
         assert_eq!(Some(id), request_id.map(|v| v.to_str().unwrap()));
+    } else if path.starts_with("/v1beta/interactions") {
+        // The Interactions error names its code as a string and has no `status`.
+        let code = match status {
+            401 => "unauthenticated",
+            413 => "resource_exhausted",
+            501 => "unimplemented",
+            _ => "invalid_argument",
+        };
+        assert_eq!(error["code"], code, "{body}");
+        assert!(error.get("status").is_none(), "{body}");
     } else if path.starts_with("/v1beta/") {
         assert_eq!(error["code"], status);
         let kind = match status {

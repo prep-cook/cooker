@@ -531,7 +531,8 @@ async fn a_request_without_max_tokens_needs_a_configured_default() {
         // An explicit client limit never needs a default, and other refusals keep their kind.
         (CATALOG, "claude-opus-4-7", json!({"max_tokens": 64}), "accepted"),
         ("", SONNET, json!({"max_completion_tokens": 64}), "accepted"),
-        ("", SONNET, json!({"max_tokens": 0}), "schema"),
+        // An explicit zero pre-warms Anthropic's prompt cache.
+        ("", SONNET, json!({"max_tokens": 0}), "accepted"),
         ("", SONNET, json!({"max_tokens": 64, "n": 2}), "unsupported"),
         ("", SONNET, json!({"max_completion_tokens": 64, "n": 2}), "unsupported"),
     ];

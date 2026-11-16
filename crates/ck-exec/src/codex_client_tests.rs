@@ -54,6 +54,10 @@ fn replays_go_translation_and_optimization() {
                     tool_search: false,
                 };
                 let got = translate_request(from, to, &ctx, input, &client).unwrap();
+                let want = match to {
+                    Format::Claude => crate::claude::go_exec::without_guessed_max_tokens(from, input, want),
+                    _ => want.to_owned(),
+                };
                 assert_eq!(
                     String::from_utf8(got).unwrap(),
                     want,

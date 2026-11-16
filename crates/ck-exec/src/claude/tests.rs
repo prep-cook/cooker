@@ -1415,7 +1415,11 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
                 text.to_owned()
             }
         };
-        let mut go_body = upstream["body"].as_str().unwrap().to_owned();
+        let mut go_body = super::go_exec::without_guessed_max_tokens(
+            source,
+            scenario["body"].as_str().unwrap().as_bytes(),
+            upstream["body"].as_str().unwrap(),
+        );
         if RELOCATES_API_KEY_SYSTEM.contains(&name) {
             let relocated = with_relocated_system(&go_body);
             assert_ne!(relocated, go_body, "{name}: Go kept no caller system text top-level");

@@ -396,6 +396,11 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
             actual = expected.clone();
         }
     }
+    if invents_max_tokens(client, upstream, f, bytes) {
+        for out in &mut expected {
+            gj::delete(out, "max_tokens");
+        }
+    }
     let mut errors = early;
     errors.extend(normalize(&mut actual, &dynamics, Some((start, end))));
     normalize(&mut expected, &dynamics, None);
@@ -408,6 +413,26 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
         errors.push(format!("\n  go:   {:?}\n  rust: {:?}", show(&expected), show(&actual)));
     }
     errors
+}
+
+/// Owner ruling Q-H: Go's Chat and Gemini to Claude request translators send a guessed
+/// `max_tokens` (32000, 64000 or the registry's) when the client set no limit. Rust sends
+/// none; the Claude executor fills the `model-catalog` default or the registered limit.
+fn invents_max_tokens(client: Format, upstream: Format, f: &Value, bytes: bool) -> bool {
+    let request = matches!(f["path"].as_str(), Some("request" | "request_compat"));
+    if !request || upstream != Format::Claude {
+        return false;
+    }
+    let input = field(&f["input"], bytes);
+    let set = |path: &str| {
+        let value = gj::get(&input, path);
+        value.exists() && value.kind != gj::Kind::Null
+    };
+    match client {
+        Format::OpenAI => !set("max_tokens") && !set("max_completion_tokens"),
+        Format::Gemini => !gj::get(&input, "generationConfig.maxOutputTokens").exists(),
+        _ => false,
+    }
 }
 
 /// Pair fixtures (recorded at 6fecc6e) whose behaviour a later Go commit changed, each

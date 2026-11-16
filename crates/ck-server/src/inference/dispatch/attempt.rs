@@ -142,6 +142,7 @@ pub(super) async fn run<X: Arms>(
     usage: Option<&Arc<Facts>>,
     lease: &mut Lease,
     upstream: &str,
+    old_only: bool,
 ) -> Ran {
     let store = match rt.streams().store() {
         Ok(store) => store,
@@ -230,6 +231,11 @@ pub(super) async fn run<X: Arms>(
             };
         }
     };
+    if old_only {
+        // The candidate passed admission and its fence; only the old arm serves it.
+        arm.request = kept.or_else(|| Some(fenced.into_request()));
+        return old_arm(&attempt, trace, withheld);
+    }
     if withheld {
         log_withheld(&attempt, trace);
     }
