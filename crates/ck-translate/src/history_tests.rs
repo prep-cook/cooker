@@ -995,6 +995,29 @@ fn expansion_puts_the_stored_turn_before_the_new_input() {
         assert_eq!(out.to_string().contains("SIG/abc+=="), signed, "{producer:?}: {out}");
     }
 
+    // A Gemini answer's signatures, on text, thought or call parts, survive the stored round
+    // trip and go back only to the account that produced them.
+    let first = rig.request(json!({"model": "m", "input": "q1"}));
+    let next = json!({"model": "m", "previous_response_id": "resp_1", "input": "q2"});
+    for (source, signatures) in [
+        (Source::GeminiText, &["TSIG=="][..]),
+        (Source::Gemini, &["GSIG==", "G2=="][..]),
+    ] {
+        let answer = rig.stored(source, usize::MAX);
+        for (producer, signed) in [(GEMINI_A, true), (GEMINI_B, false)] {
+            let (mut owner, mut doc, media) = rig.expand(next.clone(), &first, &answer, GEMINI_A);
+            let out = attempt(&mut owner, &mut doc, &media, producer, To::Gemini).unwrap();
+            assert!(out.to_string().contains("\"hi\""), "{source:?} at {producer:?}: {out}");
+            for signature in signatures {
+                assert_eq!(
+                    out.to_string().contains(signature),
+                    signed,
+                    "{source:?} at {producer:?}: {out}"
+                );
+            }
+        }
+    }
+
     // A compaction answer replaces the history before it.
     let compacted = rig.stored(Source::Compaction, usize::MAX);
     let next = json!({"model": "m", "input": "q2", "previous_response_id": "resp_c"});
@@ -1004,6 +1027,54 @@ fn expansion_puts_the_stored_turn_before_the_new_input() {
     assert_eq!(input.len(), 2, "{out}");
     assert_eq!(input[0]["encrypted_content"], json!("CMP=="), "{out}");
     drop(second);
+}
+
+/// A stored binding may name the `signature` carrier only as a producer-tagged Gemini replay
+/// entry, the one admission returns to its producer alone; any other such binding is refused.
+#[test]
+fn only_a_tagged_gemini_replay_entry_carries_a_signature() {
+    let rig = Rig::new();
+    let tagged =
+        json!({"kind": "gemini", "signature": "S==", "producer": {"provider": "gemini", "credential": "eeee"}});
+    let rows = [
+        ("a tagged Gemini replay entry", "replay", tagged.clone(), true),
+        (
+            "an untagged Gemini replay entry",
+            "replay",
+            json!({"kind": "gemini", "signature": "S=="}),
+            false,
+        ),
+        (
+            "a tagged entry of another provider",
+            "replay",
+            json!({"kind": "anthropic", "signature": "S==", "producer": {"provider": "claude", "credential": "aaaa"}}),
+            false,
+        ),
+        (
+            "a tagged Gemini entry without its signature",
+            "replay",
+            json!({"kind": "gemini", "producer": {"provider": "gemini", "credential": "eeee"}}),
+            false,
+        ),
+        ("a tagged Gemini entry outside replay", "original", tagged, false),
+    ];
+    for (case, list, mut entry, restored) in rows {
+        entry["binding"] = json!("/messages/0/content/0");
+        entry["carrier"] = json!("signature");
+        let body = json!({
+            "messages": [{"role": "assistant", "content": [{"type": "text", "text": "hi"}]}],
+            "x_ck": {list: [entry]}
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let mut owner = rig.store.create().unwrap();
+        let lease = crate::codec::encode::scratch(&mut owner, |e| e.bytes(&bytes)).unwrap();
+        let mut source = crate::codec::source::Source::new(&mut owner).unwrap();
+        source.push_scratch(lease).unwrap();
+        let len = source.len();
+        let mut doc = Document::parse(&mut owner, source, len).unwrap();
+        let result = crate::codec::provenance::restore_bindings(&mut doc);
+        assert_eq!(result.is_ok(), restored, "{case}: {result:?}");
+    }
 }
 
 /// One line per Responses input item: its kind and its text, encrypted content or call name.
