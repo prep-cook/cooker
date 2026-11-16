@@ -21,6 +21,7 @@ use crate::common::{
 use crate::gemini_chat_request::{content_node as content, text_part};
 use crate::gemini_gemini::{set_function_response_raw, set_function_response_result};
 use crate::gemini_web_search as ws;
+use crate::responses::request::PROVEN;
 use crate::responses_tools::{
     client_tool_search_name, gemini_function_declarations, is_client_tool_search_item, map_tool_name,
     tool_choice_to_gemini,
@@ -586,10 +587,20 @@ fn with_field(item: &Res<'_>, path: &str, value: &[u8]) -> Res<'static> {
     owned(&raw)
 }
 
+/// `call` with the `_ck_proven` identity of `reasoning`, the item its signature comes from.
+fn with_source(mut call: Vec<u8>, reasoning: &Res<'_>) -> Vec<u8> {
+    let proven = reasoning.get(PROVEN);
+    if proven.exists() {
+        gj::set_raw(&mut call, PROVEN, &proven.raw);
+    }
+    call
+}
+
 /// pairOpenAIResponsesReasoningWithFunctionCalls: moves reasoning signatures onto the
 /// function calls they belong to (`_cpa_reasoning_signature`, `_cpa_reasoning_summary`).
 fn pair_reasoning_with_function_calls<'a>(items: &[Res<'a>]) -> Vec<Res<'a>> {
-    let mut post_call_signature: HashMap<usize, Vec<u8>> = HashMap::new();
+    // A call's index, to the index of the carrier after it whose signature it takes.
+    let mut post_call_signature: HashMap<usize, usize> = HashMap::new();
     let mut post_call_carrier: HashSet<usize> = HashSet::new();
     let mut consumed_post_call_carrier: HashSet<usize> = HashSet::new();
     let mut group_start = 0;
@@ -636,7 +647,7 @@ fn pair_reasoning_with_function_calls<'a>(items: &[Res<'a>]) -> Vec<Res<'a>> {
                     continue;
                 }
                 if (group_end..output_end).any(|o| extract_call_id(&items[o]) == call_id) {
-                    post_call_signature.insert(call_index, trimmed(&items[call_index + 1], "encrypted_content"));
+                    post_call_signature.insert(call_index, call_index + 1);
                     consumed_post_call_carrier.insert(call_index + 1);
                 }
             }
@@ -648,10 +659,15 @@ fn pair_reasoning_with_function_calls<'a>(items: &[Res<'a>]) -> Vec<Res<'a>> {
     let mut index = 0;
     while index < items.len() {
         let item = &items[index];
-        if let Some(signature) = post_call_signature.get(&index).filter(|s| !s.is_empty()) {
-            paired.push(with_field(item, SIGNATURE_FIELD, signature));
-            index += 1;
-            continue;
+        if let Some(carrier) = post_call_signature.get(&index).map(|&c| &items[c]) {
+            let signature = trimmed(carrier, "encrypted_content");
+            if !signature.is_empty() {
+                let mut call = item.raw.to_vec();
+                gj::set_str(&mut call, SIGNATURE_FIELD, &signature);
+                paired.push(owned(&with_source(call, carrier)));
+                index += 1;
+                continue;
+            }
         }
         if consumed_post_call_carrier.contains(&index) {
             index += 1;
@@ -674,7 +690,7 @@ fn pair_reasoning_with_function_calls<'a>(items: &[Res<'a>]) -> Vec<Res<'a>> {
                 if !summary.is_empty() {
                     gj::set_str(&mut call, SUMMARY_FIELD, &summary);
                 }
-                paired.push(owned(&call));
+                paired.push(owned(&with_source(call, item)));
                 index += 2;
                 continue;
             }
@@ -1808,6 +1824,18 @@ fn effective_role(role: &[u8]) -> Vec<u8> {
 
 /// ConvertOpenAIResponsesRequestToGemini.
 pub(crate) fn convert(model: &str, raw: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    convert_with_sources(model, raw).map(|(out, _)| out)
+}
+
+/// Per function call part, in output order, the `_ck_proven` identity of its signature's item.
+pub(crate) type CallSources = Vec<Option<Vec<u8>>>;
+
+/// [`convert`], with the `_ck_proven` identity of the reasoning item each function call part
+/// takes its signature from, one entry per part in output order (`None`: no proven item). The
+/// identity follows the call occurrence through the pairing, so calls sharing a call ID keep
+/// their own items.
+pub(crate) fn convert_with_sources(model: &str, raw: &[u8]) -> Result<(Vec<u8>, CallSources), crate::Error> {
+    let mut sources = vec![];
     let mut drops = UserTurnDrops::default();
     let mut native = sig::provider_from_model_name(model) == Provider::Gemini;
     let mut out = br#"{"contents":[]}"#.to_vec();
@@ -1857,7 +1885,7 @@ pub(crate) fn convert(model: &str, raw: &[u8]) -> Result<Vec<u8>, crate::Error> 
         native |= has_carrier;
         let items = normalize_tool_call_outputs(items);
         let items = pair_reasoning_with_function_calls(&items);
-        let mut contents = convert_items(&items, native, &forward, &mut system_parts, &mut drops);
+        let mut contents = convert_items(&items, native, &forward, &mut system_parts, &mut drops, &mut sources);
         contents = coalesce_model_contents(contents);
         contents = merge_adjacent_user_contents(contents);
         gj::set_items(&mut out, "contents", &contents);
@@ -1915,7 +1943,7 @@ pub(crate) fn convert(model: &str, raw: &[u8]) -> Result<Vec<u8>, crate::Error> 
         result = sig::sanitize_gemini_request_thought_signatures(&result, "contents");
     }
     let result = strip_trailing_model_prefill(result);
-    drops.result().map(|()| result)
+    drops.result().map(|()| (result, sources))
 }
 
 /// The `input` loop of ConvertOpenAIResponsesRequestToGemini.
@@ -1925,6 +1953,7 @@ fn convert_items(
     forward: &HashMap<Vec<u8>, Vec<u8>>,
     system_parts: &mut Vec<Vec<u8>>,
     drops: &mut UserTurnDrops,
+    sources: &mut CallSources,
 ) -> Vec<Vec<u8>> {
     let mut contents: Vec<Vec<u8>> = vec![];
     let mut names_by_call: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
@@ -2109,6 +2138,8 @@ fn convert_items(
                 } else {
                     sig::gemini_replay_signature_or_bypass(&raw_signature, BlockKind::GeminiFunctionCall).into_bytes()
                 };
+                let proven = item.get(PROVEN);
+                sources.push(proven.exists().then(|| proven.raw.to_vec()));
                 let thought_text = field(item, SUMMARY_FIELD);
                 if !thought_text.is_empty() {
                     contents.push(reasoning_function_call_content(
@@ -2251,6 +2282,52 @@ fn convert_items(
 
 #[cfg(test)]
 mod tests {
+    /// Each function call part names the reasoning item its signature comes from, by call
+    /// occurrence: whether the item comes before the call or rides after it as a carrier, and
+    /// when two calls share a call ID. An unproven item names none.
+    #[test]
+    fn each_function_call_part_names_the_item_its_signature_comes_from() {
+        let call = |id: &str| format!(r#"{{"type":"function_call","call_id":"{id}","name":"f","arguments":"{{}}"}}"#);
+        let output = |id: &str| format!(r#"{{"type":"function_call_output","call_id":"{id}","output":"ok"}}"#);
+        let reasoning =
+            |proof: &str| format!(r#"{{"type":"reasoning","summary":[],"encrypted_content":" S\n"{proof}}}"#);
+        // (case, items, identity per function call part)
+        let rows = [
+            (
+                "reasoning before each call",
+                vec![
+                    reasoning(r#","_ck_proven":3"#),
+                    call("a"),
+                    reasoning(r#","_ck_proven":5"#),
+                    call("b"),
+                ],
+                vec![Some("3"), Some("5")],
+            ),
+            (
+                "two calls sharing a call ID",
+                vec![
+                    reasoning(r#","_ck_proven":3"#),
+                    call("a"),
+                    reasoning(r#","_ck_proven":5"#),
+                    call("a"),
+                ],
+                vec![Some("3"), Some("5")],
+            ),
+            (
+                "a carrier after the call",
+                vec![call("a"), reasoning(r#","_ck_proven":7"#), output("a")],
+                vec![Some("7")],
+            ),
+            ("an unproven item", vec![reasoning(""), call("a")], vec![None]),
+        ];
+        for (case, items, want) in rows {
+            let raw = format!(r#"{{"input":[{}]}}"#, items.join(","));
+            let (_, got) = super::convert_with_sources("claude-sonnet-4-6", raw.as_bytes()).unwrap();
+            let want: Vec<Option<Vec<u8>>> = want.iter().map(|w| w.map(|p| p.as_bytes().to_vec())).collect();
+            assert_eq!(got, want, "{case}");
+        }
+    }
+
     /// openAIResponsesDiscoveredToolNames: a replayed tool_search_output lists each
     /// discovered tool once, by its Gemini name, in first-seen order (a namespace child and
     /// the same qualified name declared directly are one tool).

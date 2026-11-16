@@ -1,11 +1,13 @@
 use super::super::{is, member};
 use super::native::{item_type, native, typed};
 use super::reasoning::write_reasoning_options;
+use super::{ANTIGRAVITY, PROVEN};
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
     encode::Encoder,
 };
+use ck_wire::signature;
 pub(in crate::responses) use fields::write_echo;
 use fields::write_field;
 use results::write_results;
@@ -69,7 +71,7 @@ pub(super) fn write_request(
     };
     for message in doc.children(doc.required(root, "messages")?)? {
         if !instructions(doc, message)? {
-            write_message(view, message, &mut replay, &mut first, e)?;
+            write_message(view, message, &mut replay, destination, &mut first, e)?;
         }
     }
     e.bytes(b"]")?;
@@ -183,6 +185,7 @@ fn write_message(
     view: RequestView<'_>,
     message: usize,
     replay: &mut Replay,
+    destination: &str,
     first: &mut bool,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
@@ -205,9 +208,14 @@ fn write_message(
         }
         let results = write_results(view, content, first, e)?;
         let reasoning = native || any_part(doc, content, true)?;
-        if reasoning {
+        let provenance = provenance(doc, message, content, replay)?;
+        // Settled 62: reasoning no producer vouches for, in a form only Antigravity reads, is left
+        // out at every other destination.
+        if reasoning && (destination == ANTIGRAVITY || provenance != Provenance::AntigravityForm) {
             separate(first, e)?;
-            write_reasoning(doc, message, content, replay, e)?;
+            // Tells the Antigravity steps that a producer tag proves the item theirs.
+            let proven = destination == ANTIGRAVITY && provenance == Provenance::Producer;
+            write_reasoning(doc, message, content, replay, proven, e)?;
         }
         let text = match doc.node(content)?.value {
             Value::Array => any_part(doc, content, false)? || (!reasoning && !results && calls.is_none()),
@@ -226,6 +234,67 @@ fn write_message(
         }
     }
     Ok(())
+}
+/// Who vouches for the encrypted reasoning of a message.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Provenance {
+    /// No encrypted part, or one no producer tagged in a form any destination may read.
+    None,
+    /// A producer tag: history the server stored and `codec::provenance::admit` admitted for
+    /// this attempt's account (Settled 73).
+    Producer,
+    /// No producer tag, and a form only the Antigravity steps read.
+    AntigravityForm,
+}
+
+/// The provenance of `message`'s encrypted parts. A client replaying an item itself sends no
+/// tag (the owner cut the signed envelope on 2026-11-15).
+fn provenance(doc: &Document, message: usize, content: usize, replay: &mut Replay) -> Result<Provenance> {
+    if !matches!(doc.node(content)?.value, Value::Array) {
+        return Ok(Provenance::None);
+    }
+    let mut provenance = Provenance::None;
+    for part in doc.children(content)? {
+        if is(doc, part, "type", "encrypted")? {
+            let entry = replay.seek(doc, doc.unsigned(doc.required(part, "replay_index")?)?, message)?;
+            if doc.member(entry, "producer")?.is_some() {
+                provenance = Provenance::Producer;
+            } else if antigravity_reasoning(doc, doc.required(entry, "signature")?)? {
+                return Ok(Provenance::AntigravityForm);
+            }
+        }
+    }
+    Ok(provenance)
+}
+
+/// Whether string `value` is Antigravity reasoning: a Claude thinking signature, which reaches a
+/// Responses client only from Antigravity, or one of CLIProxyAPI's Antigravity carriers and
+/// compaction capsules. Only a value that can be a Claude signature is copied out to be checked.
+fn antigravity_reasoning(doc: &Document, value: usize) -> Result<bool> {
+    const PREFIXES: [&str; 3] = [
+        "cpa-gemini-responses-carrier-v1:",
+        "cpa-gemini-carrier-v1:",
+        "cpa-ag-compact-v1:",
+    ];
+    let mut chars = doc.chars(value)?;
+    let mut text = String::new();
+    while text.trim_start().len() < PREFIXES[0].len() {
+        match chars.next_scalar()? {
+            Some(c) => text.push(c),
+            None => break,
+        }
+    }
+    let head = text.trim_start();
+    if PREFIXES.iter().any(|p| head.starts_with(p)) {
+        return Ok(true);
+    }
+    if !head.starts_with("claude#") && !head.starts_with(['C', 'E', 'Q', 'R']) {
+        return Ok(false);
+    }
+    while let Some(c) = chars.next_scalar()? {
+        text.push(c);
+    }
+    Ok(signature::detect_provider(&text) == signature::Provider::Claude)
 }
 /// True when array `content` has a reasoning part (`reasoning`) or a message part.
 fn any_part(doc: &Document, content: usize, reasoning: bool) -> Result<bool> {
@@ -364,6 +433,7 @@ fn write_reasoning(
     message: usize,
     content: usize,
     replay: &mut Replay,
+    proven: bool,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
     let compaction = typed(doc, item_type(doc, message)?, "compaction")?;
@@ -387,14 +457,26 @@ fn write_reasoning(
         write_reasoning_parts(doc, content, ("content", "reasoning", "reasoning_text"), e)?;
     }
     let parts = matches!(doc.node(content)?.value, Value::Array).then_some(content);
+    let mut held = None;
     for part in parts.map(|p| doc.children(p)).transpose()?.into_iter().flatten() {
         if is(doc, part, "type", "encrypted")? {
-            let entry = replay.seek(doc, doc.unsigned(doc.required(part, "replay_index")?)?, message)?;
+            let index = doc.unsigned(doc.required(part, "replay_index")?)?;
+            let entry = replay.seek(doc, index, message)?;
             e.bytes(b",\"encrypted_content\":")?;
             doc.write(doc.required(entry, "signature")?, e)?;
+            held = Some(index);
         }
     }
-    originals(doc, message, e, &["type"])?;
+    // The replay index names this item, so a call restores only the bytes of the item it pairs
+    // with. Request ingress drops a client's member of that name; a stored answer's original
+    // member of that name never passes as proof either.
+    if let Some(index) = held.filter(|_| proven && !compaction) {
+        e.bytes(b",\"")?;
+        e.bytes(PROVEN.as_bytes())?;
+        e.bytes(b"\":")?;
+        e.unsigned(index)?;
+    }
+    originals(doc, message, e, &["type", PROVEN])?;
     e.bytes(b"}")
 }
 /// Writes member `field` listing the `kind` parts of `content` as `native` parts.

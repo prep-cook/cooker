@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Res};
+use ck_wire::signature::{Provider, provider_from_model_name};
 
 use crate::apply_patch::{self, CallState};
 use crate::claude_responses_response::{Echo, copy_request_fields, pick_request};
@@ -459,6 +460,27 @@ pub fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
     })
 }
 
+/// The `encrypted_content` carrying an upstream thought signature. A Claude model's signature
+/// reaches the client as the upstream sent it (Settled 68), so the client can return it
+/// unchanged; CLIProxyAPI's carrier would make the next turn drop it. Other models keep the
+/// carrier.
+fn encrypted_content(model: &str, signature: &[u8], direction: &str, target: &str) -> Vec<u8> {
+    if provider_from_model_name(model) == Provider::Claude {
+        return upstream_signature(model, signature);
+    }
+    encode_carrier(signature, direction, target)
+}
+
+/// An upstream thought signature, or empty when it is blank. A Claude model's keeps the bytes
+/// the upstream sent (Settled 68); CLIProxyAPI trims every signature.
+fn upstream_signature(model: &str, raw: &[u8]) -> Vec<u8> {
+    let trimmed = trim_space(raw);
+    if trimmed.is_empty() || provider_from_model_name(model) != Provider::Claude {
+        return trimmed.to_vec();
+    }
+    raw.to_vec()
+}
+
 fn grounding_exists(grounding: &Option<Vec<u8>>) -> bool {
     grounding.as_deref().is_some_and(|g| gj::parse(g).exists())
 }
@@ -473,7 +495,12 @@ impl State {
         if self.reasoning_enc.is_empty() || self.reasoning_direction.is_empty() {
             return self.reasoning_enc.clone();
         }
-        encode_carrier(&self.reasoning_enc, self.reasoning_direction, self.reasoning_target)
+        encrypted_content(
+            &self.model,
+            &self.reasoning_enc,
+            self.reasoning_direction,
+            self.reasoning_target,
+        )
     }
 
     fn fill_web_search_query(&mut self) {
@@ -826,7 +853,7 @@ impl State {
     }
 
     fn emit_detached_reasoning(&mut self, signature: &[u8], direction: &str, target: &str, out: &mut Vec<Vec<u8>>) {
-        let signature = trim_space(signature).to_vec();
+        let signature = upstream_signature(&self.model, signature);
         if signature.is_empty() || self.seen_reasoning_signatures.contains(&signature) {
             return;
         }
@@ -841,7 +868,7 @@ impl State {
             format!("_detached_{placement}_{index}").as_bytes(),
         ]
         .concat();
-        let carrier = encode_carrier(&signature, direction, target);
+        let carrier = encrypted_content(&self.model, &signature, direction, target);
         for (name, template) in [
             (
                 "response.output_item.added",
@@ -868,7 +895,7 @@ impl State {
     fn emit_trailing_detached_reasoning(&mut self, signature: &[u8], out: &mut Vec<Vec<u8>>) {
         match self.last_semantic_kind {
             TEXT => {
-                let signature = trim_space(signature).to_vec();
+                let signature = upstream_signature(&self.model, signature);
                 if signature.is_empty() || self.seen_reasoning_signatures.contains(&signature) {
                     return;
                 }
@@ -974,9 +1001,9 @@ impl State {
             .into_iter()
             .find(Res::exists)
             .map_or(-1, |p| p.int());
-        let mut signature = trim_space(&part.get("thoughtSignature").bytes()).to_vec();
+        let mut signature = upstream_signature(&self.model, &part.get("thoughtSignature").bytes());
         if signature.is_empty() {
-            signature = trim_space(&part.get("thought_signature").bytes()).to_vec();
+            signature = upstream_signature(&self.model, &part.get("thought_signature").bytes());
         }
         let function_call = part.get("functionCall");
         let text = part.get("text");
@@ -1807,9 +1834,9 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
         for (key, p) in parts.array().iter().enumerate() {
             let explicit = [p.get("partIndex"), p.get("index")].into_iter().find(Res::exists);
             let part_index = explicit.as_ref().map_or(key as i64, Res::int);
-            let mut signature = trim_space(&p.get("thoughtSignature").bytes()).to_vec();
+            let mut signature = upstream_signature(ctx.model, &p.get("thoughtSignature").bytes());
             if signature.is_empty() {
-                signature = trim_space(&p.get("thought_signature").bytes()).to_vec();
+                signature = upstream_signature(ctx.model, &p.get("thought_signature").bytes());
             }
             if p.get("thought").bool() {
                 flush_message!();
@@ -2019,7 +2046,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
         gj::set_str(
             &mut item,
             "encrypted_content",
-            encode_carrier(signature, direction, target),
+            encrypted_content(ctx.model, signature, direction, target),
         );
         detached_index += 1;
         outputs.push(item);
@@ -2043,7 +2070,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
                 let mut item = br#"{"id":"","type":"reasoning","encrypted_content":""}"#.to_vec();
                 gj::set_str(&mut item, "id", &reasoning_id);
                 let encrypted = if !signature.is_empty() && !direction.is_empty() {
-                    encode_carrier(signature, direction, target)
+                    encrypted_content(ctx.model, signature, direction, target)
                 } else {
                     signature.clone()
                 };

@@ -1,4 +1,5 @@
 use super::super::{is, move_field, string};
+use super::PROVEN;
 use crate::codec::{
     Error, Operation, Result,
     document::{Document, Name, Value},
@@ -30,6 +31,7 @@ const ROOT_FIELDS: &[&str] = &[
 
 pub(super) fn normalize(doc: &mut Document, owner: &mut Writer, operation: Operation) -> Result<()> {
     let root = doc.root();
+    drop_proof(doc, root)?;
     let wire_x = doc.remove(root, "x_ck")?;
     let x = doc.set(root, "x_ck", Value::Object)?;
     doc.set(x, "v", Value::Unsigned(1))?;
@@ -53,6 +55,38 @@ pub(super) fn normalize(doc: &mut Document, owner: &mut Writer, operation: Opera
     normalize_tools(doc, owner, x, original)?;
     preserve_unknown(doc, original, root, ROOT_FIELDS)?;
     pointers(doc, owner, original)
+}
+/// Removes `_ck_proven`, the member the Responses egress sets on an item the server proves it
+/// produced, from the root, every input item and every content part the client sent, before
+/// any branch moves or copies their members.
+fn drop_proof(doc: &mut Document, root: usize) -> Result<()> {
+    doc.remove(root, PROVEN)?;
+    let Some(input) = doc.member(root, "input")? else {
+        return Ok(());
+    };
+    if !matches!(doc.node(input)?.value, Value::Array) {
+        return Ok(());
+    }
+    let mut item = doc.node(input)?.first;
+    while let Some(i) = item {
+        item = doc.node(i)?.next;
+        if !matches!(doc.node(i)?.value, Value::Object) {
+            continue;
+        }
+        doc.remove(i, PROVEN)?;
+        if let Some(content) = doc.member(i, "content")?
+            && matches!(doc.node(content)?.value, Value::Array)
+        {
+            let mut part = doc.node(content)?.first;
+            while let Some(p) = part {
+                part = doc.node(p)?.next;
+                if matches!(doc.node(p)?.value, Value::Object) {
+                    doc.remove(p, PROVEN)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 /// Moves `instructions` and `input` into canonical messages. A null `instructions`, and a
 /// compact's null `input`, are documented as absent.

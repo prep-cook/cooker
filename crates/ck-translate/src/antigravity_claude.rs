@@ -380,14 +380,23 @@ fn provider(model: &str) -> Provider {
 /// resolveProviderCompatibleSignature, except that a valid Claude signature, on a thinking
 /// block or a tool call, goes upstream as the client holds it (ruling 68): only CLIProxyAPI's
 /// legacy `<group>#` prefix comes off, without its double-layer rewrite.
-fn provider_compatible(target: Provider, raw: &[u8], kind: BlockKind) -> Vec<u8> {
+pub(crate) fn provider_compatible(target: Provider, raw: &[u8], kind: BlockKind) -> Vec<u8> {
     if raw.is_empty() {
         return vec![];
     }
     if target == Provider::Claude {
-        return match compatible_antigravity_claude_thinking_signature(raw) {
-            Some(_) => sig::payload_without_provider_prefix(raw).to_vec(),
-            None => vec![],
+        if compatible_antigravity_claude_thinking_signature(raw).is_none() {
+            return vec![];
+        }
+        // The check reads a trimmed view; the bytes stay as held, whitespace included, less only
+        // a legacy prefix.
+        let lead = trim_space(raw).as_ptr() as usize - raw.as_ptr() as usize;
+        return match sig::split_provider_prefix(raw) {
+            Some(_) => {
+                let hash = lead + raw[lead..].iter().position(|b| *b == b'#').unwrap_or(0);
+                [&raw[..lead], &raw[hash + 1..]].concat()
+            }
+            None => raw.to_vec(),
         };
     }
     sig::compatible_signature_for_provider_block(target, raw, kind)

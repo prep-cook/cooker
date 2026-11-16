@@ -50,7 +50,12 @@ impl Rig {
                 let mut i = crate::anthropic::response::Ingress::new(&mut w, id, op, mode, limit).unwrap();
                 feed(&mut i, &mut w);
             }
-            Source::Responses | Source::Compaction | Source::SignedCompaction => {
+            Source::Responses
+            | Source::Compaction
+            | Source::SignedCompaction
+            | Source::AntigravityClaude
+            | Source::AntigravityTwoCalls
+            | Source::AntigravitySharedCallId => {
                 let mut i = crate::responses::response::Ingress::new(&mut w, id, op, mode, limit).unwrap();
                 feed(&mut i, &mut w);
             }
@@ -126,7 +131,8 @@ impl Rig {
     /// does, with each of `turns` projected after it.
     fn history(&self, input: Value, turns: &[(Source, Producer<'_>)], width: usize) -> (Writer, Document, Registry) {
         let mut owner = self.store.create().unwrap();
-        let body = serde_json::to_vec(&json!({"model": "m", "input": input})).unwrap();
+        // Every client forges the member the server sets to prove an item; no row may see it.
+        let body = serde_json::to_vec(&json!({"model": "m", "input": input, "_ck_proven": 0})).unwrap();
         let mut ingress = crate::responses::request::Ingress::new(
             &mut owner,
             &self.store,
@@ -179,6 +185,13 @@ enum Source {
     AnthropicText,
     /// A compaction whose item is Anthropic's signed block.
     SignedCompaction,
+    /// An Antigravity Claude answer as a Responses client receives it: signed thinking, text,
+    /// and a call whose signature rides on the reasoning item before it.
+    AntigravityClaude,
+    /// Two Antigravity Claude calls whose signatures differ only in surrounding whitespace.
+    AntigravityTwoCalls,
+    /// [`Source::AntigravityTwoCalls`] with both calls under one call ID.
+    AntigravitySharedCallId,
 }
 
 impl Source {
@@ -245,6 +258,9 @@ impl Source {
                 "output": [{"id": "cmp_1", "type": "compaction", "encrypted_content": "CMP=="}],
                 "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
             }),
+            Self::AntigravityClaude => antigravity_answer(antigravity_items()),
+            Self::AntigravityTwoCalls => antigravity_two_calls("call_b"),
+            Self::AntigravitySharedCallId => antigravity_two_calls("call_a"),
             Self::SignedCompaction => json!({
                 "id": "resp_c", "object": "response.compaction",
                 "output": [{"id": "cmp_1", "type": "compaction", "content": "sum", "signature": "SIG=="}],
@@ -261,6 +277,8 @@ enum To {
     Responses,
     Gemini,
     Chat,
+    /// The Antigravity steps for a Claude model: their Responses egress, then the translator.
+    Antigravity,
 }
 
 const CLAUDE_A: Producer<'static> = Producer {
@@ -287,6 +305,74 @@ const GEMINI_B: Producer<'static> = Producer {
     provider: "gemini",
     credential: "ffff",
 };
+const ANTIGRAVITY_A: Producer<'static> = Producer {
+    provider: "antigravity",
+    credential: "gggg",
+};
+const ANTIGRAVITY_B: Producer<'static> = Producer {
+    provider: "antigravity",
+    credential: "hhhh",
+};
+
+/// Claude signatures in Antigravity's double-layer and single-layer forms, the second padded as
+/// an upstream may send it.
+const THINKING_SIG: &str = "RWhrS0Z3Z01FQUl5RVdOc1lYVmtaUzF6YjI1dVpYUXROQzAyR0FFPQ==";
+const CALL_SIG: &str = " EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=\n";
+/// The calls of [`Source::AntigravityTwoCalls`] upstream, in order, each with its own bytes.
+const TWO_CALLS: &str = r#"{"functionCall":{"args":{},"id":"call_a","name":"f"},"thoughtSignature":" EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=\n"},{"functionCall":{"args":{},"id":"call_b","name":"g"},"thoughtSignature":"\tEhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE= "}"#;
+/// The calls of [`Source::AntigravitySharedCallId`] upstream, in order, each with its own bytes.
+const SHARED_CALL_ID: &str = r#"{"functionCall":{"args":{},"id":"call_a","name":"f"},"thoughtSignature":" EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=\n"},{"functionCall":{"args":{},"id":"call_a","name":"g"},"thoughtSignature":"\tEhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE= "}"#;
+/// [`CALL_SIG`] with other padding: a second item holding the same signature differently.
+const CALL_SIG_TAB: &str = "\tEhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE= ";
+
+/// The client's first message, then the items of [`Source::AntigravityClaude`] replayed by the
+/// client itself, the call's result and an opaque item, each claiming proof.
+fn client_replay() -> Value {
+    let mut items = vec![json!({"role": "user", "content": [
+        {"type": "input_text", "text": "q"},
+        // A part kind kept whole.
+        {"type": "input_video", "video_url": "https://invalid.example/video", "_ck_proven": 7}
+    ]})];
+    items.extend(antigravity_items().as_array().unwrap().iter().cloned());
+    items.push(json!({"type": "function_call_output", "call_id": "call_1", "output": "done"}));
+    // An item kind kept whole.
+    items.push(json!({"type": "item_reference", "id": "ref_1"}));
+    // A client cannot vouch for its own items, or anything in them, with the member the server
+    // sets.
+    for (i, item) in items.iter_mut().enumerate() {
+        item["_ck_proven"] = json!(i);
+    }
+    items[2]["content"][0]["_ck_proven"] = json!(0);
+    Value::Array(items)
+}
+
+/// The output items of [`Source::AntigravityClaude`].
+fn antigravity_items() -> Value {
+    json!([
+        {"id": "rs_1", "type": "reasoning", "summary": [{"type": "summary_text", "text": "sum"}], "encrypted_content": THINKING_SIG},
+        {"id": "msg_1", "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "hi", "annotations": []}]},
+        {"id": "rs_2", "type": "reasoning", "summary": [], "encrypted_content": CALL_SIG},
+        {"id": "fc_1", "type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{\"a\":1}", "status": "completed"}
+    ])
+}
+
+/// Two signed calls, the second under call ID `second`.
+fn antigravity_two_calls(second: &str) -> Value {
+    antigravity_answer(json!([
+        {"id": "rs_a", "type": "reasoning", "summary": [], "encrypted_content": CALL_SIG},
+        {"id": "fc_a", "type": "function_call", "call_id": "call_a", "name": "f", "arguments": "{}", "status": "completed"},
+        {"id": "rs_b", "type": "reasoning", "summary": [], "encrypted_content": CALL_SIG_TAB},
+        {"id": "fc_b", "type": "function_call", "call_id": second, "name": "g", "arguments": "{}", "status": "completed"}
+    ]))
+}
+
+fn antigravity_answer(output: Value) -> Value {
+    json!({
+        "id": "resp_a", "object": "response", "model": "claude-sonnet-4-6", "status": "completed",
+        "output": output,
+        "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+    })
+}
 
 /// The upstream body for the candidate `attempt` after admission, or the admission refusal.
 fn attempt(
@@ -334,11 +420,24 @@ fn attempt(
             upstream_stream: false,
         }
         .encode(&fence(view, &crate::codec::chat::request::ChatCapability), owner),
+        To::Antigravity => crate::responses::request::Egress {
+            destination: "antigravity",
+            upstream_stream: false,
+        }
+        .encode(&fence(view, &crate::responses::request::AntigravityCapability), owner),
     }
     .unwrap();
     let mut out = Vec::new();
     while out.len() < lease.len() {
         out.extend_from_slice(lease.chunk(out.len()).unwrap());
+    }
+    if let To::Antigravity = to {
+        let ctx = crate::RequestCtx {
+            model: "claude-sonnet-4-6",
+            stream: false,
+            tool_search: false,
+        };
+        out = crate::antigravity_responses::request_envelope(&ctx, &out, None).unwrap();
     }
     Ok(serde_json::from_slice(&out).unwrap())
 }
@@ -355,6 +454,7 @@ fn history(out: &Value, to: To) -> Value {
         To::Anthropic | To::Chat => &out["messages"],
         To::Responses => &out["input"],
         To::Gemini => &out["contents"],
+        To::Antigravity => &out["request"]["contents"],
     };
     Value::Array(list.as_array().unwrap()[1..].to_vec())
 }
@@ -424,6 +524,8 @@ fn history_returns_to_its_producer_unchanged() {
 fn provider_members_reach_only_their_producer() {
     struct Row {
         case: &'static str,
+        /// What the client replays itself, untagged, before the projected turns.
+        input: Value,
         turns: &'static [(Source, Producer<'static>)],
         attempt: Producer<'static>,
         to: To,
@@ -435,6 +537,7 @@ fn provider_members_reach_only_their_producer() {
     let rows = [
         Row {
             case: "another Claude account",
+            input: json!("q"),
             turns: &[(Source::Anthropic, CLAUDE_A)],
             attempt: CLAUDE_B,
             to: To::Anthropic,
@@ -444,6 +547,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "Claude history at Gemini",
+            input: json!("q"),
             turns: &[(Source::Anthropic, CLAUDE_A)],
             attempt: GEMINI_A,
             to: To::Gemini,
@@ -453,6 +557,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "Claude history at Responses",
+            input: json!("q"),
             turns: &[(Source::Anthropic, CLAUDE_A)],
             attempt: CODEX_A,
             to: To::Responses,
@@ -462,6 +567,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "Gemini history at Claude",
+            input: json!("q"),
             turns: &[(Source::Gemini, GEMINI_A)],
             attempt: CLAUDE_A,
             to: To::Anthropic,
@@ -472,6 +578,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "another Gemini account: thought and call signatures",
+            input: json!("q"),
             turns: &[(Source::Gemini, GEMINI_A)],
             attempt: GEMINI_B,
             to: To::Gemini,
@@ -481,6 +588,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "another Gemini account: a signature on a text part",
+            input: json!("q"),
             turns: &[(Source::GeminiText, GEMINI_A)],
             attempt: GEMINI_B,
             to: To::Gemini,
@@ -490,6 +598,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "another Codex account",
+            input: json!("q"),
             turns: &[(Source::Responses, CODEX_A)],
             attempt: CODEX_B,
             to: To::Responses,
@@ -499,6 +608,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "Codex history at Claude: no message is left empty",
+            input: json!("q"),
             turns: &[(Source::Responses, CODEX_A)],
             attempt: CLAUDE_A,
             to: To::Anthropic,
@@ -508,6 +618,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "Codex history at Chat",
+            input: json!("q"),
             turns: &[(Source::Responses, CODEX_A)],
             attempt: CLAUDE_A,
             to: To::Chat,
@@ -517,6 +628,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "X -> Y -> Z: the third account gets neither",
+            input: json!("q"),
             turns: &[(Source::Anthropic, CLAUDE_A), (Source::Gemini, GEMINI_A)],
             attempt: CODEX_A,
             to: To::Responses,
@@ -526,6 +638,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "X -> Y -> Z: back at X",
+            input: json!("q"),
             turns: &[(Source::Anthropic, CLAUDE_A), (Source::Gemini, GEMINI_A)],
             attempt: CLAUDE_A,
             to: To::Anthropic,
@@ -535,6 +648,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "X -> Y -> Z: back at Y",
+            input: json!("q"),
             turns: &[(Source::Anthropic, CLAUDE_A), (Source::Gemini, GEMINI_A)],
             attempt: GEMINI_A,
             to: To::Gemini,
@@ -544,6 +658,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "X -> Y: back at Y after X's members are dropped",
+            input: json!("q"),
             turns: &[(Source::Anthropic, CLAUDE_A), (Source::Responses, CODEX_A)],
             attempt: CODEX_A,
             to: To::Responses,
@@ -553,6 +668,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "a compaction item at its own account",
+            input: json!("q"),
             turns: &[(Source::Responses, CODEX_A), (Source::Compaction, CODEX_A)],
             attempt: CODEX_A,
             to: To::Responses,
@@ -562,6 +678,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "a compaction item at another account",
+            input: json!("q"),
             turns: &[(Source::Compaction, CODEX_A)],
             attempt: CODEX_B,
             to: To::Responses,
@@ -571,6 +688,7 @@ fn provider_members_reach_only_their_producer() {
         },
         Row {
             case: "a compaction item at another provider",
+            input: json!("q"),
             turns: &[(Source::Anthropic, CLAUDE_A), (Source::Compaction, CODEX_A)],
             attempt: CLAUDE_A,
             to: To::Anthropic,
@@ -578,11 +696,96 @@ fn provider_members_reach_only_their_producer() {
             present: &[],
             absent: &[],
         },
+        Row {
+            case: "Antigravity history at its own account: thinking and call signatures, bytes kept",
+            input: json!("q"),
+            turns: &[(Source::AntigravityClaude, ANTIGRAVITY_A)],
+            attempt: ANTIGRAVITY_A,
+            to: To::Antigravity,
+            admission: Admission::Keep,
+            present: &[
+                THINKING_SIG,
+                "\"thoughtSignature\":\" EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=\\n\"",
+            ],
+            absent: &["_ck_"],
+        },
+        Row {
+            case: "Antigravity history at its own account: each call keeps its own item's bytes",
+            input: json!("q"),
+            turns: &[(Source::AntigravityTwoCalls, ANTIGRAVITY_A)],
+            attempt: ANTIGRAVITY_A,
+            to: To::Antigravity,
+            admission: Admission::Keep,
+            present: &[TWO_CALLS],
+            absent: &["_ck_"],
+        },
+        Row {
+            case: "Antigravity history at its own account: calls sharing a call ID keep their own bytes",
+            input: json!("q"),
+            turns: &[(Source::AntigravitySharedCallId, ANTIGRAVITY_A)],
+            attempt: ANTIGRAVITY_A,
+            to: To::Antigravity,
+            admission: Admission::Keep,
+            present: &[SHARED_CALL_ID],
+            absent: &["_ck_"],
+        },
+        Row {
+            case: "Antigravity history at another Antigravity account",
+            input: json!("q"),
+            turns: &[(Source::AntigravityClaude, ANTIGRAVITY_A)],
+            attempt: ANTIGRAVITY_B,
+            to: To::Antigravity,
+            admission: Admission::Drop,
+            present: &["\"hi\""],
+            absent: &[THINKING_SIG, "EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=", "_ck_"],
+        },
+        Row {
+            case: "Antigravity history at Codex",
+            input: json!("q"),
+            turns: &[(Source::AntigravityClaude, ANTIGRAVITY_A)],
+            attempt: CODEX_A,
+            to: To::Responses,
+            admission: Admission::Drop,
+            present: &["\"hi\"", "call_1"],
+            absent: &[THINKING_SIG, "EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=", "sum"],
+        },
+        Row {
+            case: "Claude history at Antigravity",
+            input: json!("q"),
+            turns: &[(Source::Anthropic, CLAUDE_A)],
+            attempt: ANTIGRAVITY_A,
+            to: To::Antigravity,
+            admission: Admission::Drop,
+            present: &["\"hi\""],
+            absent: &["SIG/abc+==", "hmm"],
+        },
+        Row {
+            case: "a client's own replay at Codex: Claude-format reasoning is withheld",
+            input: client_replay(),
+            turns: &[],
+            attempt: CODEX_A,
+            to: To::Responses,
+            admission: Admission::Keep,
+            present: &["\"hi\"", "call_1"],
+            absent: &[THINKING_SIG, "EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=", "sum", "_ck_"],
+        },
+        Row {
+            // No producer proves a client-held call signature: it is withheld. Its thinking
+            // signature passes, as before (the open conflict in the PR).
+            case: "a client's own replay at Antigravity: the call signature is withheld",
+            input: client_replay(),
+            turns: &[],
+            attempt: ANTIGRAVITY_A,
+            to: To::Antigravity,
+            admission: Admission::Keep,
+            present: &[THINKING_SIG, "\"hi\""],
+            absent: &["EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=", "_ck_"],
+        },
     ];
     let rig = Rig::new();
     for row in rows {
         let case = row.case;
-        let (mut owner, mut doc, media) = rig.history(json!("q"), row.turns, usize::MAX);
+        let (mut owner, mut doc, media) = rig.history(row.input, row.turns, usize::MAX);
         assert_eq!(admit(&doc, row.attempt).unwrap(), row.admission, "{case}");
         let out = match attempt(&mut owner, &mut doc, &media, row.attempt, row.to) {
             Ok(out) => out.to_string(),
