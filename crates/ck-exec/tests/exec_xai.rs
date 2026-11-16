@@ -120,7 +120,7 @@ async fn run_with<I: RequestIngress>(
     let mut request = exchange.request(validated);
     request.client.execution_session = sessions.execution;
     request.client.derived_session = sessions.derived;
-    let started = executors.start(&attempt, &request, &mut writer, response).await;
+    let started = executors.start(&attempt, &mut request, &mut writer, response).await;
     Run {
         started,
         _request: writer,

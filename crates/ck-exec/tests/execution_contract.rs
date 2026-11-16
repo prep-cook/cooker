@@ -20,14 +20,14 @@ impl Execute for Probe {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<Ingress>, ExecError> {
         tokio::task::yield_now().await;
         let _held = (
             attempt.model,
             attempt.store.used_frames(),
-            request.validated.view(),
+            request.validated().view(),
             streams.request.id(),
             streams.response.id(),
         );
@@ -37,7 +37,7 @@ impl Execute for Probe {
     async fn count_tokens(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Counted<Ingress>, ExecError> {
         tokio::task::yield_now().await;
@@ -47,7 +47,7 @@ impl Execute for Probe {
     async fn compact(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<Ingress>, ExecError> {
         self.execute(attempt, request, streams).await
@@ -58,14 +58,14 @@ fn sends<T: Send>(_: &T) {}
 
 /// A server task awaiting an attempt while it keeps the request handle stays `Send`.
 #[allow(dead_code, reason = "type-checked, never run")]
-fn server_task(attempt: &Attempt<'_>, request: &Request<'_>, mut upload: Writer, mut response: Writer) {
+fn server_task(attempt: &Attempt<'_>, request: &mut Request<'_>, mut upload: Writer, mut response: Writer) {
     let task = async move {
         let streams = Streams {
             request: &mut upload,
             response: &mut response,
         };
         let upstream = Probe.execute(attempt, request, streams).await;
-        let _view = request.validated.view();
+        let _view = request.validated().view();
         upstream.map(|upstream| upstream.status)
     };
     sends(&task);

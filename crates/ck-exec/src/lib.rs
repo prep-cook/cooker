@@ -269,13 +269,13 @@ impl Executors {
     pub async fn start(
         &self,
         attempt: &types::Attempt<'_>,
-        request: &types::Request<'_>,
+        request: &mut types::Request<'_>,
         upload: &mut ck_stream::Writer,
         mut response: ck_stream::Writer,
     ) -> Result<pipeline::Started, ExecError> {
         match attempt.credential.provider.as_str() {
             "codex" => pipeline::start(&self.codex, attempt, request, upload, response).await,
-            "claude" if self.claude.contract_path(attempt, request.validated.view()) => {
+            "claude" if self.claude.contract_path(attempt, request.validated().view()) => {
                 pipeline::start(&self.claude, attempt, request, upload, response).await
             }
             p if openai_compat::handles(p) => {

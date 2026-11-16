@@ -83,13 +83,13 @@ impl Execute for XaiExecutor {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<XaiIngress>, ExecError> {
-        if let Operation::Media(media) = request.validated.view().operation {
+        if let Operation::Media(media) = request.validated().view().operation {
             return self.serve_media(attempt, request, streams, media).await;
         }
-        let upload = encode(&request.validated, true, streams.request)?;
+        let upload = encode(&request.validated(), true, streams.request)?;
         let call = Call::new(attempt, request)?;
         let mut prepared = call.shape(&upload, &self.replay, true, Format::Codex)?;
         call.report(&prepared.body);
@@ -118,12 +118,12 @@ impl Execute for XaiExecutor {
     async fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<XaiIngress>, ExecError> {
         let view = RequestView {
             operation: Operation::Generate,
-            ..request.validated.view()
+            ..request.validated().view()
         };
         let generate = RequestFence::default().end(view, &XaiCapability).map_err(encoding)?;
         let upload = encode(&generate, false, streams.request)?;
@@ -146,10 +146,10 @@ impl Execute for XaiExecutor {
     async fn compact(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<XaiIngress>, ExecError> {
-        let upload = encode(&request.validated, false, streams.request)?;
+        let upload = encode(&request.validated(), false, streams.request)?;
         let previous = text(&gj::get(&upload, "previous_response_id"));
         let call = Call::new(attempt, request)?;
         let mut prepared = call.shape(&upload, &self.replay, false, Format::OpenAIResponse)?;
@@ -243,7 +243,7 @@ pub(crate) struct Call<'r> {
 
 impl<'r> Call<'r> {
     pub(crate) fn new(attempt: &'r Attempt<'r>, request: &'r Request<'r>) -> Result<Self, ExecError> {
-        let document = request.validated.view().document;
+        let document = request.validated().view().document;
         Ok(Self {
             attempt,
             request,

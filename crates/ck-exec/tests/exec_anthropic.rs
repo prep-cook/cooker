@@ -137,10 +137,10 @@ impl Fixture {
         }
         let attempt = self.exchange.attempt(&self.streams.store);
         let validated = self.executors.fence(&attempt, ingress, request).unwrap();
-        let handle = self.exchange.request_with(validated, body);
+        let mut handle = self.exchange.request_with(validated, body);
         let response = self.streams.response(request);
         let id = response.id();
-        (self.executors.start(&attempt, &handle, request, response).await, id)
+        (self.executors.start(&attempt, &mut handle, request, response).await, id)
     }
 
     /// An Anthropic client request run to its upstream answer.

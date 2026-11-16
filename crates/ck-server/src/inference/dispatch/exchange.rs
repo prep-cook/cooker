@@ -16,7 +16,7 @@ use axum::response::Response;
 use ck_core::exec::{ExecError, FailureScope};
 use ck_stream::{Store, Writer};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
-use ck_translate::codec::{self, ClientCapability, RequestIngress, RequestView};
+use ck_translate::codec::{self, ClientCapability, RequestIngress};
 
 use super::attempt::{Codec, stored};
 use super::{Call, Done, Failure, Served, Trace, run_exchange, traced, upstream_headers};
@@ -47,8 +47,7 @@ where
 pub(crate) async fn run(rt: &Arc<Runtime>, call: Call, output: Output, trace: &Trace) -> Result<Served, Failure> {
     let store = rt.streams().store().map_err(|error| Failure::Exec(stored(&error)))?;
     // Client errors answer before selection, and before a router's judge, with nothing sent.
-    let mut first = Decoded::new(&store, &call, output)?;
-    let mut fenced = Some(first.codec()?);
+    let mut fenced = Some(Decoded::new(&store, &call, output)?.codec()?);
     let mut call = call;
     let mut picked = None;
     if call.forced_provider.is_none()
@@ -60,13 +59,9 @@ pub(crate) async fn run(rt: &Arc<Runtime>, call: Call, output: Output, trace: &T
     }
     let original = picked.as_ref().is_some_and(|p| p.falls_back()).then(|| call.clone());
     loop {
-        let mut again;
         let codec = match fenced.take() {
             Some(codec) => codec,
-            None => {
-                again = Decoded::new(&store, &call, output)?;
-                again.codec()?
-            }
+            None => Decoded::new(&store, &call, output)?.codec()?,
         };
         if call.operation == ck_core::exec::Operation::Generate && rt.usage_queue().accepts() {
             trace.prompt_prefix(call.entry, &call.body);
@@ -98,7 +93,7 @@ pub(crate) async fn run(rt: &Arc<Runtime>, call: Call, output: Output, trace: &T
 }
 
 /// A request decoded into its exchange: the request stream holds the client request, and
-/// the ingress holds the view every attempt re-fences.
+/// the ingress the document the client fence closes.
 struct Decoded {
     exchange: Option<Exchange>,
     ingress: Ingress,
@@ -163,25 +158,27 @@ impl Decoded {
         }
     }
 
-    /// Closes the client fence (contract G8) and hands the exchange to the selection loop.
-    fn codec(&mut self) -> Result<Codec<'_>, Failure> {
+    /// Closes the client fence (contract G8) and hands the exchange and the closed document
+    /// to the selection loop; the parser state goes with the ingress.
+    fn codec(mut self) -> Result<Codec, Failure> {
         let mut exchange = self.exchange.take().ok_or_else(|| refused(codec::Error::Closed))?;
-        let view = match &mut self.ingress {
-            Ingress::Chat(ingress) => fence(ingress, &mut exchange.request),
-            Ingress::Anthropic(ingress) => fence(ingress, &mut exchange.request),
-            Ingress::Gemini(ingress) => fence(ingress, &mut exchange.request),
+        let request = &mut exchange.request;
+        let request = match self.ingress {
+            Ingress::Chat(mut ingress) => fence(&mut ingress, request).and_then(|()| ingress.into_request()),
+            Ingress::Anthropic(mut ingress) => fence(&mut ingress, request).and_then(|()| ingress.into_request()),
+            Ingress::Gemini(mut ingress) => fence(&mut ingress, request).and_then(|()| ingress.into_request()),
         }
         .map_err(refused)?;
         Ok(Codec {
             exchange,
-            view,
+            request,
             request_id: self.request_id,
         })
     }
 }
 
-fn fence<'i>(ingress: &'i mut impl RequestIngress, request: &mut Writer) -> codec::Result<RequestView<'i>> {
-    Ok(ingress.finish(request, &ClientCapability)?.view())
+fn fence(ingress: &mut impl RequestIngress, request: &mut Writer) -> codec::Result<()> {
+    ingress.finish(request, &ClientCapability).map(drop)
 }
 
 fn random_id() -> LocalId {

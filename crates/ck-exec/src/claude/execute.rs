@@ -32,7 +32,7 @@ use super::{
     ClaudeExecutor, Completion, Ctx, Delegation, Input, Prepared, RawResponse, base_model, cloak, detect,
     fast_request_error, header_value, rebuild_mid_system, replay, sanitize_for_upstream, stream, telemetry,
 };
-use crate::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
+use crate::types::{Attempt, Body, Client, Counted, Execute, Request, Streams, Upstream};
 
 /// The capability key of the Anthropic Messages API.
 pub const DESTINATION: &str = "anthropic";
@@ -52,7 +52,7 @@ impl Execute for ClaudeExecutor {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<ClaudeIngress>, ExecError> {
         // Boxed like the old path: the prepared request future is large.
@@ -62,7 +62,7 @@ impl Execute for ClaudeExecutor {
     async fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<ClaudeIngress>, ExecError> {
         Box::pin(self.count(attempt, request, streams)).await
@@ -71,7 +71,7 @@ impl Execute for ClaudeExecutor {
     async fn compact(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<ClaudeIngress>, ExecError> {
         Box::pin(self.messages(attempt, request, streams)).await
@@ -83,9 +83,14 @@ impl Execute for ClaudeExecutor {
 /// refuse such a request, so the scheduler skips this candidate instead of sending a guessed
 /// value (owner ruling Q-H).
 fn default_max_tokens(cfg: &Config, model: &str) -> Option<u64> {
+    max_tokens_for(&ck_core::config::model_catalog::catalog(cfg), model)
+}
+
+/// [`default_max_tokens`] against a catalog the caller already holds.
+pub(super) fn max_tokens_for(catalog: &ck_core::config::model_catalog::ModelCatalog, model: &str) -> Option<u64> {
     let model = base_model(model);
     let model = model.trim();
-    ck_core::config::model_catalog::default_max_tokens(cfg, model, || {
+    catalog.resolve(model, || {
         ck_core::registry::model_providers(model)
             .iter()
             .any(|p| p.eq_ignore_ascii_case("claude"))
@@ -138,10 +143,13 @@ impl ClaudeExecutor {
     async fn messages(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<ClaudeIngress>, ExecError> {
-        let (doc, operation) = (request.validated.view().document, request.validated.view().operation);
+        let (doc, operation) = (
+            request.validated().view().document,
+            request.validated().view().operation,
+        );
         let facts = Facts::of(doc).map_err(encoding)?;
         // The fence refuses a streamed compaction.
         let stream = streaming(doc, facts.client_format).map_err(encoding)?;
@@ -154,14 +162,17 @@ impl ClaudeExecutor {
                 (original, &translated)
             }
             None => {
-                let default_max_tokens =
-                    capability(attempt.cfg, attempt.model, attempt.resolved_model).default_max_tokens;
-                encoded = encode(&request.validated, streams.request, stream, default_max_tokens)?;
+                let default_max_tokens = default_max_tokens(attempt.cfg, attempt.model);
+                encoded = encode(&request.validated(), streams.request, stream, default_max_tokens)?;
                 (&encoded, &encoded)
             }
         };
         let usage = request.client.usage;
-        let input = facts.input(request, attempt, original, stream);
+        let compaction = ck_translate::anthropic::compaction::requested(request.validated().view()).unwrap_or(false);
+        // Everything below reads the encoded or client body: the request document is freed
+        // before the preparation copies and the wait for the upstream.
+        request.validated.release();
+        let input = facts.client_input(&request.client, attempt, original, stream, compaction);
         // As the old path: a foreign client's generation always streams upstream.
         let upstream_stream = stream || (operation == Operation::Generate && facts.client_format != Format::Claude);
         let mut prepared = ctx.prepare_messages(&input, body, body, upstream_stream).await?;
@@ -200,40 +211,46 @@ impl ClaudeExecutor {
     async fn count(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<ClaudeIngress>, ExecError> {
         let cfg = scoped(attempt);
         let mut ctx = context(self, attempt, request, &cfg);
-        let facts = Facts::of(request.validated.view().document).map_err(encoding)?;
-        if let Some(original) = shaped(&mut ctx, request, facts.client_format, true) {
-            let translated = codex_tools(original, request.client.headers);
-            let input = facts.input(request, attempt, original, false);
-            if ctx.api_key.trim().is_empty() || !ctx.first_party {
-                let input_tokens = local_count(&ctx, &input, &translated)?;
-                return Ok(Counted::Local { input_tokens });
+        let facts = Facts::of(request.validated().view().document).map_err(encoding)?;
+        let local = ctx.api_key.trim().is_empty() || !ctx.first_party;
+        let (encoded, translated);
+        let (original, body): (&[u8], &[u8]) = match shaped(&mut ctx, request, facts.client_format, true) {
+            Some(original) => {
+                translated = codex_tools(original, request.client.headers);
+                (original, &translated)
             }
-            let prepared = ctx.prepare_count(&input, &translated, &translated).await?;
-            return self.count_upstream(&ctx, attempt, request, streams, prepared).await;
-        }
-        if ctx.api_key.trim().is_empty() || !ctx.first_party {
-            let view = RequestView {
-                operation: Operation::Generate,
-                ..request.validated.view()
-            };
-            // A count carries no `max_tokens`; the projection only needs one to pass the fence.
-            let mut capability = capability(attempt.cfg, attempt.model, attempt.resolved_model);
-            capability.default_max_tokens = capability.default_max_tokens.or(Some(u64::MAX));
-            let generate = RequestFence::default().end(view, &capability).map_err(encoding)?;
-            let upload = encode(&generate, streams.request, false, capability.default_max_tokens)?;
-            let input = facts.input(request, attempt, &upload, false);
+            None if local => {
+                let view = RequestView {
+                    operation: Operation::Generate,
+                    ..request.validated().view()
+                };
+                // A count carries no `max_tokens`; the projection only needs one to pass the fence.
+                let mut capability = capability(attempt.cfg, attempt.model, attempt.resolved_model);
+                capability.default_max_tokens = capability.default_max_tokens.or(Some(u64::MAX));
+                let generate = RequestFence::default().end(view, &capability).map_err(encoding)?;
+                encoded = encode(&generate, streams.request, false, capability.default_max_tokens)?;
+                (&encoded, &encoded)
+            }
+            None => {
+                encoded = encode(&request.validated(), streams.request, false, None)?;
+                (&encoded, &encoded)
+            }
+        };
+        let compaction = ck_translate::anthropic::compaction::requested(request.validated().view()).unwrap_or(false);
+        // As for a generation: the count reads only the encoded or client body from here on.
+        request.validated.release();
+        let input = facts.client_input(&request.client, attempt, original, false, compaction);
+        if local {
             return Ok(Counted::Local {
-                input_tokens: local_count(&ctx, &input, &upload)?,
+                input_tokens: local_count(&ctx, &input, body)?,
             });
         }
-        let upload = encode(&request.validated, streams.request, false, None)?;
-        let input = facts.input(request, attempt, &upload, false);
-        let prepared = ctx.prepare_count(&input, &upload, &upload).await?;
+        let prepared = ctx.prepare_count(&input, body, body).await?;
         self.count_upstream(&ctx, attempt, request, streams, prepared).await
     }
 
@@ -516,15 +533,16 @@ impl Facts {
         })
     }
 
-    /// The encoded Messages body stands for both the client body and the translated one.
-    fn input<'a>(
+    /// The request input the preparation reads: `body` stands for both the client body and the
+    /// translated one. It holds only client facts, so the caller may release the document first.
+    fn client_input<'a>(
         &'a self,
-        request: &'a Request<'_>,
+        client: &'a Client<'_>,
         attempt: &'a Attempt<'_>,
         body: &'a [u8],
         stream: bool,
+        compaction: bool,
     ) -> Input<'a> {
-        let client = &request.client;
         Input {
             headers: client.headers,
             original_body: body,
@@ -540,7 +558,7 @@ impl Facts {
             derived_session: client.derived_session,
             execution_session: client.execution_session,
             stream,
-            compaction: ck_translate::anthropic::compaction::requested(request.validated.view()).unwrap_or(false),
+            compaction,
         }
     }
 }

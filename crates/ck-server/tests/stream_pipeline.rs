@@ -20,16 +20,19 @@ use ck_core::format::Format;
 use ck_exec::pipeline::Started;
 use ck_exec::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
 use ck_server::Runtime;
-use ck_server::http::egress::{Failed, Framing, Output, Protocol, deliver};
+use ck_server::http::egress::{Failed, Framing, Output, Protocol, deliver, prepare};
 use ck_server::inference::dispatch::{self, Arms, Call, Codec, Served, Trace};
 use ck_server::inference::streams::{Exchange, StreamId, Uncommitted};
 use ck_stream::{Terminal, Writer};
-use ck_translate::codec::chat::request::{ChatCapability, read_request};
+use ck_translate::codec::chat::request::{ChatCapability, Egress as ChatEgress, read_request};
 use ck_translate::codec::chat::response::Ingress as ChatIngress;
 use ck_translate::codec::document::Document;
 use ck_translate::codec::event::{Direction, Identity, LocalId};
 use ck_translate::codec::provenance::Producer;
-use ck_translate::codec::{self, BodyMode, Operation, RequestFence, RequestView, ResponseIngress, ValidatedRequest};
+use ck_translate::codec::{
+    self, BodyMode, Operation, OwnedRequest, RequestEgress, RequestFence, RequestView, ResponseIngress,
+    ValidatedRequest,
+};
 use ck_translate::responses::history::project;
 use futures_util::{FutureExt, StreamExt, stream};
 use serde_json::Value;
@@ -74,14 +77,9 @@ async fn delivered(
     headers.insert("x-ck-trace-id", HeaderValue::from_static("trace"));
     let request = exchange.request.id();
     let response = live.response.allocator();
-    let delivery = deliver(
-        fixture.rt.streams(),
-        exchange,
-        &response,
-        identity(Direction::Response),
-        view,
-        headers,
-    );
+    let egress = prepare(&exchange, &response, identity(Direction::Response), view);
+    drop((document, media));
+    let delivery = deliver(fixture.rt.streams(), exchange, &response, egress, headers);
     let mut delivery: std::pin::Pin<&mut dyn Future<Output = _>> = std::pin::pin!(delivery);
     steps(&mut live, &mut delivery).await;
     let result = tokio::time::timeout(Duration::from_secs(5), delivery)
@@ -433,6 +431,8 @@ struct Begun {
     /// The route facts the attempt's request handle carries: `alt` and the route's stream
     /// choice.
     route: (Option<String>, Option<bool>),
+    /// The Chat body this attempt's fenced request encodes to.
+    upload: Vec<u8>,
 }
 
 /// The contract arm scripted per credential id; `start` runs the real `pipeline::start`.
@@ -494,11 +494,22 @@ impl Arms for Fake {
     async fn start(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         upload: &mut Writer,
         response: Writer,
     ) -> Result<Started, ExecError> {
         let records = self.drain();
+        let lease = ChatEgress {
+            destination: "chat",
+            upstream_stream: true,
+        }
+        .encode(&request.validated(), upload)
+        .unwrap();
+        let mut body = Vec::new();
+        while body.len() < lease.len() {
+            body.extend_from_slice(lease.chunk(body.len()).unwrap());
+        }
+        drop(lease);
         {
             let mut begun = self.begun.lock().unwrap();
             let previous = begun.last().map(|previous| previous.stream);
@@ -510,13 +521,20 @@ impl Arms for Fake {
                 previous_gone: previous.map(|id| matches!(attempt.store.reader(id, 0), Err(ck_stream::Error::Gone))),
                 records,
                 route: (request.client.alt.map(str::to_owned), request.client.streaming),
+                upload: body,
             });
         }
         let executor = Executor {
             script: self.script(attempt),
             release: &self.release,
         };
-        ck_exec::pipeline::start(&executor, attempt, request, upload, response).await
+        let started = ck_exec::pipeline::start(&executor, attempt, request, upload, response).await;
+        // A refused attempt frees its document as the Claude executor does, so the next one
+        // rebuilds it from the request stream.
+        if matches!(executor.script, Script::Refused) {
+            request.release();
+        }
+        started
     }
 }
 
@@ -537,7 +555,7 @@ impl Execute for Executor<'_> {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<ChatIngress>, ExecError> {
         let mut ingress = ChatIngress::new(
@@ -620,7 +638,7 @@ impl Execute for Executor<'_> {
     async fn count_tokens(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Counted<ChatIngress>, ExecError> {
         unreachable!("generation only")
@@ -629,7 +647,7 @@ impl Execute for Executor<'_> {
     async fn compact(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Upstream<ChatIngress>, ExecError> {
         unreachable!("generation only")
@@ -712,9 +730,9 @@ async fn an_attempt_carries_the_route_facts() {
         let (document, media) = request_view(&fixture, &mut exchange);
         let codec = Codec {
             exchange,
-            view: RequestView {
-                document: &document,
-                media: &media,
+            request: OwnedRequest {
+                document,
+                media,
                 operation: Operation::Generate,
             },
             request_id: LocalId::new("request").unwrap(),
@@ -734,7 +752,6 @@ async fn an_attempt_carries_the_route_facts() {
         let want = (want.0.map(str::to_owned), want.1);
         assert_eq!(got, want, "{entry:?} stream {stream} alt {alt:?}");
         drop(begun);
-        drop((document, media));
     }
 }
 
@@ -1204,9 +1221,9 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
         }
         let codec = Codec {
             exchange,
-            view: RequestView {
-                document: &document,
-                media: &media,
+            request: OwnedRequest {
+                document,
+                media,
                 operation: if row.compact {
                     Operation::Compact
                 } else {
@@ -1351,6 +1368,13 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
                     "{case}: attempt {} starts after the previous one was discarded",
                     i + 1
                 );
+                if row.withheld == 0 {
+                    assert!(
+                        attempt.upload == previous.upload,
+                        "{case}: attempt {} reads the client's document",
+                        i + 1
+                    );
+                }
             }
         }
     }
@@ -1471,9 +1495,9 @@ async fn every_exit_keeps_the_committed_streams_and_discards_the_rest() {
         let request = exchange.request.id();
         let codec = Codec {
             exchange,
-            view: RequestView {
-                document: &document,
-                media: &media,
+            request: OwnedRequest {
+                document,
+                media,
                 operation: Operation::Generate,
             },
             request_id: LocalId::new("request").unwrap(),
@@ -1518,7 +1542,6 @@ async fn every_exit_keeps_the_committed_streams_and_discards_the_rest() {
                 }
             }
         }
-        drop((document, media));
         let streams: Vec<u64> = std::iter::once(request)
             .chain(fake.begun.lock().unwrap().iter().map(|begun| begun.stream))
             .collect();

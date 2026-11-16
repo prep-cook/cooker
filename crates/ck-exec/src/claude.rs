@@ -995,6 +995,9 @@ struct Ctx<'a> {
     today: String,
     /// The thread continuation aliases of the executor serving the request.
     thread_aliases: Arc<thread::Aliases>,
+    /// The snapshot's `model-catalog`: a request without `max_tokens` gets its default, else
+    /// the registered completion limit, as on the contract path.
+    catalog: Arc<ck_core::config::model_catalog::ModelCatalog>,
 }
 
 struct Prepared {
@@ -1349,6 +1352,7 @@ impl<'a> Ctx<'a> {
             } else {
                 exec.thread_aliases.clone()
             },
+            catalog: ck_core::config::model_catalog::catalog(cfg),
         }
         .with_today(credential, chrono::Utc::now())
     }
@@ -2163,32 +2167,20 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// `ensureModelMaxTokens` without its 1024 fallback (owner Q-H): only a model some
-    /// Claude credential registered gets its completion limit as the default `max_tokens`.
+    /// `ensureModelMaxTokens` without its 1024 fallback (owner Q-H).
     fn ensure_max_tokens(&self, body: String) -> String {
-        let model = self.base_model.trim();
-        if !ck_core::registry::model_providers(model)
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case("claude"))
-        {
-            return body;
-        }
-        let limit = ck_core::registry::registered_model(model, Some("claude")).and_then(|info| {
-            info.raw
-                .get("max_completion_tokens")
-                .and_then(serde_json::Value::as_i64)
-        });
-        default_max_tokens(body, limit)
+        default_max_tokens(body, || execute::max_tokens_for(&self.catalog, &self.base_model))
     }
 }
 
-/// Sets `limit` as `max_tokens` on a body without one. Without a positive limit the body goes
-/// as the client sent it, and Anthropic answers a missing limit itself.
-fn default_max_tokens(body: String, limit: Option<i64>) -> String {
+/// Sets `limit` as `max_tokens` on a body without one; `limit` is resolved only then. Without
+/// a positive limit the body goes as the client sent it, and Anthropic answers a missing limit
+/// itself.
+fn default_max_tokens(body: String, limit: impl FnOnce() -> Option<u64>) -> String {
     if !rawjson::valid(&body) || rawjson::get(&body, "max_tokens").exists() {
         return body;
     }
-    match limit.filter(|n| *n > 0) {
+    match limit().filter(|n| *n > 0) {
         Some(max) => rawjson::set_raw(&body, "max_tokens", &max.to_string()),
         None => body,
     }

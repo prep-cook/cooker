@@ -310,7 +310,7 @@ pub(crate) async fn start_on(
         request: &mut request,
         response: &mut response,
     };
-    let turn = executor.turn(&attempt, &handle, streams).await;
+    let turn = executor.turn(&attempt, &mut handle, streams).await;
     (turn.map(|t| (t.upstream, t.cancel)), response, request)
 }
 

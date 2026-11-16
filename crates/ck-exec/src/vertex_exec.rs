@@ -133,7 +133,7 @@ impl Execute for VertexExecutor {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<VertexIngress>, ExecError> {
         match self.capability(attempt) {
@@ -145,7 +145,7 @@ impl Execute for VertexExecutor {
     async fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<VertexIngress>, ExecError> {
         match self.capability(attempt) {
@@ -165,7 +165,7 @@ impl Execute for VertexExecutor {
     async fn compact(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Upstream<VertexIngress>, ExecError> {
         Err(encoding(codec::Error::Unsupported))
@@ -182,14 +182,14 @@ impl VertexExecutor {
         operation: Operation,
     ) -> Result<Upstream<VertexIngress>, ExecError> {
         let count = operation == Operation::CountTokens;
-        let doc = request.validated.view().document;
+        let doc = request.validated().view().document;
         // Vertex streams one candidate only; a request for several calls `generateContent`.
         let stream = !count && streaming(doc).map_err(encoding)? && !several_candidates(doc).map_err(encoding)?;
         let egress = Egress {
             destination: GeminiCapability.destination(),
             upstream_stream: stream,
         };
-        let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
+        let upload = copy(&egress.encode(&request.validated(), streams.request).map_err(encoding)?)?;
         let target = Target::new(attempt)?;
         let call = Call::new(attempt, request, vertex::PROVIDER, |model| target.resource(model))?;
         let (body, method) = match (count, stream) {

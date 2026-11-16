@@ -148,7 +148,7 @@ impl Execute for Stub {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<Probe>, ExecError> {
         if self.answer == Answer::Refuse {
@@ -222,7 +222,7 @@ impl Execute for Stub {
     async fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<Probe>, ExecError> {
         if self.answer == Answer::Local {
@@ -234,7 +234,7 @@ impl Execute for Stub {
     async fn compact(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<Probe>, ExecError> {
         self.execute(attempt, request, streams).await
@@ -332,14 +332,11 @@ impl Fixture {
             operation,
             ..fenced.view()
         };
-        let request = Request {
-            validated: pipeline::refence(stub, &attempt, view).unwrap(),
-            client: self.client(),
-        };
-        assert_eq!(request.validated.destination(), pipeline::destination(stub, &attempt));
+        let mut request = Request::new(pipeline::refence(stub, &attempt, view).unwrap(), self.client());
+        assert_eq!(request.validated().destination(), pipeline::destination(stub, &attempt));
         let response = self.store.create_dependent(&upload).unwrap();
         let id = response.id();
-        let started = pipeline::start(stub, &attempt, &request, &mut upload, response).await;
+        let started = pipeline::start(stub, &attempt, &mut request, &mut upload, response).await;
         (started, upload, id)
     }
 

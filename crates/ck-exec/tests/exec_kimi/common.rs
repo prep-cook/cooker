@@ -141,8 +141,8 @@ async fn attempt<I: RequestIngress>(
     }
     let fenced = executors.fence(&attempt, ingress, request)?;
     let validated = executors.refence(&attempt, fenced.view())?;
-    let handle = exchange.request(validated);
-    Ok((executors.start(&attempt, &handle, request, response).await, id))
+    let mut handle = exchange.request(validated);
+    Ok((executors.start(&attempt, &mut handle, request, response).await, id))
 }
 
 /// Runs `operation` from a `protocol` client: the fence's outcome, or the pipeline's start

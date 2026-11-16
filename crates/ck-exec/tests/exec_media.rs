@@ -220,8 +220,8 @@ async fn run_on<E: Execute>(
     };
     let response = streams.response(upload);
     let id = response.id();
-    let handle = exchange.request(validated);
-    let started = match pipeline::start(executor, &attempt, &handle, upload, response).await {
+    let mut handle = exchange.request(validated);
+    let started = match pipeline::start(executor, &attempt, &mut handle, upload, response).await {
         Ok(started) => started,
         Err(error) => {
             let published = streams.read_to_end(id).await;

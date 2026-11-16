@@ -79,10 +79,13 @@ async fn run<I: RequestIngress>(
     }
     let validated = fixture.executors.fence(attempt, ingress, request)?;
     assert!(fixture.executors.refence(attempt, validated.view()).is_ok());
-    let handle = fixture.exchange.request_with(validated, body);
+    let mut handle = fixture.exchange.request_with(validated, body);
     let response = fixture.streams.response(request);
     let id = response.id();
-    Ok((fixture.executors.start(attempt, &handle, request, response).await, id))
+    Ok((
+        fixture.executors.start(attempt, &mut handle, request, response).await,
+        id,
+    ))
 }
 
 fn responses_ingress(fixture: &Fixture, request: &mut Writer, operation: Operation) -> responses::request::Ingress {
@@ -234,9 +237,12 @@ async fn replay_eligible_compaction_takes_new_arm() {
     let validated = fixture.executors.fence(&api_key, &mut ingress, &mut request).unwrap();
     let refused = fixture.executors.refence(&attempt, validated.view());
     assert!(matches!(refused.err(), Some(codec::Error::Destination)));
-    let handle = fixture.exchange.request_with(validated, plain);
+    let mut handle = fixture.exchange.request_with(validated, plain);
     let response = fixture.streams.response(&request);
-    let started = fixture.executors.start(&attempt, &handle, &mut request, response).await;
+    let started = fixture
+        .executors
+        .start(&attempt, &mut handle, &mut request, response)
+        .await;
     assert!(
         started.is_err(),
         "start keeps the old arm's generation off the contract path"

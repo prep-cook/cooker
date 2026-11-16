@@ -279,9 +279,9 @@ impl Exchange {
 
     /// [`Self::request`] whose client sent `original` (contract G5).
     pub fn request_with<'a>(&'a self, validated: ValidatedRequest<'a>, original: &'a [u8]) -> Request<'a> {
-        Request {
+        Request::new(
             validated,
-            client: Client {
+            Client {
                 caller: &self.caller,
                 headers: &self.headers,
                 route: &self.route,
@@ -293,7 +293,7 @@ impl Exchange {
                 usage: &self.usage,
                 original,
             },
-        }
+        )
     }
 }
 

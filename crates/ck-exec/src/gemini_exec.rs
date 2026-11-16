@@ -43,15 +43,15 @@ impl Execute for GeminiExecutor {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<Ingress>, ExecError> {
-        let stream = streaming(request.validated.view().document).map_err(encoding)?;
+        let stream = streaming(request.validated().view().document).map_err(encoding)?;
         let egress = Egress {
             destination: DESTINATION,
             upstream_stream: stream,
         };
-        let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
+        let upload = copy(&egress.encode(&request.validated(), streams.request).map_err(encoding)?)?;
         let call = Call::new(attempt, request, PROVIDER, wire::model_name)?;
         let body = call.generate(upload)?;
         let mode = if stream {
@@ -84,14 +84,14 @@ impl Execute for GeminiExecutor {
     async fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<Ingress>, ExecError> {
         let egress = Egress {
             destination: DESTINATION,
             upstream_stream: false,
         };
-        let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
+        let upload = copy(&egress.encode(&request.validated(), streams.request).map_err(encoding)?)?;
         let call = Call::new(attempt, request, PROVIDER, wire::model_name)?;
         let body = call.count(upload);
         let ingress = Ingress::new(
@@ -115,7 +115,7 @@ impl Execute for GeminiExecutor {
     async fn compact(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Upstream<Ingress>, ExecError> {
         Err(encoding(codec::Error::Unsupported))
@@ -198,7 +198,7 @@ impl<'r> Call<'r> {
         executor: &'static str,
         resource: impl FnOnce(&str) -> String,
     ) -> Result<Self, ExecError> {
-        let document = request.validated.view().document;
+        let document = request.validated().view().document;
         let base_model = parse_suffix(attempt.model).model_name.trim().to_owned();
         Ok(Self {
             attempt,

@@ -80,7 +80,7 @@ async fn run_attempt(streams: &Streams, exchange: &Exchange, held: &mut Held, cl
     let id = response.id();
     let mut handle = exchange.request(validated);
     handle.client.session = Some("s1");
-    let started = pipeline::start(&executor, &attempt, &handle, upload, response).await;
+    let started = pipeline::start(&executor, &attempt, &mut handle, upload, response).await;
     let started = match started {
         Ok(started) => started,
         Err(error) => {

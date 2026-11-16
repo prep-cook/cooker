@@ -1070,7 +1070,7 @@ pub async fn run_exchange<X: Arms>(
     arms: &X,
     call: Call,
     trace: &Trace,
-    codec: Codec<'_>,
+    codec: Codec,
     scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
 ) -> Result<Served, RunError> {
     let resolved = route(rt, &rt.registry(), &call)?;
@@ -1100,7 +1100,7 @@ async fn run_loop<X: Arms>(
     trace: &Trace,
     (providers, model): (Vec<String>, String),
     scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
-    mut arm: Option<&mut Arm<'_, '_, X>>,
+    mut arm: Option<&mut Arm<'_, X>>,
 ) -> Result<Served, RunError> {
     let (cfg, policy) = rt.request_snapshot();
     let registry = rt.registry();
@@ -1437,7 +1437,7 @@ impl Credits<'_> {
         trace: &Trace,
         request: &ExecRequest,
         usage: Option<&Arc<crate::observability::usage_record::Facts>>,
-        mut arm: Option<&mut Arm<'_, '_, X>>,
+        mut arm: Option<&mut Arm<'_, X>>,
         error: RunError,
     ) -> Result<Served, RunError> {
         // Go's ExecuteCount has no credits fallback; Execute and ExecuteStream do.
@@ -1541,7 +1541,7 @@ async fn attempt<X: Arms>(
     trace: &Trace,
     request: &ExecRequest,
     usage: Option<&Arc<crate::observability::usage_record::Facts>>,
-    mut arm: Option<&mut Arm<'_, '_, X>>,
+    mut arm: Option<&mut Arm<'_, X>>,
     mut lease: Lease,
     target: Target<'_>,
 ) -> Attempt {

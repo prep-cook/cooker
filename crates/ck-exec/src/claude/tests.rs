@@ -2720,21 +2720,26 @@ pub(super) fn api_key_identity(ctx: &Ctx<'_>, req: &ExecRequest, count: bool) ->
     !ctx.bearer && !ctx.cli_profile && !detection.confirmed && !ctx.wire_policy(detection.confirmed).0
 }
 
-/// The old route invents no `max_tokens` (owner Q-H): only a registered completion limit
-/// fills a missing one.
+/// The old route, which force-mapped aliases still take, invents no `max_tokens` (owner Q-H):
+/// only the `model-catalog` default or a registered limit fills a missing one.
 #[test]
-fn a_missing_max_tokens_takes_only_a_registered_limit() {
+fn a_missing_max_tokens_takes_only_a_configured_limit() {
     let without = r#"{"model":"m","messages":[]}"#;
     let with = r#"{"model":"m","max_tokens":8,"messages":[]}"#;
-    // (body, registered limit, sent max_tokens)
+    let catalog = "model-catalog: [{match: m, overrides: {default-max-tokens: 4096}}]";
+    let other = "model-catalog: [{match: n, overrides: {default-max-tokens: 4096}}]";
+    // (body, config, sent max_tokens); the unit test installs no registry.
     let rows = [
-        (without, Some(4096), Some(4096)),
-        (without, None, None),
-        (without, Some(0), None),
-        (with, Some(4096), Some(8)),
+        (without, catalog, Some(4096)),
+        (without, other, None),
+        (without, "", None),
+        (with, catalog, Some(8)),
     ];
-    for (body, limit, want) in rows {
-        let got: Value = serde_json::from_str(&default_max_tokens(body.to_owned(), limit)).unwrap();
-        assert_eq!(got["max_tokens"].as_i64(), want, "{body} {limit:?}");
+    for (body, yaml, want) in rows {
+        let cfg = Config::parse(yaml).unwrap();
+        let catalog = ck_core::config::model_catalog::catalog(&cfg);
+        let got = default_max_tokens(body.to_owned(), || execute::max_tokens_for(&catalog, "m"));
+        let got: Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(got["max_tokens"].as_i64(), want, "{body} {yaml}");
     }
 }

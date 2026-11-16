@@ -41,7 +41,7 @@ pub(crate) async fn images(
     route: Route,
     media: Media,
 ) -> Result<Upstream<RelayIngress>, ExecError> {
-    let document = request.validated.view().document;
+    let document = request.validated().view().document;
     let stream = media_exec::images_stream(document).map_err(encoding)?;
     let boundary = format!("cooker-{}", uuid::Uuid::new_v4().simple());
     let (target, content_type) = match media {
@@ -99,7 +99,7 @@ fn rules(
     (body, content_type): (&[u8], &str),
     (upload, upload_type): (&[u8], &str),
 ) -> Result<(Vec<u8>, String), ExecError> {
-    let requested = media_exec::requested_model(request.validated.view().document).map_err(encoding)?;
+    let requested = media_exec::requested_model(request.validated().view().document).map_err(encoding)?;
     let requested = if requested.is_empty() {
         model
     } else {

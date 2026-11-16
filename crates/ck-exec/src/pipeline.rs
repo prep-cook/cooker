@@ -87,7 +87,7 @@ pub fn refence<'a, E: Execute>(
 pub async fn start<E: Execute>(
     executor: &E,
     attempt: &Attempt<'_>,
-    request: &Request<'_>,
+    request: &mut Request<'_>,
     upload: &mut Writer,
     mut response: Writer,
 ) -> Result<Started, ExecError> {
@@ -96,7 +96,7 @@ pub async fn start<E: Execute>(
         request: upload,
         response: &mut response,
     };
-    let upstream = match request.validated.view().operation {
+    let upstream = match request.validated().view().operation {
         Operation::Generate | Operation::Media(_) | Operation::AlphaSearch => {
             executor.execute(attempt, request, streams).await
         }
@@ -122,7 +122,7 @@ pub async fn start<E: Execute>(
 pub async fn start_turn<E: Turns>(
     executor: &E,
     attempt: &Attempt<'_>,
-    request: &Request<'_>,
+    request: &mut Request<'_>,
     upload: &mut Writer,
     mut response: Writer,
 ) -> Result<(Started, E::Cancel), ExecError> {

@@ -209,8 +209,8 @@ async fn run_on(streams: &Streams, s: &Value, upstream: &StreamUpstream, usage: 
             let validated = executors
                 .refence(&attempt, validated.view())
                 .expect("the re-fence accepts");
-            let request = exchange.request(validated);
-            executors.start(&attempt, &request, &mut writer, response).await
+            let mut request = exchange.request(validated);
+            executors.start(&attempt, &mut request, &mut writer, response).await
         }};
     }
     let started = match client {

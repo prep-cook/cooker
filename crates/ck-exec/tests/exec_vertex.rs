@@ -87,8 +87,8 @@ async fn run_with<I: RequestIngress>(
     let validated = executors
         .refence(&attempt, validated.view())
         .expect("the re-fence accepts");
-    let request = exchange.request(validated);
-    let started = executors.start(&attempt, &request, &mut writer, response).await;
+    let mut request = exchange.request(validated);
+    let started = executors.start(&attempt, &mut request, &mut writer, response).await;
     Run {
         started,
         _request: writer,

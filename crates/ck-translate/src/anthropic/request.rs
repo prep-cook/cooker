@@ -27,6 +27,16 @@ pub struct Ingress {
     closed: bool,
 }
 impl Ingress {
+    /// Hands over the document and media [`RequestIngress::finish`] closed, and drops the
+    /// parser state, so only the request the attempts read stays in memory.
+    pub fn into_request(self) -> Result<crate::codec::OwnedRequest> {
+        Ok(crate::codec::OwnedRequest {
+            document: self.document.filter(|_| self.closed).ok_or(Error::Closed)?,
+            media: self.media,
+            operation: self.operation,
+        })
+    }
+
     pub fn new(
         owner: &mut Writer,
         store: &ck_stream::Store,

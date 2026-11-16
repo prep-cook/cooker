@@ -122,8 +122,8 @@ pub(crate) const fn video_action(media: Media) -> Option<video::Action> {
 
 /// The destination's fenced view of `request`: a fence closed for another destination, or only
 /// the client's, encodes nothing.
-fn fenced<'a>(request: &Request<'a>, destination: &str) -> Result<RequestView<'a>, ExecError> {
-    request.validated.for_destination(destination).map_err(encoding)
+fn fenced<'r>(request: &'r Request<'_>, destination: &str) -> Result<RequestView<'r>, ExecError> {
+    request.validated().for_destination(destination).map_err(encoding)
 }
 
 /// The image upload for `target`, encoded from `destination`'s fence.
