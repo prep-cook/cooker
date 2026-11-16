@@ -1177,27 +1177,14 @@
       "name": "video_retrieve_unbound",
       "method": "GET",
       "path": "/openai/v1/videos/req-unknown",
-      "upstreams": [
-        {
-          "status": 200,
-          "headers": [
-            [
-              "Content-Type",
-              "application/json"
-            ]
-          ],
-          "body": "{\"status\":\"queued\"}"
-        }
-      ],
-      "status": 200,
+      "upstreams": [],
+      "status": 404,
       "response_headers": {
-        "Content-Length": "84",
+        "Content-Length": "202",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-unknown\",\"model\":\"grok-imagine-video\",\"status\":\"queued\"}",
-      "requests": [
-        "GET /v1/videos/req-unknown HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
-      ]
+      "response": "{\"error\":{\"message\":\"Video job 'req-unknown' was not created through this server since it last started, or has expired. Create the video again.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+      "requests": []
     },
     {
       "name": "native_generations",

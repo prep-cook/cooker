@@ -249,7 +249,15 @@ async fn go_reference_scenarios() {
         let path = s["request_path"].as_str().unwrap_or_default().to_owned();
         let result = match op {
             "images" => executor.images(&cred, req, &path, &cfg).await,
-            "videos" => executor.videos(&cred, req, &path, &cfg).await,
+            "videos" => {
+                // Go polls any ID; cooker polls only a job it created (VideoJobs), as the
+                // recorded poll's job had been here.
+                let polled = gj::get(&req.body, "request_id").str().into_owned();
+                if !path.ends_with("/generations") && !polled.is_empty() {
+                    executor.jobs.created(&polled);
+                }
+                executor.videos(&cred, req, &path, &cfg).await
+            }
             _ => {
                 executor
                     .execute(&cred, req, &cfg, s["websocket"].as_bool() == Some(true))
@@ -528,89 +536,100 @@ async fn speech_errors_keep_go_scope() {
 /// server reads its counts and billed units. A body without a billed value in its usage (absent,
 /// null or empty) reports only its model. A video job is charged at the first poll whose usage
 /// reports a value, an explicit zero included, and never again (E-Q13), while another job is
-/// charged on its own.
+/// charged on its own. A poll of a job the process neither created nor charged, such as one
+/// created before a restart, is refused with a request-scoped 404 before anything is sent.
 #[tokio::test]
 async fn media_usage_is_charged_once_per_response_or_job() {
     let cfg = Config::default();
     let target: Arc<Mutex<String>> = Arc::default();
-    let executor = {
+    // Two processes in turn: the second starts with none of the first's jobs.
+    let processes: [XaiExecutor; 2] = std::array::from_fn(|_| {
         let target = target.clone();
         XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &target.lock().unwrap()))
-    };
+    });
     let charged =
         r#"{"status":"done","video":{"url":"https://v.example/out.mp4"},"usage":{"cost_in_usd_ticks":5000000000}}"#;
     let image = r#"{"data":[{"b64_json":"AAAA"}],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3,"cost_in_usd_ticks":200000000}}"#;
-    let rows: [(&str, &str, &str, &str, bool); 12] = [
-        ("images", "/v1/images/generations", r#"{"prompt":"a"}"#, image, true),
-        ("images", "/v1/images/generations", r#"{"prompt":"a"}"#, image, true),
+    const CREATE: &str = "/v1/videos/generations";
+    let poll = |id: &str| (format!("/v1/videos/{id}"), format!(r#"{{"request_id":"{id}"}}"#));
+    // (process, op, path, payload, upstream body, expected): `Some(charged)` for a 200 and
+    // whether its usage was reported, `None` for a refusal that sends nothing upstream.
+    type Row = (usize, &'static str, String, String, String, Option<bool>);
+    let mut rows: Vec<Row> = vec![
         (
+            0,
             "images",
-            "/v1/images/generations",
-            r#"{"prompt":"a"}"#,
-            r#"{"data":[{"b64_json":"AAAA"}]}"#,
-            false,
+            "/v1/images/generations".into(),
+            r#"{"prompt":"a"}"#.into(),
+            image.into(),
+            Some(true),
         ),
         (
-            "videos",
-            "/v1/videos/generations",
-            r#"{"prompt":"a"}"#,
-            r#"{"request_id":"vid_9"}"#,
-            false,
+            0,
+            "images",
+            "/v1/images/generations".into(),
+            r#"{"prompt":"a"}"#.into(),
+            image.into(),
+            Some(true),
         ),
         (
-            "videos",
-            "/v1/videos/vid_9",
-            r#"{"request_id":"vid_9"}"#,
-            r#"{"status":"pending","usage":null}"#,
-            false,
-        ),
-        ("videos", "/v1/videos/vid_9", r#"{"request_id":"vid_9"}"#, charged, true),
-        (
-            "videos",
-            "/v1/videos/vid_9",
-            r#"{"request_id":"vid_9"}"#,
-            charged,
-            false,
-        ),
-        (
-            "videos",
-            "/v1/videos/vid_10",
-            r#"{"request_id":"vid_10"}"#,
-            charged,
-            true,
-        ),
-        // A usage without a billed value is not the job's report; its later charge still counts.
-        (
-            "videos",
-            "/v1/videos/vid_11",
-            r#"{"request_id":"vid_11"}"#,
-            r#"{"status":"pending","usage":{}}"#,
-            false,
-        ),
-        (
-            "videos",
-            "/v1/videos/vid_11",
-            r#"{"request_id":"vid_11"}"#,
-            r#"{"status":"pending","usage":{"input_tokens_details":{},"cost_in_usd_ticks":null}}"#,
-            false,
-        ),
-        (
-            "videos",
-            "/v1/videos/vid_11",
-            r#"{"request_id":"vid_11"}"#,
-            charged,
-            true,
-        ),
-        // An explicit zero charge is a report.
-        (
-            "videos",
-            "/v1/videos/vid_12",
-            r#"{"request_id":"vid_12"}"#,
-            r#"{"status":"done","usage":{"cost_in_usd_ticks":0}}"#,
-            true,
+            0,
+            "images",
+            "/v1/images/generations".into(),
+            r#"{"prompt":"a"}"#.into(),
+            r#"{"data":[{"b64_json":"AAAA"}]}"#.into(),
+            Some(false),
         ),
     ];
-    for (op, path, payload, body, reports_usage) in rows {
+    let mut create = |process: usize, body: &str| {
+        rows.push((
+            process,
+            "videos",
+            CREATE.into(),
+            r#"{"prompt":"a"}"#.into(),
+            body.into(),
+            Some(false),
+        ));
+    };
+    for id in ["vid_9", "vid_10", "vid_11", "vid_12"] {
+        create(0, &format!(r#"{{"request_id":"{id}"}}"#));
+    }
+    // A create answered with `id` instead of `request_id`.
+    create(0, r#"{"id":"vid_13","status":"in_progress"}"#);
+    create(1, r#"{"request_id":"vid_20"}"#);
+    for (process, id, body, expected) in [
+        (0, "vid_9", r#"{"status":"pending","usage":null}"#, Some(false)),
+        (0, "vid_9", charged, Some(true)),
+        (0, "vid_9", charged, Some(false)),
+        (0, "vid_10", charged, Some(true)),
+        // A usage without a billed value is not the job's report; its later charge still counts.
+        (0, "vid_11", r#"{"status":"pending","usage":{}}"#, Some(false)),
+        (
+            0,
+            "vid_11",
+            r#"{"status":"pending","usage":{"input_tokens_details":{},"cost_in_usd_ticks":null}}"#,
+            Some(false),
+        ),
+        (0, "vid_11", charged, Some(true)),
+        // An explicit zero charge is a report.
+        (
+            0,
+            "vid_12",
+            r#"{"status":"done","usage":{"cost_in_usd_ticks":0}}"#,
+            Some(true),
+        ),
+        (0, "vid_13", charged, Some(true)),
+        // Never created through this process.
+        (0, "vid_99", charged, None),
+        // After a restart: the charged job is unknown and refused; a new job is charged.
+        (1, "vid_9", charged, None),
+        (1, "vid_11", charged, None),
+        (1, "vid_20", charged, Some(true)),
+    ] {
+        let (path, payload) = poll(id);
+        rows.push((process, "videos", path, payload, body.into(), expected));
+    }
+    for (process, op, path, payload, body, expected) in rows {
         let mock = Mock::start(
             &serde_json::json!({"status": 200, "headers": [["Content-Type", "application/json"]], "body": body}),
         )
@@ -627,11 +646,12 @@ async fn media_usage_is_charged_once_per_response_or_job() {
         });
         let (recorder, _capture, sink) = crate::openai_compat_usage::sinks();
         let req = request(&s, sink);
-        match op {
-            "images" => executor.images(&credential(&s, &cfg), req, path, &cfg).await,
-            _ => executor.videos(&credential(&s, &cfg), req, path, &cfg).await,
-        }
-        .expect("a 200");
+        let executor = &processes[process];
+        let result = match op {
+            "images" => executor.images(&credential(&s, &cfg), req, &path, &cfg).await,
+            _ => executor.videos(&credential(&s, &cfg), req, &path, &cfg).await,
+        };
+        let row = format!("process {process} {op} {path} {body}");
         let reports = recorder.0.lock().unwrap();
         let bodies: Vec<String> = reports
             .iter()
@@ -642,12 +662,19 @@ async fn media_usage_is_charged_once_per_response_or_job() {
                 _ => None,
             })
             .collect();
-        let want: Vec<String> = if reports_usage {
-            vec![body.to_owned()]
-        } else {
-            Vec::new()
+        let charged_now = match (expected, result) {
+            (Some(charged_now), Ok(_)) => charged_now,
+            (None, Err(error)) => {
+                assert_eq!((error.status, error.scope), (404, FailureScope::Request), "{row}");
+                let message: Value = serde_json::from_slice(&error.body).expect("a JSON error");
+                assert_eq!(message["error"]["type"], "invalid_request_error", "{row}");
+                assert_eq!(mock.request(), None, "{row}: nothing is sent upstream");
+                false
+            }
+            (expected, result) => panic!("{row}: expected {expected:?}, got {:?}", result.map(|_| ())),
         };
-        assert_eq!(bodies, want, "{op} {path} {body}");
+        let want: Vec<String> = if charged_now { vec![body.clone()] } else { Vec::new() };
+        assert_eq!(bodies, want, "{row}");
     }
 }
 

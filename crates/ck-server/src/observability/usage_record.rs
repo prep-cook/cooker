@@ -1042,6 +1042,11 @@ impl StreamUsage {
         } else {
             self.detail.response_service_tier = tier;
             self.detail.dimensions = detail.dimensions;
+            // No earlier counts to keep: the update's unreported counts stay unreported, so a
+            // tiered billed-only terminal writes no zero tokens.
+            if !self.ok {
+                self.detail.unreported = detail.unreported;
+            }
         }
         self.ok = true;
     }
@@ -3016,6 +3021,14 @@ mod tests {
                 serde_json::json!({"cost_in_usd_ticks":5000000000_u64}),
                 None,
                 "",
+            ),
+            (
+                "xai",
+                true,
+                r#"data: {"type":"response.completed","response":{"service_tier":"priority","usage":{"cost_in_usd_ticks":5000000000}}}"#.to_owned(),
+                serde_json::json!({"cost_in_usd_ticks":5000000000_u64}),
+                None,
+                r#""response_service_tier":"priority""#,
             ),
         ] {
             let tracker = Tracker::start(&rt, &facts, &credential_for(provider), "m");
