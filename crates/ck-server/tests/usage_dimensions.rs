@@ -4,9 +4,9 @@
 
 mod stream_fixture;
 
-use ck_server::observability::usage_snapshot::{self, CanonicalUsage, Dimension, ResponseFacts};
+use ck_server::observability::usage_snapshot::{self, CanonicalUsage, Dimension, ResponseFacts, Usage};
 use ck_stream::{Store, Terminal, Writer};
-use ck_translate::codec::event::{Direction, Identity, LocalId};
+use ck_translate::codec::event::{Direction, Emitter, Identity, Kind, LocalId, Scope};
 use ck_translate::codec::{BodyMode, Operation, ResponseIngress};
 use stream_fixture::Fixture;
 
@@ -24,6 +24,15 @@ fn identity() -> Identity {
 /// Runs one upstream body through a response ingress and reads the stream as the runtime's
 /// usage reader does.
 async fn account(run: impl FnOnce(&mut Writer, &Store)) -> CanonicalUsage {
+    account_scopes(run)
+        .await
+        .attempt()
+        .cloned()
+        .expect("the body reported usage")
+}
+
+/// [`account`] by usage scope.
+async fn account_scopes(run: impl FnOnce(&mut Writer, &Store)) -> Usage {
     let fixture = Fixture::new(|_| {});
     let (allocator, reader) = fixture
         .rt
@@ -38,7 +47,7 @@ async fn account(run: impl FnOnce(&mut Writer, &Store)) -> CanonicalUsage {
         })
         .unwrap();
     let (usage, _): (_, ResponseFacts) = usage_snapshot::read(allocator, reader).await;
-    usage.expect("the body reported usage")
+    usage
 }
 
 fn ingest(ingress: &mut impl ResponseIngress, writer: &mut Writer, body: &[u8]) {
@@ -288,4 +297,165 @@ async fn responses_billed_units_reach_accounting() {
             );
         }
     }
+}
+
+/// Snapshot records as a codec emits them: `(scope, input tokens)` each.
+fn snapshots<'a>(rows: &'a [(Option<&'a str>, u64)]) -> impl FnOnce(&mut Writer, &Store) + 'a {
+    move |writer, _| {
+        let mut emitter = Emitter::new(identity());
+        emitter
+            .emit(
+                writer,
+                Kind::ResponseStart,
+                Scope::default(),
+                |e| e.bytes(b",\"id\":\"r\",\"model\":\"m\",\"created\":0"),
+                |_| Ok(()),
+            )
+            .unwrap();
+        for (scope, input) in rows {
+            let payload = match scope {
+                Some(scope) => format!(
+                    ",\"scope\":\"{scope}\",\"usage\":{{\"native\":{{\"protocol\":\"responses\",\"value\":{{}}}},\"final\":true,\"input_tokens\":{input}}}"
+                ),
+                None => format!(
+                    ",\"usage\":{{\"native\":{{\"protocol\":\"responses\",\"value\":{{}}}},\"final\":true,\"input_tokens\":{input}}}"
+                ),
+            };
+            emitter
+                .emit(
+                    writer,
+                    Kind::Usage,
+                    Scope::default(),
+                    |e| e.bytes(payload.as_bytes()),
+                    |_| Ok(()),
+                )
+                .unwrap();
+        }
+    }
+}
+
+/// Usage is read per scope (E-Q13): a snapshot replaces only its own scope's, scopes are never
+/// summed, the attempt's own scope stays apart from the named ones, and the scope map is bounded.
+#[tokio::test]
+async fn usage_is_read_per_scope() {
+    let many: Vec<(Option<String>, u64)> = (0..=usage_snapshot::MAX_SCOPES as u64)
+        .map(|n| (Some(format!("tool:m{n}")), n))
+        .collect();
+    let many: Vec<(Option<&str>, u64)> = many.iter().map(|(s, n)| (s.as_deref(), *n)).collect();
+    // (label, snapshots in stream order, expected attempt input, expected named scopes)
+    type Case<'a> = (&'a str, Vec<(Option<&'a str>, u64)>, Option<u64>, Vec<(String, u64)>);
+    let cases: Vec<Case> = vec![
+        ("attempt only", vec![(None, 1), (None, 2)], Some(2), vec![]),
+        (
+            "two scopes stay apart",
+            vec![(None, 10), (Some("tool:gpt-image-2"), 50)],
+            Some(10),
+            vec![("tool:gpt-image-2".into(), 50)],
+        ),
+        (
+            "replacement within a scope only",
+            vec![
+                (Some("job:v"), 1),
+                (None, 2),
+                (Some("tool:a"), 3),
+                (Some("job:v"), 4),
+                (None, 5),
+            ],
+            Some(5),
+            vec![("job:v".into(), 4), ("tool:a".into(), 3)],
+        ),
+        (
+            "a named scope alone leaves the attempt's unreported",
+            vec![(Some("job:v"), 7)],
+            None,
+            vec![("job:v".into(), 7)],
+        ),
+        (
+            "at most MAX_SCOPES scopes",
+            many,
+            None,
+            (0..usage_snapshot::MAX_SCOPES as u64)
+                .map(|n| (format!("tool:m{n}"), n))
+                .collect(),
+        ),
+    ];
+    for (label, rows, attempt, named) in cases {
+        let usage = account_scopes(snapshots(&rows)).await;
+        assert_eq!(usage.attempt().and_then(|u| u.input_tokens), attempt, "{label}");
+        let scoped: Vec<(String, u64)> = usage
+            .scoped()
+            .map(|(scope, u)| (scope.to_owned(), u.input_tokens.unwrap()))
+            .collect();
+        assert_eq!(scoped, named, "{label}");
+    }
+}
+
+/// The codecs' own scopes reach the reader: Codex's image tool apart from the model, and a video
+/// job apart from the poll attempt, with xAI's charge for images and video jobs.
+#[tokio::test]
+async fn codec_usage_scopes_and_xai_media_charges_reach_accounting() {
+    let image = br#"{"created":1,"data":[{"url":"https://example.invalid/a.png"}],"usage":{"cost_in_usd_ticks":7,"input_tokens":1}}"#;
+    let usage = account_scopes(|writer, _| {
+        let mut ingress = ck_translate::images::Ingress::new(
+            writer,
+            identity(),
+            ck_translate::images::Wire::Xai,
+            BodyMode::Buffered,
+            LIMIT,
+        )
+        .unwrap();
+        ingest(&mut ingress, writer, image);
+    })
+    .await;
+    let attempt = usage.attempt().unwrap();
+    assert_eq!(attempt.input_tokens, Some(1));
+    assert_eq!(attempt.dimensions, vec![("cost_in_usd_ticks", Dimension::Count(7))]);
+    assert_eq!(usage.scoped().count(), 0);
+
+    let tool = br#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"AAEC"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"created_at":1,"usage":{"input_tokens":5,"output_tokens":6,"total_tokens":11},"tool_usage":{"image_gen":{"input_tokens":50,"output_tokens":1056,"total_tokens":1106}},"tools":[{"type":"image_generation","model":"gpt-image-2"}]}}
+
+"#;
+    let usage = account_scopes(|writer, _| {
+        let mut ingress = ck_translate::images::Ingress::new(
+            writer,
+            identity(),
+            ck_translate::images::Wire::Codex,
+            BodyMode::Streaming,
+            LIMIT,
+        )
+        .unwrap();
+        ingest(&mut ingress, writer, tool);
+    })
+    .await;
+    assert_eq!(usage.attempt().and_then(|u| u.input_tokens), Some(5));
+    let scoped: Vec<_> = usage.scoped().map(|(s, u)| (s.to_owned(), u.input_tokens)).collect();
+    assert_eq!(scoped, vec![("tool:gpt-image-2".to_owned(), Some(50))]);
+
+    let poll = br#"{"status":"done","usage":{"cost_in_usd_ticks":7}}"#;
+    let usage = account_scopes(|writer, _| {
+        let mut ingress = ck_translate::video::Ingress::new(
+            writer,
+            identity(),
+            ck_translate::video::Dialect::Xai,
+            ck_translate::video::Phase::Job,
+            Some("vid_1"),
+            LIMIT,
+        )
+        .unwrap();
+        ingest(&mut ingress, writer, poll);
+    })
+    .await;
+    assert_eq!(usage.attempt(), None);
+    let scoped: Vec<_> = usage
+        .scoped()
+        .map(|(s, u)| (s.to_owned(), u.dimensions.clone()))
+        .collect();
+    assert_eq!(
+        scoped,
+        vec![("job:vid_1".to_owned(), vec![("cost_in_usd_ticks", Dimension::Count(7))])]
+    );
 }

@@ -1573,6 +1573,9 @@ pub struct Record {
     /// [`prompt_prefix`] of the client request; empty when it has none. Not in Go.
     pub prompt_prefix_hash: String,
     pub claude_cache: Option<ck_core::exec::ClaudeCacheTelemetry>,
+    /// The usage scope of a record that is not the attempt's own (`tool:<model>`, `job:<id>`,
+    /// an upstream response); empty for the attempt's. Not in Go.
+    pub usage_scope: String,
     /// Present only for additional telemetry-only records that Go omits.
     pub usage_observed: Option<bool>,
     pub timings: Timings,
@@ -1887,6 +1890,7 @@ pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
     // Not in Go's record (docs/DIFFERENCES-FROM-GO.md).
     w.opt_str("session_source", client.session_source);
     w.opt_str("prompt_prefix_hash", &record.prompt_prefix_hash);
+    w.opt_str("usage_scope", &record.usage_scope);
     if let Some(cache) = &record.claude_cache {
         w.key("claude_cache");
         serde_json::to_writer(&mut w.0, cache).expect("cache telemetry contains only JSON primitives");
@@ -2310,6 +2314,8 @@ pub struct Tracker {
     /// The attempt's canonical usage ([`Tracker::canonical`]). It is the record's usage on
     /// success and on failure alike, whatever the provider.
     canonical: Option<Detail>,
+    /// The last usage of each named scope ([`Tracker::usage`]), each its own record.
+    scoped: Vec<(String, Detail)>,
     model: ResponseModel,
     first: Option<std::time::Duration>,
     published: bool,
@@ -2385,6 +2391,7 @@ impl Tracker {
             stream: StreamUsage::default(),
             body: None,
             canonical: None,
+            scoped: Vec::new(),
             model: ResponseModel::default(),
             first: None,
             published: false,
@@ -2445,6 +2452,16 @@ impl Tracker {
         if let Some(model) = &facts.model {
             self.model.set(model);
         }
+    }
+
+    /// The attempt's usage by scope (`usage_snapshot::read`): the attempt's own is its record's
+    /// ([`Tracker::canonical`]), and each named scope's is a record of its own.
+    pub fn usage(&mut self, usage: &usage_snapshot::Usage, facts: &ResponseFacts) {
+        self.canonical(usage.attempt(), facts);
+        self.scoped = usage
+            .scoped()
+            .map(|(scope, usage)| (scope.to_owned(), Detail::canonical(usage, facts)))
+            .collect();
     }
 
     pub fn succeed(mut self) {
@@ -2511,10 +2528,50 @@ impl Tracker {
         if let Some(effort) = reported.effort {
             record.reasoning_effort = effort;
         }
+        let client = self.client.as_ref().unwrap_or(&self.facts.client);
         if queue.accepts() {
-            queue.enqueue(queued(&record, self.client.as_ref().unwrap_or(&self.facts.client)));
+            queue.enqueue(queued(&record, client));
+        }
+        // One record per named scope beside the attempt's (E-Q13). A video job's is charged by
+        // the first attempt that reports it, whichever poll that is; later polls record none.
+        for (scope, detail) in std::mem::take(&mut self.scoped) {
+            let job = scope.strip_prefix("job:");
+            if job.is_some_and(|job| !rt.charged_jobs().claim(&record.provider, job)) {
+                continue;
+            }
+            let scoped = Record {
+                detail,
+                usage_scope: scope,
+                claude_cache: None,
+                ..record.clone()
+            };
+            if queue.accepts() {
+                queue.enqueue(queued(&scoped, client));
+            }
         }
         warn_model_substitution(&record, &reported.upstream_model, &self.auth_id);
+    }
+}
+
+/// How long a charged job is remembered: well past the binding TTL a client polls within.
+const CHARGED_JOB_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// The video jobs whose usage a record already charged, by provider and job id (E-Q13). The claim
+/// is atomic, so concurrent polls of one job charge it once.
+// ponytail: process memory, so a poll after a restart can charge a job again. A durable job ledger
+// (F06-1) lifts this; its store awaits an owner decision.
+#[derive(Default)]
+pub(crate) struct ChargedJobs {
+    jobs: std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>,
+}
+
+impl ChargedJobs {
+    /// Marks `job` of `provider` charged: true only for the first claim within [`CHARGED_JOB_TTL`].
+    pub(crate) fn claim(&self, provider: &str, job: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut jobs = self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        jobs.retain(|_, at| now.saturating_duration_since(*at) < CHARGED_JOB_TTL);
+        jobs.insert((provider.to_owned(), job.to_owned()), now).is_none()
     }
 }
 
@@ -2967,6 +3024,99 @@ mod tests {
         assert_eq!(records[1].get("response_service_tier"), None);
         assert_eq!(records[1]["tokens"].get("cache_creation_30m_tokens"), None);
         assert_eq!(records[2]["response_service_tier"], "flex");
+    }
+
+    /// One record per usage scope (E-Q13): the attempt's, and one per tool model, upstream
+    /// response or video job beside it. A snapshot replaces only its own scope's, and a job is
+    /// charged by the first poll that reports it, never by a later one.
+    #[test]
+    fn usage_is_recorded_once_per_scope_and_a_job_once_however_often_polled() {
+        // (label, each attempt's snapshots in stream order as (scope, input tokens), expected
+        // records as (usage_scope, input tokens)).
+        type Case = (
+            &'static str,
+            Vec<Vec<(Option<&'static str>, u64)>>,
+            Vec<(&'static str, Option<u64>)>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "a single scope is one record",
+                vec![vec![(None, 10)]],
+                vec![("", Some(10))],
+            ),
+            (
+                "two scopes give two records",
+                vec![vec![(None, 10), (Some("tool:gpt-image-2"), 50)]],
+                vec![("", Some(10)), ("tool:gpt-image-2", Some(50))],
+            ),
+            (
+                "a snapshot replaces only its own scope",
+                vec![vec![(None, 1), (Some("tool:a"), 2), (None, 3), (Some("tool:a"), 4)]],
+                vec![("", Some(3)), ("tool:a", Some(4))],
+            ),
+            (
+                "ten polls charge once",
+                vec![vec![(Some("job:vid_1"), 7)]; 10],
+                std::iter::once(("", None))
+                    .chain(std::iter::once(("job:vid_1", Some(7))))
+                    .chain(std::iter::repeat_n(("", None), 9))
+                    .collect(),
+            ),
+            (
+                "each job is charged once",
+                vec![
+                    vec![(Some("job:a"), 1)],
+                    vec![(Some("job:b"), 2)],
+                    vec![(Some("job:a"), 1)],
+                ],
+                vec![
+                    ("", None),
+                    ("job:a", Some(1)),
+                    ("", None),
+                    ("job:b", Some(2)),
+                    ("", None),
+                ],
+            ),
+        ];
+        for (label, attempts, expected) in cases {
+            let rt = usage_runtime();
+            let facts = std::sync::Arc::new(Facts::new(
+                Client::default(),
+                Format::OpenAI,
+                Format::OpenAI,
+                "m",
+                b"{}",
+                true,
+                &crate::inference::dispatch::Trace::default(),
+            ));
+            for snapshots in attempts {
+                let mut usage = usage_snapshot::Usage::default();
+                for (scope, input) in snapshots {
+                    let snapshot = CanonicalUsage {
+                        input_tokens: Some(input),
+                        ..CanonicalUsage::default()
+                    };
+                    usage.replace(scope.map(str::to_owned), snapshot);
+                }
+                let mut tracker = Tracker::start(&rt, &facts, &credential_for("xai"), "m");
+                tracker.usage(&usage, &ResponseFacts::default());
+                tracker.succeed();
+            }
+            let records: Vec<(String, Option<u64>)> = rt
+                .usage_queue()
+                .pop_oldest(100)
+                .iter()
+                .map(|raw| {
+                    let record: Value = serde_json::from_slice(raw).unwrap();
+                    (
+                        record["usage_scope"].as_str().unwrap_or_default().to_owned(),
+                        record["tokens"]["input_tokens"].as_u64(),
+                    )
+                })
+                .collect();
+            let expected: Vec<(String, Option<u64>)> = expected.into_iter().map(|(s, n)| (s.to_owned(), n)).collect();
+            assert_eq!(records, expected, "{label}");
+        }
     }
 
     /// A malformed legacy dimension or tier is unknown; the token counts still count.
@@ -3480,9 +3630,10 @@ mod tests {
                             .collect()
                     })
                     .unwrap_or_default(),
-                // Go's record has neither: none are written.
+                // Go's record has none of these: none are written.
                 prompt_prefix_hash: String::new(),
                 claude_cache: None,
+                usage_scope: String::new(),
                 usage_observed: None,
                 timings: Timings::default(),
             };
