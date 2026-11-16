@@ -380,7 +380,7 @@ fn provider(model: &str) -> Provider {
 /// resolveProviderCompatibleSignature, except that a valid Claude signature, on a thinking
 /// block or a tool call, goes upstream as the client holds it (ruling 68): only CLIProxyAPI's
 /// legacy `<group>#` prefix comes off, without its double-layer rewrite.
-fn provider_compatible(target: Provider, raw: &[u8], kind: BlockKind) -> Vec<u8> {
+pub(crate) fn provider_compatible(target: Provider, raw: &[u8], kind: BlockKind) -> Vec<u8> {
     if raw.is_empty() {
         return vec![];
     }

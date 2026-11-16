@@ -6,10 +6,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use ck_wire::json::{self as gj, GoValue, Kind, Res};
-use ck_wire::signature::{
-    compatible_antigravity_claude_thinking_signature, sanitize_gemini_request_thought_signatures,
-};
+use ck_wire::signature::{BlockKind, Provider, sanitize_gemini_request_thought_signatures};
 
+use crate::antigravity_claude::provider_compatible;
 use crate::common::{go_lower, restore_sanitized_tool_name, trim_space};
 use crate::gemini_gemini::{attach_default_safety_settings, has_function_response};
 use crate::responses_tools::{disambiguated_tool_name_map, map_sanitized_function_name, sanitized_function_name_map};
@@ -604,10 +603,15 @@ fn sanitize_part(part: &Res<'_>, model_turn: bool) -> PartFate {
             PartFate::Keep
         };
     }
-    let Some(normalized) = compatible_antigravity_claude_thinking_signature(signature.as_deref().unwrap_or_default())
-    else {
+    // Settled 68: a valid Claude signature goes upstream as the client holds it; CLIProxyAPI
+    // re-wraps the single-layer form here.
+    let raw = signature.as_deref().unwrap_or_default().as_bytes();
+    let Ok(normalized) = String::from_utf8(provider_compatible(Provider::Claude, raw, BlockKind::Unknown)) else {
         return PartFate::Drop;
     };
+    if normalized.is_empty() {
+        return PartFate::Drop;
+    }
     let text = match map.get("text") {
         Some(GoValue::String(t)) => t.as_str(),
         _ => "",
@@ -622,7 +626,8 @@ fn sanitize_part(part: &Res<'_>, model_turn: bool) -> PartFate {
 }
 
 /// SanitizeAntigravityClaudeGeminiRequestSignatures: only model thinking parts with a
-/// Claude-compatible signature and non-empty text keep (a normalized) signature; other
+/// Claude-compatible signature and non-empty text keep their signature (without the legacy
+/// `<group>#` prefix); other
 /// signature fields are removed and contents left without parts are dropped.
 pub(crate) fn sanitize_claude_signatures(raw: Vec<u8>) -> Vec<u8> {
     let contents = gj::get(&raw, "request.contents");

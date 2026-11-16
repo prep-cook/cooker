@@ -7,9 +7,10 @@
 use ck_core::registry::{self, ModelInfo};
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, GoValue, Kind};
-use ck_wire::signature::{Provider, compatible_antigravity_claude_thinking_signature, provider_from_model_name};
+use ck_wire::signature::{BlockKind, Provider, provider_from_model_name};
 use ck_wire::thinking::{SummaryConfig, SummaryMode, parse_suffix};
 
+use crate::antigravity_claude::provider_compatible;
 use crate::common::{go_lower, trim_space};
 use crate::gemini_web_search as ws;
 use crate::stream::GoStream;
@@ -200,8 +201,9 @@ fn enable_thinking_summary(raw: &[u8], out: Vec<u8>) -> Vec<u8> {
 }
 
 /// rewriteOpenAIResponsesReasoningForAntigravityClaude: for Claude models, the n-th
-/// thought part takes the n-th reasoning item's Claude-compatible signature; thought parts
-/// without one, or without text, are dropped. A change re-marshals the whole document
+/// thought part takes the n-th reasoning item's valid Claude signature as the client holds it
+/// (Settled 68: no double-layer rewrite, only the legacy `<group>#` prefix comes off); thought
+/// parts without one, or without text, are dropped. A change re-marshals the whole document
 /// the way `json.Unmarshal` into `map[string]any` and `json.Marshal` do.
 fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8> {
     if provider_from_model_name(model) != Provider::Claude {
@@ -218,10 +220,9 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
             kind = b"message".to_vec();
         }
         if kind == b"reasoning" {
-            signatures.push(
-                compatible_antigravity_claude_thinking_signature(item.get("encrypted_content").bytes())
-                    .unwrap_or_default(),
-            );
+            let raw = item.get("encrypted_content").bytes();
+            let signature = provider_compatible(Provider::Claude, &raw, BlockKind::Unknown);
+            signatures.push(String::from_utf8_lossy(&signature).into_owned());
         }
         true
     });

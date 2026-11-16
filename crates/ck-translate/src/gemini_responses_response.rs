@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Res};
+use ck_wire::signature::{Provider, provider_from_model_name};
 
 use crate::apply_patch::{self, CallState};
 use crate::claude_responses_response::{Echo, copy_request_fields, pick_request};
@@ -459,6 +460,17 @@ pub fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
     })
 }
 
+/// The `encrypted_content` carrying an upstream thought signature. A Claude model's signature
+/// reaches the client as the upstream sent it (Settled 68), so the client can return it
+/// unchanged; CLIProxyAPI's carrier would make the next turn drop it. Other models keep the
+/// carrier.
+fn encrypted_content(model: &str, signature: &[u8], direction: &str, target: &str) -> Vec<u8> {
+    if provider_from_model_name(model) == Provider::Claude {
+        return trim_space(signature).to_vec();
+    }
+    encode_carrier(signature, direction, target)
+}
+
 fn grounding_exists(grounding: &Option<Vec<u8>>) -> bool {
     grounding.as_deref().is_some_and(|g| gj::parse(g).exists())
 }
@@ -473,7 +485,12 @@ impl State {
         if self.reasoning_enc.is_empty() || self.reasoning_direction.is_empty() {
             return self.reasoning_enc.clone();
         }
-        encode_carrier(&self.reasoning_enc, self.reasoning_direction, self.reasoning_target)
+        encrypted_content(
+            &self.model,
+            &self.reasoning_enc,
+            self.reasoning_direction,
+            self.reasoning_target,
+        )
     }
 
     fn fill_web_search_query(&mut self) {
@@ -841,7 +858,7 @@ impl State {
             format!("_detached_{placement}_{index}").as_bytes(),
         ]
         .concat();
-        let carrier = encode_carrier(&signature, direction, target);
+        let carrier = encrypted_content(&self.model, &signature, direction, target);
         for (name, template) in [
             (
                 "response.output_item.added",
@@ -2019,7 +2036,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
         gj::set_str(
             &mut item,
             "encrypted_content",
-            encode_carrier(signature, direction, target),
+            encrypted_content(ctx.model, signature, direction, target),
         );
         detached_index += 1;
         outputs.push(item);
@@ -2043,7 +2060,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
                 let mut item = br#"{"id":"","type":"reasoning","encrypted_content":""}"#.to_vec();
                 gj::set_str(&mut item, "id", &reasoning_id);
                 let encrypted = if !signature.is_empty() && !direction.is_empty() {
-                    encode_carrier(signature, direction, target)
+                    encrypted_content(ctx.model, signature, direction, target)
                 } else {
                     signature.clone()
                 };

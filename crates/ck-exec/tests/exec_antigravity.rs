@@ -717,6 +717,27 @@ fn anthropic_history(signature: Option<&str>) -> Value {
     })
 }
 
+/// A Responses history whose assistant turn thought "Let me think" under `signature`, carried
+/// as the reasoning item's `encrypted_content`.
+fn responses_history(signature: Option<&str>) -> Value {
+    let mut reasoning = serde_json::json!({
+        "type": "reasoning", "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": "Let me think"}]
+    });
+    if let Some(signature) = signature {
+        reasoning["encrypted_content"] = signature.into();
+    }
+    serde_json::json!({
+        "model": "claude-sonnet-4-6", "stream": true,
+        "input": [
+            {"role": "user", "content": "q"},
+            reasoning,
+            {"role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+            {"role": "user", "content": "more"}
+        ]
+    })
+}
+
 /// An Anthropic history whose assistant turn called a tool under `signature`.
 fn tool_history(signature: &str) -> Value {
     serde_json::json!({
@@ -754,7 +775,7 @@ async fn sent_signatures(source: &str, payload: &Value) -> Vec<String> {
 #[tokio::test]
 async fn signed_thinking_goes_upstream_as_the_client_holds_it() {
     let prefixed = format!("claude#{SINGLE_LAYER}");
-    let rows: [(&str, Value, &[&str]); 8] = [
+    let rows: [(&str, Value, &[&str]); 13] = [
         ("claude", anthropic_history(Some(DOUBLE_LAYER)), &[DOUBLE_LAYER]),
         ("claude", anthropic_history(Some(SINGLE_LAYER)), &[SINGLE_LAYER]),
         ("claude", anthropic_history(Some(&prefixed)), &[SINGLE_LAYER]),
@@ -763,6 +784,19 @@ async fn signed_thinking_goes_upstream_as_the_client_holds_it() {
         ("claude", tool_history(DOUBLE_LAYER), &[DOUBLE_LAYER]),
         ("claude", tool_history(SINGLE_LAYER), &[SINGLE_LAYER]),
         ("claude", tool_history(&prefixed), &[SINGLE_LAYER]),
+        (
+            "openai-response",
+            responses_history(Some(DOUBLE_LAYER)),
+            &[DOUBLE_LAYER],
+        ),
+        (
+            "openai-response",
+            responses_history(Some(SINGLE_LAYER)),
+            &[SINGLE_LAYER],
+        ),
+        ("openai-response", responses_history(Some(&prefixed)), &[SINGLE_LAYER]),
+        ("openai-response", responses_history(Some("opaque-signature")), &[]),
+        ("openai-response", responses_history(None), &[]),
     ];
     for (source, payload, want) in rows {
         assert_eq!(sent_signatures(source, &payload).await, want, "{source}: {payload}");
@@ -803,6 +837,48 @@ async fn upstream_signatures_reach_the_client_unchanged_and_no_cache_restores_th
         sent_signatures("claude", &anthropic_history(None)).await,
         Vec::<String>::new()
     );
+}
+
+/// Ruling 68 on a Responses client: reasoning items carry the upstream's thinking and tool-call
+/// signatures in `encrypted_content` as sent, buffered or streamed, so the client can return
+/// them unchanged on the next turn.
+#[tokio::test]
+async fn a_responses_client_receives_the_upstream_signatures_as_sent() {
+    for stream in [false, true] {
+        let mut s = scenario("claude_stream_claude_model");
+        s["source"] = "openai-response".into();
+        let body = s["upstream"]["body"].as_str().unwrap().replace(
+            r#"{"functionCall":{"id":"toolu_01""#,
+            &format!(r#"{{"thoughtSignature":"{DOUBLE_LAYER}","functionCall":{{"id":"toolu_01""#),
+        );
+        s["upstream"]["body"] = body.into();
+        let mut payload = serde_json::json!({
+            "model": "claude-sonnet-4-6", "input": "q", "stream": stream,
+            "tools": [{"type": "function", "name": "calc", "parameters": {"type": "object"}}]
+        });
+        if !stream {
+            payload.as_object_mut().unwrap().remove("stream");
+            s["op"] = "execute".into();
+        }
+        s["payload"] = payload.to_string().into();
+        let streams = Streams::new();
+        let Run {
+            started,
+            client,
+            operation,
+            streaming,
+            _upstream,
+            ..
+        } = run(&streams, &s).await;
+        let (outcome, _, mut owner) = produce(&streams, started.expect("the upstream answers")).await;
+        outcome.expect("the answer completes");
+        let delivered = delivered(&streams, &mut owner, client, operation, streaming);
+        let mut got = strings(&delivered, &["encrypted_content"]);
+        // A streamed item repeats its value in the added, done and completed events.
+        let mut seen = std::collections::HashSet::new();
+        got.retain(|v| seen.insert(v.clone()));
+        assert_eq!(got, [UPSTREAM_SIGNATURE, DOUBLE_LAYER], "stream {stream}: {delivered}");
+    }
 }
 
 /// The usage facts an attempt reports, by kind.
