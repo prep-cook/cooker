@@ -110,6 +110,7 @@ mod openai_interactions;
 mod openai_interactions_response;
 mod openai_responses;
 mod openai_responses_response;
+pub mod realtime;
 mod replay_cache;
 pub mod responses;
 mod responses_interactions;
