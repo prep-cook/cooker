@@ -11,9 +11,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use ck_core::config::Config;
 use ck_core::credential::{Credential, MetadataPatch};
-use ck_core::exec::{
-    ExecError, ExecRequest, ExecResponse, ExecSession, ExecStream, FailureScope, Operation, ResponseBody,
-};
+use ck_core::exec::{ExecError, ExecRequest, ExecResponse, ExecStream, FailureScope, Operation, ResponseBody};
 use ck_core::format::Format;
 use futures_util::StreamExt;
 use http::HeaderMap;
@@ -25,9 +23,7 @@ use crate::codex_request::{self as request, Call, Settings, View};
 use crate::codex_response::{self as response, Bootstrap, Processor};
 
 pub use crate::codex_request::DEFAULT_BASE_URL;
-pub use crate::codex_ws::{
-    ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, Next, SteeringInput, Successor, TurnControl,
-};
+pub use crate::codex_ws::{Next, Successor, TurnControl};
 
 pub struct CodexExecutor {
     /// Chrome profile for chatgpt.com, Go's standard transport elsewhere, per proxy.
@@ -96,69 +92,10 @@ impl CodexExecutor {
         self.quota.clone()
     }
 
-    /// One turn of a downstream Responses WebSocket session (`CodexAutoExecutor`):
-    /// credentials with `websockets` enabled keep a pooled upstream socket; others run
-    /// the HTTP stream with the session as prompt-cache identity and cannot continue
-    /// upstream state.
-    pub async fn execute_in_session(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        cfg: &Config,
-        session: &ExecSession,
-    ) -> Result<ExecResponse, ExecError> {
-        check_response_format(&req)?;
-        crate::codex_siwc::require_token(credential)?;
-        let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
-        let settings = Settings::scoped(cfg, &view);
-        if view.websockets() {
-            return self.stream_ws(&view, &settings, req, session, cfg).await;
-        }
-        if session.continuation {
-            return Err(ExecError::replay_required());
-        }
-        self.stream_with_session(&view, &settings, req, Some(&session.id)).await
-    }
-
     /// Whether `credential` keeps upstream state on a WebSocket (Go:
     /// `websocketUpstreamSupportsIncrementalInput`).
     pub fn upstream_websocket(credential: &Credential) -> bool {
         View::new(credential).websockets()
-    }
-
-    /// `upstream.codex.response-steering` as the Responses WebSocket handler reads it
-    /// (Go `SDKConfig.CodexResponseSteering`), shared by every credential kind.
-    pub fn response_steering_configured(cfg: &Config) -> bool {
-        request::response_steering(cfg)
-    }
-
-    /// Binds a downstream connection's later client frames to its session (Go
-    /// `WithWebsocketInput` and `WithWebsocketAuthCheck`). A steering turn on that session
-    /// reads them after its first `response.created`; [`Self::close_session`] releases them.
-    pub fn attach_steering(&self, session: &str, input: SteeringInput) {
-        self.ws.attach_steering(session, input);
-    }
-
-    /// Go `InterruptExecutionSession`: forwards a client's `response.interrupt` to the
-    /// session's upstream socket while a turn reads on it (see `codex_ws::Pool::interrupt`).
-    pub async fn interrupt_session(
-        &self,
-        session: &str,
-        payload: &[u8],
-        enabled: impl FnOnce(&str) -> bool,
-    ) -> Result<(), InterruptError> {
-        self.ws.interrupt(session, payload, enabled).await
-    }
-
-    /// The error that lost the session's upstream socket, once it is lost (what Go's
-    /// disconnect notifier hands the downstream handler).
-    pub fn session_loss(&self, id: &str) -> Option<ExecError> {
-        self.ws.loss(id)
-    }
-
-    /// Resolves when the session's upstream socket is lost.
-    pub fn session_closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        self.ws.closed(id)
     }
 
     /// Releases the session's upstream socket (downstream connection ended).

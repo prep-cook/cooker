@@ -56,9 +56,8 @@ pub struct Call {
     pub request_path: String,
     /// The downstream peer (Go `Request.RemoteAddr`), when the listener provides it.
     pub peer: Option<std::net::SocketAddr>,
-    /// A turn of a long-lived downstream session (the Responses WebSocket), `None` for
-    /// ordinary HTTP requests.
-    pub turn: Option<Arc<SessionTurn>>,
+    /// The Responses WebSocket connection a turn runs on, `None` for HTTP requests.
+    pub socket: Option<Arc<Socket>>,
     /// A media route (Go's `openai-image` / `openai-video` / `openai-speech` handler
     /// types), `None` for inference routes.
     pub media: Option<Arc<Media>>,
@@ -89,36 +88,89 @@ pub enum MediaKind {
 }
 
 impl Call {
-    /// `WithPinnedAuthID` of a session turn or media call.
+    /// `WithPinnedAuthID` of a media call.
     pub(crate) fn pinned(&self) -> Option<String> {
-        self.turn
-            .as_ref()
-            .and_then(|t| t.pinned.clone())
-            .or_else(|| self.media.as_ref().and_then(|m| m.pinned.clone()))
+        self.media.as_ref().and_then(|m| m.pinned.clone())
     }
 
-    /// `WithSelectedAuthIDCallback` of a session turn.
-    fn on_selected(&self) -> Option<&OnSelected> {
-        self.turn.as_ref().and_then(|t| t.on_selected.as_ref())
+    /// The key of the WebSocket connection the call is a turn of.
+    pub(crate) fn socket_key(&self) -> Option<crate::inference::responses_state::SocketKey> {
+        self.socket.as_ref().map(|socket| socket.key)
     }
 }
 
-/// How a session transport runs one turn through [`run`] (Go
-/// `ExecuteStreamWithAuthManager` with `WithPinnedAuthID`,
-/// `WithSelectedAuthIDCallback` and the execution session).
-pub struct SessionTurn {
-    /// Passed to [`ck_exec::Executors::execute_in_session`] for every attempt.
-    pub session: ck_core::exec::ExecSession,
-    /// Only this credential may serve the turn (`WithPinnedAuthID`); every retry round
-    /// excludes all others.
-    pub pinned: Option<String>,
-    /// Called with each credential right before it is attempted
-    /// (`WithSelectedAuthIDCallback`); the last call before success is the serving one.
-    pub on_selected: Option<OnSelected>,
+/// A Responses WebSocket connection, shared by its turns (E-PLAN §2.4.1). Every turn is an
+/// ordinary Responses exchange; the connection adds the scope of the turn its socket pins, the
+/// execution session of its upstream sockets, and the cancel of the attempt in flight.
+pub struct Socket {
+    pub key: crate::inference::responses_state::SocketKey,
+    /// The attempt in flight: an allocation handle on its response stream and, for a turn on
+    /// an upstream socket, that transport's cancel.
+    inflight: std::sync::Mutex<Option<(ck_stream::Writer, Option<ck_exec::TurnCancel>)>>,
 }
 
-/// The [`SessionTurn::on_selected`] callback.
-pub type OnSelected = Box<dyn Fn(&ck_core::credential::Credential) + Send + Sync>;
+impl Socket {
+    pub fn new() -> Self {
+        Self {
+            key: uuid::Uuid::new_v4().as_u128(),
+            inflight: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The execution session its turns' upstream sockets are pooled under.
+    pub fn session(&self) -> String {
+        format!("{:032x}", self.key)
+    }
+
+    pub(super) fn started(&self, response: ck_stream::Writer, cancel: Option<ck_exec::TurnCancel>) {
+        *self.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((response, cancel));
+    }
+
+    /// The turn ended: nothing is in flight.
+    pub fn ended(&self) {
+        self.inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    /// The client went away with a turn in flight (Settled 56): an upstream socket first gets
+    /// its transport's cancel command, then the attempt's response stream ends `Cancelled`,
+    /// which stops its producer. `false` when no attempt was in flight.
+    pub async fn cancel(&self) -> bool {
+        let inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some((mut response, cancel)) = inflight else {
+            return false;
+        };
+        if let Some(cancel) = cancel {
+            cancel.cancel().await;
+        }
+        response.finish(ck_stream::Terminal::Cancelled);
+        true
+    }
+
+    /// Writes a client's `response.interrupt` to the in-flight turn's upstream socket; `None`
+    /// when no turn runs on a socket that takes one.
+    pub async fn interrupt(&self, frame: &[u8]) -> Option<Result<(), ExecError>> {
+        let control = {
+            let inflight = self.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            inflight
+                .as_ref()
+                .and_then(|(_, cancel)| cancel.as_ref().and_then(ck_exec::TurnCancel::control))
+        }?;
+        Some(control.interrupt(frame).await)
+    }
+}
+
+impl Default for Socket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// The downstream peer address, as the listener records it (`ConnectInfo`).
 pub type Peer = Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>;
@@ -1507,7 +1559,6 @@ async fn attempt<X: Arms>(
     let route_model = lease.selection.model.clone();
     let mut last = None;
     let mut refreshed = false;
-    let session = call.turn.as_ref().map(|turn| &turn.session);
     'models: for (i, upstream) in target.models.iter().enumerate() {
         // Go `stateModelForExecution`.
         let state = registry::state_model(target.selection_model, &route_model, upstream, target.pooled);
@@ -1525,9 +1576,6 @@ async fn attempt<X: Arms>(
         let lcp = lease.lcp.clone();
         if let Some(m) = &lcp {
             req.session = Some(ck_wire::session::bound_session_identity(&m.session));
-        }
-        if let Some(on_selected) = call.on_selected() {
-            on_selected(&lease.credential);
         }
         let forced_alias = target.alias.force_mapping && !target.alias.original_alias.is_empty();
         let fault = 'arm: {
@@ -1593,13 +1641,12 @@ async fn attempt<X: Arms>(
             let mut tracker = start(&lease.credential, &mut req);
             let execute = |credential: Arc<ck_core::credential::Credential>, req: ExecRequest| async move {
                 let credential = rt.for_executor(&credential);
-                match (session, call.media.as_ref().map(|m| m.kind)) {
-                    (Some(session), _) => rt.executors.execute_in_session(&credential, req, cfg, session).await,
-                    (None, Some(MediaKind::DeferredChat)) => rt.executors.deferred_chat(&credential, req, cfg).await,
+                match call.media.as_ref().map(|m| m.kind) {
+                    Some(MediaKind::DeferredChat) => rt.executors.deferred_chat(&credential, req, cfg).await,
                     // Other media runs only on the contract arm: a provider it does not take has
                     // no executor for the call.
-                    (None, Some(_)) => Err(ck_exec::no_executor(&credential.provider)),
-                    (None, None) => rt.executors.execute(&credential, req, cfg).await,
+                    Some(_) => Err(ck_exec::no_executor(&credential.provider)),
+                    None => rt.executors.execute(&credential, req, cfg).await,
                 }
             };
             tracing::trace!(target: "cpa_latency", stage = "selected");
@@ -1729,10 +1776,10 @@ fn usage_client(
         is_compaction: false,
         session_source: session.source,
         request_id: trace.request_id(),
-        // Session turns arrive on the WebSocket upgrade (a GET).
+        // WebSocket turns arrive on the upgrade (a GET).
         endpoint: format!(
             "{} {}",
-            if call.turn.is_some() { "GET" } else { "POST" },
+            if call.socket.is_some() { "GET" } else { "POST" },
             call.request_path
         ),
         api_key,
@@ -2095,7 +2142,7 @@ mod tests {
             execution_session: None,
             request_path: String::new(),
             peer: None,
-            turn: None,
+            socket: None,
             media: None,
         };
         let cfg = |yaml: &str| Config::parse(yaml).unwrap();

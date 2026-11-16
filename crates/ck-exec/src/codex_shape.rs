@@ -113,7 +113,6 @@ pub(crate) fn shape_body(
         normalize_parallel_tool_calls(body, headers)
     };
     let body = normalize_tool_schemas(body);
-    let conflict = ck_wire::codex_client::has_namespace_conflict(body.as_bytes());
     let (body, optimized) = crate::codex_client::optimize_for_auth(
         headers,
         body.as_bytes(),
@@ -125,7 +124,6 @@ pub(crate) fn shape_body(
     Shaped {
         body,
         optimized,
-        conflict,
         finalize: Finalizer { call, original },
     }
 }

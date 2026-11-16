@@ -461,7 +461,7 @@ async fn stopped_bootstrap_failure_skips_bootstrap_retries() {
             execution_session: None,
             request_path: "/v1/responses".into(),
             peer: None,
-            turn: None,
+            socket: None,
             media: None,
         };
         let trace = ck_server::inference::dispatch::Trace::default();

@@ -700,7 +700,7 @@ fn call() -> Call {
         execution_session: None,
         request_path: "/v1/chat/completions".into(),
         peer: None,
-        turn: None,
+        socket: None,
         media: None,
     }
 }

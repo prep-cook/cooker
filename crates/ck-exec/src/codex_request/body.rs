@@ -61,16 +61,6 @@ pub(crate) fn explicit_instructions(payload: &[u8]) -> bool {
     }
 }
 
-/// [`siwc_body`] with the request's own instruction and suffix flags.
-pub(crate) fn siwc_request_body(body: String, req: &ExecRequest, call: Call) -> String {
-    siwc_body(
-        body,
-        call,
-        explicit_instructions(&req.body),
-        ck_wire::thinking::has_thinking_suffix(&req.model),
-    )
-}
-
 /// `ensureWebSearchToolForHistory` (e7d4c731): upstream rejects replayed
 /// `web_search_call` input items without a web search tool ("response protection is
 /// unavailable"). A standard request gets `{"type":"web_search"}`; a Responses Lite

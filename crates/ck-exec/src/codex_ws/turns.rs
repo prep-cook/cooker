@@ -111,7 +111,7 @@ impl Turns for CodexExecutor {
         line.conn.link.lock().expect("link").awaiting = true;
         if let Err(error) = line.conn.send(frame).await {
             line.wire.ws_exec_error("send", &error);
-            line.close(&error);
+            line.close();
             return Err(error);
         }
         let frames = Frames::turn(&line, usage.clone());
@@ -235,8 +235,8 @@ impl Line {
     }
 
     /// Ends the socket: what it still carries cannot be told apart from a later turn's.
-    fn close(&self, error: &ExecError) {
-        self.session.invalidate(&self.conn, error, false);
+    fn close(&self) {
+        self.session.invalidate(&self.conn);
     }
 
     /// The socket's loss, as a turn reads it.
@@ -263,8 +263,7 @@ struct Frames {
 impl Drop for Frames {
     fn drop(&mut self) {
         if !self.done {
-            self.line
-                .close(&transport("codex websockets executor: response abandoned in flight"));
+            self.line.close();
         }
     }
 }
@@ -333,7 +332,7 @@ impl Frames {
             if let Some(error) = ws_error(payload, self.line.cooling) {
                 self.line.wire.ws_exec_error("upstream_error", &error);
                 self.done = true;
-                self.line.close(&error);
+                self.line.close();
                 return Some(Err(error));
             }
             match gjson::get(payload, "type").str() {
@@ -341,8 +340,7 @@ impl Frames {
                 // The event rules fail the attempt; the old path drops the socket with it.
                 "response.failed" | "error" => {
                     self.done = true;
-                    self.line
-                        .close(&transport("codex websockets executor: upstream response failed"));
+                    self.line.close();
                 }
                 _ => {}
             }
@@ -363,6 +361,7 @@ impl Frames {
 }
 
 /// The control of one Codex turn ([`Turns::Cancel`]).
+#[derive(Clone)]
 pub struct TurnControl {
     line: Arc<Line>,
 }
@@ -423,7 +422,7 @@ impl TurnControl {
 
     /// A failed or timed-out write may leave a partial frame, so the socket goes.
     fn written(&self, sent: Result<(), ExecError>) -> Result<(), ExecError> {
-        sent.inspect_err(|error| self.line.close(error))
+        sent.inspect_err(|_| self.line.close())
     }
 
     /// The next frame on the turn's socket once its response body ended: it waits while a
@@ -473,6 +472,6 @@ impl CancelTurn for TurnControl {
                 .send(set_str(&frame, "mode", "discard_partial_items"))
                 .await;
         }
-        self.line.close(&transport("codex websockets executor: turn cancelled"));
+        self.line.close();
     }
 }

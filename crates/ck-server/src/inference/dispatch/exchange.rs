@@ -23,6 +23,7 @@ use ck_translate::codec::{self, ClientCapability, OwnedRequest, RequestIngress};
 use super::attempt::{Codec, stored};
 use super::{Call, Done, Failure, Served, Trace, run_exchange, traced, upstream_headers};
 use crate::http::egress::{Output, Protocol};
+use crate::inference::responses_state::SocketKey;
 use crate::inference::streams::{Exchange, Owner};
 use crate::runtime::state::Runtime;
 
@@ -49,7 +50,7 @@ where
 pub(crate) async fn run(rt: &Arc<Runtime>, call: Call, output: Output, trace: &Trace) -> Result<Served, Failure> {
     let store = rt.streams().store().map_err(|error| Failure::Exec(stored(&error)))?;
     // Client errors answer before selection, and before a router's judge, with nothing sent.
-    let mut fenced = Some(Decoded::new(&store, &call, output)?.codec(rt)?);
+    let mut fenced = Some(Decoded::new(&store, &call, output)?.codec(rt, call.socket_key())?);
     let mut call = call;
     let mut picked = None;
     if call.forced_provider.is_none()
@@ -63,7 +64,7 @@ pub(crate) async fn run(rt: &Arc<Runtime>, call: Call, output: Output, trace: &T
     loop {
         let codec = match fenced.take() {
             Some(codec) => codec,
-            None => Decoded::new(&store, &call, output)?.codec(rt)?,
+            None => Decoded::new(&store, &call, output)?.codec(rt, call.socket_key())?,
         };
         if call.operation == ck_core::exec::Operation::Generate && rt.usage_queue().accepts() {
             trace.prompt_prefix(call.entry, &call.body);
@@ -171,7 +172,7 @@ impl Decoded {
     /// Closes the client fence (contract G8) and hands the exchange and the closed document
     /// to the selection loop; the parser state goes with the ingress. A Responses request
     /// continuing a stored turn hands over the expanded document instead.
-    fn codec(mut self, rt: &Runtime) -> Result<Codec, Failure> {
+    fn codec(mut self, rt: &Runtime, socket: Option<SocketKey>) -> Result<Codec, Failure> {
         let mut exchange = self.exchange.take().ok_or_else(|| refused(codec::Error::Closed))?;
         let request = &mut exchange.request;
         let request = match self.ingress {
@@ -188,6 +189,7 @@ impl Decoded {
                     &mut exchange,
                     request.view(),
                     self.request_id,
+                    crate::inference::responses_state::Keep::new(&rt.config(), socket),
                 ) {
                     Ok(Some((document, media))) => OwnedRequest {
                         document,

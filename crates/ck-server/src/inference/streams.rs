@@ -187,6 +187,7 @@ impl Exchange {
             shown: Shown {
                 id: self.turn.map(|turn| turn.id.text()),
                 model: self.model.clone(),
+                stored: self.turn.is_some_and(|turn| turn.stored),
                 gate: self.publication.as_ref().map(|publication| publication.gate()),
             },
         }
@@ -238,12 +239,13 @@ pub struct StreamHandle {
 }
 
 /// What every delivery of a committed response shows alike, live or resumed: the Responses id
-/// the exchange issued, the model alias it shows, and the index publication's gate its `done`
-/// waits for.
+/// the exchange issued, the model alias it shows, whether it shows `store: true`, and the index
+/// publication's gate its `done` waits for.
 #[derive(Clone, Default)]
 pub(crate) struct Shown {
     pub id: Option<ck_translate::codec::event::LocalId>,
     pub model: Option<Arc<str>>,
+    pub stored: bool,
     pub gate: Option<tokio::sync::watch::Receiver<bool>>,
 }
 

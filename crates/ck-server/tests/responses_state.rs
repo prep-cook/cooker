@@ -416,7 +416,7 @@ async fn send(fixture: &Fixture, fake: &Fake, ask: Ask) -> Answer {
         media: &media,
         operation: Operation::Generate,
     };
-    let expanded = match responses_state::begin(streams, &mut exchange, view, request_id) {
+    let expanded = match responses_state::begin(streams, &mut exchange, view, request_id, Default::default()) {
         Ok(expanded) => expanded,
         Err(refused) => return Answer::Refused(refused),
     };
@@ -445,7 +445,7 @@ async fn send(fixture: &Fixture, fake: &Fake, ask: Ask) -> Answer {
         execution_session: None,
         request_path: "/v1/responses".into(),
         peer: None,
-        turn: None,
+        socket: None,
         media: None,
     };
     call.headers.clear();

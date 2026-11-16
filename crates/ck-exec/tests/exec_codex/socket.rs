@@ -1,15 +1,13 @@
 //! A Responses WebSocket turn on Codex's upstream socket (`session::Turns`) against a loopback
-//! Codex backend: one `response.create` per turn with the expanded history, the old path's
-//! frame and handshake, steering and interrupt frames, each upstream response on its own
+//! Codex backend: one `response.create` per turn with the expanded history, the Codex frame
+//! and handshake, steering and interrupt frames, each upstream response on its own
 //! attempt stream, `error` frames and socket loss as attempt failures, and cancel.
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use ck_core::credential::Credential;
-use ck_core::exec::{CaptureSink, ExecRequest, ExecSession, FailureScope, Operation as ExecOperation, UsageSink};
-use ck_core::format::Format;
-use ck_exec::codex::{CodexExecutor, Next, Successor, TurnControl};
+use ck_core::exec::{CaptureSink, FailureScope, UsageSink};
+use ck_exec::codex::{Next, Successor, TurnControl};
 use ck_exec::session::CancelTurn;
 use ck_exec::types::Body;
 use ck_stream::{Terminal, Writer};
@@ -79,16 +77,15 @@ impl Kind {
     }
 }
 
-/// A turn's handshake is the old WebSocket path's byte for byte: Codex's OAuth identity for an
-/// OAuth credential, `User-Agent: cooker` for an API key (Q13). Its frame has the old path's
-/// members and values, in the order the Responses request egress writes them, with the Sign
-/// in with ChatGPT WebSocket rules for such a credential.
+/// A turn's handshake carries Codex's OAuth identity for an OAuth credential and
+/// `User-Agent: cooker` for an API key (Q13); its frame follows the Sign in with ChatGPT
+/// WebSocket rules for such a credential.
 #[tokio::test]
-async fn a_turn_sends_the_old_paths_frame_and_handshake() {
+async fn a_turn_sends_the_codex_frame_and_handshake() {
     let body = request(json!([user("hi")]));
     for kind in [Kind::ApiKey, Kind::OAuth, Kind::Siwc] {
         let oauth = kind == Kind::OAuth;
-        let upstream = CodexSocket::start([act(answer("resp_1", 3)), act(answer("resp_1", 3))]).await;
+        let upstream = CodexSocket::start([act(answer("resp_1", 3))]).await;
         let credential = kind.of(&upstream);
         let mut exchange = Exchange::new(credential, MODEL, "/v1/responses");
         for (name, value) in [("version", "0.50.0"), ("x-client-request-id", "req-1")] {
@@ -97,16 +94,13 @@ async fn a_turn_sends_the_old_paths_frame_and_handshake() {
         let streams = Streams::new();
         let (turn, response, _request) = start(&streams, &exchange, &executor(), &body).await;
         produce(&streams, turn.unwrap().0, response).await.0.unwrap();
-        old_turn(&executor(), &exchange, &body).await;
 
         let frames = upstream.sent();
-        assert_eq!(frames.len(), 2, "{kind:?}");
-        assert_eq!(frames[0], frames[1], "{kind:?}: the frame");
+        assert_eq!(frames.len(), 1, "{kind:?}");
         // The Sign in with ChatGPT WebSocket rules drop `stream`.
         assert_eq!(frames[0].get("stream").is_none(), kind == Kind::Siwc, "{kind:?}");
         let upgrades: Vec<_> = upstream.upgrades().iter().map(handshake).collect();
-        let [new, old] = <[_; 2]>::try_from(upgrades).unwrap();
-        assert_eq!(new, old, "{kind:?}: the handshake");
+        let [new] = <[_; 1]>::try_from(upgrades).unwrap();
         let header = |name: &str| new.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
         match kind {
             Kind::OAuth => {
@@ -138,43 +132,6 @@ fn handshake(headers: &http::HeaderMap) -> Vec<(String, String)> {
         .collect();
     pairs.sort();
     pairs
-}
-
-/// The same turn on the old WebSocket path (`execute_in_session`).
-async fn old_turn(executor: &CodexExecutor, exchange: &Exchange, body: &str) {
-    let request = ExecRequest {
-        operation: ExecOperation::Generate,
-        source_format: Format::OpenAIResponse,
-        response_format: Format::OpenAIResponse,
-        requested_model: "client-model".into(),
-        model: exchange.model.clone(),
-        original_body: Bytes::copy_from_slice(body.as_bytes()),
-        body: Bytes::copy_from_slice(body.as_bytes()),
-        stream: true,
-        alt: None,
-        session: None,
-        execution_session: Some(SESSION.into()),
-        derived_session: None,
-        request_path: exchange.route.clone(),
-        headers: exchange.headers.clone(),
-        caller: exchange.caller.clone(),
-        resolved_model: None,
-        usage: Default::default(),
-    };
-    let session = ExecSession {
-        id: SESSION.into(),
-        continuation: false,
-    };
-    let response = executor
-        .execute_in_session(&exchange.credential, request, &exchange.cfg, &session)
-        .await
-        .expect("the old path sends");
-    let ck_core::exec::ResponseBody::Stream(mut events) = response.body else {
-        panic!("a WebSocket turn streams");
-    };
-    while let Some(event) = events.next().await {
-        event.expect("the old path completes");
-    }
 }
 
 const STEER: &str = r#"{"type":"response.steer","previous_response_id":"r1","input":[{"role":"user","content":[{"type":"input_text","text":"STEER_OK"}]}]}"#;

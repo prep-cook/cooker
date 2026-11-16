@@ -117,7 +117,7 @@ All paths below are relative to the repository root. Globs denote the complete m
 | `crates/ck-exec/tests/fixtures/*.json` | 34 files, grouped below | Preserve provider inputs and provenance; migrate transport/codec/accounting assertions |
 | `crates/ck-server/tests/fixtures/*.json` | 24 files, grouped below | Route, capture, media, truncation and lifecycle inputs; unrelated management/model data remains unchanged |
 | `crates/ck-server/tests/fixtures/lcp_go.jsonl.zst` | Scheduler trace corpus | Scheduling policy stays unchanged; migrate only execution-envelope callers |
-| `crates/ck-server/tests/ws_fixtures/{ws_e2e,ws_vectors}.json` | WS end-to-end and vector corpus; `tests/ws_e2e.rs` | Continuation, turn identity, terminal output and disconnect ownership |
+| `crates/ck-server/tests/ws_fixtures/ws_vectors.json` | WS error-frame vectors; `src/realtime/websocket_requests_tests.rs` | Error frame shape. The end-to-end corpus and `tests/ws_e2e.rs` were removed with the old handler (E9a) |
 | `harness/fixtures.py`, `harness/evidence/{2026-10-02,2026-10-02-ultra-claude}.json.gz` | Differential request corpus and historical evidence | Keep input provenance; no regenerated Go expectations or claimed S1 pass |
 
 The 34 executor fixture filenames, all under `crates/ck-exec/tests/fixtures/`:
@@ -140,7 +140,7 @@ The 24 server JSON fixture filenames, all under `crates/ck-server/tests/fixtures
 | Capture/usage/dispatch | `capture_go.json`, `upstream_capture_go.json`, `observe_go.json`, `server_go.json`, `server_go_v8.0.35.json` |
 | Adjacent unchanged input | `codex_models_go.json`, `config_diff_go.json`, `config_v8_auth_index_go.json`, `manage_go.json`, `model_definitions_go.json`, `quota_probe_go.json`, `safe_mode_go.json` |
 
-Additional inline route acceptance inputs live in `crates/ck-server/tests/{routes,legacy_go,claude_passthrough,gemini_routes,openai_compat_routes,codex_alpha,codex_routed_images,duplex_dispatch,realtime,aistudio_relay,xai_usage_cancel,alloc_budget,scheduler_attempts}.rs` and the corresponding `src/inference/`, `src/realtime/` and executor unit tests. Existing names containing “passthrough” do not exempt their traffic from conversion. Core configuration, wire helper and binary CLI fixtures are outside codec replacement; retain their unchanged contracts when migrating callers.
+Additional inline route acceptance inputs live in `crates/ck-server/tests/{routes,legacy_go,claude_passthrough,gemini_routes,openai_compat_routes,codex_alpha,codex_routed_images,realtime,aistudio_relay,xai_usage_cancel,alloc_budget,scheduler_attempts}.rs` and the corresponding `src/inference/`, `src/realtime/` and executor unit tests. Existing names containing “passthrough” do not exempt their traffic from conversion. Core configuration, wire helper and binary CLI fixtures are outside codec replacement; retain their unchanged contracts when migrating callers.
 
 ## Route and mode inventory
 
@@ -156,7 +156,7 @@ Every accepted row requires all four boundary roles from INTERNAL-STREAM §5: cl
 | POST `/v1/messages/count_tokens` | Count; buffered JSON only | Provider count modes below; allocation and executor count fixtures | §5.15–5.16 |
 | POST `/v1/responses`, `/backend-api/codex/responses` | Responses generation; buffered or SSE; encrypted/history/tool/media content | Responses registry rows and native Responses paths | §5.5–5.6 |
 | POST `/v1/responses/compact`, `/backend-api/codex/responses/compact` | Compact; buffered only; reject `stream=true` | Supported compact providers below; preserve unsupported responses | §5.17–5.18 |
-| GET `/v1/responses`, `/backend-api/codex/responses` | WS create/append, continuation, controls and response messages | Codex/xAI sessions and ordinary executor fallback; `ws_e2e.rs`, `duplex_dispatch.rs` | §5.7–5.8 |
+| GET `/v1/responses`, `/backend-api/codex/responses` | WS create/append, continuation, controls and response messages | Codex/xAI sessions and ordinary executor fallback; `src/realtime/websocket_tests.rs` | §5.7–5.8 |
 | POST `/v1beta/models/{model}:generateContent` | Gemini buffered generation | Gemini registry rows and applicable providers; `gemini_routes.rs` | §5.9–5.10 |
 | POST `/v1beta/models/{model}:streamGenerateContent` | Gemini SSE and non-SSE `alt` output; JSON/array framing | Same providers; test both egress encodings | §5.9–5.10 |
 | POST `/v1beta/models/{model}:countTokens` | Count; buffered JSON | Provider count modes; native count wrapper/details | §5.15–5.16 |

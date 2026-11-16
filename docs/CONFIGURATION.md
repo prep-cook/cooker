@@ -204,7 +204,7 @@ Provider settings shared by account sign-ins and provider API keys. Settings lef
 
 | Setting | What it does |
 |---|---|
-| `codex.disable-codex-cloaking`, `codex.stream-bootstrap-buffering`, `codex.stream-bootstrap-timeout`, `codex.orphan-delegation-compatibility`, `codex.model-level-cooling`, `codex.response-steering` | Codex request shaping, stream start-up, cooldown scope and full-duplex WebSocket steering. |
+| `codex.disable-codex-cloaking`, `codex.stream-bootstrap-buffering`, `codex.stream-bootstrap-timeout`, `codex.orphan-delegation-compatibility`, `codex.model-level-cooling`, `codex.response-steering` | Codex request shaping, stream start-up and cooldown scope. `response-steering` is accepted and has no effect: Responses WebSocket turns do not steer yet. |
 | `claude.model-level-cooling`, `claude.disable-cloaking-model-list`, `claude.disable-claude-cloak-mode`, `claude.header-defaults.*` | Claude cooldown scope, cloaking and the fallback request headers (`user-agent`, `package-version`, `runtime-version`, `os`, `arch`, `timeout`, `timezone`, `stabilize-device-profile`). |
 | `claude.tool-search` | `false` by default. `true` turns Codex client `tool_search` on Responses requests to Claude into Anthropic native tool search (`defer_loading` tools and `tool_reference` results) on credentials that support it: Anthropic's own API, or a Claude API key with `native-tool-search: true`. Other credentials and models that predate tool search get the request without `tool_search`. The Codex model catalog then advertises the search tool for a Claude model only when every credential serving it supports native tool search. |
 | `xai.inject-x-search` | Adds the `x_search` tool to xAI requests. |
@@ -394,6 +394,12 @@ The setting is read from SQLite before the request runtime starts. Changing it r
 | `realtime.read-timeout-seconds` | Seconds a realtime client connection may go without a pong before the gateway closes it; default 60. Only a pong extends it. Deploy-only; restart required. |
 | `realtime.write-timeout-seconds` | Seconds one write to a realtime client may block before the gateway closes the session; default 10. Deploy-only; restart required. |
 | `realtime.max-sockets-per-key` | Concurrent realtime sockets per client key; default 0, no limit. Deploy-only; restart required. |
+
+## responses
+
+| Setting | What it does |
+|---|---|
+| `responses.ignore-client-store-false` | Stores every Responses turn for continuation with `previous_response_id`, including one the client sent with `store: false`; the response then shows `store: true`. Codex clients always send `store: false`, so this lets a Codex client that reconnects continue its conversation. Default false: a `store: false` turn continues only on the WebSocket that produced it, and never over HTTP. |
 
 ## model-routers
 

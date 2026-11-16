@@ -1368,35 +1368,8 @@ async fn siwc_requests_match_go() {
             "headers": sent_headers,
         });
         if call == "websocket" {
-            let req = request(&synthetic);
-            let view = View::new(&credential);
-            let settings = Settings::scoped(&cfg, &view);
-            let shaped = request::shape(&req, &view, &settings, Call::Websocket).unwrap();
-            let (body, cache) = request::prompt_cache(&req, shaped.body, Some("exec-session"), true);
-            let body = crate::codex_ws::turn_body(&view, &req, &settings, &shaped.finalize, body);
-            assert_eq!(body, case["body"].as_str().unwrap(), "{name}: body");
-            let headers = request::ws_headers(
-                &view,
-                &settings,
-                &req.headers,
-                &body,
-                &request::base_model(&req.model),
-                cache.as_deref(),
-                false,
-            );
-            let mut actual: Vec<(String, String)> = headers
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
-                .collect();
-            actual.sort();
-            let mut expected: Vec<(String, String)> = go_upstream["headers"]
-                .as_object()
-                .unwrap()
-                .iter()
-                .map(|(k, v)| (k.clone(), v[0].as_str().unwrap().to_owned()))
-                .collect();
-            expected.sort();
-            assert_eq!(actual, expected, "{name}: headers");
+            // These Go cases recorded the old turn path's body. Responses WebSocket turns shape
+            // their frame through `codex_exec::Shape` (`tests/exec_codex/socket.rs`).
             continue;
         }
         let (path, content_type, reply) = if call == "compact" {

@@ -82,7 +82,7 @@ pub(crate) async fn read_loop(
     // The session records the loss before the turn reads its error, so a handler that
     // sees the turn fail also finds the loss (Go's notifier closes the client first).
     match session.upgrade() {
-        Some(session) => session.invalidate(&conn, &error, true),
+        Some(session) => session.invalidate(&conn),
         None => conn.deactivate(),
     }
     if let Some(tx) = active {

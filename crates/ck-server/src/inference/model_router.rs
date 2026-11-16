@@ -715,7 +715,7 @@ async fn ask_chat(rt: &Arc<Runtime>, call: &Call, model: &str, task: &str) -> Re
         execution_session: None,
         request_path: "/v1/chat/completions".into(),
         peer: None,
-        turn: None,
+        socket: None,
         media: None,
     };
     let trace = Trace::with_request_id(None);
@@ -1510,7 +1510,7 @@ mod tests {
             execution_session: Some("router-regression".into()),
             request_path: "/v1/chat/completions".into(),
             peer: None,
-            turn: None,
+            socket: None,
             media: None,
         }
     }

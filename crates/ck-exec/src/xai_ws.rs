@@ -476,7 +476,7 @@ impl Frames {
             self.capture.response(payload);
             if let Some(error) = ws_error(payload) {
                 self.capture.error("upstream_error", &error);
-                self.session.invalidate(&self.conn, &error, false);
+                self.session.invalidate(&self.conn);
                 self.done = true;
                 return Some(Err(error));
             }
@@ -519,8 +519,7 @@ pub struct Cancel {
 impl CancelTurn for Cancel {
     async fn cancel(self) {
         if self.in_flight.load(Ordering::Acquire) {
-            let error = plain("xai websockets executor: turn cancelled");
-            self.session.invalidate(&self.conn, &error, false);
+            self.session.invalidate(&self.conn);
         }
     }
 }
@@ -589,7 +588,7 @@ impl Turns for XaiExecutor {
         if let Err(error) = conn.send(String::from_utf8_lossy(&frame).into_owned()).await {
             let error = pool_error(error);
             capture.error("send", &error);
-            session.invalidate(&conn, &error, false);
+            session.invalidate(&conn);
             return Err(error);
         }
         let in_flight = Arc::new(AtomicBool::new(true));

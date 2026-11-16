@@ -46,7 +46,7 @@ fn call(req: Request, entry: Format, model: String, body: Bytes, stream: bool, a
         execution_session: None,
         request_path: req.path,
         peer: req.peer,
-        turn: None,
+        socket: None,
         media: None,
     }
 }

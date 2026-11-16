@@ -15,6 +15,11 @@
 //! terminal output until the slot is decided, so a client never sees a completed response
 //! whose id does not resolve yet. A turn the index cannot hold still completes; a later
 //! continuation of it gets `previous_response_not_found` (owner, 2026-11-15).
+//!
+//! A Responses WebSocket turn sent with `store: false` is pinned to its socket (E-PLAN §2.4.1):
+//! only the socket's last such turn is indexed, under the socket's key, and only that socket
+//! continues it. `responses.ignore-client-store-false` stores every turn instead, the reconnect
+//! path of clients that always send `store: false`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -35,7 +40,7 @@ use super::streams::{Exchange, Owner, Registry};
 pub struct ResponseId([u8; 16]);
 
 impl ResponseId {
-    fn random() -> Self {
+    pub(crate) fn random() -> Self {
         let mut bytes = [0; 16];
         getrandom::fill(&mut bytes).expect("system randomness");
         Self(bytes)
@@ -56,12 +61,24 @@ impl ResponseId {
     }
 }
 
+/// The key of one Responses WebSocket connection, scoping the turn its socket pins.
+pub type SocketKey = u128;
+
 /// What a Responses exchange records before its first attempt.
 #[derive(Clone, Copy)]
 pub struct Turn {
     pub id: ResponseId,
-    /// The client did not send `store: false`: the committed turn is indexed.
+    /// The committed turn is indexed for every connection of its owner, and its response shows
+    /// `store: true`: the client did not send `store: false`, or the deploy ignores it.
     pub stored: bool,
+    /// The socket that pins this turn when it is not `stored`.
+    pub socket: Option<SocketKey>,
+}
+
+impl Turn {
+    fn indexed(&self) -> bool {
+        self.stored || self.socket.is_some()
+    }
 }
 
 /// The index of committed turns. Its capacity is the pool's header slots, fixed when the store
@@ -79,7 +96,7 @@ struct Slots {
 enum Slot {
     /// A committed turn still running.
     Reserved,
-    Published(Entry),
+    Published(Box<Entry>),
 }
 
 /// A committed turn that ended with `done`.
@@ -91,6 +108,8 @@ struct Entry {
     response: Writer,
     provider: Box<str>,
     credential: Box<str>,
+    /// The socket that pinned the turn; `None` for a stored turn.
+    socket: Option<SocketKey>,
 }
 
 impl Entry {
@@ -120,7 +139,7 @@ impl Index {
 
     /// Reserves a slot for `id`. A full table first drops every entry whose streams are gone;
     /// `false` when it is still full.
-    fn reserve(&self, capacity: usize, id: ResponseId) -> bool {
+    pub(crate) fn reserve(&self, capacity: usize, id: ResponseId) -> bool {
         self.slots(capacity, |slots| {
             if slots.entries.len() >= slots.capacity {
                 slots
@@ -135,12 +154,26 @@ impl Index {
         })
     }
 
+    /// Publishes `id`. A socket pins only its last turn, so its earlier pin leaves the table.
     fn fill(&self, id: ResponseId, entry: Entry) {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(slot) = slots.as_mut().and_then(|slots| slots.entries.get_mut(&id))
-            && matches!(slot, Slot::Reserved)
-        {
-            *slot = Slot::Published(entry);
+        let Some(slots) = slots.as_mut() else {
+            return;
+        };
+        if !matches!(slots.entries.get(&id), Some(Slot::Reserved)) {
+            return;
+        }
+        if let Some(socket) = entry.socket {
+            slots.entries.retain(|_, slot| !pinned_by(slot, socket));
+        }
+        slots.entries.insert(id, Slot::Published(Box::new(entry)));
+    }
+
+    /// Drops the turn `socket` pins: its connection ended.
+    pub(crate) fn unpin(&self, socket: SocketKey) {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slots) = slots.as_mut() {
+            slots.entries.retain(|_, slot| !pinned_by(slot, socket));
         }
     }
 
@@ -153,9 +186,10 @@ impl Index {
         }
     }
 
-    /// The published turn `id` that `owner` created. `None` alike for an unknown id, another
-    /// owner, a turn still running, and an expired or evicted one, which leaves the table.
-    fn lookup(&self, owner: &Owner, id: ResponseId) -> Option<Found> {
+    /// The published turn `id` that `owner` created, on `socket` when a socket pinned it. `None`
+    /// alike for an unknown id, another owner or socket, a turn still running, and an expired
+    /// or evicted one, which leaves the table.
+    fn lookup(&self, owner: &Owner, id: ResponseId, socket: Option<SocketKey>) -> Option<Found> {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         let slots = slots.as_mut()?;
         let Slot::Published(entry) = slots.entries.get(&id)? else {
@@ -165,13 +199,17 @@ impl Index {
             slots.entries.remove(&id);
             return None;
         }
-        (entry.owner == *owner).then(|| Found {
+        (entry.owner == *owner && (entry.socket.is_none() || entry.socket == socket)).then(|| Found {
             request: entry.request.allocator(),
             response: entry.response.allocator(),
             provider: entry.provider.clone(),
             credential: entry.credential.clone(),
         })
     }
+}
+
+fn pinned_by(slot: &Slot, socket: SocketKey) -> bool {
+    matches!(slot, Slot::Published(entry) if entry.socket == Some(socket))
 }
 
 /// One attempt's publication. Delivery reserves the slot when the attempt commits; the
@@ -202,7 +240,7 @@ impl Publication {
         response: &Writer,
         producer: provenance::Producer<'_>,
     ) -> Option<Arc<Self>> {
-        let turn = exchange.turn.filter(|turn| turn.stored)?;
+        let turn = exchange.turn.filter(Turn::indexed)?;
         let capacity = streams.store().ok()?.limits().header_slots as usize;
         Some(Arc::new(Self {
             index: streams.responses().clone(),
@@ -217,6 +255,7 @@ impl Publication {
                     response: response.allocator(),
                     provider: producer.provider.into(),
                     credential: producer.credential.into(),
+                    socket: turn.socket.filter(|_| !turn.stored),
                 }),
             }),
             decided: watch::Sender::new(false),
@@ -235,6 +274,7 @@ impl Publication {
             return;
         }
         if !self.index.reserve(self.capacity, self.id) {
+            tracing::warn!(target: "ck_dispatch", "history not retained: the response index is full");
             self.decided.send_replace(true);
             return;
         }
@@ -358,6 +398,31 @@ impl Refused {
     }
 }
 
+/// How a Responses exchange's turn is kept for continuation.
+#[derive(Clone, Copy, Default)]
+pub struct Keep {
+    /// `responses.ignore-client-store-false`: a `store: false` turn is stored anyway.
+    pub ignore_store_false: bool,
+    /// The WebSocket connection the turn runs on: it pins a `store: false` turn and continues
+    /// the turn it pinned.
+    pub socket: Option<SocketKey>,
+}
+
+impl Keep {
+    /// The deploy's rule and `socket`, the connection a WebSocket turn runs on.
+    pub fn new(cfg: &ck_core::config::Config, socket: Option<SocketKey>) -> Self {
+        let ignore_store_false = ["responses", "ignore-client-store-false"]
+            .iter()
+            .try_fold(&cfg.document, |v, k| v.get(*k))
+            .and_then(serde_yaml_ng::Value::as_bool)
+            .unwrap_or(false);
+        Self {
+            ignore_store_false,
+            socket,
+        }
+    }
+}
+
 /// Prepares a Responses exchange before its first attempt. It issues the exchange's response
 /// id, refuses `conversation`, and expands a `previous_response_id` continuation into a new
 /// request stream that replaces the exchange's. `view` is the client's request view, read from
@@ -369,6 +434,7 @@ pub fn begin(
     exchange: &mut Exchange,
     view: RequestView<'_>,
     request_id: LocalId,
+    keep: Keep,
 ) -> Result<Option<(Document, Media)>, Refused> {
     let doc = view.document;
     let x = doc.required(doc.root(), "x_ck").map_err(|_| Refused::Defect)?;
@@ -382,13 +448,14 @@ pub fn begin(
     };
     exchange.turn = Some(Turn {
         id: ResponseId::random(),
-        stored,
+        stored: stored || keep.ignore_store_false,
+        socket: keep.socket,
     });
     let Some(previous) = previous(doc, x).map_err(|_| Refused::Defect)? else {
         return Ok(None);
     };
     let found = previous
-        .and_then(|id| streams.responses().lookup(&exchange.owner, id))
+        .and_then(|id| streams.responses().lookup(&exchange.owner, id, keep.socket))
         .ok_or(Refused::NotFound)?;
     let store = streams.store().map_err(stored_error)?;
     let mut target = store.create().map_err(stored_error)?;
