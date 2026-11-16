@@ -124,6 +124,7 @@ fn reusable_prompts_preserve_model_omission_and_overrides() {
         (json!({"input":"hi"}), false),
         (json!({"prompt":null}), false),
         (json!({"prompt":{}}), false),
+        (json!({"prompt":{"id":7}}), false),
         (json!({"model":7,"prompt":{"id":"pmpt_test"}}), false),
     ] {
         let mut m = Mapped::new();
@@ -136,11 +137,18 @@ fn reusable_prompts_preserve_model_omission_and_overrides() {
         let result = ingress.finish(&mut m.writer, &ClientCapability);
         assert_eq!(result.is_ok(), accepted, "{body}");
         if let Ok(client) = result {
-            for capability in [
-                &responses::request::ResponsesCapability as &dyn Capability,
-                &responses::request::CodexCapability,
+            for (capability, accepted) in [
+                (&responses::request::ResponsesCapability as &dyn Capability, true),
+                (&responses::request::CodexCapability, true),
+                (&gemini::request::GeminiCapability, body.get("model").is_some()),
+                (&responses::request::AntigravityCapability, body.get("model").is_some()),
             ] {
-                capability.validate(client.view()).unwrap();
+                assert_eq!(
+                    capability.validate(client.view()).is_ok(),
+                    accepted,
+                    "{}: {body}",
+                    capability.destination()
+                );
             }
             let attempt = RequestFence::default()
                 .end(client.view(), &responses::request::CodexCapability)
