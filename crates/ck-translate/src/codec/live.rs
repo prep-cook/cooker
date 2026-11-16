@@ -25,13 +25,26 @@ pub enum Opcode {
     Binary,
 }
 
+/// Why a client message was refused. The boundary sends these in the protocol's own `error`
+/// event; none of them carries message content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Refusal {
+    /// Stable machine-readable reason.
+    pub code: &'static str,
+    /// What happened and what the client can do instead.
+    pub message: &'static str,
+    /// The field at fault, as a dotted path, when one is.
+    pub param: Option<&'static str>,
+}
+
 /// One live session's projector and validator; one value per session.
 pub trait Projector {
     /// Checks one client message against the session's admitted configuration before it is
     /// forwarded (E-Q14): media messages by message type only, other messages by their
-    /// control fields, never by decoding a media payload. An `Err` refuses the message: it
-    /// is not forwarded, and the client receives the protocol's own `error` event.
-    fn admit(&mut self, opcode: Opcode, payload: &[u8]) -> Result<()>;
+    /// control fields, never by decoding a media payload. A refused message is not
+    /// forwarded, and the client receives the protocol's own `error` event built from the
+    /// [`Refusal`]. An admitted message is forwarded byte for byte.
+    fn admit(&mut self, opcode: Opcode, payload: &[u8]) -> std::result::Result<(), Refusal>;
 
     /// Publishes the metadata projection of one forwarded message to the session stream.
     /// Media payloads and media fields are only counted, per sender; they never enter the

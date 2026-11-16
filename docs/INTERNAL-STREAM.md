@@ -293,6 +293,7 @@ Capability validation covers supplied model/operation, roles and ordered content
 | `image.result` | `{index: uint, media_id?: string, url?: string, mime?: string, attributes?: {index: uint, output_format?, size?, quality?, background?}, revised_prompt?: string, created_at?: uint}`; exactly one of `media_id` (a finished `image` media of this response) and `url` (an upstream URL), in image order; for a URL, `mime` and `attributes` are the media's own that no media carries; `created_at` is the source's per-image creation time; native extra fields use `X.original`. |
 | `realtime.control` | `{action: "offer"\|"answer"}\|{action: "session.configure"\|"session.created"\|"session.updated", config: RealtimeConfig}\|{action: "response.create"\|"response.append", request_id: string}\|{action: "response.cancel", response_id?: string}\|{action: "audio.commit"\|"audio.clear", track_id: string}\|{action: "session.close", reason?: string}` |
 | `realtime.rates` | `{limits: [{name: string, remaining: number, limit?: number, reset_after_ms?: uint}]}` |
+| `realtime.counters` | `{client: Counts, upstream: Counts, responses: [{response_id: string, output_audio_bytes: uint}]}`, `Counts = {messages, bytes, media_messages, media_bytes, decoded_bytes, refused, unreadable}` (uint each); a live session's last record. `responses` lists responses without `response.done`. |
 
 `RealtimeConfig = {model?: string, modalities?: ("text"|"audio"|"image"|"video")[], voice?: string, instructions?: string, tools?: Q.tools, tool_choice?: Q.tool_choice, input_audio?: AudioFormat, output_audio?: AudioFormat, turn_detection?: {mode: "disabled"|"server_vad"|"semantic_vad", threshold?: number, prefix_ms?: uint, silence_ms?: uint}}`; `AudioFormat = {codec: string, sample_rate_hz?: uint, channels?: uint}`. Omission preserves existing session settings; provider-only extras use `X.provider_parameters`.
 Conversation items/tool results use Q history; live-session messages, including audio append and inline media fields, are forwarded as received; Q and X hold only their metadata projection, with no `MediaRef` and no media events (Settled 55). Response controls reference a separately validated request; cancellation is not successful completion. Unknown sideband commands use `opaque`; mapped commands never do.
@@ -545,7 +546,7 @@ For live sessions, the §5.25 and §5.26 tables define only the metadata project
 | Wire fields | Internal location | Notes |
 | --- | --- | --- |
 | SDP offer, session config/model/modalities/voice/tools, call/session IDs | X session; `operation(kind: realtime.control)` | §4 offer/config schema; SDP is forwarded as received and projected only as its action and IDs, never as media; credentials stay outside. |
-| Conversation items, response.create/cancel, tool calls/results | Q history/tools; §4 response controls | Per-turn validation and lifecycle are distinct from session lifecycle. |
+| Conversation items, response.create/cancel, tool calls/results | §4 response controls; `opaque` with event type and IDs in X source | Content, instructions and arguments are never projected. |
 | WS input audio append, binary messages; WebRTC media packets | Counted only | |
 | WS input audio commit/clear | §4 audio controls | |
 | Hangup/sideband commands/unknown event types | §4 session.close; `opaque` for unmapped commands | End all owned directions on close; no silent tunnel fallback. |
@@ -555,7 +556,7 @@ For live sessions, the §5.25 and §5.26 tables define only the metadata project
 | Wire fields | Internal location | Notes |
 | --- | --- | --- |
 | SDP answer, session created/updated, call/response/item IDs | §4 answer/session controls; X source/session | Transport negotiation remains outside internal stages. |
-| Text/transcript/tool events | C deltas/tool lifecycle | |
+| Text/transcript/tool events | `opaque` with event type and IDs in X source | Text, transcripts and arguments are never projected. |
 | Audio deltas, reflected sideband audio, media packets | Counted only | |
 | Usage/rate limits, errors, response.done/session close | Usage/`realtime.rates`/terminal per response or session | §4 rates schema; response.done does not close a live connection. |
 
