@@ -1,0 +1,26 @@
+//! What the cloak's preparation leaves alone on an Anthropic compaction (D2 plan §2.7):
+//! Anthropic refuses `compaction` beside `context_management`, and replays a signed
+//! `compaction` block only as it sent it, so no cache marker goes into one.
+use ck_core::exec::{ExecError, FailureScope};
+
+use super::thinking_accepts_clear;
+use crate::rawjson;
+
+/// Whether the cloak may add its `context_management` to `body`: its thinking accepts
+/// clearing, and it asks for no compaction.
+pub(super) fn accepts_context(body: &str) -> bool {
+    thinking_accepts_clear(body) && !rawjson::get(body, "compaction").exists()
+}
+
+/// Refuses a prepared body that still pairs `compaction` with `context_management`, which a
+/// payload rule or the caller added; the cloak adds none ([`accepts_context`]).
+pub(crate) fn refuse_context(body: String) -> Result<String, ExecError> {
+    if rawjson::get(&body, "compaction").exists() && rawjson::get(&body, "context_management").exists() {
+        return Err(ExecError::local(
+            400,
+            FailureScope::Request,
+            "Anthropic compaction refuses context_management; remove it from the request or the payload rule",
+        ));
+    }
+    Ok(body)
+}

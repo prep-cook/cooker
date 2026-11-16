@@ -1754,7 +1754,7 @@ impl<'a> Ctx<'a> {
             diagnostics = session::Continuity::default();
         }
         let (extra_betas, stripped) = extract_betas(body);
-        body = cloak::strip_prompt_cache_options(stripped);
+        body = cloak::compaction::refuse_context(cloak::strip_prompt_cache_options(stripped))?;
         if cch {
             body = signing::sign(body)
                 .map_err(|e| ExecError::local(500, FailureScope::Request, format!("sign Claude CCH: {e}")))?;

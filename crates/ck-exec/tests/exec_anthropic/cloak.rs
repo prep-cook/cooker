@@ -491,26 +491,51 @@ async fn a_buffered_cloaked_body_over_the_stream_quota_fails_visibly() {
 }
 
 /// A compaction on an OAuth credential is prepared like any cloaked request and still asks
-/// for native compaction with its beta (D2 plan §2.7).
+/// for native compaction with its beta (D2 plan §2.7). Anthropic refuses `compaction` with
+/// `context_management`, so the cloak adds none to it, even with thinking on through the
+/// model's thinking suffix, and one a payload rule adds is refused.
 #[tokio::test]
-async fn a_cloaked_compaction_keeps_its_request_and_beta() {
-    let (fixture, recorder) = at(ORIGIN, &oauth(), SONNET, &[]);
-    let mut request = fixture.streams.request();
-    let (store, id) = (&fixture.streams.store, identity(Direction::Request));
-    let mut ingress = responses::request::Ingress::new(&mut request, store, id, Operation::Compact, LIMIT).unwrap();
-    let body = br#"{"model":"m","max_output_tokens":4096,"input":[{"role":"user","content":"Explain lifetimes."}]}"#;
-    let (started, _) = fixture.start(&mut ingress, &mut request, body).await;
-    assert!(started.is_err(), "the proxy refuses every connection");
-    let wire = recorder.0.lock().unwrap().pop().expect("the compaction request");
-    let sent: Value = serde_json::from_str(&wire.body).unwrap();
-    assert_eq!(sent["compaction"], json!({"type": "summarize"}));
-    assert_eq!(sent["stream"], false);
-    let betas = wire
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
-        .unwrap();
-    for beta in ["oauth-2025-04-20", "compact-2026-09-04"] {
-        assert!(betas.1.split(',').any(|b| b == beta), "{beta} missing from {}", betas.1);
+async fn a_cloaked_compaction_asks_for_compaction_without_context_management() {
+    let body = br#"{"model":"m","max_output_tokens":16000,"input":[{"role":"user","content":"Explain lifetimes."}]}"#;
+    let thinking = format!("{SONNET}(8192)");
+    let rule = format!(
+        "requests:\n  payload:\n    default:\n      - models: [{{name: {SONNET}}}]\n        params: {{context_management: {{edits: []}}}}\n"
+    );
+    for (model, rules, refused) in [
+        (SONNET, None, false),
+        (thinking.as_str(), None, false),
+        (SONNET, Some(&rule), true),
+    ] {
+        let (mut fixture, recorder) = at(ORIGIN, &oauth(), model, &[]);
+        if let Some(rules) = rules {
+            fixture.exchange.cfg = ck_core::config::Config::parse(rules).unwrap();
+        }
+        let mut request = fixture.streams.request();
+        let (store, id) = (&fixture.streams.store, identity(Direction::Request));
+        let mut ingress = responses::request::Ingress::new(&mut request, store, id, Operation::Compact, LIMIT).unwrap();
+        let (started, _) = fixture.start(&mut ingress, &mut request, body).await;
+        let Err(error) = started else {
+            panic!("the proxy refuses every connection")
+        };
+        let wire = recorder.0.lock().unwrap().pop();
+        if refused {
+            assert!(wire.is_none(), "{model}");
+            assert!(format!("{error:?}").contains("context_management"), "{error:?}");
+            continue;
+        }
+        let wire = wire.expect("the compaction request");
+        let sent: Value = serde_json::from_str(&wire.body).unwrap();
+        assert_eq!(sent["compaction"], json!({"type": "summarize"}));
+        assert_eq!(sent["stream"], false);
+        assert!(sent.get("context_management").is_none(), "{sent}");
+        assert_eq!(sent.get("thinking").is_some(), model != SONNET, "{sent}");
+        let betas = wire
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
+            .unwrap();
+        for beta in ["oauth-2025-04-20", "compact-2026-09-04"] {
+            assert!(betas.1.split(',').any(|b| b == beta), "{beta} missing from {}", betas.1);
+        }
     }
 }

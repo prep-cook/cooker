@@ -23,14 +23,18 @@ fn compacted() -> String {
     )
 }
 
-/// An Anthropic client's next turn after `block`, with the turns `block` summarized before it.
-fn continuation(block: &Value) -> Vec<u8> {
-    let body = json!({"model": "m", "max_tokens": 64, "system": "Be brief.", "messages": [
+/// An Anthropic client's next turn after `block`, with the turns `block` summarized before it;
+/// the block ends the conversation unless `ask`.
+fn continuation(block: &Value, ask: bool) -> Vec<u8> {
+    let mut body = json!({"model": "m", "max_tokens": 64, "system": "Be brief.", "messages": [
         {"role": "user", "content": "Explain lifetimes."},
         {"role": "assistant", "content": "They bound references."},
         {"role": "assistant", "content": [block]},
-        {"role": "user", "content": "And now?"},
     ]});
+    if ask {
+        let messages = body["messages"].as_array_mut().unwrap();
+        messages.push(json!({"role": "user", "content": "And now?"}));
+    }
     serde_json::to_vec(&body).unwrap()
 }
 
@@ -136,10 +140,16 @@ async fn compact(fixture: &Fixture, upstream: &StreamUpstream, attempt: &Attempt
 
 /// Sends `block`'s continuation on `attempt`; returns the upstream body and whether it carried
 /// the compaction beta.
-async fn replay(fixture: &Fixture, upstream: &StreamUpstream, attempt: &Attempt<'_>, block: &Value) -> Value {
+async fn replay(
+    fixture: &Fixture,
+    upstream: &StreamUpstream,
+    attempt: &Attempt<'_>,
+    block: &Value,
+    ask: bool,
+) -> Value {
     let mut request = fixture.streams.request();
     let mut ingress = anthropic_ingress(fixture, &mut request);
-    let body = continuation(block);
+    let body = continuation(block, ask);
     let (started, _) = run(fixture, attempt, &mut ingress, &mut request, &body).await.unwrap();
     started.unwrap().producer.await.unwrap().unwrap();
     let (sent, captured) = sent(upstream);
@@ -151,10 +161,11 @@ async fn replay(fixture: &Fixture, upstream: &StreamUpstream, attempt: &Attempt<
 }
 
 /// Compact, then replay on the same credential: an API key, and one thinking replay serves,
-/// whose compaction and continuation both take the contract path.
+/// whose compaction and continuation both take the contract path. The rolling cache marker
+/// never lands inside the signed block, even when the block ends the conversation.
 #[tokio::test]
 async fn compact_then_replay_sends_the_block_first_and_unchanged() {
-    for replay_key in [false, true] {
+    for (replay_key, ask) in [(false, true), (true, true), (false, false)] {
         let reply = Reply::json(compacted()).byte_at_a_time();
         let upstream = StreamUpstream::start([reply, Reply::json(MESSAGE)]).await;
         let fixture = Fixture::new(&upstream, SONNET);
@@ -169,14 +180,17 @@ async fn compact_then_replay_sends_the_block_first_and_unchanged() {
             item,
             json!({"type": "opaque", "protocol": "anthropic", "value": native["content"][0]})
         );
-        let sent = replay(&fixture, &upstream, &attempt, &item["value"]).await;
+        let sent = replay(&fixture, &upstream, &attempt, &item["value"], ask).await;
         let messages = sent["messages"].as_array().unwrap();
         assert_eq!(
             messages[0],
             json!({"role": "assistant", "content": [native["content"][0]]})
         );
-        assert_eq!(messages.len(), 2, "earlier turns stay behind: {sent}");
-        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(
+            messages.len(),
+            1 + usize::from(ask),
+            "earlier turns stay behind: {sent}"
+        );
         assert!(sent["system"].to_string().contains("Be brief."), "{sent}");
     }
 }
@@ -224,7 +238,7 @@ async fn other_destinations_refuse_a_compaction_block() {
     let native: Value = serde_json::from_str(&compacted()).unwrap();
     let mut request = fixture.streams.request();
     let mut ingress = anthropic_ingress(&fixture, &mut request);
-    for byte in continuation(&native["content"][0]).chunks(1) {
+    for byte in continuation(&native["content"][0], true).chunks(1) {
         ingress.advance(&mut request, byte).unwrap();
     }
     let attempt = fixture.exchange.attempt(&fixture.streams.store);

@@ -36,18 +36,20 @@ pub fn requested(view: RequestView<'_>) -> Result<bool> {
     Ok(view.operation == Operation::Compact || replay_from(view.document)?.is_some())
 }
 
-/// Refuses a compaction block that does not lead its message, which Anthropic refuses as
-/// misplaced. Nothing else needs refusing here: the Responses request ingress, the only one
-/// with a compact operation, refuses a streamed compact, and Anthropic egress writes only
-/// Anthropic members, so another protocol's `context_management` never reaches a compact.
+/// Refuses a compaction block Anthropic would not read as one: a block behind another part,
+/// which it refuses as misplaced, and a block in the system prompt, which the encoder would
+/// send as system text. Another protocol's `context_management` never reaches a compact
+/// because the egress writes only Anthropic members; the Claude executor's cloak adds none,
+/// and it refuses one a payload rule or the caller pairs with `compaction` (`ck-exec`).
 pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     let doc = view.document;
     for message in doc.children(doc.required(doc.root(), "messages")?)? {
+        let system = is(doc, message, "role", "system")? || is(doc, message, "role", "developer")?;
         if let Some(content) = doc.member(message, "content")?
             && matches!(doc.node(content)?.value, Value::Array)
         {
             for (index, part) in doc.children(content)?.enumerate() {
-                if index != 0 && block(doc, part)? {
+                if (system || index != 0) && block(doc, part)? {
                     return Err(Error::Unsupported);
                 }
             }

@@ -130,24 +130,30 @@ fn a_replayed_block_goes_first_and_unchanged_and_earlier_turns_stay_behind() {
         json!([{"role": "assistant", "content": [native]}, {"role": "user", "content": "And now?"}])
     );
     assert_eq!(sent["system"], "Be brief.");
-    // A block that does not lead its message is what Anthropic refuses as misplaced.
-    let misplaced = format!(
-        r#"{{"model":"m","max_tokens":64,"messages":[{{"role":"assistant","content":[{{"type":"text","text":"x"}},{}]}},{{"role":"user","content":"go"}}]}}"#,
-        block()
-    );
-    let mut mapped = Mapped::new();
-    let mut ingress = anthropic::request::Ingress::new(
-        &mut mapped.writer,
-        &mapped.store,
-        identity(Direction::Request),
-        Operation::Generate,
-        1024 * 1024,
-    )
-    .unwrap();
-    ingress.advance(&mut mapped.writer, misplaced.as_bytes()).unwrap();
-    let capability = anthropic::request::AnthropicCapability::default();
-    assert!(matches!(
-        ingress.finish(&mut mapped.writer, &capability),
-        Err(codec::Error::Unsupported)
-    ));
+    // Anthropic accepts a block only at the head of a conversation message: one behind another
+    // block is misplaced, and one in the system prompt would be sent as system text.
+    for misplaced in [
+        format!(
+            r#"{{"model":"m","max_tokens":64,"messages":[{{"role":"assistant","content":[{{"type":"text","text":"x"}},{}]}},{{"role":"user","content":"go"}}]}}"#,
+            block()
+        ),
+        format!(
+            r#"{{"model":"m","max_tokens":64,"system":[{}],"messages":[{{"role":"user","content":"go"}}]}}"#,
+            block()
+        ),
+    ] {
+        let mut mapped = Mapped::new();
+        let mut ingress = anthropic::request::Ingress::new(
+            &mut mapped.writer,
+            &mapped.store,
+            identity(Direction::Request),
+            Operation::Generate,
+            1024 * 1024,
+        )
+        .unwrap();
+        let fenced = ingress
+            .advance(&mut mapped.writer, misplaced.as_bytes())
+            .and_then(|()| ingress.finish(&mut mapped.writer, &anthropic::request::AnthropicCapability::default()));
+        assert!(matches!(fenced, Err(codec::Error::Unsupported)), "{misplaced}");
+    }
 }
