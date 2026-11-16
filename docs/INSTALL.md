@@ -64,7 +64,7 @@ cargo build --release -p cooker
 
 The dashboard in `ui/dist` is not committed, so the binary build needs it built first. To skip Node and Rust, build the image with `docker build`. To change the dashboard, see [ui/README.md](../ui/README.md).
 
-The WebRTC media relay is an optional feature and is not part of the Docker image. To include it, build with `cargo build --release -p cooker --features ck-server/media-relay`.
+The Docker image includes the WebRTC media relay. A source build includes it with `cargo build --release -p cooker --features ck-server/media-relay`; without it, WebRTC calls (`POST /v1/realtime/calls`, `/v1/realtime`, `/v1/live`) answer 501. Calls also answer 501 until `oauth.providers.codex.live-media-relay.enabled` is true.
 
 ## First run from source
 

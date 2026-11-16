@@ -2,9 +2,11 @@
 //! `media-relay`.
 //!
 //! Each call gets two peer connections: one answering the client's offer (downstream) and
-//! one offering to the Codex upstream. Opus RTP and the `oai-events` data channel are
-//! forwarded between them; anything else is dropped. Data channel messages over 256 KiB,
-//! a failed or remotely closed peer, or a failed data channel end the session.
+//! one offering to the Codex upstream. Opus RTP is forwarded between them with its payload
+//! unchanged; only the header fields each leg negotiated are rewritten. The `oai-events`
+//! data channel messages go to the call's live session ([`super::relay::Events`]), which
+//! admits and forwards them; anything else is dropped. A data channel message over 256 KiB,
+//! a failed or remotely closed peer, or a failed data channel ends that peer's side.
 //!
 //! A credential with a proxy keeps the upstream peer on loopback and reaches the upstream
 //! over ICE-TCP through that proxy (tunnel.rs, Go tcp_proxy.go).
@@ -14,10 +16,12 @@
 //! ones learned from STUN.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
+use bytes::BytesMut;
+use ck_exec::session::Frame;
 use futures_util::future::BoxFuture;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::rtp_transceiver::rtp_sender::{
@@ -25,7 +29,7 @@ use rtc::rtp_transceiver::rtp_sender::{
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
-use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelMessage};
+use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::Track;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
@@ -38,7 +42,9 @@ use webrtc::peer_connection::{
 use webrtc::rtp_transceiver::RtpSender;
 
 use super::dialer::{self, Dial, proxy_scheme};
-use super::relay::{Hold, Limiter, MediaRelay, MediaSession, NewSession, RelayConfig, RelayError, Route, Slot};
+use super::relay::{
+    Events, Hold, Limiter, MediaRelay, MediaSession, NewSession, RelayConfig, RelayError, Route, Rtp, Slot,
+};
 use super::tunnel::{self, Tunnel};
 
 /// `realtimeDataChannelLabel`.
@@ -598,9 +604,6 @@ fn public_candidates_only(sdp: &str) -> String {
 #[derive(Default)]
 struct State {
     call_id: String,
-    failure: Option<String>,
-    handler: Option<super::relay::CloseHandler>,
-    handler_called: bool,
     slot: Option<Slot>,
 }
 
@@ -616,9 +619,16 @@ struct Shared {
     gathered: [watch::Sender<bool>; 2],
     outputs: [OnceLock<Output>; 2],
     channels: [OnceLock<Arc<dyn DataChannel>>; 2],
-    /// Messages to send on each side's channel, and their receivers until it attaches.
-    queues: [mpsc::Sender<RTCDataChannelMessage>; 2],
-    receivers: [Mutex<Option<mpsc::Receiver<RTCDataChannelMessage>>>; 2],
+    /// Messages to send on each side's channel until it attaches ([`Events`] holds the
+    /// senders).
+    receivers: [Mutex<Option<mpsc::Receiver<Frame>>>; 2],
+    /// Where each side's channel delivers its messages; dropped when that side fails, which
+    /// ends its receiver in [`Events`] while the other side's stays open.
+    inbox: [Mutex<Option<mpsc::Sender<Frame>>>; 2],
+    /// The live session's ends of both channels, until it takes them.
+    events: Mutex<Option<Events>>,
+    /// RTP forwarded from each side: packets, payload bytes.
+    rtp: [[AtomicU64; 2]; 2],
     tasks: Mutex<Vec<AbortHandle>>,
     /// The two peers once both exist, for negotiation.
     pcs: OnceLock<[Arc<dyn PeerConnection>; 2]>,
@@ -649,6 +659,14 @@ impl Shared {
     fn new(slot: Slot, route: Route, proxy: Option<Proxied>, public_ip: String) -> Arc<Self> {
         let (down_tx, down_rx) = mpsc::channel(QUEUE);
         let (up_tx, up_rx) = mpsc::channel(QUEUE);
+        let (from_client_tx, from_client) = mpsc::channel(QUEUE);
+        let (from_upstream_tx, from_upstream) = mpsc::channel(QUEUE);
+        let events = Events {
+            from_client,
+            to_client: down_tx,
+            from_upstream,
+            to_upstream: up_tx,
+        };
         Arc::new(Self {
             id: crate::inference::dispatch::request_id(),
             route,
@@ -662,8 +680,10 @@ impl Shared {
             gathered: [watch::channel(false).0, watch::channel(false).0],
             outputs: [OnceLock::new(), OnceLock::new()],
             channels: [OnceLock::new(), OnceLock::new()],
-            queues: [down_tx, up_tx],
             receivers: [Mutex::new(Some(down_rx)), Mutex::new(Some(up_rx))],
+            inbox: [Mutex::new(Some(from_client_tx)), Mutex::new(Some(from_upstream_tx))],
+            events: Mutex::new(Some(events)),
+            rtp: Default::default(),
             tasks: Mutex::default(),
             pcs: OnceLock::new(),
             created: Mutex::default(),
@@ -786,8 +806,8 @@ impl Shared {
         }
     }
 
-    /// Binds a data channel to its side: a reader that forwards its messages to the other
-    /// side's queue, and a writer that sends this side's queue once the channel is open.
+    /// Binds a data channel to its side: a reader that delivers its messages to the side's
+    /// inbox, and a writer that sends this side's queue once the channel is open.
     fn attach(self: &Arc<Self>, side: Side, channel: Arc<dyn DataChannel>) {
         if self.channels[side as usize].set(channel.clone()).is_err() {
             tokio::spawn(async move {
@@ -799,11 +819,14 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        let inbox = self.inbox[side as usize]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let (open_tx, mut open_rx) = watch::channel(false);
         let me = Arc::downgrade(self);
-        let to_other = self.queues[side.other() as usize].clone();
         let reader = channel.clone();
-        let name = format!("{}-to-{}", side.name(), side.other().name());
+        let name = side.name();
         self.spawn(async move {
             while let Some(event) = reader.poll().await {
                 match event {
@@ -812,22 +835,37 @@ impl Shared {
                     }
                     DataChannelEvent::OnMessage(message) => {
                         if message.data.len() > MAX_MESSAGE {
-                            fail(&me, &format!("{name} DataChannel message exceeds {MAX_MESSAGE} bytes"));
+                            fail(
+                                &me,
+                                side,
+                                &format!("{name} DataChannel message exceeds {MAX_MESSAGE} bytes"),
+                            );
                             return;
                         }
-                        if to_other.send(message).await.is_err() {
+                        let data = message.data.freeze();
+                        let frame = match (message.is_string, std::str::from_utf8(&data)) {
+                            (true, Ok(_)) => Frame::Text(data),
+                            _ => Frame::Binary(data),
+                        };
+                        let Some(inbox) = &inbox else { return };
+                        if inbox.send(frame).await.is_err() {
                             return;
                         }
                     }
                     DataChannelEvent::OnError => {
-                        fail(&me, &format!("{name} DataChannel error"));
+                        fail(&me, side, &format!("{name} DataChannel error"));
                         return;
                     }
-                    DataChannelEvent::OnClose => break,
+                    DataChannelEvent::OnClose => {
+                        if let Some(inbox) = &inbox {
+                            let _ = inbox.send(Frame::Close(None)).await;
+                        }
+                        return;
+                    }
                     _ => {}
                 }
             }
-            fail(&me, &format!("{name} DataChannel closed"));
+            fail(&me, side, &format!("{name} DataChannel closed"));
         });
         let Some(mut rx) = rx else { return };
         let me = Arc::downgrade(self);
@@ -835,13 +873,14 @@ impl Shared {
             if open_rx.wait_for(|open| *open).await.is_err() {
                 return;
             }
-            while let Some(message) = rx.recv().await {
-                let sent = match (message.is_string, std::str::from_utf8(&message.data)) {
-                    (true, Ok(text)) => channel.send_text(text).await,
-                    _ => channel.send(message.data).await,
+            while let Some(frame) = rx.recv().await {
+                let sent = match frame {
+                    Frame::Text(text) => channel.send_text(&String::from_utf8_lossy(&text)).await,
+                    Frame::Binary(data) => channel.send(BytesMut::from(data)).await,
+                    Frame::Close(_) => continue,
                 };
                 if let Err(e) = sent {
-                    fail(&me, &format!("send DataChannel message: {e}"));
+                    fail(&me, side, &format!("send DataChannel message: {e}"));
                     return;
                 }
             }
@@ -888,32 +927,23 @@ impl Shared {
 }
 
 /// A data channel failure (`dataChannelPipe.reportError`).
-fn fail(shared: &Weak<Shared>, detail: &str) {
+fn fail(shared: &Weak<Shared>, side: Side, detail: &str) {
     let Some(shared) = shared.upgrade() else { return };
-    fail_shared(&shared, "data_channel_failed", detail);
+    fail_shared(&shared, side, "data_channel_failed", detail);
 }
 
-/// `pionMediaSession.fail`: closes the session once with `reason` and tells the call.
-fn fail_shared(shared: &Shared, reason: &str, detail: &str) {
+/// `pionMediaSession.fail`: ends `side`'s messages, then closes the session once with
+/// `reason`. The call's live session sees that side end and closes the call.
+fn fail_shared(shared: &Shared, side: Side, reason: &str, detail: &str) {
+    shared.inbox[side as usize]
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
     if shared.failed.swap(true, Ordering::SeqCst) {
         return;
     }
     tracing::warn!(media_session_id = %shared.id, reason, detail, "codex live WebRTC media session failed");
-    let code = reason.to_owned();
-    shared.close(&code);
-    let handler = {
-        let mut state = shared.lock();
-        state.failure = Some(code.clone());
-        if state.handler_called {
-            None
-        } else {
-            state.handler_called = state.handler.is_some();
-            state.handler.take()
-        }
-    };
-    if let Some(handler) = handler {
-        handler(code);
-    }
+    shared.close(reason);
 }
 
 struct Handler {
@@ -939,6 +969,7 @@ impl PeerConnectionEventHandler for Handler {
             RTCPeerConnectionState::Failed => {
                 fail_shared(
                     &shared,
+                    self.side,
                     &format!("{}_failed", self.side.name()),
                     "PeerConnection failed",
                 );
@@ -946,6 +977,7 @@ impl PeerConnectionEventHandler for Handler {
             RTCPeerConnectionState::Closed if !shared.closed.load(Ordering::SeqCst) => {
                 fail_shared(
                     &shared,
+                    self.side,
                     &format!("{}_closed", self.side.name()),
                     "PeerConnection closed",
                 );
@@ -960,7 +992,7 @@ impl PeerConnectionEventHandler for Handler {
             return;
         }
         let me = Arc::downgrade(&shared);
-        let to = self.side.other();
+        let (from, to) = (self.side, self.side.other());
         shared.spawn(async move {
             while let Some(event) = track.poll().await {
                 let TrackRemoteEvent::OnRtpPacket(mut packet) = event else {
@@ -979,9 +1011,13 @@ impl PeerConnectionEventHandler for Handler {
                 packet.header.extensions.clear();
                 packet.header.ssrc = output.ssrc;
                 packet.header.payload_type = payload_type;
+                let bytes = packet.payload.len() as u64;
                 if output.track.write_rtp(packet).await.is_err() {
                     return;
                 }
+                let [packets, payload] = &shared.rtp[from as usize];
+                packets.fetch_add(1, Ordering::Relaxed);
+                payload.fetch_add(bytes, Ordering::Relaxed);
             }
         });
     }
@@ -1083,17 +1119,19 @@ impl MediaSession for Session {
         self.0.lock().call_id = call_id.trim().to_owned();
     }
 
-    /// Called at once when the session already failed (Go `SetCloseHandler`).
-    fn set_close_handler(&self, handler: super::relay::CloseHandler) {
-        let mut state = self.0.lock();
-        match state.failure.clone() {
-            Some(reason) if !state.handler_called => {
-                state.handler_called = true;
-                drop(state);
-                handler(reason);
-            }
-            Some(_) => {}
-            None => state.handler = Some(handler),
+    fn events(&self) -> Option<Events> {
+        self.0.events.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+
+    fn rtp(&self) -> Rtp {
+        let side = |side: Side| {
+            self.0.rtp[side as usize]
+                .each_ref()
+                .map(|count| count.load(Ordering::Relaxed))
+        };
+        Rtp {
+            client: side(Side::Down),
+            upstream: side(Side::Up),
         }
     }
 

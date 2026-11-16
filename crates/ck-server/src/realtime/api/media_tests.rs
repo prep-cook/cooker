@@ -1,5 +1,7 @@
 //! Go media_test.go: `TestIsPublicRemoteIP` and `TestPionMediaRelayBridgesAudioAndDataChannel`
-//! (a client peer, the relay and a fake upstream peer, all on loopback).
+//! (a client peer, the relay and a fake upstream peer, all on loopback). The call's live
+//! session over the data channel is tested with the call routes (`http.rs`); here [`pump`]
+//! stands in for it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +19,37 @@ use webrtc::peer_connection::{
 
 use super::*;
 use crate::realtime::api::relay::{Limiter, MediaRelay, Route};
+
+/// Stands in for the call's live session: forwards each peer's data channel messages to the
+/// other as received. Each task returns how its peer's messages ended: its close, or `None`
+/// when they ended without one.
+fn pump(session: &dyn MediaSession) -> [tokio::task::JoinHandle<Option<Frame>>; 2] {
+    let Events {
+        from_client,
+        to_client,
+        from_upstream,
+        to_upstream,
+    } = session.events().expect("the data channel ends");
+    let forward = |mut from: mpsc::Receiver<Frame>, to: mpsc::Sender<Frame>| {
+        tokio::spawn(async move {
+            loop {
+                match from.recv().await {
+                    Some(Frame::Close(close)) => return Some(Frame::Close(close)),
+                    Some(frame) => {
+                        let _ = to.send(frame).await;
+                    }
+                    None => return None,
+                }
+            }
+        })
+    };
+    [forward(from_client, to_upstream), forward(from_upstream, to_client)]
+}
+
+/// RTP counted per sender: at least one packet, and only whole payloads of `len` bytes.
+fn counted(rtp: [u64; 2], len: u64) {
+    assert!(rtp[0] >= 1 && rtp[1] >= len && rtp[1].is_multiple_of(len), "{rtp:?}");
+}
 
 #[test]
 fn public_remote_ips_match_go() {
@@ -248,13 +281,14 @@ async fn relays_audio_and_data_channel_between_peers() {
 
     session.set_call_id("call-relay");
     let downstream_answer = session.accept_upstream_answer(upstream_answer).await.unwrap();
+    let [from_client, from_upstream] = pump(&*session);
     client
         .pc
         .set_remote_description(RTCSessionDescription::answer(downstream_answer).unwrap())
         .await
         .unwrap();
 
-    // Audio both ways.
+    // Audio both ways, payloads unchanged and counted.
     assert_eq!(
         rtp_flows(&client_audio, &mut upstream.tracks, b"to-openai").await,
         b"to-openai"
@@ -263,6 +297,9 @@ async fn relays_audio_and_data_channel_between_peers() {
         rtp_flows(&upstream_audio, &mut client.tracks, b"to-desktop").await,
         b"to-desktop"
     );
+    let rtp = session.rtp();
+    counted(rtp.client, 9);
+    counted(rtp.upstream, 10);
 
     // Data channel both ways, text and binary kept apart.
     let upstream_channel = tokio::time::timeout(Duration::from_secs(15), upstream.channels.recv())
@@ -279,13 +316,17 @@ async fn relays_audio_and_data_channel_between_peers() {
         .unwrap();
     assert_eq!(next_message(&client_channel).await, "response.done");
 
-    // The close handler runs when the media ends on its own; an explicit close frees the slot.
-    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
-    session.set_close_handler(Box::new(move |reason| {
-        let _ = closed_tx.send(reason);
-    }));
+    // The client closing its channel ends its messages with a close; the upstream's go on.
+    client_channel.close().await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(15), from_client)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended, Some(Frame::Close(None)));
+    assert!(!from_upstream.is_finished());
+
+    // An explicit close frees the slot.
     session.close("test_done");
-    assert!(closed_rx.try_recv().is_err(), "an explicit close is not a failure");
     let (second, _) = relay
         .new_session(
             {
@@ -658,6 +699,7 @@ async fn proxied_credentials_relay_media_through_the_proxy() {
 
     session.set_call_id("call-proxied");
     let downstream_answer = session.accept_upstream_answer(public_answer).await.unwrap();
+    let _pumps = pump(&*session);
     client
         .pc
         .set_remote_description(RTCSessionDescription::answer(downstream_answer).unwrap())
@@ -693,10 +735,6 @@ async fn proxied_credentials_relay_media_through_the_proxy() {
     assert_eq!(proxy_log.ended.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     // Closing the session ends every proxied connection while both test peers stay up.
-    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
-    session.set_close_handler(Box::new(move |reason| {
-        let _ = closed_tx.send(reason);
-    }));
     session.close("test_done");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while proxy_log.ended.load(std::sync::atomic::Ordering::SeqCst) < targets.len() {
@@ -706,7 +744,6 @@ async fn proxied_credentials_relay_media_through_the_proxy() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(closed_rx.try_recv().is_err(), "an explicit close is not a failure");
     let _ = client.pc.close().await;
     let _ = upstream.pc.close().await;
 }
@@ -832,6 +869,7 @@ async fn relays_over_ipv6() {
     let answer = upstream.pc.create_answer(None).await.unwrap();
     let upstream_answer = complete(&mut upstream, answer).await;
     let downstream_answer = session.accept_upstream_answer(upstream_answer).await.unwrap();
+    let _pumps = pump(&*session);
     client
         .pc
         .set_remote_description(RTCSessionDescription::answer(downstream_answer).unwrap())
@@ -968,4 +1006,37 @@ async fn close_ends_a_pending_gathering_wait() {
         late.expect("no timeout fallback"),
         Err("peer connection closed".to_owned())
     );
+}
+
+/// A failed peer or channel ends only its own side's messages, so the call's live session
+/// names the side that ended; the other side's stay open until the session ends the call.
+#[tokio::test]
+async fn a_failure_ends_only_its_sides_messages() {
+    for failed in [Side::Down, Side::Up] {
+        let limiter = Arc::new(Limiter::default());
+        limiter.set_limit(1);
+        let route = Route {
+            proxy_url: String::new(),
+            credential: "c".into(),
+            auth_index: "a".into(),
+        };
+        let shared = Shared::new(limiter.acquire().unwrap(), route, None, String::new());
+        let Events {
+            from_client,
+            from_upstream,
+            ..
+        } = Session(shared.clone()).events().unwrap();
+        fail_shared(&shared, failed, "failed", "test");
+        let (mut ended, mut open) = match failed {
+            Side::Down => (from_client, from_upstream),
+            Side::Up => (from_upstream, from_client),
+        };
+        let end = tokio::time::timeout(Duration::from_secs(5), ended.recv()).await;
+        assert_eq!(end, Ok(None), "{failed:?}: its side ended");
+        assert_eq!(
+            open.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "{failed:?}: the other side stays open"
+        );
+    }
 }

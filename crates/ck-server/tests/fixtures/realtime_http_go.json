@@ -378,6 +378,9 @@
    ],
    "X-Cpa-Trace-Id": [
     "20261003122516-ed3d6b1db19d35a0-01a101b9-cce0-7a67-b225-d9cc2a57e5d6"
+   ],
+   "Content-Type": [
+    "application/sdp"
    ]
   },
   "body": "v=0\r\n",
@@ -466,13 +469,13 @@
       "acct-1"
      ],
      "Content-Type": [
-      "application/sdp"
+      "application/json"
      ],
      "X-Operator": [
       "op-value"
      ]
     },
-    "body": "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\n",
+    "body": "{\"sdp\":\"v=0\\r\\no=- 1 2 IN IP4 127.0.0.1\\r\\ns=-\\r\\n\"}",
     "auth_id": "b-codex-oauth"
    }
   ]
@@ -494,7 +497,7 @@
    "status": 201,
    "body": "v=0"
   },
-  "status": 201,
+  "status": 400,
   "headers": {
    "Access-Control-Allow-Headers": [
     "*"
@@ -510,31 +513,13 @@
    ],
    "X-Cpa-Trace-Id": [
     "20261003122516-ed3d6b1db19d35a0-01a101b9-cce1-7191-90d1-c3832be32479"
+   ],
+   "Content-Type": [
+    "application/json; charset=utf-8"
    ]
   },
-  "body": "v=0",
-  "sent": [
-   {
-    "method": "POST",
-    "url": "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver\u0026architecture=avas",
-    "headers": {
-     "Authorization": [
-      "Bearer oauth-token"
-     ],
-     "Chatgpt-Account-Id": [
-      "acct-1"
-     ],
-     "Content-Type": [
-      "application/json"
-     ],
-     "X-Operator": [
-      "op-value"
-     ]
-    },
-    "body": "{\"model\":\"custom-live\"}",
-    "auth_id": "b-codex-oauth"
-   }
-  ]
+  "body": "{\"error\":\"Codex live call request requires an SDP offer\"}",
+  "sent": []
  },
  {
   "name": "live_invalid_multipart",
@@ -861,7 +846,7 @@
    },
    "body": "v=0"
   },
-  "status": 201,
+  "status": 502,
   "headers": {
    "Access-Control-Allow-Headers": [
     "*"
@@ -876,13 +861,13 @@
     "X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id"
    ],
    "Content-Type": [
-    "application/sdp"
+    "application/json; charset=utf-8"
    ],
    "X-Cpa-Trace-Id": [
     "20261003122516-ed3d6b1db19d35a0-01a101b9-cce6-7e99-8a25-4c699afae59b"
    ]
   },
-  "body": "v=0",
+  "body": "{\"error\":\"Codex live response is missing a valid call ID\"}",
   "sent": [
    {
     "method": "POST",

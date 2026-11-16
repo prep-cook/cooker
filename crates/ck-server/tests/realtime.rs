@@ -124,6 +124,7 @@ async fn proxy(credentials: Vec<Credential>, mock: Shared) -> String {
             google: Default::default(),
         },
     ));
+    ck_server::testing::passthrough_media_relay(&rt);
     serve(router(rt)).await
 }
 
@@ -562,6 +563,7 @@ async fn realtime_websockets_match_go() {
             google: Default::default(),
         },
     ));
+    ck_server::testing::passthrough_media_relay(&rt);
     let proxy = serve(router(rt)).await;
     let client = wreq::Client::new();
     let secret = client
@@ -830,6 +832,7 @@ async fn sideband_claims_and_hangup_teardown() {
             google: Default::default(),
         },
     ));
+    ck_server::testing::passthrough_media_relay(&rt);
     let proxy = serve(router(rt.clone())).await;
     let client = wreq::Client::new();
     let create = |call_id: &'static str| {
@@ -917,6 +920,7 @@ async fn raw_handshakes_match_gorilla() {
             google: Default::default(),
         },
     ));
+    ck_server::testing::passthrough_media_relay(&rt);
     let proxy = serve(router(rt)).await;
     let client = wreq::Client::new();
     let mut failures = Vec::new();
@@ -1006,6 +1010,7 @@ async fn relay_end_close_codes_match_gorilla() {
             google: Default::default(),
         },
     ));
+    ck_server::testing::passthrough_media_relay(&rt);
     let proxy = serve(router(rt)).await;
     let client = wreq::Client::new();
     let mut failures = Vec::new();
@@ -1147,6 +1152,7 @@ async fn live_proxy(config: &str) -> (String, Arc<ck_server::Runtime>, WsShared)
             google: Default::default(),
         },
     ));
+    ck_server::testing::passthrough_media_relay(&rt);
     let proxy = serve(router(rt.clone())).await;
     (proxy, rt, mock)
 }
