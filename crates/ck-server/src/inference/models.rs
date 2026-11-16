@@ -236,7 +236,7 @@ fn cursor_positions(
     let (before, after) = (pos(before_id.as_ref()), pos(after_id.as_ref()));
     let missing = |name: &str, id: &str| format!("{name}: Value not found for `{name}`: {id}. Input was '{id}'.");
     match (before, after) {
-        (None | Some(None), Some(None)) => Err(missing("after_id", after_id.as_deref().unwrap_or_default())),
+        (_, Some(None)) => Err(missing("after_id", after_id.as_deref().unwrap_or_default())),
         (Some(None), _) => Err(missing("before_id", before_id.as_deref().unwrap_or_default())),
         (before, after) => Ok((before.flatten(), after.flatten())),
     }
@@ -350,8 +350,13 @@ fn claude_list<'a>(
         Some(page) => {
             let (before, after) = cursor_positions(&data, &page.before_id, &page.after_id)?;
             let (start, end, more) = match (before, after) {
-                // A page ending just before `before_id`, taken from its end backwards.
-                (Some(before), _) => (before.saturating_sub(page.limit), before, before > page.limit),
+                // A page ending just before `before_id`, taken from its end backwards and, with
+                // `after_id` too, starting no earlier than just after it.
+                (Some(before), after) => {
+                    let floor = after.map_or(0, |after| after + 1).min(before);
+                    let start = before.saturating_sub(page.limit).max(floor);
+                    (start, before, start > floor)
+                }
                 // A page starting just after `after_id`.
                 (None, Some(after)) => {
                     let start = (after + 1).min(data.len());
@@ -575,11 +580,16 @@ mod tests {
             ),
             ("before_id=m-a&limit=1", Ok((ids(&[]), None, None, false))),
             ("before_id=m-a&limit=2", Ok((ids(&[]), None, None, false))),
-            // Both cursors bound one page.
+            // Both cursors bound one page: only what lies between them, whatever the limit.
             (
                 "after_id=m-a&before_id=m-c&limit=1",
-                Ok((ids(&["m-b"]), Some("m-b"), Some("m-b"), true)),
+                Ok((ids(&["m-b"]), Some("m-b"), Some("m-b"), false)),
             ),
+            (
+                "after_id=m-a&before_id=m-c&limit=10",
+                Ok((ids(&["m-b"]), Some("m-b"), Some("m-b"), false)),
+            ),
+            ("after_id=m-c&before_id=m-a&limit=10", Ok((ids(&[]), None, None, false))),
             // An unknown cursor or limit is an invalid_request_error message.
             (
                 "after_id=m-x",
@@ -588,6 +598,10 @@ mod tests {
             (
                 "before_id=m-x",
                 Err("before_id: Value not found for `before_id`: m-x. Input was 'm-x'."),
+            ),
+            (
+                "before_id=m-c&after_id=m-x&limit=2",
+                Err("after_id: Value not found for `after_id`: m-x. Input was 'm-x'."),
             ),
             (
                 "after_id=m-x&before_id=m-y",
