@@ -136,7 +136,7 @@ impl State {
             Scope::default(),
             |_| Ok(()),
             |e| match record {
-                Some((source, event)) => sse_provenance(source, event, e),
+                Some((source, event)) => sse_provenance("chat", source, event, e),
                 None => Ok(()),
             },
         )?;

@@ -2,7 +2,7 @@ mod decode;
 mod retained;
 
 pub use decode::bytes;
-pub(crate) use decode::{Base64Fragments, InputDecoder, decode_base64, write_base64_fragments};
+pub(crate) use decode::{Base64Fragments, InputDecoder, decode_base64, write_base64_fragments, write_encoded_chunks};
 
 use super::{
     Error, Result,
@@ -12,7 +12,7 @@ use super::{
     json::Decoded,
 };
 use ck_stream::{MetadataPermit, Writer};
-use decode::{write_encoded_chunks, write_payload};
+use decode::write_payload;
 
 #[derive(Clone, Copy)]
 pub enum Encoding {
@@ -297,6 +297,31 @@ impl Registry {
         e.bytes(b"\"")
     }
 
+    /// Streams a registered payload's decoded bytes, from retained records when the payload has
+    /// them and from its string otherwise.
+    #[allow(
+        dead_code,
+        reason = "only the images codec reads parts; test crates that include this module by path do not"
+    )]
+    pub(crate) fn raw_bytes(
+        &self,
+        doc: &Document,
+        node: usize,
+        mut emit: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let media = self.get(doc, node)?.ok_or(Error::Position)?;
+        let entry = &self.entries[*self.active.get(&node).ok_or(Error::Position)?];
+        match &entry.chunks {
+            Some(chunks) => {
+                for text in chunks.iter() {
+                    decode_base64(doc, *text, &mut emit)?;
+                }
+                Ok(())
+            }
+            None => bytes(doc, media, emit),
+        }
+    }
+
     /// Writes the payload's bytes as base64 without quotes, from retained records when the
     /// payload has them and from its string otherwise.
     fn write_bytes(entry: &Entry, doc: &Document, media: Media, e: &mut Encoder<'_, '_>) -> Result<()> {
@@ -456,7 +481,18 @@ impl Publisher {
         scope: Scope,
         fields: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
     ) -> Result<Self> {
-        emitter.emit(owner, Kind::MediaStart, scope, fields, |_| Ok(()))?;
+        Self::start_with(emitter, owner, scope, fields, |_| Ok(()))
+    }
+
+    /// [`Self::start`] with `provenance` members on the `media.start` record's `x_ck`.
+    pub(crate) fn start_with(
+        emitter: &mut Emitter,
+        owner: &mut Writer,
+        scope: Scope,
+        fields: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
+        provenance: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
+    ) -> Result<Self> {
+        emitter.emit(owner, Kind::MediaStart, scope, fields, provenance)?;
         Ok(Self {
             scope,
             index: 0,
