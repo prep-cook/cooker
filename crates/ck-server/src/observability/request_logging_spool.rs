@@ -158,7 +158,7 @@ impl Section {
         }
         match &self.spool {
             Some(spool) => spool.copy_redacted(&self.memory, out),
-            None => out.write_all(&ck_wire::redact::bytes(&self.memory)),
+            None => ck_wire::redact::write(&self.memory, out),
         }
     }
 }

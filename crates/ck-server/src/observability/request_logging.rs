@@ -1197,7 +1197,7 @@ fn write_body(out: &mut dyn Write, body: &[u8]) -> io::Result<()> {
 /// Writes one section of a log with every URL in it redacted. The section is redacted as
 /// a whole, so a URL anywhere in it is seen whole.
 fn write_redacted(out: &mut dyn Write, section: &[u8]) -> io::Result<()> {
-    out.write_all(&ck_wire::redact::bytes(section))
+    ck_wire::redact::write(section, out)
 }
 
 fn trim(bytes: &[u8]) -> &[u8] {
@@ -2529,8 +2529,10 @@ mod tests {
     #[tokio::test]
     async fn large_upstream_sections_stay_bounded_in_memory() {
         use ck_core::exec::CaptureEvent::*;
-        let body = vec![b'q'; 20 << 20];
-        let chunk: Vec<u8> = (0..64 << 10).map(|i| b'a' + (i % 26) as u8).collect();
+        // Lines, since a word longer than the redaction hold limit prints as a placeholder.
+        let line = |i: usize, letter: u8| if i % 64 == 32 { b'\n' } else { letter };
+        let body: Vec<u8> = (0..20 << 20).map(|i| line(i, b'q')).collect();
+        let chunk: Vec<u8> = (0..64 << 10).map(|i| line(i, b'a' + (i % 26) as u8)).collect();
         const CHUNKS: usize = 640;
         let events = {
             let body = body.clone();

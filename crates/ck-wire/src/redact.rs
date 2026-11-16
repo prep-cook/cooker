@@ -22,27 +22,57 @@ pub const UNPRINTABLE: &str = "<redacted url>";
 /// path, where a password holding an unescaped '?' or '#' would leave its start as the
 /// host.
 ///
-/// A `scheme://` before the query or fragment that does not open `raw` starts a URL of
-/// its own (`/r/https://user:key@host/`), so `raw` is cut where its scheme starts and
-/// each part is rendered alone; a part that cannot be rendered prints as [`UNPRINTABLE`].
+/// A `//` before the query or fragment that does not open `raw` starts a URL of its own
+/// (`/r/https://user:key@host/`), so `raw` is cut where that URL's scheme starts, but
+/// never inside the authority of the part before it, and each part is rendered alone; a
+/// part that cannot be rendered prints as [`UNPRINTABLE`]. A result whose word could
+/// still carry a credential prints as [`UNPRINTABLE`] too ([`bytes`]).
 pub fn url(raw: &str) -> String {
     let end = raw.find(['?', '#']).unwrap_or(raw.len());
     let mut out = String::new();
     let mut from = 0;
     let mut at = 0;
-    while let Some(found) = raw[at..end].find("://") {
-        let colon = at + found;
-        at = colon + 3;
-        let start = colon - raw[..colon].bytes().rev().take_while(|b| scheme_byte(*b)).count();
-        // The scheme that opens `raw` (after its leading spaces) is its own.
-        if raw[from..start].trim_start_matches(' ').is_empty() {
+    while let Some(found) = raw[at..end].find("//") {
+        let slashes = at + found;
+        at = slashes + 2;
+        let (opening, authority_end) = authority(&raw[from..end]);
+        let start = match raw[..slashes].strip_suffix(':') {
+            Some(head) => head.len() - head.bytes().rev().take_while(|b| scheme_byte(*b)).count(),
+            None => slashes,
+        };
+        let start = start.max(from + authority_end);
+        // The `//` that opens the part is its own.
+        if slashes < from + opening || start <= from {
             continue;
         }
         out.push_str(&rendered(&raw[from..start]));
         from = start;
     }
     out.push_str(&rendered(&raw[from..]));
-    out
+    scan::guarded(out)
+}
+
+/// Where the `//` opening `part` (after its leading spaces, alone or after scheme bytes,
+/// valid scheme or not) ends, and where the authority after it ends; both 0 for a part
+/// with no authority.
+fn authority(part: &str) -> (usize, usize) {
+    let body = part.trim_start_matches(' ');
+    let opening = match body.find("//") {
+        Some(i)
+            if body[..i]
+                .strip_suffix(':')
+                .unwrap_or(&body[..i])
+                .bytes()
+                .all(scheme_byte) =>
+        {
+            part.len() - body.len() + i + 2
+        }
+        _ => return (0, 0),
+    };
+    let end = part[opening..]
+        .find(['/', '?', '#'])
+        .map_or(part.len(), |n| opening + n);
+    (opening, end)
 }
 
 fn rendered(raw: &str) -> String {
@@ -68,16 +98,20 @@ pub fn urls_in(text: &str) -> Cow<'_, str> {
 ///   quoted URL holding spaces is redacted whole, and one holding a line break prints as
 ///   [`UNPRINTABLE`].
 /// - Otherwise a token running to the next whitespace or `"` that starts after whitespace,
-///   non-ASCII text or a delimiter (`` "'`(<[{=,;: ``) with `scheme://`, `://`, `//` or `/`. A token that is
+///   non-ASCII text or a delimiter (`` "'`(<>[{=,;: ``) with `scheme://`, `://`, `//` or `/`. A token that is
 ///   none of these but carries a query or fragment (`callback?code=…`, `next#…`, `#…`)
 ///   is a relative reference and prints as [`UNPRINTABLE`] from the last delimiter
 ///   before its `?` or `#`.
 ///
-/// A reference that is not UTF-8 prints as [`UNPRINTABLE`]; other bytes are unchanged.
-/// The scan is linear in `text`, and a reference is passed over whole, so text that is
-/// already redacted comes back unchanged.
+/// A reference that is not UTF-8 prints as [`UNPRINTABLE`]. Last, a word of the result
+/// (the bytes between whitespace and `"`) that could still carry a credential prints as
+/// [`UNPRINTABLE`] whole, whatever the scan found in it: one holding a `//` not followed
+/// by a host and port ([`valid_authority`]), or an `@` after a `:` in the same path
+/// segment (`redis:key@host`). Other bytes are unchanged. The scan is linear in `text`,
+/// and a reference is passed over whole, so text that is already redacted comes back
+/// unchanged.
 pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
-    if !text.iter().any(|b| matches!(b, b'/' | b'?' | b'#')) {
+    if !text.iter().any(|b| matches!(b, b'/' | b'?' | b'#' | b'@')) {
         return Cow::Borrowed(text);
     }
     let mut out = Vec::with_capacity(text.len());
@@ -89,12 +123,18 @@ pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
-/// Copies `input` to `out` with every URL reference rendered by [`url`], as [`bytes`]
-/// renders the whole text, for a capture too large to hold in memory. Memory stays
-/// within a fixed read size and hold limit: a reference still unfinished past the hold
-/// limit (1 MiB) prints as [`UNPRINTABLE`] and the rest of it is dropped.
+/// Copies `input` to `out` redacted as [`bytes`] redacts the whole text, for a capture
+/// too large to hold in memory. Memory stays within a fixed read size and twice the hold
+/// limit (1 MiB): a reference or word still unfinished past the limit prints as
+/// [`UNPRINTABLE`] and the rest of it is dropped.
 pub fn copy(input: &mut dyn std::io::Read, out: &mut dyn std::io::Write) -> std::io::Result<()> {
     scan::copy(input, out, scan::HOLD)
+}
+
+/// Writes `text` to `out` redacted as [`copy`] redacts it, without a copy of the whole
+/// text.
+pub fn write(text: &[u8], out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    scan::write(text, out, scan::HOLD)
 }
 
 #[cfg(test)]
@@ -159,6 +199,32 @@ fn masked_tail(tail: &str) -> String {
         out.push_str(MASK);
     }
     out
+}
+
+/// Whether a word of redacted text could still carry a credential (see [`bytes`]).
+fn suspect(word: &[u8]) -> bool {
+    let mut colon = false;
+    for (i, &b) in word.iter().enumerate() {
+        match b {
+            b'/' => {
+                colon = false;
+                if word.get(i + 1) == Some(&b'/') {
+                    let rest = &word[i + 2..];
+                    let host = &rest[..rest
+                        .iter()
+                        .position(|b| matches!(b, b'/' | b'?' | b'#'))
+                        .unwrap_or(rest.len())];
+                    if !std::str::from_utf8(host).is_ok_and(valid_authority) {
+                        return true;
+                    }
+                }
+            }
+            b':' => colon = true,
+            b'@' if colon => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn scheme_byte(b: u8) -> bool {

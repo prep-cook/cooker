@@ -194,6 +194,8 @@ async fn every_reference_shape_in_captured_errors_is_redacted() {
             "request failed: url=//user:sk-review-secret@127.0.0.1/?code=sk-review-secret",
             "request failed: /callback?code=sk-review-secret#sk-review-secret",
             "Post \"http://127.0.0.1/?code=prefix\r\nsk-review-secret\": EOF",
+            "dial https://user:sk-review-secret://host: refused",
+            "dial redis:sk-review-secret@host: refused",
         ] {
             sink.record(ResponseError(error));
         }
@@ -210,6 +212,8 @@ async fn every_reference_shape_in_captured_errors_is_redacted() {
         "Error: Post \" http://127.0.0.1/?code=***\": EOF",
         "Error: request failed: url=//127.0.0.1/?code=***",
         "Error: request failed: /callback?code=***#***",
+        "Error: dial <redacted url>//host: refused",
+        "Error: dial <redacted url> refused",
     ] {
         line(&content, want);
     }
@@ -247,8 +251,9 @@ async fn spools_leave_no_file_in_the_log_directory() {
     line(&content, "Upstream URL: http://127.0.0.1/v1?code=***#***");
 }
 
-/// A spooled section is redacted as it is copied into the log: a URL right after a token
-/// longer than the copy's hold limit is redacted even when a read ends between them.
+/// A spooled section is redacted as it is copied into the log: a word longer than the
+/// copy's hold limit prints as the placeholder, a URL at its end included, wherever the
+/// read that passes the limit ends.
 #[test]
 fn spooled_sections_redact_urls_after_long_tokens() {
     let dir = super::tests::scratch();
@@ -263,12 +268,7 @@ fn spooled_sections_redact_urls_after_long_tokens() {
         let mut out = Vec::new();
         section.write_to(&mut out).unwrap();
         let out = String::from_utf8(out).unwrap();
-        assert!(!out.contains(SECRET), "{ending}: {}", &out[out.len() - 80..]);
-        assert!(
-            out.ends_with(&format!("{ending}//host.example/ end")),
-            "{ending}: {}",
-            &out[out.len() - 80..]
-        );
+        assert_eq!(out, "<redacted url> end", "{ending}");
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -54,6 +54,14 @@ fn credentials_never_print() {
             "http://h.example/9://u:sk-review-secret@x/",
             "http://h.example/<redacted url>",
         ),
+        // A `scheme://` or `//` inside the authority does not end it.
+        ("https://user:sk-review-secret://host", "<redacted url>//host"),
+        ("//user:sk-review-secret://host", "<redacted url>//host"),
+        ("https://h.example://u:sk-review-secret@x/", "https://h.example://x/"),
+        (
+            "https://h.example/p].https://user:sk-review-secret://host",
+            "https://h.example/p]<redacted url>//host",
+        ),
         // Inside the query it is a masked value.
         (
             "http://h.example/a?next=https://u:sk-review-secret@x/",
@@ -313,6 +321,19 @@ fn every_reference_shape_is_redacted() {
             "see \"http://h.example/x https://u:sk-review-secret@y.example/\" end",
             "see \"http://h.example/x https://y.example/\" end",
         ),
+        // A scan that passes over a span resumes at its closer, where a token can start.
+        (
+            "see a<http://h.example/?k=v#x>&#sk-review-secret end",
+            "see a<http://h.example/?k=***#***><redacted url> end",
+        ),
+        // A word that could still carry a credential prints as the placeholder whole.
+        ("dsn=redis:sk-review-secret@host end", "<redacted url> end"),
+        ("see foo//user:sk-review-secret@host end", "see <redacted url> end"),
+        // A reference that hides the opener of a reference span ending after it.
+        (
+            "see /a`<http://h.example/?code=a sk-review-secret> end",
+            "see <redacted url>> end",
+        ),
     ] {
         let got = urls_in(text);
         assert_eq!(got, want, "{text}");
@@ -399,23 +420,33 @@ fn copied_text_is_redacted_wherever_reads_end() {
             16,
             Some("see \"<redacted url>\" tail"),
         ),
-        // A long token that cannot become a reference is written; a later `?` starts
-        // a relative reference of its own.
+        // A word longer than the hold limit prints as the placeholder, even when its
+        // `?` comes last.
         (
             "see xxxxxxxxxxxxxxxxxxxx?code=sk-review-secret tail",
             16,
-            Some("see xxxxxxxxxxxxxxxxxxxx<redacted url> tail"),
+            Some("see <redacted url> tail"),
         ),
         (
             "see qqqqqqqqqqqqqqqqqqqqqqqq/b+c= tail",
             16,
-            Some("see qqqqqqqqqqqqqqqqqqqqqqqq/b+c= tail"),
+            Some("see <redacted url> tail"),
+        ),
+        // A dropped token that opens a reference span is dropped through its closer,
+        // whatever closed before it; other spans it opens end nothing.
+        (
+            "see /aaaaaaaaaaaaaaaaaaaa`<http://h.example/?code=a sk-review-secret> tail",
+            16,
+            Some("see <redacted url>> tail"),
         ),
         (
-            "see qqqqqqqqqqqqqqqqqqqq://u:sk-review-secret@h/ tail",
+            "see /aaaaaaaaaaaaaaaaaaaa``http://h.example/?code=a sk-review-secret` tail",
             16,
-            Some("see qqqqqqqqqqqqqqqqqqqq:<redacted url> tail"),
+            Some("see <redacted url>` tail"),
         ),
+        ("see /aaaaaaaaaaaaaaaaaaaa'x tail", 16, Some("see <redacted url> tail")),
+        // A word the scan writes as it goes is held too, up to the same limit.
+        ("see a=b=c=d=e=f=g=h=i=j tail", 16, Some("see <redacted url> tail")),
     ] {
         let whole = urls_in(text).into_owned();
         let bytes_read: Vec<&[u8]> = text.as_bytes().chunks(1).collect();
@@ -428,34 +459,146 @@ fn copied_text_is_redacted_wherever_reads_end() {
             }
         }
     }
-    // Every URL shape right after a token past the hold limit, whatever byte ends that
-    // token, wherever a read ends.
-    let urls = [
-        "//user:sk-review-secret@host.example/",
-        "http://user:sk-review-secret@host.example/",
-        "/p?k=sk-review-secret",
-        "?code=sk-review-secret",
-        "#sk-review-secret",
-        "\"http://h.example/?code=prefix sk-review-secret\"",
-        "'http://h.example/?code=prefix sk-review-secret'",
-        "<http://h.example/?code=prefix sk-review-secret>",
-        "`http://h.example/?code=prefix sk-review-secret`",
-    ];
-    for body in ["aaaaaaaaaaaaaaaaaaaa", "qqqqqqqqqqqqqqqqqqqq", "ab+c/dab+c/dab+c/d"] {
-        for ending in ["", "=", ",", ";", "(", "[", "{", "<", "'", "`", ":", "é", " ", "\""] {
-            for url in urls {
-                // `foo//user:…` is no reference even in a whole text.
-                if ending.is_empty() && url.starts_with("//") {
-                    continue;
+    let long = format!(" sk-review-secret{}?k=v end", "x".repeat(BIG + (64 << 10)));
+    assert_eq!(copied(&[long.as_bytes()], BIG), " <redacted url> end");
+}
+
+/// splitmix64, so every run generates the same texts.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.below(items.len())]
+    }
+}
+
+/// URLs whose `S` and `T` stand for secrets: userinfo, query values and fragments.
+const SHAPES: &[&str] = &[
+    "https://user:S@host.example/p",
+    "https://S@host.example/",
+    "https://u:S@T@h.example:8443/p",
+    "https://u%3AS@h.example/",
+    "//user:S@host.example/p",
+    "http://host.example/p?k=S&j=T",
+    "/v1/x?key=S#T",
+    "https://host.example/p#S",
+    "a/b?k=S",
+    "callback?code=S",
+    "?code=S",
+    "#S",
+    "redis:S@host.example",
+    "mailto:S@host.example",
+    "https://host.example/r/https://u:S@x.example/a",
+    "/r/https://u:S@x.example/a",
+    "https://host.example/a//u:S@x.example/",
+    "https://user:S://host",
+    "//user:S://host",
+    "https://user:S//host",
+    "https://host.example/?next=https://u:S@x.example/",
+    "foo//user:S@host",
+    "x.y/https://u:S@h.example",
+    "https://u:S/x@h.example/",
+    "https://u:S?x@h.example/",
+    "https://u:S#x@h.example/",
+    "http://u:S@[::1]:80/",
+    "https://h.example/p:S@x",
+];
+
+/// Shapes holding a space, which only a span keeps in one reference.
+const SPACED: &[&str] = &["http://h.example/?code=prefix S", " //u:S@h.example/a b"];
+
+/// Spans first, then the other wrappings.
+const WRAPS: &[(&str, &str)] = &[
+    ("\"", "\""),
+    ("'", "'"),
+    ("<", ">"),
+    ("`", "`"),
+    ("", ""),
+    ("\" ", "\""),
+    ("(", ")"),
+    ("[", "]"),
+    ("{", "}"),
+    ("x=", ""),
+];
+
+const SEPARATORS: &[&str] = &[
+    "", " ", "\n", "\t", "\r\n", ",", ";", ":", "=", "\"", "'", "(", ")", "<", ">", "[", "]", "{", "}", "`", "é", "中",
+    "?", "#", "/", "@", "\\", "&", ".", "-",
+];
+
+/// A random text of words, long tokens, separators and secret-bearing URLs. Secrets are
+/// the only upper-case letters in it.
+fn generated(rng: &mut Rng) -> String {
+    let mut text = String::new();
+    for _ in 0..1 + rng.below(8) {
+        match rng.below(5) {
+            0 | 1 => {
+                let (shape, (open, close)) = match rng.below(6) {
+                    0 => (rng.pick(SPACED), rng.pick(&WRAPS[..4])),
+                    _ => (rng.pick(SHAPES), rng.pick(WRAPS)),
+                };
+                let mut url = String::new();
+                for c in shape.chars() {
+                    match c {
+                        'S' | 'T' => url.extend((0..4 + rng.below(12)).map(|_| (b'A' + rng.below(26) as u8) as char)),
+                        c => url.push(c),
+                    }
                 }
-                let text = format!("see {body}{ending}{url} tail");
-                assert_no_secret(&urls_in(&text), &text);
-                let bytes_read: Vec<&[u8]> = text.as_bytes().chunks(1).collect();
-                assert_no_secret(&copied(&bytes_read, 16), &text);
-                for cut in 0..=text.len() {
-                    assert_no_secret(&copied(&[&text.as_bytes()[..cut], &text.as_bytes()[cut..]], 16), &text);
-                }
+                text.extend([open, &url, close]);
             }
+            2 => {
+                const LONG: &[u8] = b"abcdefqrstuvwxyz0123456789+/=._-";
+                text.extend((0..100 + rng.below(1900)).map(|_| rng.pick(LONG) as char));
+            }
+            _ => {
+                const WORD: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+                text.extend((0..1 + rng.below(8)).map(|_| rng.pick(WORD) as char));
+            }
+        }
+        text.push_str(rng.pick(SEPARATORS));
+    }
+    text
+}
+
+/// Generated texts with secrets in URLs of every shape, wrapping and neighbour: copying
+/// a text in pieces gives what redacting it whole gives, wherever reads end, and no
+/// secret byte prints either way. Under a 16-byte hold limit only the second holds.
+/// `CK_REDACT_CASES` sets the number of texts for a longer run.
+#[test]
+fn copying_in_pieces_equals_redacting_whole() {
+    let cases = std::env::var("CK_REDACT_CASES").map_or(48, |n| n.parse().unwrap());
+    let mut rng = Rng(0x5eed_c0de_2026_1116);
+    for case in 0..cases {
+        let text = generated(&mut rng);
+        let bytes_text = text.as_bytes();
+        let whole = urls_in(&text).into_owned();
+        let leaks = |got: &str| got.bytes().any(|b| b.is_ascii_uppercase());
+        assert!(!leaks(&whole), "case {case}: {text:?} printed {whole:?}");
+        let one_byte: Vec<&[u8]> = bytes_text.chunks(1).collect();
+        assert_eq!(
+            copied(&one_byte, scan::HOLD),
+            whole,
+            "case {case}: {text:?} byte by byte"
+        );
+        let small = copied(&one_byte, 16);
+        assert!(!leaks(&small), "case {case}: {text:?} printed {small:?} under hold 16");
+        for cut in 0..=bytes_text.len() {
+            let pieces = [&bytes_text[..cut], &bytes_text[cut..]];
+            assert_eq!(copied(&pieces, scan::HOLD), whole, "case {case}: {text:?} cut at {cut}");
+            let small = copied(&pieces, 16);
+            assert!(!leaks(&small), "case {case}: {text:?} cut at {cut} printed {small:?}");
         }
     }
 }
