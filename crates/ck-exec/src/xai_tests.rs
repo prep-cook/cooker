@@ -525,9 +525,10 @@ async fn speech_errors_keep_go_scope() {
 }
 
 /// An image or video body reports its top-level usage as a buffered Responses body, so the
-/// server reads its counts and billed units. A body without usage reports only its model. A
-/// video job is charged at the first poll that reports usage and never again (E-Q13), while
-/// another job is charged on its own.
+/// server reads its counts and billed units. A body without a billed value in its usage (absent,
+/// null or empty) reports only its model. A video job is charged at the first poll whose usage
+/// reports a value, an explicit zero included, and never again (E-Q13), while another job is
+/// charged on its own.
 #[tokio::test]
 async fn media_usage_is_charged_once_per_response_or_job() {
     let cfg = Config::default();
@@ -539,7 +540,7 @@ async fn media_usage_is_charged_once_per_response_or_job() {
     let charged =
         r#"{"status":"done","video":{"url":"https://v.example/out.mp4"},"usage":{"cost_in_usd_ticks":5000000000}}"#;
     let image = r#"{"data":[{"b64_json":"AAAA"}],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3,"cost_in_usd_ticks":200000000}}"#;
-    let rows: [(&str, &str, &str, &str, bool); 8] = [
+    let rows: [(&str, &str, &str, &str, bool); 12] = [
         ("images", "/v1/images/generations", r#"{"prompt":"a"}"#, image, true),
         ("images", "/v1/images/generations", r#"{"prompt":"a"}"#, image, true),
         (
@@ -576,6 +577,36 @@ async fn media_usage_is_charged_once_per_response_or_job() {
             "/v1/videos/vid_10",
             r#"{"request_id":"vid_10"}"#,
             charged,
+            true,
+        ),
+        // A usage without a billed value is not the job's report; its later charge still counts.
+        (
+            "videos",
+            "/v1/videos/vid_11",
+            r#"{"request_id":"vid_11"}"#,
+            r#"{"status":"pending","usage":{}}"#,
+            false,
+        ),
+        (
+            "videos",
+            "/v1/videos/vid_11",
+            r#"{"request_id":"vid_11"}"#,
+            r#"{"status":"pending","usage":{"input_tokens_details":{},"cost_in_usd_ticks":null}}"#,
+            false,
+        ),
+        (
+            "videos",
+            "/v1/videos/vid_11",
+            r#"{"request_id":"vid_11"}"#,
+            charged,
+            true,
+        ),
+        // An explicit zero charge is a report.
+        (
+            "videos",
+            "/v1/videos/vid_12",
+            r#"{"request_id":"vid_12"}"#,
+            r#"{"status":"done","usage":{"cost_in_usd_ticks":0}}"#,
             true,
         ),
     ];

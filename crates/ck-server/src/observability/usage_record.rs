@@ -656,23 +656,26 @@ pub fn parse_openai(body: &[u8]) -> Detail {
     parse_usage(body, parse_openai_node)
 }
 
-/// [`parse_openai`] of a buffered Responses body. A usage reporting billed units but no token
-/// count, such as an xAI video's `{"cost_in_usd_ticks":…}`, keeps those units and leaves every
-/// token count unreported rather than zero.
-fn parse_responses(body: &[u8]) -> Detail {
-    let node = gj::parse(body).get("usage");
-    if node.is_object() && !has_openai_token_fields(&node) {
-        let dimensions = native_dimensions("responses", &node);
-        if !dimensions.is_empty() {
-            return Detail {
-                dimensions,
-                unreported: Unreported::ALL,
-                response_service_tier: service_tier(body),
-                ..Detail::default()
-            };
-        }
+/// A Responses usage reporting billed units but no token count, such as an xAI video's
+/// `{"cost_in_usd_ticks":…}` or a Codex terminal's `{"codex_rollout_budget_units":…}`: its
+/// units, with every token count unreported rather than zero.
+fn billed_only(node: &Res<'_>, tier: String) -> Option<Detail> {
+    if !node.is_object() || has_openai_token_fields(node) {
+        return None;
     }
-    parse_usage(body, parse_responses_node)
+    let dimensions = native_dimensions("responses", node);
+    (!dimensions.is_empty()).then(|| Detail {
+        dimensions,
+        unreported: Unreported::ALL,
+        response_service_tier: tier,
+        ..Detail::default()
+    })
+}
+
+/// [`parse_openai`] of a buffered Responses body, or its [`billed_only`] usage.
+fn parse_responses(body: &[u8]) -> Detail {
+    billed_only(&gj::parse(body).get("usage"), service_tier(body))
+        .unwrap_or_else(|| parse_usage(body, parse_responses_node))
 }
 
 fn parse_usage(body: &[u8], parse: fn(&Res<'_>) -> Detail) -> Detail {
@@ -689,11 +692,14 @@ fn parse_usage(body: &[u8], parse: fn(&Res<'_>) -> Detail) -> Detail {
     d
 }
 
-/// Go `ParseCodexUsage`.
+/// Go `ParseCodexUsage`, or the terminal's [`billed_only`] usage.
 pub fn parse_codex(data: &[u8]) -> Option<Detail> {
     let tier = service_tier(data);
     let node = gj::parse(data).get("response.usage");
     if !has_openai_token_fields(&node) {
+        if let Some(d) = billed_only(&node, tier.clone()) {
+            return Some(d);
+        }
         return (!tier.is_empty()).then(|| Detail {
             response_service_tier: tier,
             ..Detail::default()
@@ -2944,8 +2950,8 @@ mod tests {
     /// The billed units of a Responses usage an executor reports, streamed or as a buffered
     /// body, reach the record as their own dimensions in their own units: xAI ticks, nano-USD
     /// and tool counts as integers, Codex rollout budget units as the number the upstream wrote.
-    /// A body reporting units but no token count leaves the tokens unreported, not zero; a body
-    /// without usage records no dimension.
+    /// A usage, streamed or buffered, reporting units but no token count leaves the tokens
+    /// unreported, not zero; a body without usage records no dimension.
     #[test]
     fn responses_billed_units_reach_the_record() {
         let rt = usage_runtime();
@@ -2995,6 +3001,22 @@ mod tests {
                 "",
             ),
             ("xai", false, r#"{"status":"pending"}"#.to_owned(), Value::Null, Some(0), ""),
+            (
+                "codex",
+                true,
+                terminal(r#"{"codex_rollout_budget_units":2.50}"#),
+                serde_json::json!({"codex_rollout_budget_units":2.5}),
+                None,
+                r#""codex_rollout_budget_units":2.50"#,
+            ),
+            (
+                "xai",
+                true,
+                terminal(r#"{"cost_in_usd_ticks":5000000000}"#),
+                serde_json::json!({"cost_in_usd_ticks":5000000000_u64}),
+                None,
+                "",
+            ),
         ] {
             let tracker = Tracker::start(&rt, &facts, &credential_for(provider), "m");
             if streamed {

@@ -151,7 +151,7 @@ impl XaiExecutor {
                 let source = if poll { &payload[..] } else { &data[..] };
                 text(&gj::get(source, "request_id"))
             });
-            if gj::get(&data, "usage").is_object() && job.is_none_or(|job| self.jobs.first_charge(&job)) {
+            if reports_usage(&data) && job.is_none_or(|job| self.jobs.first_charge(&job)) {
                 // The top-level usage of an image or video body, read as a Responses body's.
                 req.usage.response_body(Format::Codex, &data);
             } else {
@@ -167,13 +167,30 @@ impl XaiExecutor {
     }
 }
 
+/// The usage members accounting records from an image or video body: the charge and the token
+/// counts (xAI images and videos reference).
+const BILLED: &[&str] = &[
+    "usage.cost_in_usd_ticks",
+    "usage.cost_in_nano_usd",
+    "usage.input_tokens",
+    "usage.output_tokens",
+    "usage.total_tokens",
+];
+
+/// Whether `body` reports a billed value: a number, zero included, in one of [`BILLED`]. An
+/// absent, null or empty usage reports nothing, so it does not spend a job's charge (E-Q13).
+fn reports_usage(body: &[u8]) -> bool {
+    BILLED.iter().any(|path| gj::get(body, path).kind == gj::Kind::Number)
+}
+
 /// How long a charged job is remembered: well past the binding TTL a client polls within.
 const CHARGED_JOB_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// The video jobs whose usage was recorded (E-Q13): a job is charged at the first poll that
 /// reports usage and never again, however often it is polled after.
-// ponytail: process memory, so a poll after a restart can charge a job again; a durable job
-// table removes that.
+// ponytail: process memory, so a poll after a restart can charge a job again. No store on this
+// path outlives the process: the usage queue is in memory, and SQLite holds configuration and
+// credentials only. A durable job ledger removes this; it needs an owner decision on its store.
 #[derive(Default)]
 pub(crate) struct ChargedJobs(Mutex<HashMap<String, Instant>>);
 
