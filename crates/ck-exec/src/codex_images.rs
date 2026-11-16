@@ -442,7 +442,13 @@ fn direct_route_model(req: &ExecRequest) -> Option<String> {
     } else {
         String::new()
     };
-    [req.requested_model.trim(), payload_model.as_str(), req.model.as_str()]
+    direct_route([req.requested_model.trim(), payload_model.as_str(), req.model.as_str()])
+}
+
+/// The first of `models` that names a gpt-image-* model the backend serves directly, as its
+/// base model.
+pub(crate) fn direct_route<'a>(models: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    models
         .into_iter()
         .map(image_base_model)
         .find(|m| DIRECT_MODELS.contains(&m.as_str()))
@@ -478,12 +484,6 @@ pub(crate) fn resolve_direct(route: String, model: &str, settings: &Settings) ->
     } else {
         model
     }
-}
-
-/// Whether an attempt on `model` goes to the backend's own Images endpoints: a gpt-image-*
-/// execution model on a credential other than Sign in with ChatGPT, which has none.
-pub(crate) fn direct_attempt(model: &str, siwc: bool) -> bool {
-    !siwc && DIRECT_MODELS.contains(&image_base_model(model).as_str())
 }
 
 /// `codexOpenAIImageBaseModel`: no thinking suffix, no `provider/` prefix, lower case.

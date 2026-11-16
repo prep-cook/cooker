@@ -358,7 +358,7 @@ impl XaiExecutor {
                         &call,
                         wreq::Method::POST,
                         path,
-                        Some(call.rules("openai", upload)),
+                        Some(call.rules("openai", call.with_model(upload))),
                         false,
                     )
                     .await?;
@@ -444,7 +444,7 @@ impl XaiExecutor {
         };
         // A poll sends no body; a POST is the request with the payload rules.
         let body = match upload {
-            Some(upload) if method == wreq::Method::POST => Some(call.rules("openai", upload)),
+            Some(upload) if method == wreq::Method::POST => Some(call.rules("openai", call.with_model(upload))),
             _ => None,
         };
         let upstream = self.media_send(call, method, &path, body, false).await?;
@@ -538,15 +538,21 @@ struct MediaCall<'r> {
 }
 
 impl MediaCall<'_> {
-    /// The upload with the upstream model, then the configured payload rules, the last change to
-    /// the body (Go's media finalizer: protocol `openai`, the encoded upload as the baseline).
-    fn rules(&self, from: &str, mut upload: Vec<u8>) -> Vec<u8> {
+    /// An image or video upload naming the upstream model the route resolved, whether or not the
+    /// client named one. Speech has no model member on xAI's wire.
+    fn with_model(&self, mut upload: Vec<u8>) -> Vec<u8> {
+        let model = parse_suffix(self.attempt.model).model_name;
+        if !model.trim().is_empty() {
+            crate::openai_compat_payload::set_str_if_different(&mut upload, "model", model.trim());
+        }
+        upload
+    }
+
+    /// The configured payload rules, the last change to the body (Go's media finalizer: protocol
+    /// `openai`, the encoded upload as the baseline).
+    fn rules(&self, from: &str, upload: Vec<u8>) -> Vec<u8> {
         let model = parse_suffix(self.attempt.model).model_name;
         let original = upload.clone();
-        // The upstream model the route resolved, where the request names one (speech does not).
-        if !model.is_empty() && gj::get(&upload, "model").exists() {
-            crate::openai_compat_payload::set_str_if_different(&mut upload, "model", &model);
-        }
         let requested = media_exec::requested_model(self.request.validated.view().document).unwrap_or_default();
         let requested = if requested.is_empty() {
             model.as_str()

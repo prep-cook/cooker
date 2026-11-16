@@ -39,11 +39,11 @@ pub const DESTINATION: &str = "codex";
 
 /// Responses generation, its token count, and the Responses native compact; Alpha Search
 /// for a credential that may serve it (`CodexExecutor::alpha_allowed`); image generation and
-/// edits, on the backend's own Images endpoint when `direct_images` (`codex_media`).
+/// edits (`codex_media`).
 #[derive(Clone, Copy, Default)]
 pub struct CodexCapability {
     alpha: bool,
-    direct_images: bool,
+    images: crate::codex_media::Route,
 }
 
 impl Capability for CodexCapability {
@@ -68,7 +68,7 @@ impl Capability for CodexCapability {
             Operation::AlphaSearch => ck_translate::search::check_request(view.document),
             Operation::Media(Media::ImageGenerate | Media::ImageEdit) => {
                 // The tool's main model does not change what the body can express.
-                let target = if self.direct_images {
+                let target = if self.images.direct(view.document)? {
                     images::Destination::OpenAi
                 } else {
                     images::Destination::Codex("")
@@ -85,10 +85,9 @@ impl Execute for CodexExecutor {
     type Ingress = CodexIngress;
 
     fn capability(&self, attempt: &Attempt<'_>) -> CodexCapability {
-        let siwc = View::for_request(attempt.credential, attempt.cfg).siwc;
         CodexCapability {
             alpha: self.alpha_allowed(attempt.credential, attempt.cfg),
-            direct_images: crate::codex_images::direct_attempt(attempt.model, siwc),
+            images: crate::codex_media::Route::of(attempt),
         }
     }
 
@@ -100,10 +99,7 @@ impl Execute for CodexExecutor {
     ) -> Result<Upstream<CodexIngress>, ExecError> {
         match request.validated.view().operation {
             Operation::AlphaSearch => return self.alpha(attempt, request, streams).await,
-            Operation::Media(media) => {
-                let direct = self.capability(attempt).direct_images;
-                return self.serve_images(attempt, request, streams, media, direct).await;
-            }
+            Operation::Media(media) => return self.serve_images(attempt, request, streams, media).await,
             _ => {}
         }
         crate::codex_siwc::require_token(attempt.credential)?;

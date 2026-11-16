@@ -26,8 +26,20 @@ const LIMIT: u64 = 1 << 20;
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Provider {
     Codex,
+    /// A Codex ChatGPT login with cloaking off, so the client's headers reach the header rules.
+    CodexLogin,
     Compat,
     Xai,
+}
+
+impl Provider {
+    /// The bearer token the upstream sees.
+    fn token(self) -> &'static str {
+        match self {
+            Self::CodexLogin => "oauth-token",
+            _ => "sk-up",
+        }
+    }
 }
 
 /// One client request: its operation, body, and the job a non-create video action names.
@@ -65,8 +77,22 @@ const SPEECH: &str = r#"{"model":"tts-1","input":"hello","voice":"alloy","respon
 const VIDEO: &str = r#"{"model":"client-video","prompt":"waves","duration":5}"#;
 
 fn exchange(provider: Provider, upstream: &StreamUpstream, model: &str) -> Exchange {
+    if provider == Provider::CodexLogin {
+        let metadata = json!({"type": "codex", "access_token": "oauth-token", "account_id": "acct-1"});
+        let path = std::path::Path::new("/fake/codex-oauth.json");
+        let mut login = ck_core::credential::Credential::from_file(
+            std::path::Path::new("/fake"),
+            path,
+            metadata.as_object().unwrap().clone(),
+        )
+        .unwrap();
+        for (name, value) in [("base_url", upstream.url()), ("codex_disable_cloaking", "true".into())] {
+            login.attributes.insert(name.into(), value);
+        }
+        return Exchange::new(login, model, "/v1/images/generations");
+    }
     let (name, base) = match provider {
-        Provider::Codex => ("codex", upstream.url()),
+        Provider::Codex | Provider::CodexLogin => ("codex", upstream.url()),
         Provider::Compat => ("openai-compatibility", format!("{}/v1", upstream.url())),
         Provider::Xai => ("xai", upstream.url()),
     };
@@ -131,7 +157,7 @@ async fn run_as(
 ) -> Outcome {
     let op = Operation::Media(ask.claimed.unwrap_or(ask.op));
     match provider {
-        Provider::Codex => {
+        Provider::Codex | Provider::CodexLogin => {
             let codex = CodexExecutor::with_client(wreq::Client::new(), CodexOAuth::new(wreq::Client::new()));
             run_on(&codex, streams, exchange, held, op, client_only).await
         }
@@ -206,8 +232,30 @@ fn usages(records: &[(String, Value)]) -> Vec<&Value> {
     records.iter().filter(|(k, _)| k == "usage").map(|(_, v)| v).collect()
 }
 
-fn sent_json(captured: &Captured) -> Value {
-    serde_json::from_slice(&captured.body).unwrap()
+/// The sent body as JSON; a multipart form as an object of its parts, a file part as
+/// `<filename>;<content type>;<byte count>`.
+fn sent_body(captured: &Captured) -> Value {
+    let content_type = captured.header("content-type").unwrap_or_default();
+    let Some(boundary) = content_type.strip_prefix("multipart/form-data; boundary=") else {
+        return serde_json::from_slice(&captured.body).unwrap();
+    };
+    let body = String::from_utf8_lossy(&captured.body).into_owned();
+    let mut form = serde_json::Map::new();
+    for part in body.split(&format!("--{boundary}")).filter(|p| p.starts_with("\r\n")) {
+        let (head, value) = part[2..].split_once("\r\n\r\n").unwrap();
+        let value = value.strip_suffix("\r\n").unwrap();
+        let name = head.split("name=\"").nth(1).unwrap().split('"').next().unwrap();
+        let value = match head.split("filename=\"").nth(1) {
+            Some(rest) => {
+                let filename = rest.split('"').next().unwrap();
+                let mime = head.split("Content-Type: ").nth(1).unwrap();
+                format!("{filename};{mime};{}", value.len())
+            }
+            None => value.to_owned(),
+        };
+        form.insert(name.to_owned(), value.into());
+    }
+    Value::Object(form)
 }
 
 fn sse(events: &[Value]) -> String {
@@ -288,14 +336,47 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
             &[],
         ),
         (
-            "OpenAI-compatible edit as JSON image references",
+            "OpenAI-compatible edit as the Images multipart form",
             Provider::Compat,
             "up-image",
             ask(Media::ImageEdit, EDIT),
             Reply::json(IMAGES_JSON),
             "POST",
             "/v1/images/edits",
-            json!({"model":"up-image","prompt":"add a hat","images":[{"image_url":"data:image/png;base64,AAEC"}]}),
+            json!({"model":"up-image","prompt":"add a hat","image":"image1;image/png;3"}),
+            &[],
+        ),
+        (
+            "Codex gpt-image model aliased to a custom upstream name stays direct",
+            Provider::Codex,
+            "relay-image-alias",
+            ask(Media::ImageGenerate, r#"{"model":"gpt-image-2","prompt":"a cat"}"#),
+            Reply::json(IMAGES_JSON),
+            "POST",
+            "/images/generations",
+            json!({"model":"relay-image-alias","prompt":"a cat"}),
+            &[],
+        ),
+        (
+            "Codex login sends its own User-Agent to the Images endpoint",
+            Provider::CodexLogin,
+            "gpt-image-2",
+            ask(Media::ImageGenerate, GENERATE),
+            Reply::json(IMAGES_JSON),
+            "POST",
+            "/images/generations",
+            json!({"model":"gpt-image-2"}),
+            &[("user-agent", None), ("chatgpt-account-id", Some("acct-1"))],
+        ),
+        (
+            "xAI image request without a model names the resolved one",
+            Provider::Xai,
+            "grok-imagine-image",
+            ask(Media::ImageGenerate, r#"{"prompt":"a cat"}"#),
+            Reply::json(XAI_IMAGES_JSON),
+            "POST",
+            "/images/generations",
+            json!({"model":"grok-imagine-image","prompt":"a cat"}),
             &[],
         ),
         (
@@ -368,7 +449,8 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
             (method, path),
             "{name}"
         );
-        assert_eq!(sent[0].header("authorization"), Some("Bearer sk-up"), "{name}");
+        let bearer = format!("Bearer {}", provider.token());
+        assert_eq!(sent[0].header("authorization"), Some(bearer.as_str()), "{name}");
         for (header, value) in headers {
             match value {
                 Some(value) => assert_eq!(sent[0].header(header), Some(*value), "{name}: {header}"),
@@ -383,11 +465,11 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
             assert!(sent[0].body.is_empty(), "{name}: a poll sends no body");
             continue;
         }
-        let body = sent_json(&sent[0]);
+        let body = sent_body(&sent[0]);
         for (key, value) in members.as_object().unwrap() {
             assert_eq!(&body[key], value, "{name}: member {key}");
         }
-        if provider == Provider::Codex {
+        if matches!(provider, Provider::Codex | Provider::CodexLogin) {
             assert!(body["prompt_cache_key"].is_string(), "{name}: the session's cache key");
         }
     }
@@ -663,6 +745,16 @@ async fn refused_media_requests_send_nothing() {
                 claimed: Some(Media::ImageEdit),
                 ..ask(Media::ImageGenerate, GENERATE)
             },
+            false,
+        ),
+        (
+            "a multipart edit carries image data, not a URL",
+            Provider::Compat,
+            "up-image",
+            ask(
+                Media::ImageEdit,
+                r#"{"prompt":"add a hat","images":[{"image_url":"https://img.x/a.png"}]}"#,
+            ),
             false,
         ),
         (

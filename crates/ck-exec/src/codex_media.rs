@@ -1,5 +1,6 @@
-//! Codex images under the execution contract (`docs/EXECUTION-CONTRACT.md`): a gpt-image-*
-//! execution model goes to the backend's own Images endpoint ("direct"), any other becomes a
+//! Codex images under the execution contract (`docs/EXECUTION-CONTRACT.md`): a request or
+//! execution model naming a gpt-image-* model goes to the backend's own Images endpoint
+//! ("direct"), any other becomes a
 //! Responses request that forces the `image_generation` tool on the images main model. The
 //! images codec encodes both bodies from this destination's fence; the executor adds what the
 //! old path adds (the direct model, the prompt cache key, the tool body's thinking and Codex
@@ -8,18 +9,54 @@
 
 use ck_core::exec::ExecError;
 use ck_core::format::Format;
+use ck_translate::codec::document::Document;
 use ck_translate::codec::{BodyMode, Media};
 use ck_translate::images;
 
 use crate::codex::{CodexExecutor, ErrorBody};
 use crate::codex_capture::Wire;
 use crate::codex_exec::{CodexIngress, DESTINATION, encoding, observed};
-use crate::codex_images::{SOURCE, image_base_model, main_model, resolve_direct, tool_body};
+use crate::codex_images::{SOURCE, direct_route, main_model, resolve_direct, tool_body};
 use crate::codex_json::set_str_if_different;
 use crate::codex_replay::Scope;
 use crate::codex_request::{self as request, Settings, View};
 use crate::media_exec;
 use crate::types::{Attempt, Request, Streams, Upstream};
+
+/// What decides whether an image attempt goes direct, as the capability and the execution both
+/// read it (`codexDirectOpenAIImageRouteModel`): the request's model, else the execution model,
+/// naming a gpt-image-* model, so an alias resolved to a custom upstream name still goes direct.
+/// Sign in with ChatGPT has no direct endpoint.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Route {
+    siwc: bool,
+    /// The execution model names a gpt-image-* model.
+    execution: bool,
+}
+
+impl Route {
+    pub(crate) fn of(attempt: &Attempt<'_>) -> Self {
+        Self {
+            siwc: View::for_request(attempt.credential, attempt.cfg).siwc,
+            execution: direct_route([attempt.model]).is_some(),
+        }
+    }
+
+    /// Whether the attempt for `doc` goes direct.
+    pub(crate) fn direct(self, doc: &Document) -> ck_translate::codec::Result<bool> {
+        let requested = media_exec::requested_model(doc)?;
+        Ok(!self.siwc && (self.execution || direct_route([requested.as_str()]).is_some()))
+    }
+
+    /// The gpt-image-* model a direct attempt for `doc` routes by; `None` for the tool path.
+    fn model(self, doc: &Document, execution: &str) -> ck_translate::codec::Result<Option<String>> {
+        if !self.direct(doc)? {
+            return Ok(None);
+        }
+        let requested = media_exec::requested_model(doc)?;
+        Ok(direct_route([requested.as_str(), execution]))
+    }
+}
 
 /// One upstream call: where it goes, what it sends, and how its answer reads.
 struct ImageCall {
@@ -33,15 +70,14 @@ struct ImageCall {
 
 impl CodexExecutor {
     /// Sends the fenced image request and returns the upstream answer with the images ingress on
-    /// the attempt's response stream. `direct` is the capability's choice, so the body encoded
-    /// here is the one the fence checked.
+    /// the attempt's response stream. The route is decided from the same facts as the
+    /// capability's, so the body encoded here is the one the fence checked.
     pub(crate) async fn serve_images(
         &self,
         attempt: &Attempt<'_>,
         request: &Request<'_>,
         streams: Streams<'_>,
         media: Media,
-        direct: bool,
     ) -> Result<Upstream<CodexIngress>, ExecError> {
         crate::codex_siwc::require_token(attempt.credential)?;
         let session = ck_wire::session::cpa_session_id(request.client.session);
@@ -54,10 +90,10 @@ impl CodexExecutor {
             settings: &settings,
             cache: crate::codex_shape::sessions_uuid(request.client.execution_session, request.client.derived_session),
         };
-        let call = if direct {
-            shape.direct(streams.request, media)?
-        } else {
-            shape.tool(streams.request)?
+        let document = request.validated.view().document;
+        let call = match Route::of(attempt).model(document, attempt.model).map_err(encoding)? {
+            Some(route) => shape.direct(streams.request, media, route)?,
+            None => shape.tool(streams.request)?,
         };
         let usage = request.client.usage;
         let wire = Wire::new(usage.capture(), attempt.credential);
@@ -105,9 +141,10 @@ struct Shape<'r> {
 }
 
 impl Shape<'_> {
-    /// The backend's own Images endpoint: the JSON request with the resolved gpt-image-* model
-    /// and the prompt cache key; an event stream when the client asked for one.
-    fn direct(&self, owner: &mut ck_stream::Writer, media: Media) -> Result<ImageCall, ExecError> {
+    /// The backend's own Images endpoint: the JSON request with the upstream model `route`
+    /// resolves to (`directOpenAIImageModel`) and the prompt cache key; an event stream when the
+    /// client asked for one.
+    fn direct(&self, owner: &mut ck_stream::Writer, media: Media, route: String) -> Result<ImageCall, ExecError> {
         let document = self.request.validated.view().document;
         let stream = media_exec::images_stream(document).map_err(encoding)?;
         let upload = utf8(media_exec::images_upload(
@@ -116,7 +153,7 @@ impl Shape<'_> {
             images::Destination::OpenAi,
             owner,
         )?)?;
-        let model = resolve_direct(image_base_model(self.attempt.model), self.attempt.model, self.settings);
+        let model = resolve_direct(route, self.attempt.model, self.settings);
         let mut body = set_str_if_different(upload.clone(), "model", &model);
         let usage = self.request.client.usage;
         if usage.enabled() {
@@ -126,14 +163,10 @@ impl Shape<'_> {
             body = set_str_if_different(body, "prompt_cache_key", id);
         }
         let body = self.rules(&model, "openai", &upload, request::sanitize_input_ids(body))?;
-        let headers = request::image_headers(
-            self.view,
-            self.settings,
-            self.request.client.headers,
-            &model,
-            self.cache.as_deref(),
-            stream,
-        );
+        // `applyCodexDirectImageHeaders`: the client's User-Agent is not forwarded.
+        let mut client = self.request.client.headers.clone();
+        client.remove(http::header::USER_AGENT);
+        let headers = request::image_headers(self.view, self.settings, &client, &model, self.cache.as_deref(), stream);
         let endpoint = if media == Media::ImageEdit {
             "/images/edits"
         } else {

@@ -390,10 +390,13 @@ fn canonical(doc: &Document) -> Result<Canonical> {
     })
 }
 
-/// The checks [`encode`] runs before writing, without writing: a destination's capability runs
-/// them at the fence, so a request it cannot express is refused before any attempt sends.
+/// What [`encode`] refuses, without keeping any byte: a counting pass over the same body, so a
+/// destination's capability can run it at the fence and refuse before any attempt sends. A
+/// multipart form also needs every image as a data URL and every unknown member as text.
 pub fn check(doc: &Document, destination: Destination<'_>) -> Result<()> {
-    expressible(doc, &canonical(doc)?, destination)
+    let c = canonical(doc)?;
+    expressible(doc, &c, destination)?;
+    encode::measure(|e| body(doc, &c, destination, e)).map(drop)
 }
 
 fn expressible(doc: &Document, c: &Canonical, destination: Destination<'_>) -> Result<()> {
@@ -422,15 +425,17 @@ pub fn encode(
     doc.check_owner(owner)?;
     let c = canonical(doc)?;
     expressible(doc, &c, destination)?;
+    Ok(encode::scratch(owner, |e| body(doc, &c, destination, e))?)
+}
+
+fn body(doc: &Document, c: &Canonical, destination: Destination<'_>, e: &mut Encoder<'_, '_>) -> Result<()> {
     let owner_protocol = boundary::is(doc, c.x, "original_protocol", PROTOCOL)?;
-    Ok(match destination {
-        Destination::OpenAi => encode::scratch(owner, |e| json_body(doc, &c, owner_protocol, e))?,
-        Destination::OpenAiForm(boundary) => {
-            encode::scratch(owner, |e| form_body(doc, &c, boundary, owner_protocol, e))?
-        }
-        Destination::Xai => encode::scratch(owner, |e| xai_body(doc, &c, e))?,
-        Destination::Codex(main) => encode::scratch(owner, |e| codex_body(doc, &c, main, e))?,
-    })
+    match destination {
+        Destination::OpenAi => json_body(doc, c, owner_protocol, e),
+        Destination::OpenAiForm(boundary) => form_body(doc, c, boundary, owner_protocol, e),
+        Destination::Xai => xai_body(doc, c, e),
+        Destination::Codex(main) => codex_body(doc, c, main, e),
+    }
 }
 
 /// Writes `,"key":value` when `parent` has a non-null member `key`.

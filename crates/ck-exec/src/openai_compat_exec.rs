@@ -57,9 +57,13 @@ impl Capability for RelayCapability {
                 ..view
             }),
             Operation::Compact => ResponsesCapability.validate(view),
-            Operation::Media(Media::ImageGenerate | Media::ImageEdit) => {
+            Operation::Media(Media::ImageGenerate) => {
                 crate::media_exec::check_images(view, ck_translate::images::Destination::OpenAi)
             }
+            Operation::Media(Media::ImageEdit) => crate::media_exec::check_images(
+                view,
+                ck_translate::images::Destination::OpenAiForm(crate::openai_compat_media::CHECK_BOUNDARY),
+            ),
             Operation::Media(_) | Operation::AlphaSearch => Err(codec::Error::Unsupported),
         }
     }
@@ -210,7 +214,16 @@ impl Execute for OpenAICompatExecutor {
             compat::MAX_LINE as u64,
         )
         .map_err(encoding)?;
-        let upstream = send(&route, attempt, request, COMPACT_PATH, &relay.base_model, body, false).await?;
+        let upstream = send(
+            &route,
+            attempt,
+            request,
+            (COMPACT_PATH, "application/json"),
+            &relay.base_model,
+            body,
+            false,
+        )
+        .await?;
         Ok(Upstream {
             status: upstream.status,
             headers: upstream.headers,
@@ -279,7 +292,16 @@ pub(crate) async fn chat(
     )
     .map_err(encoding)?
     .with_glm(thinking::glm::is_model(&relay.base_model));
-    let upstream = send(&route, attempt, request, CHAT_PATH, &relay.base_model, body, stream).await?;
+    let upstream = send(
+        &route,
+        attempt,
+        request,
+        (CHAT_PATH, "application/json"),
+        &relay.base_model,
+        body,
+        stream,
+    )
+    .await?;
     Ok(Upstream {
         status: upstream.status,
         headers: upstream.headers,
@@ -322,12 +344,12 @@ pub(crate) async fn send(
     route: &Route,
     attempt: &Attempt<'_>,
     request: &Request<'_>,
-    path: &str,
+    (path, content_type): (&str, &str),
     model: &str,
     body: Vec<u8>,
     stream: bool,
 ) -> Result<wire::Upstream, ExecError> {
-    let mut headers = crate::openai_compat_headers::base_headers(&route.key, "application/json", route.api_auth);
+    let mut headers = crate::openai_compat_headers::base_headers(&route.key, content_type, route.api_auth);
     let session = ck_wire::session::cpa_session_id(request.client.session);
     for (name, value) in ck_wire::headers::custom_headers(
         &attempt.credential.attributes,
