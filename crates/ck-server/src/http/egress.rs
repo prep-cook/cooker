@@ -25,6 +25,8 @@ pub enum Protocol {
     Gemini,
     /// OpenAI speech: the audio file itself.
     Speech,
+    /// OpenAI Images, with results as base64 or URLs, as the client asked.
+    Images(ck_translate::images::Delivery),
 }
 
 /// Client body framing. `Json` is a buffered body; `Sse` and `JsonArray` stream, the latter

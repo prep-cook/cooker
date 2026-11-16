@@ -1,7 +1,7 @@
 //! Media routes on the execution contract (E-PLAN §2.3, E7), through the real router against a
-//! local upstream: speech commits at its first audio byte and resumes on `/v1/streams` from a
-//! byte cursor; video job ids belong to the caller that created them, and a full job table
-//! refuses a create before anything is sent.
+//! local upstream: speech commits at its first audio byte and resumes from a byte cursor; images
+//! commit once the answer holds an image and resume from an event cursor; video job ids belong to
+//! the caller that created them, and a full job table refuses a create before anything is sent.
 
 #[path = "support/stream_upstream.rs"]
 mod stream_upstream;
@@ -197,5 +197,101 @@ async fn video_jobs_belong_to_their_caller_and_a_full_table_sends_nothing() {
         let response = request.send().await.unwrap();
         assert_eq!(response.status(), status, "{case}");
         assert_eq!(upstream.requests(), sends, "{case}");
+    }
+}
+
+const IMAGES: &str = r#"{"created":1700000001,"data":[{"b64_json":"QUJD"},{"url":"https://img.x/2.png"}]}"#;
+
+/// A streamed image generation on xAI, which answers one buffered body.
+fn image_stream(proxy: &Proxy, key: &str) -> wreq::RequestBuilder {
+    proxy
+        .request(wreq::Method::POST, key, "/v1/images/generations")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"grok-imagine-image","prompt":"a cat","stream":true}"#)
+}
+
+/// Images reach the client only once the upstream answer holds an image: until then nothing is
+/// sent, and an answer without one fails over to the next credential with the client none the
+/// wiser. Each image is one event the stream can resume after, for its own caller only.
+#[tokio::test]
+async fn images_commit_at_their_first_image_and_resume_from_an_event_cursor() {
+    let late = Duration::from_millis(400);
+    // (case, upstream replies, upstream requests, earliest response head)
+    let cases = [
+        (
+            "the response head waits for the upstream answer",
+            vec![Reply::json(IMAGES).first_byte_after(late)],
+            1,
+            late,
+        ),
+        (
+            "an answer without an image fails over",
+            vec![
+                Reply::json(r#"{"data":[{"b64_json":"","url":"","revised_prompt":"none"}]}"#),
+                Reply::json(IMAGES),
+            ],
+            2,
+            Duration::ZERO,
+        ),
+    ];
+    for (case, replies, sends, earliest) in cases {
+        let upstream = StreamUpstream::start(replies).await;
+        let proxy = proxy(&upstream, 4096).await;
+        let started = Instant::now();
+        let response = image_stream(&proxy, "client-a").send().await.unwrap();
+        assert!(
+            started.elapsed() >= earliest,
+            "{case}: head after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(response.status(), 200, "{case}");
+        assert_eq!(response.headers()["content-type"], "text/event-stream", "{case}");
+        let id = response.headers()["x-ck-stream-id"].to_str().unwrap().to_owned();
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            body.matches("event: image_generation.completed").count(),
+            2,
+            "{case}: {body}"
+        );
+        assert!(body.contains(r#""b64_json":"QUJD""#), "{case}: {body}");
+        assert_eq!(upstream.requests(), sends, "{case}");
+
+        // (resume case, client key, query, status, the only image in the suffix)
+        let resumes = [
+            (
+                "after the first image",
+                "client-a",
+                "after=v1.e.1",
+                200,
+                Some("https://img.x/2.png"),
+            ),
+            (
+                "a byte cursor on an event stream",
+                "client-a",
+                "after=v1.b.3",
+                400,
+                None,
+            ),
+            ("another caller", "client-b", "after=v1.e.1", 410, None),
+        ];
+        for (resume, key, query, status, image) in resumes {
+            let resumed = proxy
+                .request(wreq::Method::GET, key, &format!("/v1/streams?{query}"))
+                .header("x-ck-stream-id", &id)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resumed.status(), status, "{case}, {resume}");
+            if let Some(image) = image {
+                let suffix = resumed.text().await.unwrap();
+                assert_eq!(
+                    suffix.matches("event: image_generation.completed").count(),
+                    1,
+                    "{case}, {resume}: {suffix}"
+                );
+                assert!(suffix.contains(image), "{case}, {resume}: {suffix}");
+            }
+        }
+        assert_eq!(upstream.requests(), sends, "{case}: a resume sends nothing upstream");
     }
 }

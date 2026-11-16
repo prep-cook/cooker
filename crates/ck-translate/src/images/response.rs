@@ -56,7 +56,6 @@ const ITEM: &[&str] = &[
     "b64_json",
     "url",
     "revised_prompt",
-    "mime_type",
     "type",
     "partial_image_index",
     "created_at",
@@ -143,6 +142,18 @@ fn nonempty(doc: &Document, node: usize) -> Result<usize> {
         return Err(Error::Schema);
     }
     Ok(node)
+}
+
+/// A member that is present and, when a string, not empty.
+fn filled(doc: &Document, parent: usize, name: &str) -> Result<Option<usize>> {
+    Ok(match present(doc, parent, name)? {
+        Some(node)
+            if matches!(doc.node(node)?.value, Value::String(_)) && doc.chars(node)?.next_scalar()?.is_none() =>
+        {
+            None
+        }
+        member => member,
+    })
 }
 
 struct State {
@@ -490,14 +501,19 @@ impl State {
             if !matches!(doc.node(item)?.value, Value::Object) {
                 return Err(Error::Schema);
             }
+            let (b64, url) = (filled(doc, item, "b64_json")?, filled(doc, item, "url")?);
+            // An item with neither is no image; a response left with none fails at completion.
+            if b64.is_none() && url.is_none() {
+                continue;
+            }
             self.image(
                 owner,
                 &Image {
                     doc,
                     item,
                     top: root,
-                    b64: present(doc, item, "b64_json")?,
-                    url: present(doc, item, "url")?,
+                    b64,
+                    url,
                     partial: false,
                     created: None,
                     sse: None,
@@ -506,6 +522,9 @@ impl State {
                     known: ITEM,
                 },
             )?;
+        }
+        if self.images == 0 {
+            return Err(Error::Schema);
         }
         Ok(())
     }

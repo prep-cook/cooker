@@ -62,7 +62,7 @@ impl Capability for RelayCapability {
             }
             Operation::Media(Media::ImageEdit) => crate::media_exec::check_images(
                 view,
-                ck_translate::images::Destination::OpenAiForm(crate::openai_compat_media::CHECK_BOUNDARY),
+                crate::openai_compat_media::edit_destination(view.document, crate::openai_compat_media::CHECK_BOUNDARY),
             ),
             Operation::Media(_) | Operation::AlphaSearch => Err(codec::Error::Unsupported),
         }

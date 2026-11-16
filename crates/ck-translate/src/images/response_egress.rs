@@ -15,6 +15,13 @@ use crate::{
 
 const PROTOCOL: &str = "openai-images";
 
+/// Whether a member kept from the source belongs in the client's response: one of OpenAI Images,
+/// or of xAI's Images API, which extends it on the same endpoints (`mime_type`, `file_output`,
+/// `storage_error`).
+fn restored(doc: &Document, entry: usize) -> Result<bool> {
+    Ok(boundary::is(doc, entry, "protocol", PROTOCOL)? || boundary::is(doc, entry, "protocol", "xai-images")?)
+}
+
 /// The client's Images response form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Format {
@@ -125,7 +132,7 @@ impl Egress {
         }
         if let Some(original) = doc.member(x, "original")? {
             for entry in doc.children(original)? {
-                if !boundary::is(doc, entry, "protocol", PROTOCOL)? {
+                if !restored(doc, entry)? {
                     self.drop(
                         "members of another protocol",
                         "only a client of the source protocol gets them",
@@ -319,10 +326,8 @@ impl Egress {
                 }
             },
             (None, Some((op, value))) => {
-                // A URL cannot become base64 here: nothing fetches it.
-                if self.delivery == Delivery::Base64 {
-                    return Err(Error::Unsupported);
-                }
+                // A URL result stays a URL whatever the delivery, as Go's handler writes it:
+                // nothing here fetches it to make base64.
                 sep(e, first)?;
                 e.bytes(b"\"url\":")?;
                 op.write(op.required(value, "url")?, e)
@@ -403,7 +408,7 @@ impl Egress {
             return Ok(());
         };
         for entry in doc.children(original)? {
-            if !boundary::is(doc, entry, "protocol", PROTOCOL)? {
+            if !restored(doc, entry)? {
                 continue;
             }
             let pointer = doc.required(entry, "pointer")?;

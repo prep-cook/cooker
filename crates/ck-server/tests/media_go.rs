@@ -271,11 +271,6 @@ async fn media_routes_match_go() {
         if s.name.starts_with("models_grok_shell") {
             s.response
                 .replace(PREVIEW_ENTRY, &format!("{PREVIEW_ENTRY},{speech_entries}"))
-        } else if s.name == "slow_gen_compat_error" {
-            // OpenAI's SDK error envelope includes nullable param/code, also after
-            // a JSON keepalive: openai-python/src/openai/_exceptions.py (APIError).
-            "\n{\"error\":{\"message\":\"nope\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}"
-                .into()
         } else {
             s.response.clone()
         }
@@ -323,16 +318,25 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
     // soonest-reset, whose one probe per key reorders the two xAI keys across models
     // (docs/DIFFERENCES-FROM-GO.md "Default routing strategy"), so Go's is set.
     assert!(!config.contains("strategy:"), "the fixture leaves the strategy unset");
-    let config = format!("{config}\nrouting:\n  strategy: round-robin\n");
-    // Undelayed recordings expect no keepalive; host load must not select their mode.
-    let quiet = Config::parse(
-        &config
-            .replace("nonstream-keepalive-interval: 1", "nonstream-keepalive-interval: 0")
-            .replace("keepalive-seconds: 1", "keepalive-seconds: 0"),
-    )
-    .expect("config without keepalives parses");
-    let config = Config::parse(&config).expect("config parses");
-    let credentials = ck_core::config::credentials::load(&config);
+    // An upstream answer the media codecs refuse fails its attempt and cools the credential; Go
+    // refused it after the executor succeeded and cooled nothing. Cooling stays off except for
+    // the scenarios that record it, so one refused answer leaves the next scenario's credentials
+    // as Go had them.
+    let variant = |delayed: bool, cooling: bool| {
+        let mut text = format!("{config}\nrouting:\n  strategy: round-robin\n");
+        if !cooling {
+            text.push_str("  cooldown:\n    disable-cooling: true\n");
+        }
+        // Undelayed recordings expect no keepalive; host load must not select their mode.
+        if !delayed {
+            text = text
+                .replace("nonstream-keepalive-interval: 1", "nonstream-keepalive-interval: 0")
+                .replace("keepalive-seconds: 1", "keepalive-seconds: 0");
+        }
+        Config::parse(&text).expect("config parses")
+    };
+    let quiet = variant(false, false);
+    let credentials = ck_core::config::credentials::load(&quiet);
     let executors = Executors {
         claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: Default::default(),
@@ -357,12 +361,13 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
     };
     let client = wreq::Client::new();
     let mut failures = Vec::new();
-    let mut keepalive = false;
+    let mut mode = (false, false);
     for s in &fixture.scenarios {
         let delayed = s.upstreams.iter().any(|reply| reply.delay_ms > 0);
-        if delayed != keepalive {
-            assert!(rt.publish_config(if delayed { config.clone() } else { quiet.clone() }));
-            keepalive = delayed;
+        let next = (delayed, s.name.contains("429"));
+        if next != mode {
+            assert!(rt.publish_config(variant(next.0, next.1)));
+            mode = next;
         }
         *upstream.replies.lock().unwrap() = s.upstreams.iter().cloned().collect();
         upstream.requests.lock().unwrap().clear();
