@@ -338,7 +338,8 @@ fn every_reference_shape_is_redacted() {
         let got = urls_in(text);
         assert_eq!(got, want, "{text}");
         assert_no_secret(&got, text);
-        // The log writer scans error lines that were redacted already.
+        // The log writer scans error lines that were redacted already; these rows come
+        // back unchanged.
         assert_eq!(urls_in(&got), got, "{text}");
     }
     for unchanged in [
@@ -355,9 +356,9 @@ fn every_reference_shape_is_redacted() {
 }
 
 /// Reads that end where the test says.
-struct Pieces<'a>(std::collections::VecDeque<&'a [u8]>);
+struct Reads<'a>(std::collections::VecDeque<&'a [u8]>);
 
-impl std::io::Read for Pieces<'_> {
+impl std::io::Read for Reads<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // An empty read would mean the end.
         self.0.retain(|piece| !piece.is_empty());
@@ -373,7 +374,7 @@ impl std::io::Read for Pieces<'_> {
 
 fn copied(pieces: &[&[u8]], hold: usize) -> String {
     let mut out = Vec::new();
-    copy_holding(&mut Pieces(pieces.iter().copied().collect()), &mut out, hold).unwrap();
+    copy_holding(&mut Reads(pieces.iter().copied().collect()), &mut out, hold).unwrap();
     String::from_utf8(out).unwrap()
 }
 
@@ -572,10 +573,59 @@ fn generated(rng: &mut Rng) -> String {
     text
 }
 
+/// `parts` of one text as a log writes them: [`Pieces`] with an event header between
+/// them, under the hold limit `hold`.
+fn parted(parts: &[&[u8]], hold: usize) -> String {
+    let mut out = Vec::new();
+    let mut pieces = Pieces(scan::Copy::new(hold));
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            pieces.cut(&mut out).unwrap();
+            write(b"\n\ntimestamp: t\nevent: x\n", &mut out).unwrap();
+        }
+        pieces.push(part, &mut out).unwrap();
+    }
+    pieces.finish(&mut out).unwrap();
+    // A cut may split a character; the secrets are ASCII.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A text in parts fails closed where a part ends in what the next part may carry on into
+/// a credential, and nowhere else.
+#[test]
+fn parts_fail_closed_where_a_credential_may_go_on() {
+    const HEADER: &str = "\n\ntimestamp: t\nevent: x\n";
+    for (parts, want) in [
+        (&["wss://user:", "sk-review-secret@host/ x"][..], "<redacted url>|| x"),
+        (
+            &["see https://h.example/?k=", "sk-review-secret end"],
+            "see <redacted url>|| end",
+        ),
+        (&["dsn=redis:sk-rev", "iew-secret@host end"], "<redacted url>|| end"),
+        (
+            &["x <http://h.example/?code=a", " sk-review-secret> y"],
+            "x <<redacted url>||> y",
+        ),
+        (&["callback?code=", "sk-review-secret"], "<redacted url>||"),
+        (&["a//user", ":sk-review-secret@h b"], "<redacted url>|| b"),
+        // So does a word after a `:` that a userinfo could hold.
+        (&["ratio 1:2", "x y"], "ratio <redacted url>|| y"),
+        // JSON messages and plain words end with their part.
+        (&[r#"{"input":[]}"#, r#"{"type":"x"}"#], r#"{"input":[]}||{"type":"x"}"#),
+        (&["ratio 1:2}", "x"], "ratio 1:2}||x"),
+        (&["see http://h.example/ ", "x"], "see http://h.example/ ||x"),
+    ] {
+        let parts: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();
+        assert_eq!(parted(&parts, scan::HOLD), want.replace("||", HEADER), "{parts:?}");
+    }
+}
+
 /// Generated texts with secrets in URLs of every shape, wrapping and neighbour: copying
 /// a text in pieces gives what redacting it whole gives, wherever reads end, and no
-/// secret byte prints either way. Under a 16-byte hold limit only the second holds.
-/// `CK_REDACT_CASES` sets the number of texts for a longer run.
+/// secret byte prints either way. Under a 16-byte hold limit only the second holds. The
+/// same text cut into parts with an event header between them, at every byte and at
+/// random places, prints no secret byte either. `CK_REDACT_CASES` sets the number of
+/// texts for a longer run.
 #[test]
 fn copying_in_pieces_equals_redacting_whole() {
     let cases = std::env::var("CK_REDACT_CASES").map_or(48, |n| n.parse().unwrap());
@@ -594,11 +644,33 @@ fn copying_in_pieces_equals_redacting_whole() {
         );
         let small = copied(&one_byte, 16);
         assert!(!leaks(&small), "case {case}: {text:?} printed {small:?} under hold 16");
+        assert_eq!(
+            parted(&[bytes_text], scan::HOLD),
+            whole,
+            "case {case}: {text:?} in one part"
+        );
         for cut in 0..=bytes_text.len() {
             let pieces = [&bytes_text[..cut], &bytes_text[cut..]];
             assert_eq!(copied(&pieces, scan::HOLD), whole, "case {case}: {text:?} cut at {cut}");
             let small = copied(&pieces, 16);
             assert!(!leaks(&small), "case {case}: {text:?} cut at {cut} printed {small:?}");
+            let parts = parted(&pieces, scan::HOLD);
+            assert!(
+                !leaks(&parts),
+                "case {case}: {text:?} parted at {cut} printed {parts:?}"
+            );
+        }
+        let mut cuts: Vec<usize> = (0..1 + rng.below(6)).map(|_| rng.below(bytes_text.len() + 1)).collect();
+        cuts.sort_unstable();
+        let parts: Vec<&[u8]> = [0]
+            .iter()
+            .chain(&cuts)
+            .zip(cuts.iter().chain([&bytes_text.len()]))
+            .map(|(from, to)| &bytes_text[*from..*to])
+            .collect();
+        for hold in [scan::HOLD, 16] {
+            let got = parted(&parts, hold);
+            assert!(!leaks(&got), "case {case}: {parts:?} under hold {hold} printed {got:?}");
         }
     }
 }

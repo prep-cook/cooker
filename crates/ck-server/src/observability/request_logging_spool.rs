@@ -1,8 +1,9 @@
 //! Capture files: an upstream [`Section`] of the request log, kept in memory and then
 //! in a [`Spool`] file. Spools hold captured bytes as they arrive; a section's URLs are
 //! redacted over the whole section as it is copied into the log (owner ruling Q18 and
-//! decisions 2026-11-15 and 2026-11-16), so no URL split across chunks or writes escapes
-//! redaction, and a spooled section is never read into memory whole.
+//! decisions 2026-11-15 and 2026-11-16), so a URL split across chunks or writes is seen
+//! whole, and a spooled section is never read into memory whole. A WebSocket timeline
+//! fails closed at each message end instead ([`Section`]).
 
 use super::trim;
 use std::fs::{File, OpenOptions};
@@ -62,8 +63,15 @@ const SECTION_HEAD: usize = 32;
 /// and moves them to a spool file whenever the next append would pass that. If a spool
 /// write fails, the section drops its content and every later append, and prints
 /// [`DROPPED`].
+///
+/// A WebSocket timeline is a framed section: captured messages ([`Section::piece`])
+/// with the text the log inserts between them ([`Section::insert`]). Each frame is a tag
+/// byte and a little-endian `u64` length before its bytes, so the messages are redacted
+/// as one text with a cut at each of their ends ([`ck_wire::redact::Pieces`]); a
+/// whole-section pass would see the inserted text inside a URL split across messages.
 pub(super) struct Section {
     prefix: &'static str,
+    framed: bool,
     pub(super) memory: Vec<u8>,
     pub(super) spool: Option<Spool>,
     dropped: bool,
@@ -79,12 +87,21 @@ impl Section {
     pub(super) fn new(prefix: &'static str) -> Self {
         Self {
             prefix,
+            framed: false,
             memory: Vec::new(),
             spool: None,
             dropped: false,
             head: Vec::new(),
             trailing: 0,
             blank: true,
+        }
+    }
+
+    /// A framed section, for a WebSocket timeline.
+    pub(super) fn framed(prefix: &'static str) -> Self {
+        Self {
+            framed: true,
+            ..Self::new(prefix)
         }
     }
 
@@ -121,10 +138,37 @@ impl Section {
     }
 
     pub(super) fn append(&mut self, dir: &Path, bytes: &[u8]) {
+        debug_assert!(!self.framed, "a framed section takes pieces and inserts");
         if bytes.is_empty() {
             return;
         }
         self.track(bytes);
+        self.store(dir, bytes);
+    }
+
+    /// Text the log inserts between the captured messages of a framed section.
+    pub(super) fn insert(&mut self, dir: &Path, text: &[u8]) {
+        self.frame(dir, INSERT, text);
+    }
+
+    /// A captured message of a framed section.
+    pub(super) fn piece(&mut self, dir: &Path, bytes: &[u8]) {
+        self.frame(dir, PIECE, bytes);
+    }
+
+    fn frame(&mut self, dir: &Path, tag: u8, bytes: &[u8]) {
+        debug_assert!(self.framed, "an unframed section takes appends");
+        if bytes.is_empty() {
+            return;
+        }
+        self.track(bytes);
+        let mut head = [tag; FRAME_HEAD];
+        head[1..].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+        self.store(dir, &head);
+        self.store(dir, bytes);
+    }
+
+    fn store(&mut self, dir: &Path, bytes: &[u8]) {
         if self.dropped {
             return;
         }
@@ -157,8 +201,52 @@ impl Section {
             return out.write_all(DROPPED);
         }
         match &self.spool {
+            Some(spool) if self.framed => {
+                let mut file = &spool.file;
+                file.seek(io::SeekFrom::Start(0))?;
+                write_frames(&mut file.chain(&self.memory[..]), out)
+            }
             Some(spool) => spool.copy_redacted(&self.memory, out),
+            None if self.framed => write_frames(&mut &self.memory[..], out),
             None => ck_wire::redact::write(&self.memory, out),
         }
     }
+}
+
+const INSERT: u8 = 0;
+const PIECE: u8 = 1;
+/// A frame's tag byte and length.
+const FRAME_HEAD: usize = 9;
+
+/// Writes the frames of a framed section, redacted.
+fn write_frames(input: &mut dyn Read, out: &mut dyn Write) -> io::Result<()> {
+    let mut pieces = ck_wire::redact::Pieces::default();
+    let mut in_piece = false;
+    let mut head = [0; FRAME_HEAD];
+    let mut buf = vec![0; 64 << 10];
+    loop {
+        match input.read_exact(&mut head) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        let mut frame = (&mut *input).take(u64::from_le_bytes(head[1..].try_into().unwrap_or_default()));
+        if head[0] == PIECE {
+            in_piece = true;
+            loop {
+                match frame.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => pieces.push(&buf[..n], out)?,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        } else {
+            if std::mem::take(&mut in_piece) {
+                pieces.cut(out)?;
+            }
+            ck_wire::redact::copy(&mut frame, out)?;
+        }
+    }
+    pieces.finish(out)
 }

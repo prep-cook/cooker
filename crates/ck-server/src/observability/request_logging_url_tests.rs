@@ -273,6 +273,51 @@ fn spooled_sections_redact_urls_after_long_tokens() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A URL split across two messages of a WebSocket timeline, at any byte, prints no part
+/// of its credential, upstream and downstream, in memory and spooled. The secrets are
+/// the only upper-case letters.
+#[test]
+fn urls_split_across_timeline_messages_are_redacted() {
+    let dir = super::tests::scratch();
+    let shapes = [
+        "wss://user:QXKEY@host.example/",
+        "see https://h.example/?k=QXKEY end",
+        "dsn=redis:QXKEY@host.example",
+        "x <http://h.example/?code=a QXKEY> y",
+        "{\"u\":\"x//user:QXKEY@h.example\"}",
+        "callback?code=QXKEY#QXKEY",
+    ];
+    type Event = fn(&mut super::Section, &std::path::Path, &[u8], &[u8]);
+    let surfaces: [Event; 2] = [super::upstream_timeline, super::downstream_timeline];
+    for filler in [0, super::SECTION_MEMORY] {
+        for shape in shapes {
+            for cut in 0..=shape.len() {
+                for event in surfaces {
+                    let mut section = super::Section::framed("timeline");
+                    let first = [&vec![b'a'; filler][..], b" ", &shape.as_bytes()[..cut]].concat();
+                    event(&mut section, &dir, b"t: 1\n", &first);
+                    event(&mut section, &dir, b"t: 2\n", &shape.as_bytes()[cut..]);
+                    assert_eq!(section.spool.is_some(), filler > 0);
+                    let mut out = Vec::new();
+                    section.write_to(&mut out).unwrap();
+                    let out = String::from_utf8(out).unwrap();
+                    assert!(
+                        !out.bytes().any(|b| b.is_ascii_uppercase()),
+                        "{shape} cut at {cut}: {out}"
+                    );
+                }
+            }
+        }
+    }
+    let mut section = super::Section::framed("timeline");
+    super::upstream_timeline(&mut section, &dir, b"t: 1\n", b"wss://user:");
+    super::upstream_timeline(&mut section, &dir, b"t: 2\n", b"APIKEY@host/");
+    let mut out = Vec::new();
+    section.write_to(&mut out).unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), "t: 1\n<redacted url>\n\nt: 2\n");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Makes every later write to the upstream response section's spool fail.
 fn fail_spool(log: &super::RequestLog) {
     let mut locked = log.0.lock().unwrap();

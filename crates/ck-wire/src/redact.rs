@@ -107,9 +107,8 @@ pub fn urls_in(text: &str) -> Cow<'_, str> {
 /// (the bytes between whitespace and `"`) that could still carry a credential prints as
 /// [`UNPRINTABLE`] whole, whatever the scan found in it: one holding a `//` not followed
 /// by a host and port ([`valid_authority`]), or an `@` after a `:` in the same path
-/// segment (`redis:key@host`). Other bytes are unchanged. The scan is linear in `text`,
-/// and a reference is passed over whole, so text that is already redacted comes back
-/// unchanged.
+/// segment (`redis:key@host`). Other bytes are unchanged. The scan is linear in `text`.
+/// A second pass over redacted text can replace more of it with the placeholder.
 pub fn bytes(text: &[u8]) -> Cow<'_, [u8]> {
     if !text.iter().any(|b| matches!(b, b'/' | b'?' | b'#' | b'@')) {
         return Cow::Borrowed(text);
@@ -135,6 +134,38 @@ pub fn copy(input: &mut dyn std::io::Read, out: &mut dyn std::io::Write) -> std:
 /// text.
 pub fn write(text: &[u8], out: &mut dyn std::io::Write) -> std::io::Result<()> {
     scan::write(text, out, scan::HOLD)
+}
+
+/// Redacts a text that reaches a log in pieces with other text between them, such as
+/// the messages of a WebSocket timeline between their event headers. The pieces are
+/// redacted as one text, as [`copy`] redacts it, except at each [`Pieces::cut`]: what a
+/// piece ends in may go on in the next piece, so a reference, or a word that could still
+/// carry a credential, prints as [`UNPRINTABLE`] there, and the start of the next piece
+/// is dropped up to where it would end. The text between pieces is redacted on its own,
+/// with [`write`].
+pub struct Pieces(scan::Copy);
+
+impl Default for Pieces {
+    fn default() -> Self {
+        Self(scan::Copy::new(scan::HOLD))
+    }
+}
+
+impl Pieces {
+    /// More bytes of the current piece.
+    pub fn push(&mut self, bytes: &[u8], out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        bytes.chunks(scan::PIECE).try_for_each(|piece| self.0.push(piece, out))
+    }
+
+    /// Ends the current piece; the next [`Pieces::push`] starts the next one.
+    pub fn cut(&mut self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        self.0.cut(out)
+    }
+
+    /// Ends the text.
+    pub fn finish(self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        self.0.finish(out)
+    }
 }
 
 #[cfg(test)]

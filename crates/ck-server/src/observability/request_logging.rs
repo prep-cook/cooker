@@ -1,8 +1,10 @@
 //! Go request_logging.go / response_writer.go and request_logger_writer.go.
 //! Request bodies in these files are intentionally unredacted, as in Go, except for
-//! URLs: each section of a log is redacted with `ck_wire::redact` as a whole when the log
-//! is written, so no URL credential reaches a log (owner ruling Q18). Spools hold the
-//! captured bytes until then, with no name in the log directory. Headers and URL queries
+//! URLs: each section of a log is redacted with `ck_wire::redact` when the log is written
+//! (owner ruling Q18), as a whole, or as the messages of a WebSocket timeline that fail
+//! closed at each message end. A URL that a protocol splits across separate JSON values
+//! (stream deltas) is redacted value by value. Spools hold the captured bytes until then,
+//! with no name in the log directory. Headers and URL queries
 //! are masked before writing; management routes are never captured.
 
 use ck_core::gostr::GoStr;
@@ -224,8 +226,8 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             detached: false,
             metadata_ready: false,
             websocket_done: false,
-            timeline: Section::new("websocket-timeline"),
-            api_timeline: Section::new("api-websocket-timeline"),
+            timeline: Section::framed("websocket-timeline"),
+            api_timeline: Section::framed("api-websocket-timeline"),
             api_request: Section::new("api-request"),
             deferred_api_request: Vec::new(),
             api_response: Section::new("api-response"),
@@ -394,12 +396,6 @@ impl RequestLog {
         if let Some(record) = self.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
             record.api_response.append(&record.state.dir, bytes);
             record.api_timestamp.get_or_insert(timestamp);
-        }
-    }
-
-    pub fn api_websocket_timeline(&self, bytes: &[u8]) {
-        if let Some(record) = self.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-            record.api_timeline.append(&record.state.dir, bytes);
         }
     }
 
@@ -656,8 +652,10 @@ impl RequestLog {
                 part.extend_from_slice(b"Headers:\n");
                 upstream_headers(&mut part, info.headers);
                 part.extend_from_slice(b"\nBody:\n");
-                part.extend_from_slice(if info.body.is_empty() { b"<empty>" } else { info.body });
-                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
+                if info.body.is_empty() {
+                    part.extend_from_slice(b"<empty>");
+                }
+                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part, info.body);
             }
             WebsocketHandshake(status, headers) => {
                 let mut part = websocket_event("api.websocket.handshake");
@@ -666,7 +664,7 @@ impl RequestLog {
                 }
                 part.extend_from_slice(b"Headers:\n");
                 upstream_headers(&mut part, headers);
-                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
+                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part, b"");
             }
             WebsocketResponse(payload) => {
                 let payload = trim(payload);
@@ -674,9 +672,8 @@ impl RequestLog {
                     return;
                 }
                 record.api_timestamp.get_or_insert_with(Local::now);
-                let mut part = websocket_event("api.websocket.response");
-                part.extend_from_slice(payload);
-                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
+                let part = websocket_event("api.websocket.response");
+                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part, payload);
             }
             WebsocketError { stage, error } => {
                 record.api_timestamp.get_or_insert_with(Local::now);
@@ -686,7 +683,7 @@ impl RequestLog {
                     writeln!(part, "Stage: {stage}").unwrap();
                 }
                 writeln!(part, "Error: {error}").unwrap();
-                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
+                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part, b"");
             }
         }
     }
@@ -766,11 +763,28 @@ fn websocket_event(event: &str) -> Vec<u8> {
     format!("Timestamp: {}\nEvent: {event}\n", timestamp(Local::now())).into_bytes()
 }
 
-fn upstream_timeline(out: &mut Section, dir: &Path, part: &[u8]) {
+/// One event of the upstream timeline: the log's `text` and the captured `payload` after
+/// it, trimmed as one part.
+fn upstream_timeline(out: &mut Section, dir: &Path, text: &[u8], payload: &[u8]) {
     if !out.is_empty() {
-        out.append(dir, b"\n\n");
+        out.insert(dir, b"\n\n");
     }
-    out.append(dir, trim(part));
+    let part = [text, payload].concat();
+    let trimmed = trim(&part);
+    let start = trimmed.as_ptr() as usize - part.as_ptr() as usize;
+    let (text, payload) = trimmed.split_at(text.len().saturating_sub(start).min(trimmed.len()));
+    out.insert(dir, text);
+    out.piece(dir, payload);
+}
+
+/// One event of the downstream timeline: the log's `header` lines, then the payload.
+fn downstream_timeline(out: &mut Section, dir: &Path, header: &[u8], payload: &[u8]) {
+    if !out.is_empty() {
+        out.insert(dir, b"\n");
+    }
+    out.insert(dir, header);
+    out.piece(dir, payload);
+    out.insert(dir, b"\n");
 }
 
 /// Connection-owned timeline sink. Explicit `close().await` waits for the durable
@@ -778,21 +792,15 @@ fn upstream_timeline(out: &mut Section, dir: &Path, part: &[u8]) {
 pub struct WebsocketLog(Option<RequestLog>);
 
 impl WebsocketLog {
-    pub fn append_part(&self, part: &[u8]) -> io::Result<()> {
-        if trim(part).is_empty() {
+    /// One event: the log's `header` lines and the client's or upstream's `payload`.
+    pub fn append_part(&self, header: &[u8], payload: &[u8]) -> io::Result<()> {
+        if trim(header).is_empty() && trim(payload).is_empty() {
             return Ok(());
         }
         if let Some(sink) = &self.0 {
             let mut record = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(record) = record.as_mut() {
-                let dir = &record.state.dir;
-                if !record.timeline.is_empty() {
-                    record.timeline.append(dir, b"\n");
-                }
-                record.timeline.append(dir, part);
-                if !part.ends_with(b"\n") {
-                    record.timeline.append(dir, b"\n");
-                }
+                downstream_timeline(&mut record.timeline, &record.state.dir, header, payload);
             } else {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "request log finalized"));
             }
@@ -1094,9 +1102,8 @@ impl Record {
         Ok(())
     }
 
-    /// Writes the log. Each section is redacted as a whole ([`write_redacted`]), so no URL
-    /// credential reaches the file; the bytes sent to the client and upstream are not
-    /// touched.
+    /// Writes the log, each section redacted ([`write_redacted`], [`Section::write_to`]);
+    /// the bytes sent to the client and upstream are not touched.
     fn format(&self, out: &mut dyn Write, decompress_error: Option<String>) -> io::Result<()> {
         let websocket = !self.timeline.is_empty();
         let downstream = if websocket
@@ -1764,7 +1771,7 @@ mod tests {
         drop(response);
         let (log, socket) = rx.recv().await.unwrap();
         socket
-            .append_part(b"Timestamp: fixture\nEvent: websocket.disconnect\nbye\n")
+            .append_part(b"Timestamp: fixture\nEvent: websocket.disconnect\n", b"bye")
             .unwrap();
         // The first poll hands the delivery to the work pool; dropping the caller then
         // cancels only the wait for it.
@@ -1900,12 +1907,14 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(logs(&dir).is_empty(), "HTTP 101 must not flush the transcript");
         for part in fixture["websocket"]["parts"].as_array().unwrap() {
-            sink.append_part(
-                &base64::engine::general_purpose::STANDARD
-                    .decode(part.as_str().unwrap())
-                    .unwrap(),
-            )
-            .unwrap();
+            let part = base64::engine::general_purpose::STANDARD
+                .decode(part.as_str().unwrap())
+                .unwrap();
+            // A Go part is its `Timestamp:` and `Event:` lines, the payload and a newline.
+            let header = part.iter().enumerate().filter(|(_, b)| **b == b'\n').nth(1).unwrap().0 + 1;
+            let payload = &part[header..];
+            sink.append_part(&part[..header], payload.strip_suffix(b"\n").unwrap_or(payload))
+                .unwrap();
         }
         sink.close().await;
         let files = logs(&dir);

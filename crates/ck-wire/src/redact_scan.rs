@@ -10,12 +10,12 @@ use std::io::{self, Read, Write};
 pub(super) const HOLD: usize = 1 << 20;
 
 /// The most [`copy`] reads, and [`write`] scans, at once.
-const PIECE: usize = 64 << 10;
+pub(super) const PIECE: usize = 64 << 10;
 
 /// Redacts the whole of `text` into `out`.
 pub(super) fn whole(text: &[u8], out: &mut Vec<u8>) {
     let mut scanned = Vec::with_capacity(text.len());
-    scan(text, true, None, &mut scanned);
+    scan(text, Rest::None, None, &mut scanned);
     let mut words = Words::new(usize::MAX);
     words.push(&scanned, out);
     words.end(out);
@@ -113,7 +113,7 @@ impl Words {
     }
 }
 
-struct Copy {
+pub(super) struct Copy {
     /// Bytes read but not yet scanned to the end: a reference whose end was not read yet,
     /// and what follows it.
     held: Vec<u8>,
@@ -129,7 +129,7 @@ struct Copy {
 }
 
 impl Copy {
-    fn new(hold: usize) -> Self {
+    pub(super) fn new(hold: usize) -> Self {
         Self {
             held: Vec::new(),
             before: None,
@@ -141,7 +141,7 @@ impl Copy {
         }
     }
 
-    fn push(&mut self, input: &[u8], out: &mut dyn Write) -> io::Result<()> {
+    pub(super) fn push(&mut self, input: &[u8], out: &mut dyn Write) -> io::Result<()> {
         self.scan(input);
         self.words.push(&self.scanned, &mut self.written);
         self.scanned.clear();
@@ -150,13 +150,74 @@ impl Copy {
         Ok(())
     }
 
-    fn finish(mut self, out: &mut dyn Write) -> io::Result<()> {
+    pub(super) fn finish(mut self, out: &mut dyn Write) -> io::Result<()> {
         if self.skip.is_none() {
-            scan(&self.held, true, self.before, &mut self.scanned);
+            scan(&self.held, Rest::None, self.before, &mut self.scanned);
         }
         self.words.push(&self.scanned, &mut self.written);
         self.words.end(&mut self.written);
         out.write_all(&self.written)
+    }
+
+    /// Ends a piece of a text that reaches the log with other text after it
+    /// ([`super::Pieces`]). The next piece may go on with what this one ends in, so a
+    /// reference, or a word that more bytes could make [`suspect`], prints as the
+    /// placeholder and the next piece is dropped up to where it would end. Anything
+    /// else ends with the piece.
+    pub(super) fn cut(&mut self, out: &mut dyn Write) -> io::Result<()> {
+        if self.skip.is_none() {
+            while let Some(at) = scan(&self.held, Rest::Piece, self.before, &mut self.scanned) {
+                if at > 0 {
+                    self.before = Some(self.held[at - 1]);
+                }
+                if self.drop_waiting(at) {
+                    break;
+                }
+            }
+            self.held.clear();
+        }
+        self.words.push(&self.scanned, &mut self.written);
+        self.scanned.clear();
+        if !self.words.dropping {
+            if self.skip.is_none() && unfinished(&self.words.word) {
+                self.words.word.clear();
+                self.written.extend_from_slice(UNPRINTABLE.as_bytes());
+                self.skip = Some(Skip::new(None, None));
+            } else {
+                self.words.end(&mut self.written);
+            }
+        }
+        self.before = None;
+        out.write_all(&self.written)?;
+        self.written.clear();
+        Ok(())
+    }
+
+    /// Prints what waits at `at` in `held` as the placeholder, after a span's opener and
+    /// the spaces that follow it, and drops it up to its end. Returns whether the drop
+    /// goes on past `held`.
+    fn drop_waiting(&mut self, at: usize) -> bool {
+        let waiting = &self.held[at..];
+        let kind = DELIMITERS.iter().position(|(open, _)| *open == waiting[0]);
+        let keep = match kind {
+            Some(_) => 1 + waiting[1..].iter().take_while(|b| **b == b' ').count(),
+            None => 0,
+        };
+        self.scanned.extend_from_slice(&waiting[..keep]);
+        self.scanned.extend_from_slice(UNPRINTABLE.as_bytes());
+        let mut skip = Skip::new(kind, keep.checked_sub(1).map(|k| waiting[k]).or(self.before));
+        match skip.end(&self.held[at + keep..]) {
+            Some(end) => {
+                self.before = skip.last;
+                self.held.drain(..at + keep + end);
+                false
+            }
+            None => {
+                self.held = Vec::new();
+                self.skip = Some(skip);
+                true
+            }
+        }
     }
 
     fn scan(&mut self, mut input: &[u8]) {
@@ -167,7 +228,7 @@ impl Copy {
             input = &input[end..];
         }
         self.held.extend_from_slice(input);
-        while let Some(at) = scan(&self.held, false, self.before, &mut self.scanned) {
+        while let Some(at) = scan(&self.held, Rest::Unread, self.before, &mut self.scanned) {
             if at > 0 {
                 self.before = Some(self.held[at - 1]);
             }
@@ -176,27 +237,9 @@ impl Copy {
                 return;
             }
             // Past the hold limit a reference, or a token that may still become one,
-            // prints as the placeholder, after a span's opener and the spaces that follow
-            // it, and is dropped up to its end.
-            let waiting = &self.held[at..];
-            let kind = DELIMITERS.iter().position(|(open, _)| *open == waiting[0]);
-            let keep = match kind {
-                Some(_) => 1 + waiting[1..].iter().take_while(|b| **b == b' ').count(),
-                None => 0,
-            };
-            self.scanned.extend_from_slice(&waiting[..keep]);
-            self.scanned.extend_from_slice(UNPRINTABLE.as_bytes());
-            let mut skip = Skip::new(kind, keep.checked_sub(1).map(|k| waiting[k]).or(self.before));
-            match skip.end(&self.held[at + keep..]) {
-                Some(end) => {
-                    self.before = skip.last;
-                    self.held.drain(..at + keep + end);
-                }
-                None => {
-                    self.held = Vec::new();
-                    self.skip = Some(skip);
-                    return;
-                }
+            // fails closed.
+            if self.drop_waiting(at) {
+                return;
             }
         }
         if let Some(last) = self.held.last() {
@@ -204,6 +247,20 @@ impl Copy {
         }
         self.held.clear();
     }
+}
+
+/// Whether more bytes could make `word` [`suspect`]: a `:` after its last `/` followed
+/// only by bytes a userinfo can hold, which an `@` may follow; a `/` at its end, which a
+/// `/` may double; or a `//` whose authority may go on.
+fn unfinished(word: &[u8]) -> bool {
+    let userinfo = |b: &u8| *b >= 0x80 || b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=%".contains(b);
+    let last = word.iter().rposition(|b| *b == b'/');
+    let tail = &word[last.map_or(0, |i| i + 1)..];
+    let colon = tail.iter().rposition(|b| *b == b':');
+    colon.is_some_and(|c| tail[c + 1..].iter().all(userinfo))
+        || last.is_some_and(|i| {
+            tail.is_empty() || (i > 0 && word[i - 1] == b'/' && tail.iter().all(|b| userinfo(b) || b":@[]".contains(b)))
+        })
 }
 
 /// The end of a dropped reference: its span's closer, or the end of its token. As
@@ -336,16 +393,29 @@ impl Open {
     }
 }
 
-/// Scans `text`, which follows the byte `before`, into `out`. Unless the text is
-/// `complete`, a reference whose end is not in `text` stops the scan: its start is
-/// returned and nothing from there on is written.
-fn scan(text: &[u8], complete: bool, before: Option<u8>, out: &mut Vec<u8>) -> Option<usize> {
+/// What follows a scanned text.
+#[derive(Clone, Copy, PartialEq)]
+enum Rest {
+    /// Nothing: the text is complete.
+    None,
+    /// Bytes not read yet.
+    Unread,
+    /// Another piece, after text the log inserts ([`Copy::cut`]). It is scanned on its
+    /// own, so only what it could go on to make a credential of waits: a reference, a
+    /// span that is or may become one, and a token with a `?` or `#`.
+    Piece,
+}
+
+/// Scans `text`, which follows the byte `before` and is followed by `rest`, into `out`.
+/// Unless the text is complete, a reference whose end is not in `text` stops the scan:
+/// its start is returned and nothing from there on is written.
+fn scan(text: &[u8], rest: Rest, before: Option<u8>, out: &mut Vec<u8>) -> Option<usize> {
     let (mut copied, mut i) = (0, 0);
     let mut next = Next::default();
     while i < text.len() {
         let step = match DELIMITERS.iter().position(|(open, _)| *open == text[i]) {
-            Some(kind) => next.span(text, i, kind, complete),
-            None if boundary(text, i, before) => next.token(text, i, complete),
+            Some(kind) => next.span(text, i, kind, rest),
+            None if boundary(text, i, before) => next.token(text, i, rest),
             None => Step::No,
         };
         match step {
@@ -393,9 +463,9 @@ struct Next {
 
 impl Next {
     /// The reference delimited by the opener at `i`.
-    fn span(&mut self, text: &[u8], i: usize, kind: usize, complete: bool) -> Step {
-        match self.reach(text, i, kind, complete) {
-            Span::Ref(start, close) => self.unhidden(text, start, close, complete, render_bytes(&text[start..close])),
+    fn span(&mut self, text: &[u8], i: usize, kind: usize, rest: Rest) -> Step {
+        match self.reach(text, i, kind, rest) {
+            Span::Ref(start, close) => self.unhidden(text, start, close, rest, render_bytes(&text[start..close])),
             Span::No => Step::No,
             Span::Wait => Step::Wait,
         }
@@ -403,7 +473,7 @@ impl Next {
 
     /// Whether the span opened at `i` is a reference, without rendering it. An unclosed
     /// span is none in a complete text.
-    fn reach(&mut self, text: &[u8], i: usize, kind: usize, complete: bool) -> Span {
+    fn reach(&mut self, text: &[u8], i: usize, kind: usize, rest: Rest) -> Span {
         // A closer found for an earlier opener also closes this one: the opener lies
         // inside that span, so it is escaped there and the escape parity matches.
         let close = match self.closers[kind] {
@@ -419,7 +489,7 @@ impl Next {
                 false => Span::No,
             };
         }
-        if !complete && (reference(contents) || reference_prefix(contents)) {
+        if rest != Rest::None && (reference(contents) || reference_prefix(contents)) {
             Span::Wait
         } else {
             Span::No
@@ -429,12 +499,12 @@ impl Next {
     /// The reference over `start..end`, unless it hides the opener of a reference span
     /// that ends after it (`https://h/x<https://h/?code=a key>`): then both print as one
     /// [`UNPRINTABLE`], since neither alone is the whole URL.
-    fn unhidden(&mut self, text: &[u8], start: usize, mut end: usize, complete: bool, rendered: String) -> Step {
+    fn unhidden(&mut self, text: &[u8], start: usize, mut end: usize, rest: Rest, rendered: String) -> Step {
         let mut hidden = false;
         let mut j = start + 1;
         while j < end {
             if let Some(kind) = DELIMITERS.iter().position(|(open, _)| *open == text[j]) {
-                match self.reach(text, j, kind, complete) {
+                match self.reach(text, j, kind, rest) {
                     Span::Ref(_, close) if close > end => {
                         end = close;
                         hidden = true;
@@ -449,15 +519,15 @@ impl Next {
     }
 
     /// The reference or relative reference starting at `i`.
-    fn token(&mut self, text: &[u8], i: usize, complete: bool) -> Step {
+    fn token(&mut self, text: &[u8], i: usize, rest: Rest) -> Step {
         let end = seek(text, i, &mut self.stop, stop);
-        let open = end == text.len() && !complete;
+        let open = end == text.len() && rest != Rest::None;
         let token = &text[i..end];
-        if reference(token) || (open && reference_prefix(token)) {
+        if reference(token) || (open && rest == Rest::Unread && reference_prefix(token)) {
             return if open {
                 Step::Wait
             } else {
-                self.unhidden(text, i, end, complete, render_bytes(token))
+                self.unhidden(text, i, end, rest, render_bytes(token))
             };
         }
         let mark = seek(text, i, &mut self.mark, |b| matches!(b, b'?' | b'#'));
@@ -466,14 +536,14 @@ impl Next {
         if (i + 1..mark.min(end)).any(|j| boundary(text, j, None)) {
             return Step::No;
         }
-        if open {
+        if open && (rest == Rest::Unread || mark < end) {
             return Step::Wait;
         }
         // `what?` and a Markdown `##` carry no query or fragment.
         if mark >= end || text[mark..end].iter().all(|b| matches!(b, b'?' | b'#')) {
             return Step::No;
         }
-        self.unhidden(text, i, end, complete, UNPRINTABLE.to_owned())
+        self.unhidden(text, i, end, rest, UNPRINTABLE.to_owned())
     }
 }
 
