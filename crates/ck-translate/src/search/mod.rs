@@ -7,10 +7,13 @@
 
 use ck_stream::{ScratchLease, Writer};
 
+mod response;
+pub use response::Ingress;
+
 use crate::{
     boundary,
     codec::{
-        Error, Result,
+        self, Error, Result,
         document::{Document, Value},
         encode::{self, Encoder},
         json::Scanner,
@@ -91,6 +94,30 @@ impl Decoder {
         let mut operation = boundary::mapped(owner, |e| write_operation(&native, self.phase, e))?;
         provenance::restore_bindings(&mut operation)?;
         Ok(operation)
+    }
+}
+
+/// Whether `operation` is a search request a destination may encode: an `alpha_search`
+/// operation whose value is a request, which a result is not. The destination decides whether it serves the operation.
+pub fn check_request(operation: &Document) -> Result<()> {
+    let root = operation.root();
+    if !boundary::is(operation, root, "kind", "alpha_search")? {
+        return Err(Error::Unsupported);
+    }
+    validate(operation, operation.required(root, "value")?, Phase::Request)
+}
+
+/// Request egress for one destination, like every other protocol's: it encodes only what
+/// that destination's own fence validated, so a client-only fence authorizes no upload.
+pub struct Egress {
+    pub destination: &'static str,
+}
+
+impl codec::RequestEgress for Egress {
+    fn encode(&self, request: &codec::ValidatedRequest<'_>, output: &mut Writer) -> Result<ScratchLease> {
+        let view = request.for_destination(self.destination)?;
+        check_request(view.document)?;
+        encode(output, view.document)
     }
 }
 
