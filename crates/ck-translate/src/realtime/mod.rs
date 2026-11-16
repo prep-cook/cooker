@@ -50,7 +50,7 @@ use crate::{
     codec::{
         Error, Result,
         event::{Emitter, Identity, Kind, LocalId, Scope},
-        live::{Opcode, Projector, Refusal, Sender},
+        live::{Opcode, Projector, Refusal, Route, Sender},
     },
 };
 use envelope::{At, Envelope, N, T, Text};
@@ -256,7 +256,13 @@ fn tally(responses: &mut Vec<(Text, u64)>, envelope: &Envelope, event: &str, aud
 }
 
 impl Projector for Session {
-    fn admit(&mut self, opcode: Opcode, payload: &[u8]) -> std::result::Result<(), Refusal> {
+    /// The counters record: an envelope naming two ids of at most 64 bytes, 14 counters and
+    /// at most [`MAX_RESPONSES`] response ids of at most 64 bytes, each escaped to at most 128,
+    /// with their output audio bytes; every number at most 20 digits. Under 5,000 bytes;
+    /// `the_final_counters_fit_the_room_held_for_them` measures the largest reachable record.
+    const FINAL_RECORD_BYTES: usize = 8 * 1024;
+
+    fn admit(&mut self, _: &mut impl Route, opcode: Opcode, payload: &[u8]) -> std::result::Result<(), Refusal> {
         self.admitted = None;
         let checked = self.check(opcode, payload);
         match checked {
@@ -266,8 +272,8 @@ impl Projector for Session {
         checked
     }
 
-    fn project(&mut self, owner: &mut Writer, sender: Sender, opcode: Opcode, payload: &[u8]) -> Result<()> {
-        boundary::enter(self.owner, owner, self.closed)?;
+    fn project(&mut self, route: &mut impl Route, sender: Sender, opcode: Opcode, payload: &[u8]) -> Result<()> {
+        boundary::enter(self.owner, route.session(), self.closed)?;
         let length = payload.len() as u64;
         let counts = &mut self.counts[sender as usize];
         counts.messages += 1;
@@ -314,7 +320,24 @@ impl Projector for Session {
             ordinal,
             output_audio,
         };
-        record.publish(&mut self.emitter, owner)
+        record.publish(&mut self.emitter, route.session())?;
+        // The response lifecycle, from the fields that carry it. A `response.created` names no
+        // client request, so no request is recorded and every Realtime response starts as the
+        // upstream's own.
+        match (sender, event) {
+            (Sender::Upstream, "response.created") => {
+                if let Some(id) = envelope.text(T::ResponseObjectId).get() {
+                    route.started(id, None);
+                }
+            }
+            (Sender::Upstream, "response.done") => {
+                if let Some(id) = envelope.text(T::ResponseObjectId).get() {
+                    route.done(id);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn finish(&mut self, owner: &mut Writer) -> Result<()> {

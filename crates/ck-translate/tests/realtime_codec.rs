@@ -4,11 +4,12 @@
 #[allow(dead_code, reason = "shared mapped codec harness")]
 mod semantic;
 
+use ck_stream::Writer;
 use ck_translate::{
     codec::{
         Error,
         event::{Direction, Identity, LocalId},
-        live::{Opcode, Projector, Sender},
+        live::{Opcode, Projector, Route, Sender},
     },
     realtime::{Admission, Counts, Events, Session, Start},
 };
@@ -163,7 +164,7 @@ fn client_messages_pass_unchanged_or_are_refused_with_a_reason() {
         let mut mapped = Mapped::new();
         let mut session = open(&mut mapped, events);
         let sent = payload.clone();
-        let got = session.admit(opcode, &payload).map_err(|refusal| {
+        let got = session.admit(&mut mapped.writer, opcode, &payload).map_err(|refusal| {
             assert!(!refusal.message.is_empty());
             (refusal.code, refusal.param)
         });
@@ -294,7 +295,7 @@ fn projection_carries_metadata_never_media_or_text() {
     let (mut client, mut upstream) = (Counts::default(), Counts::default());
     for (sender, opcode, payload) in &script {
         if *sender == Sender::Client {
-            session.admit(*opcode, payload).unwrap();
+            session.admit(&mut mapped.writer, *opcode, payload).unwrap();
         }
         session.project(&mut mapped.writer, *sender, *opcode, payload).unwrap();
         let counts = if *sender == Sender::Client {
@@ -501,7 +502,7 @@ fn every_documented_event_type_is_projected_or_counted() {
         let mut session = open(&mut mapped, Events::Sideband);
         if sender == Sender::Client {
             session
-                .admit(Opcode::Text, &payload)
+                .admit(&mut mapped.writer, Opcode::Text, &payload)
                 .unwrap_or_else(|r| panic!("{event}: {r:?}"));
         }
         session
@@ -614,7 +615,7 @@ fn media_counts_use_the_base64_length_without_decoding() {
         }
         let mut mapped = Mapped::new();
         let mut session = open(&mut mapped, Events::Realtime);
-        session.admit(Opcode::Text, &payload).unwrap();
+        session.admit(&mut mapped.writer, Opcode::Text, &payload).unwrap();
         session
             .project(&mut mapped.writer, Sender::Client, Opcode::Text, &payload)
             .unwrap();
@@ -650,4 +651,132 @@ fn a_session_publishes_its_counters_once_and_only_to_its_own_stream() {
         let projected = session.project(&mut mapped.writer, Sender::Upstream, Opcode::Text, &created);
         assert_eq!(projected.is_err_and(|e| matches!(e, Error::Limit)), n == 16, "{n}");
     }
+}
+
+/// A route over the mapped stream that records the response lifecycle it is told.
+struct Lifecycle<'a> {
+    writer: &'a mut Writer,
+    calls: Vec<String>,
+}
+
+impl Route for Lifecycle<'_> {
+    fn session(&mut self) -> &mut Writer {
+        self.writer
+    }
+    fn requested(&mut self, request: &str) -> Result<(), ck_translate::codec::live::Refusal> {
+        self.calls.push(format!("requested {request}"));
+        Ok(())
+    }
+    fn rejected(&mut self, request: &str) {
+        self.calls.push(format!("rejected {request}"));
+    }
+    fn started(&mut self, id: &str, request: Option<&str>) {
+        self.calls.push(format!("started {id} {request:?}"));
+    }
+    fn done(&mut self, id: &str) {
+        self.calls.push(format!("done {id}"));
+    }
+}
+
+#[test]
+fn the_response_lifecycle_comes_from_the_ids_events_carry() {
+    // (sender, event, lifecycle reported)
+    let cases: [(Sender, Value, Option<&str>); 8] = [
+        // A Realtime start never names a client request, so none is recorded or refused.
+        (Sender::Client, json!({"type":"response.create","event_id":"c1"}), None),
+        (Sender::Client, json!({"type":"response.create"}), None),
+        (
+            Sender::Upstream,
+            json!({"type":"error","error":{"type":"invalid_request_error","event_id":"c1"}}),
+            None,
+        ),
+        (
+            Sender::Upstream,
+            json!({"type":"error","error":{"type":"server_error"}}),
+            None,
+        ),
+        (
+            Sender::Upstream,
+            json!({"type":"response.created","event_id":"e1","response":{"id":"resp_1"}}),
+            Some("started resp_1 None"),
+        ),
+        (
+            Sender::Upstream,
+            json!({"type":"response.done","event_id":"e2","response":{"id":"resp_1"}}),
+            Some("done resp_1"),
+        ),
+        // An item event names a response only as `response_id`; it starts and ends nothing.
+        (
+            Sender::Upstream,
+            json!({"type":"response.output_item.added","response_id":"resp_1"}),
+            None,
+        ),
+        (Sender::Client, json!({"type":"response.cancel","event_id":"c2"}), None),
+    ];
+    let mut mapped = Mapped::new();
+    let mut session = open(&mut mapped, Events::Realtime);
+    for (sender, event, expected) in cases {
+        let payload = text(&event);
+        let mut route = Lifecycle {
+            writer: &mut mapped.writer,
+            calls: Vec::new(),
+        };
+        if sender == Sender::Client {
+            session.admit(&mut route, Opcode::Text, &payload).unwrap();
+        }
+        session.project(&mut route, sender, Opcode::Text, &payload).unwrap();
+        assert_eq!(route.calls, expected.into_iter().collect::<Vec<_>>(), "{event}");
+    }
+}
+
+/// The largest counters record a session can publish fits `FINAL_RECORD_BYTES`, the room the
+/// runtime holds for it: 64-byte identity ids, the most open responses, each with a 64-byte id
+/// that escapes to twice its length, and room for every number to reach 20 digits.
+#[test]
+fn the_final_counters_fit_the_room_held_for_them() {
+    let long = "i".repeat(64);
+    let identity = Identity {
+        request_id: LocalId::new(&long).unwrap(),
+        stream_id: LocalId::new(&long).unwrap(),
+        attempt: u64::MAX,
+        direction: Direction::Response,
+    };
+    let start = Start {
+        id: &long,
+        model: &long,
+        created: u64::MAX,
+    };
+    let admission = Admission {
+        events: Events::Sideband,
+        model: None,
+    };
+    let mut mapped = Mapped::new();
+    let mut session = Session::new(&mut mapped.writer, identity, &start, admission).unwrap();
+    let mut opened = 0;
+    while opened < 64 {
+        // Quotes escape to two bytes each in the record.
+        let id = format!("{opened:02}{}", "\"".repeat(62));
+        let created = text(&json!({"type":"response.created","response":{"id": id}}));
+        if session
+            .project(&mut mapped.writer, Sender::Upstream, Opcode::Text, &created)
+            .is_err()
+        {
+            break;
+        }
+        opened += 1;
+    }
+    session.finish(&mut mapped.writer).unwrap();
+    let output = String::from_utf8(mapped.output(&mapped.writer)).unwrap();
+    let last = output.split_terminator("\n\n").last().unwrap();
+    assert!(last.contains("realtime.counters"), "{last}");
+    let responses = last.matches("response_id").count();
+    assert_eq!(responses, opened, "every open response is listed");
+    assert!(
+        responses >= 16,
+        "the most open responses a session tallies: {responses}"
+    );
+    // 14 counters and the byte count of each response may each grow to 20 digits.
+    let digits = (14 + responses) * 20;
+    let largest = last.len() + "\n\n".len() + digits;
+    assert!(largest <= <Session as Projector>::FINAL_RECORD_BYTES, "{largest} bytes");
 }

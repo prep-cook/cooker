@@ -288,3 +288,34 @@ fn overlapping_scrapes_all_see_leases_on_forgotten_streams() {
     drop(leases);
     assert_eq!(store.stats().leased_frames, 0);
 }
+
+/// The final record goes into the frame its room pins, so another exchange allocating while
+/// the record is written cannot take that frame.
+#[test]
+fn a_final_record_keeps_its_frame_from_a_concurrent_allocation() {
+    let (_dir, store) = store();
+    let mut producer = store.create().unwrap();
+    producer.reserve_final(b"counters".len()).unwrap();
+    for _ in 0..3 {
+        producer.append(&[1; FRAME_BYTES]).unwrap();
+    }
+    assert_eq!(store.used_frames(), 4, "the pool is full");
+    let mut other = store.create().unwrap();
+    let (taken, taken_signal) = std::sync::mpsc::channel();
+    *store.inner.allocate_hook.lock() = Some(Box::new(move || {
+        taken.send(other.begin_scratch(FRAME_BYTES)).unwrap();
+    }));
+    producer.release_final();
+    let written = producer.append(b"counters");
+    drop(store.inner.allocate_hook.lock().take());
+    assert!(written.is_ok(), "{written:?}");
+    assert!(taken_signal.try_recv().is_err(), "the final record allocated no frame");
+    producer.finish(Terminal::Shutdown);
+    let mut reader = store.reader(producer.id(), 0).unwrap();
+    let mut last = Vec::new();
+    while let Poll::Ready(Some(Read::Record(lease))) = reader.try_next() {
+        last.clear();
+        lease.visit(|chunk| last.extend_from_slice(chunk)).unwrap();
+    }
+    assert_eq!(last, b"counters");
+}
