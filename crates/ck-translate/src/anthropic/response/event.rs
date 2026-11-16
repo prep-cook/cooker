@@ -26,7 +26,7 @@ impl State {
             names_type(&doc, kind, source, name)?;
         }
         if doc.string_is(kind, "error")? {
-            return Err(Error::Schema);
+            return self.upstream_error(owner, &doc);
         }
         if doc.string_is(kind, "ping")? {
             self.start(owner, None)?;

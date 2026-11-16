@@ -421,6 +421,62 @@ async fn a_body_cut_before_its_end_publishes_exactly_one_error() {
     }
 }
 
+/// An `error` event after the stream started, then a clean end of the body: the attempt fails
+/// with the error type's status, the usage already reported stays, no upstream message
+/// passes, and an Anthropic client receives the same error type.
+#[tokio::test]
+async fn a_mid_stream_error_event_fails_the_attempt_with_its_own_type() {
+    let started = &SSE[..SSE.find("event: content_block_stop").unwrap()];
+    // (upstream error type, attempt status, type an Anthropic client sees)
+    let rows = [
+        ("overloaded_error", 529, "overloaded_error"),
+        ("api_error", 500, "api_error"),
+        ("rate_limit_error", 429, "rate_limit_error"),
+        ("future_error", 502, "api_error"),
+    ];
+    for (kind, status, client) in rows {
+        let body = format!(
+            "{started}event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{kind}\",\"message\":\"upstream detail\"}}}}\n\n"
+        );
+        let upstream = StreamUpstream::start([Reply::sse(body)]).await;
+        let fixture = Fixture::new(&upstream, SONNET);
+        let request = br#"{"model":"m","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let (started, id, _request) = fixture.anthropic(request, Operation::Generate).await;
+        let mut started = started.unwrap();
+        let error = started.producer.await.unwrap().expect_err(kind);
+        assert_eq!(error.status, status, "{kind}");
+        let (records, terminal) = events(&fixture.streams, id).await;
+        assert_eq!(terminal, Some(Terminal::UpstreamError), "{kind}");
+        let errors: Vec<_> = records.iter().filter(|(name, _)| name == "x_ck.error").collect();
+        assert_eq!(errors.len(), 1, "{kind}: {records:?}");
+        assert_eq!(errors[0].1["status"], status, "{kind}");
+        assert!(!errors[0].1.to_string().contains("upstream detail"), "{kind}");
+        let usage = records.iter().rev().find(|(name, _)| name == "x_ck.usage");
+        assert_eq!(usage.map(|(_, data)| &data["usage"]["input_tokens"]), Some(&json!(12)));
+        let mut egress = anthropic::egress::Egress::new(
+            &mut started.stream,
+            identity(Direction::Response),
+            Operation::Generate,
+            BodyMode::Streaming,
+            |_| {},
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut reader = fixture.streams.reader(id);
+        while let Some(Read::Record(lease)) = reader.next().await {
+            egress
+                .advance(&mut started.stream, lease, |bytes| {
+                    out.extend_from_slice(&lease_bytes(&bytes));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let (name, data) = sse(std::str::from_utf8(&out).unwrap()).pop().unwrap();
+        assert_eq!(name, "error", "{kind}");
+        assert_eq!(data["error"]["type"], client, "{kind}");
+    }
+}
+
 #[tokio::test]
 async fn a_count_away_from_anthropic_is_local_and_sends_nothing() {
     let upstream = StreamUpstream::start([]).await;

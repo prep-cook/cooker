@@ -224,18 +224,31 @@ impl Egress {
         self.terminal = true;
         Ok(())
     }
+    /// Ends the response with an error of the type an Anthropic upstream reported in `record`,
+    /// else `api_error`; the message is the gateway's own.
     pub(super) fn error(
         &mut self,
         owner: &mut Writer,
+        record: &Document,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
+        let kind = super::super::error_type(record, record.member(record.root(), "type")?)?;
+        let kind = kind.map_or("api_error", |(kind, _)| kind);
+        let error = |e: &mut Encoder<'_, '_>| {
+            e.bytes(b"\"error\":{\"type\":")?;
+            e.string(kind)?;
+            e.bytes(b",\"message\":\"Response failed\"}")
+        };
         if self.mode == BodyMode::Streaming {
             output(event(owner, "error", |e| {
-                e.bytes(b",\"error\":{\"type\":\"api_error\",\"message\":\"Response failed\"}")
+                e.bytes(b",")?;
+                error(e)
             })?)?;
         } else {
             output(encode::scratch(owner, |e| {
-                e.bytes(b"{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Response failed\"}}")
+                e.bytes(b"{\"type\":\"error\",")?;
+                error(e)?;
+                e.bytes(b"}")
             })?)?;
         }
         self.terminal = true;

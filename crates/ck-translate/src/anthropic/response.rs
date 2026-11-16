@@ -314,6 +314,29 @@ impl State {
         }
         self.done(owner, None)
     }
+    /// Ends the stream with the upstream's own `error` event: the attempt fails with the status
+    /// its official type stands for, else 502, and the record keeps that type for egress. The
+    /// upstream message never passes.
+    fn upstream_error(&mut self, owner: &mut Writer, doc: &Document) -> Result<()> {
+        let error = doc.required(doc.root(), "error")?;
+        let (kind, status) = super::error_type(doc, doc.member(error, "type")?)?.unwrap_or(("api_error", 502));
+        self.emitter.emit(
+            owner,
+            Kind::Error,
+            Scope::default(),
+            |e| {
+                e.bytes(b",\"code\":")?;
+                e.string(kind)?;
+                e.bytes(b",\"status\":")?;
+                e.unsigned(u64::from(status))?;
+                e.bytes(b",\"message\":\"Response failed\",\"scope\":\"upstream\",\"type\":")?;
+                e.string(kind)
+            },
+            |_| Ok(()),
+        )?;
+        self.terminal = true;
+        Ok(())
+    }
     fn update_usage(&mut self, owner: &mut Writer, doc: &Document, parent: usize) -> Result<()> {
         if let Some(usage) = doc.member(parent, "usage")? {
             self.usage.update(owner, doc, usage)?;
