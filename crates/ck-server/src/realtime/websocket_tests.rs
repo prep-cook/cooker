@@ -1356,14 +1356,12 @@ async fn early_upstream_failures_switch_before_downstream_output() {
     }
 }
 
-/// Go 1e37b52b: removing a Codex or xAI credential from the store closes the upstream
-/// WebSocket its session holds and no other; a sibling credential's connection keeps its
-/// socket for the next turn.
+/// Go 1e37b52b: removing a Codex credential from the store closes the upstream WebSocket
+/// its session holds and no other; a sibling credential's connection keeps its socket for
+/// the next turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_a_credential_closes_only_its_upstream_sockets() {
-    for section in ["codex", "xai"] {
-        removal_closes_only_its_sockets(section).await;
-    }
+    removal_closes_only_its_sockets("codex").await;
 }
 
 async fn removal_closes_only_its_sockets(section: &str) {
@@ -1478,4 +1476,105 @@ async fn removal_closes_only_its_sockets(section: &str) {
     drop((kept, dropped));
     servers.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Until the server runs xAI turns through `session::Turns`, an xAI credential with
+/// `websockets` serves Responses WebSocket turns over HTTP: a continuation replays the
+/// connection's own history upstream instead of closing the client for a replay, and a
+/// warmup (`generate: false`) on the pinned connection is answered locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_xai_websockets_credential_continues_over_http() {
+    use futures_util::StreamExt;
+    use wreq::ws::message::Message as WsMessage;
+    let mut servers = Servers::default();
+    let uploads: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let upstream = {
+        let uploads = uploads.clone();
+        servers
+            .serve(axum::Router::new().fallback(move |body: axum::body::Bytes| {
+                let uploads = uploads.clone();
+                async move {
+                    let n = {
+                        let mut uploads = uploads.lock().unwrap();
+                        uploads.push(serde_json::from_slice(&body).unwrap());
+                        uploads.len()
+                    };
+                    let message = format!(
+                        r#"{{"type":"message","id":"msg_{n}","status":"completed","role":"assistant","content":[{{"type":"output_text","text":"answer {n}","annotations":[]}}]}}"#
+                    );
+                    let response = |status: &str, output: &str| {
+                        format!(
+                            r#"{{"id":"resp_{n}","object":"response","created_at":1700000000,"status":"{status}","model":"grok-test","output":{output},"usage":{{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}}"#
+                        )
+                    };
+                    let sse = format!(
+                        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{}}}\n\nevent: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{message}}}\n\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{}}}\n\n",
+                        response("in_progress", "[]"),
+                        response("completed", &format!("[{message}]")),
+                    );
+                    ([("content-type", "text/event-stream")], sse)
+                }
+            }))
+            .await
+    };
+    let cfg = Config::parse(&format!(
+        "api-keys:\n  xai:\n    - base-url: http://{upstream}/v1\n      models:\n        - name: grok-test\n      keys:\n        - api-key: xai-key\n          websockets: true\n"
+    ))
+    .unwrap();
+    let credentials = ck_core::config::credentials::from_config(&cfg);
+    let executors = Executors {
+        claude: ck_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+        codex: Default::default(),
+        devices: Default::default(),
+        openai: Default::default(),
+        google: Default::default(),
+    };
+    let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
+    let proxy = servers.serve(router(rt)).await;
+    let mut socket = wreq::Client::new()
+        .websocket(format!("ws://{proxy}/v1/responses"))
+        .send()
+        .await
+        .unwrap()
+        .into_websocket()
+        .await
+        .unwrap();
+    let mut previous = String::new();
+    for text in ["first", "second", "warmup"] {
+        let mut create = serde_json::json!({
+            "type": "response.create",
+            "model": "grok-test",
+            "previous_response_id": previous,
+            "input": [{"type":"message","role":"user","content":text}],
+        });
+        if text == "warmup" {
+            create["generate"] = false.into();
+            create["previous_response_id"] = "".into();
+        }
+        socket.send(WsMessage::text(create.to_string())).await.unwrap();
+        previous = loop {
+            let frame = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
+                Ok(Some(Ok(WsMessage::Text(frame)))) => frame.as_str().to_owned(),
+                other => panic!("{text}: no text frame: {other:?}"),
+            };
+            match gjson::get(&frame, "type").str() {
+                "response.completed" => break gjson::get(&frame, "response.id").str().to_owned(),
+                "error" => panic!("{text}: {frame}"),
+                _ => {}
+            }
+        };
+    }
+    let uploads = uploads.lock().unwrap().clone();
+    assert_eq!(
+        uploads.len(),
+        2,
+        "both turns went over HTTP and the warmup stayed local"
+    );
+    let replayed = uploads[1]["input"].to_string();
+    assert!(
+        replayed.contains("first") && replayed.contains("answer 1") && replayed.contains("second"),
+        "{replayed}"
+    );
+    drop(socket);
+    servers.shutdown().await;
 }

@@ -357,10 +357,11 @@ impl Executors {
         }
     }
 
-    /// One turn of a downstream Responses WebSocket session. Codex and xAI credentials
-    /// with `websockets` keep a pooled upstream socket per session; every other credential
-    /// runs an ordinary execution and cannot continue upstream state, so a continuation
-    /// turn fails with [`ExecError::replay_required`].
+    /// One turn of a downstream Responses WebSocket session. Codex credentials with
+    /// `websockets` keep a pooled upstream socket per session; every other credential runs
+    /// an ordinary execution and cannot continue upstream state, so a continuation turn
+    /// fails with [`ExecError::replay_required`]. xAI's upstream socket runs only through
+    /// [`session::Turns`].
     pub async fn execute_in_session(
         &self,
         credential: &Credential,
@@ -381,7 +382,6 @@ impl Executors {
     pub fn session_upstream(&self, credential: &Credential) -> bool {
         match credential.provider.as_str() {
             "codex" => codex::CodexExecutor::upstream_websocket(credential),
-            xai::PROVIDER => xai::XaiExecutor::session_upstream(credential),
             _ => false,
         }
     }
@@ -389,20 +389,12 @@ impl Executors {
     /// Starts another downstream session attempt without retaining its predecessor's loss.
     pub fn clear_session_loss(&self, id: &str) {
         self.codex.ws.clear_loss(id);
-        self.openai.xai.ws.clear_loss(id);
     }
 
     /// Resolves when an upstream socket held for session `id` is lost; pending forever
     /// when no executor holds one.
     pub fn session_closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        let codex = self.codex.session_closed(id);
-        let xai = self.openai.xai.session_closed(id);
-        async move {
-            tokio::select! {
-                error = codex => error,
-                error = xai => error,
-            }
-        }
+        self.codex.session_closed(id)
     }
 
     /// Releases everything executors hold for session `id`.

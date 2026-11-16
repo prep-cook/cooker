@@ -117,11 +117,6 @@ impl Target {
         }
     }
 
-    /// `websocketSessionTargetMatches` under the current config.
-    pub(crate) fn same(&self, want: &Target) -> bool {
-        self.credential == want.credential && self.url == want.url && self.setting == want.setting
-    }
-
     /// Whether the live socket dialed for `self` still serves `want`. Go 1e37b52b
     /// (`effectiveConfig`): for the same credential, the global proxy is the one the
     /// socket dialed with, so a reload that changes only `requests.proxy-url` keeps the

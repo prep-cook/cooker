@@ -93,13 +93,13 @@ All paths below are relative to the repository root. Globs denote the complete m
 | `crates/ck-exec/tests/device_fixtures/devin/*.json` | 58 files; `src/devin_tests.rs` and related cases | Connect/protobuf/gzip envelopes, trailer order, all recorded client formats, count estimate, truncation and media refusals; auth-only files remain boundary tests |
 | `crates/ck-exec/tests/device_fixtures/kimi/*.json` | 44 files; `src/kimi_tests.rs` and related cases | Claude delegation, Chat/Responses stream and buffered output, count, apply_patch, compact rejection, gzip/redirect and failure cases |
 | `crates/ck-exec/tests/device_fixtures/meta/*.json` | 38 files; `src/meta_tests.rs` and related cases | Responses stream/buffered collection, count, compact rejection, usage and malformed/truncated output; retain auth-only coverage |
-| `crates/ck-exec/tests/fixtures/*.json` | 35 files, grouped below | Preserve provider inputs and provenance; migrate transport/codec/accounting assertions |
+| `crates/ck-exec/tests/fixtures/*.json` | 34 files, grouped below | Preserve provider inputs and provenance; migrate transport/codec/accounting assertions |
 | `crates/ck-server/tests/fixtures/*.json` | 24 files, grouped below | Route, capture, media, truncation and lifecycle inputs; unrelated management/model data remains unchanged |
 | `crates/ck-server/tests/fixtures/lcp_go.jsonl.zst` | Scheduler trace corpus | Scheduling policy stays unchanged; migrate only execution-envelope callers |
 | `crates/ck-server/tests/ws_fixtures/{ws_e2e,ws_vectors}.json` | WS end-to-end and vector corpus; `tests/ws_e2e.rs` | Continuation, turn identity, terminal output and disconnect ownership |
 | `harness/fixtures.py`, `harness/evidence/{2026-10-02,2026-10-02-ultra-claude}.json.gz` | Differential request corpus and historical evidence | Keep input provenance; no regenerated Go expectations or claimed S1 pass |
 
-The 35 executor fixture filenames, all under `crates/ck-exec/tests/fixtures/`:
+The 34 executor fixture filenames, all under `crates/ck-exec/tests/fixtures/`:
 
 | Family | Files |
 | --- | --- |
@@ -107,7 +107,7 @@ The 35 executor fixture filenames, all under `crates/ck-exec/tests/fixtures/`:
 | Claude | `claude_ratelimit_go.json` |
 | Codex | `codex_chrome_hello.json`, `codex_client_translate_go.json`, `codex_go.json`, `codex_go_v8.0.35.json`, `codex_live_go.json`, `codex_siwc_bind_go.json`, `codex_siwc_expiry_go.json`, `codex_siwc_go.json`, `codex_tokens_go.json`, `codex_tool_schema_go.json`, `codex_web_search_history_go.json`, `codex_ws_deflate_go.json`, `codex_ws_errors.json` |
 | OpenAI-compatible | `openai_compat_go.json`, `openai_compat_go_v8.0.35.json` |
-| xAI | `xai_auth_go.json`, `xai_go.json`, `xai_go_v8.0.35.json`, `xai_ws_go.json` |
+| xAI | `xai_auth_go.json`, `xai_go.json`, `xai_go_v8.0.35.json` |
 | Shared boundary | `go_url_string.json`, `multipart_form_go.json`, `payload_media_go.json`, `proxy_go.json` |
 
 The 24 server JSON fixture filenames, all under `crates/ck-server/tests/fixtures/`:

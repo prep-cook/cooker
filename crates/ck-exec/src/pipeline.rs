@@ -33,7 +33,8 @@ use futures_util::StreamExt;
 use http::HeaderMap;
 use tokio::task::JoinHandle;
 
-use crate::types::{Attempt, Body, Counted, Execute, Request, Streams};
+use crate::session::{Turn, Turns};
+use crate::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
 
 /// The producer task. Its output is the attempt's routing outcome: `Err` carries the
 /// failure scope of an upstream that failed after answering, for the scheduler and
@@ -90,17 +91,7 @@ pub async fn start<E: Execute>(
     upload: &mut Writer,
     mut response: Writer,
 ) -> Result<Started, ExecError> {
-    // Attached before the upstream request, so a refusal costs no upstream call.
-    let published = match attempt.store.reader(response.id(), 0) {
-        Ok(reader) => Published {
-            reader,
-            last: Last::Other,
-        },
-        Err(error) => {
-            response.finish(Terminal::UpstreamError);
-            return Err(stored(&error));
-        }
-    };
+    let published = attach(attempt, &mut response)?;
     let streams = Streams {
         request: upload,
         response: &mut response,
@@ -117,16 +108,64 @@ pub async fn start<E: Execute>(
         },
     };
     match upstream {
-        Ok(upstream) => Ok(Started {
-            status: upstream.status,
-            headers: upstream.headers,
-            stream: response.allocator(),
-            producer: tokio::spawn(produce(upstream.body, upstream.ingress, response, published)),
-        }),
+        Ok(upstream) => Ok(spawn(upstream, response, published)),
         Err(error) => {
             response.finish(Terminal::UpstreamError);
             Err(error)
         }
+    }
+}
+
+/// [`start`] for one Responses WebSocket turn on `executor`'s upstream socket
+/// ([`Turns::turn`]). The server keeps the returned cancel and calls it when the client
+/// disconnects with the turn in flight.
+pub async fn start_turn<E: Turns>(
+    executor: &E,
+    attempt: &Attempt<'_>,
+    request: &Request<'_>,
+    upload: &mut Writer,
+    mut response: Writer,
+) -> Result<(Started, E::Cancel), ExecError> {
+    let published = attach(attempt, &mut response)?;
+    let streams = Streams {
+        request: upload,
+        response: &mut response,
+    };
+    match executor.turn(attempt, request, streams).await {
+        Ok(Turn { upstream, cancel }) => Ok((spawn(upstream, response, published), cancel)),
+        Err(error) => {
+            response.finish(Terminal::UpstreamError);
+            Err(error)
+        }
+    }
+}
+
+/// Attaches the producer's reader of what the ingress publishes, before the upstream
+/// request, so a refusal costs no upstream call.
+fn attach(attempt: &Attempt<'_>, response: &mut Writer) -> Result<Published, ExecError> {
+    match attempt.store.reader(response.id(), 0) {
+        Ok(reader) => Ok(Published {
+            reader,
+            last: Last::Other,
+        }),
+        Err(error) => {
+            response.finish(Terminal::UpstreamError);
+            Err(stored(&error))
+        }
+    }
+}
+
+/// Starts the producer of an upstream that answered.
+fn spawn<I: ResponseIngress + Send + 'static>(
+    upstream: Upstream<I>,
+    response: Writer,
+    published: Published,
+) -> Started {
+    Started {
+        status: upstream.status,
+        headers: upstream.headers,
+        stream: response.allocator(),
+        producer: tokio::spawn(produce(upstream.body, upstream.ingress, response, published)),
     }
 }
 

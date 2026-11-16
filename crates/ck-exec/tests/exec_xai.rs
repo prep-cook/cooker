@@ -1,7 +1,7 @@
 //! The xAI executor through the pipeline against a local upstream: the request each client
 //! protocol sends, the canonical response every client egress accepts, xAI's line rules, the
-//! local count, the native compact, reasoning replay, and failures before and after the
-//! upstream answered.
+//! local count, the native compact, reasoning replay, failures before and after the upstream
+//! answered, and Responses WebSocket turns on xAI's upstream socket.
 
 mod support;
 
@@ -289,3 +289,5 @@ mod heap;
 mod parity;
 #[path = "exec_xai/replay.rs"]
 mod replay;
+#[path = "exec_xai/socket.rs"]
+mod socket;
