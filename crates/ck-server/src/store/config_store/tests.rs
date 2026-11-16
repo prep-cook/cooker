@@ -708,8 +708,9 @@ fn patch_and_set_cannot_bypass_secret_resends_by_omitting_the_key() {
     }
 }
 
-/// The removed Home settings (the `home` section and the credential settings) and the
-/// removed `plugins` section are unknown keys: YAML import and management writes refuse
+/// The removed Home settings (the `home` section and the credential settings), the
+/// removed `plugins` section and the removed request keepalive and bootstrap-retry settings
+/// are unknown keys: YAML import and management writes refuse
 /// them in every spelling and publish no revision.
 #[test]
 fn removed_home_settings_are_rejected_without_a_revision() {
@@ -733,6 +734,8 @@ fn removed_home_settings_are_rejected_without_a_revision() {
         "plugins: {auth-revision: null}",
         "plugins: {enabled: true}",
         "plugins: {configs: {acme: {enabled: true, ratio: 1.5}}}",
+        "requests: {nonstream-keepalive-interval: 3}",
+        "requests: {streaming: {bootstrap-retries: 2}}",
     ] {
         assert!(store.import_yaml(&format!("{yaml}\n"), "t", "").is_err(), "{yaml}");
         assert_eq!(store.head().unwrap(), head, "{yaml}");
