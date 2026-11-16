@@ -363,11 +363,11 @@ pub(crate) fn with_extended_ttl(betas: &str) -> String {
 /// The documented betas `body` needs on every path, custom headers included, added to `betas`;
 /// `None` when it needs none, so the header stays as built: thinking binding for
 /// `thinking.block_binding`, and compaction for a body that asks for one (`"compaction"`) or
-/// opens with a compaction block, which Anthropic accepts only first.
+/// carries a compaction block in any message. A body the cloak shapes keeps the block where
+/// the client placed it (contract G5).
 pub(crate) fn documented(betas: &str, body: &str) -> Option<String> {
     let binding = rawjson::get(body, "thinking.block_binding").exists();
-    let compaction = rawjson::get(body, "compaction").exists()
-        || rawjson::get(body, "messages.0.content.0.type").str() == "compaction";
+    let compaction = rawjson::get(body, "compaction").exists() || carries_compaction(body);
     let mut betas = (binding || compaction).then(|| dedup(betas, ""))?;
     for (needed, beta) in [(binding, THINKING_BINDING), (compaction, COMPACTION)] {
         if needed && !betas.iter().any(|b| b == beta) {
@@ -375,6 +375,25 @@ pub(crate) fn documented(betas: &str, body: &str) -> Option<String> {
         }
     }
     Some(betas.join(","))
+}
+
+// ponytail: the walk below allocates per message and block, which every Claude request would pay
+// (`alloc.1900k`, `alloc.cloak.1900k` in bench/budgets.txt), so only a body naming `"compaction"`
+// is walked. A block whose type the client escaped (`\u0063ompaction`) gets no beta, and Anthropic
+// refuses it; an allocation-free walk would cover it.
+fn carries_compaction(body: &str) -> bool {
+    if !body.contains("\"compaction\"") {
+        return false;
+    }
+    let mut found = false;
+    rawjson::get(body, "messages").each(|_, message| {
+        message.get("content").each(|_, block| {
+            found = block.get("type").str() == "compaction";
+            !found
+        });
+        !found
+    });
+    found
 }
 
 /// Removes the recovery beta when the executor performs client-side recovery instead.

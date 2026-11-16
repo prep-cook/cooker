@@ -272,7 +272,7 @@ async fn streamed_and_unlimited_compactions_are_refused() {
     let mut request = fixture.streams.request();
     let mut ingress = responses_ingress(&fixture, &mut request, Operation::Compact);
     let verdict = fixture.fence(&mut ingress, &mut request, br#"{"model":"m","input":"hi"}"#);
-    assert!(matches!(verdict, Err(codec::Error::Schema)), "{verdict:?}");
+    assert!(matches!(verdict, Err(codec::Error::MaxTokensRequired)), "{verdict:?}");
     assert_eq!(upstream.requests(), 0);
 }
 

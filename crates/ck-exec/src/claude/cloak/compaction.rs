@@ -19,7 +19,7 @@ pub(crate) fn refuse_context(body: String) -> Result<String, ExecError> {
         return Err(ExecError::local(
             400,
             FailureScope::Request,
-            "Anthropic compaction refuses context_management; remove it from the request or the payload rule",
+            "compaction cannot be combined with context management; remove context_management from the request",
         ));
     }
     Ok(body)

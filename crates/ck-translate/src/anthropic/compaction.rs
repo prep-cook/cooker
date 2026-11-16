@@ -36,26 +36,41 @@ pub fn requested(view: RequestView<'_>) -> Result<bool> {
     Ok(view.operation == Operation::Compact || replay_from(view.document)?.is_some())
 }
 
-/// Refuses a compaction block Anthropic would not read as one: a block behind another part,
-/// which it refuses as misplaced, and a block in the system prompt, which the encoder would
-/// send as system text. Another protocol's `context_management` never reaches a compact
-/// because the egress writes only Anthropic members; the Claude executor's cloak adds none,
-/// and it refuses one a payload rule or the caller pairs with `compaction` (`ck-exec`).
+/// Refuses a compaction block Anthropic would not read as one: a block behind another part or
+/// behind a tool call the client placed first, which the egress writes back ahead of the
+/// content, both refused upstream as misplaced; and a block in the system prompt, which the
+/// encoder would send as system text. Another protocol's `context_management` never reaches a
+/// compact because the egress writes only Anthropic members; the Claude executor's cloak adds
+/// none, and it refuses one a payload rule or the caller pairs with `compaction` (`ck-exec`).
 pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     let doc = view.document;
     for message in doc.children(doc.required(doc.root(), "messages")?)? {
         let system = is(doc, message, "role", "system")? || is(doc, message, "role", "developer")?;
+        let leads = !system && !call_first(doc, message)?;
         if let Some(content) = doc.member(message, "content")?
             && matches!(doc.node(content)?.value, Value::Array)
         {
             for (index, part) in doc.children(content)?.enumerate() {
-                if (system || index != 0) && block(doc, part)? {
+                if (index != 0 || !leads) && block(doc, part)? {
                     return Err(Error::Unsupported);
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Whether the egress writes one of `message`'s tool calls ahead of its content.
+fn call_first(doc: &Document, message: usize) -> Result<bool> {
+    let Some(calls) = doc.member(message, "tool_calls")? else {
+        return Ok(false);
+    };
+    for call in doc.children(calls)? {
+        if super::request_encode::call_position(doc, call)? == Some(0) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Writes the compaction request member of an on-demand compaction.

@@ -131,17 +131,37 @@ fn a_replayed_block_goes_first_and_unchanged_and_earlier_turns_stay_behind() {
     );
     assert_eq!(sent["system"], "Be brief.");
     // Anthropic accepts a block only at the head of a conversation message: one behind another
-    // block is misplaced, and one in the system prompt would be sent as system text.
-    for misplaced in [
-        format!(
-            r#"{{"model":"m","max_tokens":64,"messages":[{{"role":"assistant","content":[{{"type":"text","text":"x"}},{}]}},{{"role":"user","content":"go"}}]}}"#,
-            block()
+    // block or a tool call is misplaced, and one in the system prompt would be sent as system
+    // text. Tool calls may follow the block in its message.
+    let call = json!({"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}});
+    let result =
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]});
+    let go = json!({"role": "user", "content": "go"});
+    let text = json!({"type": "text", "text": "x"});
+    for (body, accepted) in [
+        (
+            json!({"messages": [{"role": "assistant", "content": [&text, &native]}, &go]}),
+            false,
         ),
-        format!(
-            r#"{{"model":"m","max_tokens":64,"system":[{}],"messages":[{{"role":"user","content":"go"}}]}}"#,
-            block()
+        (json!({"system": [&native], "messages": [&go]}), false),
+        (
+            json!({"messages": [{"role": "assistant", "content": [&call, &native]}, &result]}),
+            false,
+        ),
+        (
+            json!({"messages": [{"role": "assistant", "content": [&native, &call]}, &result]}),
+            true,
         ),
     ] {
+        let mut body = body;
+        body["model"] = json!("m");
+        body["max_tokens"] = json!(64);
+        let body = body.to_string();
+        if accepted {
+            let (sent, _) = request(body.as_bytes(), Operation::Generate);
+            assert_eq!(sent["messages"][0]["content"], json!([&native, &call]), "{sent}");
+            continue;
+        }
         let mut mapped = Mapped::new();
         let mut ingress = anthropic::request::Ingress::new(
             &mut mapped.writer,
@@ -152,8 +172,8 @@ fn a_replayed_block_goes_first_and_unchanged_and_earlier_turns_stay_behind() {
         )
         .unwrap();
         let fenced = ingress
-            .advance(&mut mapped.writer, misplaced.as_bytes())
+            .advance(&mut mapped.writer, body.as_bytes())
             .and_then(|()| ingress.finish(&mut mapped.writer, &anthropic::request::AnthropicCapability::default()));
-        assert!(matches!(fenced, Err(codec::Error::Unsupported)), "{misplaced}");
+        assert!(matches!(fenced, Err(codec::Error::Unsupported)), "{body}");
     }
 }

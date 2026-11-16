@@ -333,7 +333,7 @@ fn message_value(view: RequestView<'_>, message: usize, at: At, e: &mut Encoder<
     originals(doc, message, e)?;
     e.bytes(b"}")
 }
-fn call_position(doc: &Document, call: usize) -> Result<Option<u64>> {
+pub(super) fn call_position(doc: &Document, call: usize) -> Result<Option<u64>> {
     super::content::history(doc, call)?
         .map(|entry| doc.unsigned(doc.required(entry, "block_index")?))
         .transpose()
