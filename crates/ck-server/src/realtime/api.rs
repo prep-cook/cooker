@@ -130,7 +130,13 @@ impl Drop for Live {
 
 pub fn routes(rt: &Arc<Runtime>) -> Router<Arc<Runtime>> {
     // Deploy-only: read once when the routes are built.
-    routes_with(rt, Arc::new(Live::new(rt.config().realtime())))
+    #[cfg_attr(not(any(test, feature = "testing")), allow(unused_mut))]
+    let mut live = Live::new(rt.config().realtime());
+    #[cfg(any(test, feature = "testing"))]
+    if rt.passthrough_media_relay.load(std::sync::atomic::Ordering::Relaxed) {
+        live.relays.fixed = Some(Arc::new(relay::PassThrough));
+    }
+    routes_with(rt, Arc::new(live))
 }
 
 fn routes_with(rt: &Arc<Runtime>, live: Arc<Live>) -> Router<Arc<Runtime>> {

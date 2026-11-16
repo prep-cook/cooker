@@ -166,16 +166,18 @@ EOF
 FROM scratch AS test-report
 COPY --from=test /home/builder/out/ /
 
-# The release binary. The default build excludes the CPU profiler and its symbol resolver.
+# The release binary. It excludes the CPU profiler and its symbol resolver, and includes the
+# WebRTC media relay: without it every WebRTC call answers 501 (owner ruling E-Q3).
 FROM source AS build
 ARG BUILD_JOBS
 RUN --mount=type=cache,id=cooker-cargo-src-release,target=/usr/local/cargo/registry/src,uid=1000,gid=1000 \
     --mount=type=cache,id=cooker-target-release,target=/src/target,uid=1000,gid=1000 <<'EOF'
-if cargo tree --locked -p cooker --edges normal --prefix none | grep -E '^(pprof|backtrace) v'; then
+features=ck-server/media-relay
+if cargo tree --locked -p cooker --features "$features" --edges normal --prefix none | grep -E '^(pprof|backtrace) v'; then
   echo 'Release binaries must exclude CPU profiling and symbol resolution'
   exit 1
 fi
-cargo build --release --locked -p cooker ${BUILD_JOBS:+--jobs "$BUILD_JOBS"}
+cargo build --release --locked -p cooker --features "$features" ${BUILD_JOBS:+--jobs "$BUILD_JOBS"}
 install -D -m 0755 target/release/cooker /home/builder/out/cooker
 EOF
 

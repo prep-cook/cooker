@@ -1,7 +1,7 @@
-//! The optional WebRTC media relay seam (live.go `mediaRelayFactory`,
-//! `mediaRelaySession`, `Handler.UpdateConfig`): with `codex.live-media-relay.enabled`,
-//! the proxy terminates the client's WebRTC session and opens its own to the upstream, so
-//! media flows through this host instead of straight to OpenAI.
+//! The WebRTC media relay seam (live.go `mediaRelayFactory`, `mediaRelaySession`,
+//! `Handler.UpdateConfig`): with `codex.live-media-relay.enabled`, the proxy terminates the
+//! client's WebRTC session and opens its own to the upstream, so media flows through this
+//! host. A call without the relay answers 501: no media goes straight to the upstream.
 //!
 //! The relay itself (`media`, feature `media-relay`) is behind this interface so the call
 //! handler and the call store do not depend on a WebRTC stack; default builds have none.
@@ -9,8 +9,10 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ck_core::config::Config;
+use ck_exec::session::Frame;
 use futures_util::future::BoxFuture;
 use serde_yaml_ng::Value;
+use tokio::sync::mpsc;
 
 /// A relay failure: Go's `clienterror.HTTPStatusFromErrorOr(err, 502)` and its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,8 +48,11 @@ pub(crate) trait MediaSession: Send + Sync {
     /// Applies the upstream's SDP answer and returns the answer for the client.
     fn accept_upstream_answer(&self, answer: String) -> BoxFuture<'_, Result<String, RelayError>>;
     fn set_call_id(&self, call_id: &str);
-    /// Called once when the media fails or closes on its own; at once if it already did.
-    fn set_close_handler(&self, handler: CloseHandler);
+    /// The `oai-events` data channel of both peers, for the call's live session; `None` once
+    /// taken.
+    fn events(&self) -> Option<Events>;
+    /// RTP packets and payload bytes relayed so far.
+    fn rtp(&self) -> Rtp;
     /// Idempotent.
     fn close(&self, reason: &str);
     /// Runs `then` once a started close finished (Go's `CloseWithReason` returns after
@@ -61,8 +66,24 @@ pub(crate) trait MediaSession: Send + Sync {
 /// not be built.
 pub(crate) type CurrentRelay = Result<Option<Arc<dyn MediaRelay>>, String>;
 
-/// Runs once when a media session ends on its own, with the reason.
-pub(crate) type CloseHandler = Box<dyn FnOnce(String) + Send>;
+/// A relayed call's `oai-events` data channel as its live session drives it. Each peer's
+/// messages arrive in order, text and binary apart; a channel the peer closed ends with
+/// [`Frame::Close`], and a failed channel or peer ends the receiver without one. A queued
+/// message is sent unchanged once that peer's channel is open; a [`Frame::Close`] is not
+/// sent, since closing the media session closes both peers.
+pub(crate) struct Events {
+    pub from_client: mpsc::Receiver<Frame>,
+    pub to_client: mpsc::Sender<Frame>,
+    pub from_upstream: mpsc::Receiver<Frame>,
+    pub to_upstream: mpsc::Sender<Frame>,
+}
+
+/// RTP relayed per sender: packets, then payload bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Rtp {
+    pub client: [u64; 2],
+    pub upstream: [u64; 2],
+}
 
 /// A started session and the offer to send upstream instead of the client's.
 pub(crate) type NewSession = Result<(Arc<dyn MediaSession>, String), RelayError>;
@@ -214,7 +235,7 @@ pub(crate) struct Relays {
     state: Mutex<Option<Current>>,
     limiter: Arc<Limiter>,
     /// Test hook: always this relay.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fixed: Option<Arc<dyn MediaRelay>>,
 }
 
@@ -244,7 +265,7 @@ impl Relays {
     }
 
     fn current_locked(&self, mut state: std::sync::MutexGuard<'_, Option<Current>>, cfg: &Config) -> CurrentRelay {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if let Some(fixed) = &self.fixed {
             return Ok(Some(fixed.clone()));
         }
@@ -279,17 +300,44 @@ impl Relays {
     }
 
     /// Default builds carry no WebRTC stack: an enabled relay is reported once per
-    /// config and calls negotiate end to end with the upstream media servers.
+    /// config and every call answers 501.
     #[cfg(not(feature = "media-relay"))]
     fn build(&self, config: &RelayConfig) -> CurrentRelay {
         if config.enabled {
             tracing::warn!(
-                "codex.live-media-relay is enabled, but this build lacks the media relay (cargo feature `media-relay`); Codex Live calls negotiate without it"
+                "codex.live-media-relay is enabled, but this build lacks the media relay (cargo feature `media-relay`); WebRTC calls answer 501"
             );
         }
         let _ = &self.limiter;
         Ok(None)
     }
+}
+
+/// A relay that hands the client's offer upstream and the upstream's answer back unchanged
+/// and has no data channel ([`crate::testing::passthrough_media_relay`]).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) struct PassThrough;
+
+#[cfg(any(test, feature = "testing"))]
+impl MediaRelay for PassThrough {
+    fn new_session(&self, offer: String, _: Route, _: Hold) -> BoxFuture<'_, NewSession> {
+        Box::pin(async move { Ok((Arc::new(PassThrough) as Arc<dyn MediaSession>, offer)) })
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl MediaSession for PassThrough {
+    fn accept_upstream_answer(&self, answer: String) -> BoxFuture<'_, Result<String, RelayError>> {
+        Box::pin(async move { Ok(answer) })
+    }
+    fn set_call_id(&self, _: &str) {}
+    fn events(&self) -> Option<Events> {
+        None
+    }
+    fn rtp(&self) -> Rtp {
+        Rtp::default()
+    }
+    fn close(&self, _: &str) {}
 }
 
 #[cfg(test)]
@@ -343,10 +391,10 @@ mod tests {
         assert!(relays.current(&cfg("{}")).unwrap().is_none(), "disabled");
     }
 
-    /// Without the feature an enabled relay is not an error: calls negotiate without it.
+    /// Without the feature an enabled relay is not a config error; calls answer 501.
     #[cfg(not(feature = "media-relay"))]
     #[test]
-    fn builds_without_the_relay_negotiate_without_it() {
+    fn builds_without_the_relay_have_none() {
         let relays = Relays::default();
         let enabled = cfg("oauth:\n  providers:\n    codex:\n      live-media-relay:\n        enabled: true\n");
         assert!(relays.current(&enabled).unwrap().is_none());

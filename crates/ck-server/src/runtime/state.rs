@@ -124,6 +124,10 @@ pub struct Runtime {
     pub(crate) model_router: crate::inference::model_router::State,
     /// The stream store, committed stream handles and stream tasks.
     streams: crate::inference::streams::Registry,
+    /// Test hook ([`crate::testing::passthrough_media_relay`]): WebRTC calls use a media relay
+    /// that hands offers and answers through unchanged.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) passthrough_media_relay: std::sync::atomic::AtomicBool,
 }
 
 /// The Codex refresh transactions under a credential file's lock: shutdown stops the
@@ -230,6 +234,8 @@ impl Runtime {
             managed_config: Default::default(),
             model_router: Default::default(),
             streams: Default::default(),
+            #[cfg(any(test, feature = "testing"))]
+            passthrough_media_relay: Default::default(),
         };
         #[cfg(any(test, feature = "testing"))]
         if let Some(clock) = clock {

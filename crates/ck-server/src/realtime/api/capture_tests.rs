@@ -90,7 +90,11 @@ async fn start(dir: &Path, upstream_url: &str) -> String {
         },
     );
     let app = axum::Router::new()
-        .merge(routes_with(&rt, Arc::new(Live::default())))
+        .merge(routes_with(&rt, {
+            let mut live = Live::default();
+            live.relays.fixed = Some(Arc::new(relay::PassThrough));
+            Arc::new(live)
+        }))
         .with_state(rt);
     serve(crate::observability::request_logging::router(&management, app)).await
 }
@@ -323,11 +327,13 @@ async fn sdp_ice_credentials_stay_out_of_spooled_sections() {
     for secret in ["offerufrag", "offerpwd", "answerufrag", "answerpwd"] {
         assert!(!log.contains(secret), "{secret} in the log");
     }
-    for name in ["API REQUEST 1", "API RESPONSE 1"] {
-        let text = section(&log, name);
-        // Each attribute line, `name:value`, prints as the placeholder.
-        assert!(text.matches("<redacted url>\n").count() > 2048, "{name} logged in full");
-    }
+    // The relay sends its offer upstream as one JSON line; the upstream's answer stays SDP,
+    // whose every attribute line, `name:value`, prints as the placeholder.
+    let text = section(&log, "API RESPONSE 1");
+    assert!(
+        text.matches("<redacted url>\n").count() > 2048,
+        "API RESPONSE 1 logged in full"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -58,7 +58,7 @@ UI scale/layout values remain in `ui/DESIGN.md` and code limits in `ui/CONVENTIO
 | Status check interval while several jobs run | | | Orchestrator; decision 13 |
 | Commit subject length | 72 characters; source: CONTRIBUTING.md, Commits and pull request titles | A setting, not measured | .github/scripts/pr-title.py checks PR titles; commit hook absent |
 | Linux release sizes | Binary 52000000 B; text 35000000 B; rodata 11000000 B; zero tolerance; source: bench/budgets.txt size.x86_64-unknown-linux-gnu | | bench/gate.sh size |
-| Duplicate linked crate versions | 11 crates, zero tolerance; source: bench/budgets.txt deps.x86_64-unknown-linux-gnu.duplicate_crates | | bench/gate.sh size |
+| Duplicate linked crate versions | 12 crates, zero tolerance; source: bench/budgets.txt deps.x86_64-unknown-linux-gnu.duplicate_crates | | bench/gate.sh size |
 | Linux idle | With 1 and 2000 credentials: 3 wakeups, 1 CPU tick, 6 threads; RSS 33500 and 85800 KB with 10% tolerance, measured in the Dockerfile perf stage; source: bench/budgets.txt idle.linux | | bench/gate.sh idle |
 | Field-mix soak peak | 173072 KB with 20% tolerance; source: bench/budgets.txt soak.field.peak_hwm_kb | | bench/soak.sh |
 | Request heap budgets | Per-route peak bytes, allocations and held bytes with keyed tolerances in bench/budgets.txt alloc.* | | crates/ck-server/tests/alloc_budget.rs through nextest |

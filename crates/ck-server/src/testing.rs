@@ -307,6 +307,14 @@ pub fn without_auth_dir(yaml: &str) -> String {
     out.concat()
 }
 
+/// Makes the routes built from `rt` afterwards run WebRTC calls through a media relay that
+/// hands the client's offer upstream and the upstream's answer back unchanged and has no data
+/// channel, so a test stores calls without a WebRTC stack.
+pub fn passthrough_media_relay(rt: &Runtime) {
+    rt.passthrough_media_relay
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A local runtime with a private SQLite database whose executors cannot leave the
 /// machine. The `.json` files a test staged in `config.auth_dir` and the files of
 /// `credentials` are saved to the database first.
