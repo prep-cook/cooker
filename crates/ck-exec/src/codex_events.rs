@@ -5,7 +5,9 @@
 //! - Data spread over several `data:` lines is joined (`codex_sse`), and each payload is
 //!   trimmed and has the client's `collaboration` names restored when the request renamed
 //!   them (multi-agent v2). Data that is not UTF-8 ends the body with an upstream failure.
-//! - A terminal failure event ends the body with its classified error. An invalid-signature
+//! - A terminal failure event ends the body with its classified error. A `response.failed`
+//!   passes to the ingress first, which publishes its identity and usage and leaves the
+//!   `error` record to that error (`Ingress::classified_failures`). An invalid-signature
 //!   failure clears the reasoning replay.
 //! - Only `response.completed` and `response.incomplete` end the response. An empty terminal
 //!   output gets the announced items from scratch leases. Only completed turns enter replay.
@@ -225,15 +227,20 @@ impl Events {
 
     /// Go's rules on one data payload, in Go's order; queues the line it becomes.
     fn payload(&mut self, payload: &str) -> Result<(), ExecError> {
-        match self.backend {
-            Backend::Codex { model_level_cooling } => self.codex_failure(payload, model_level_cooling)?,
-            Backend::Meta => {
-                if let Some(error) = crate::meta::stream_event_error(payload.as_bytes()) {
-                    return Err(error);
-                }
-            }
-        }
+        let failure = match self.backend {
+            Backend::Codex { model_level_cooling } => self.codex_failure(payload, model_level_cooling),
+            Backend::Meta => crate::meta::stream_event_error(payload.as_bytes()),
+        };
         let kind = gjson::get(payload, "type");
+        if let Some(error) = failure {
+            // Only JSON the ingress can parse, so its decoding never replaces this error.
+            if kind.str() == "response.failed" && gjson::valid(payload) {
+                self.text(b"data: ");
+                self.text(payload.as_bytes());
+                self.text(b"\n\n");
+            }
+            return Err(error);
+        }
         match kind.str() {
             "response.output_item.done" => self.collect(payload)?,
             kind @ ("response.completed" | "response.incomplete") => {
@@ -249,14 +256,12 @@ impl Events {
     }
 
     /// Classify Codex failure events without changing incomplete terminals.
-    fn codex_failure(&mut self, payload: &str, model_level_cooling: bool) -> Result<(), ExecError> {
-        if let Some((error, body)) = response::terminal_failure(payload, model_level_cooling) {
-            if let Some((cache, scope)) = &self.replay {
-                crate::codex_replay::clear_on_invalid_signature(cache, scope, error.status, body.as_bytes());
-            }
-            return Err(error);
+    fn codex_failure(&mut self, payload: &str, model_level_cooling: bool) -> Option<ExecError> {
+        let (error, body) = response::terminal_failure(payload, model_level_cooling)?;
+        if let Some((cache, scope)) = &self.replay {
+            crate::codex_replay::clear_on_invalid_signature(cache, scope, error.status, body.as_bytes());
         }
-        Ok(())
+        Some(error)
     }
 
     /// Keeps an announced item in a scratch lease, replacing an earlier one at its index.

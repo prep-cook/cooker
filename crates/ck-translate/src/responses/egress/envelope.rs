@@ -4,7 +4,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     /// Ends the response as failed with a sanitized error, as the body in buffered mode and in
     /// a `response.failed` event when streaming. A failure the upstream reported itself (an
     /// `error` record with a `type`) first gets the official `error` event, which the client SDK
-    /// raises, with the same sanitized values.
+    /// raises, with the same sanitized values as its top-level `code`, `message` and `param`.
     pub(super) fn failed(
         &mut self,
         owner: &mut Writer,
@@ -17,8 +17,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         self.created(owner, output)?;
         self.terminal = true;
         if kind == Kind::Error && record.member(record.root(), "type")?.is_some() {
-            let payload =
-                b",\"error\":{\"type\":\"server_error\",\"code\":\"server_error\",\"message\":\"Response failed\"}";
+            let payload = b",\"code\":\"server_error\",\"message\":\"Response failed\",\"param\":null";
             self.emit(owner, "error", |e| e.bytes(payload), output)?;
         }
         let doc = &mut self.document;

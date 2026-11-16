@@ -296,9 +296,10 @@ impl ResponseIngress for CodexIngress {
     }
 }
 
-/// The Responses ingress of one streamed generation on `response`.
+/// The Responses ingress of one streamed generation on `response`, behind the Codex event
+/// rules (`codex_events`), which classify its failure events.
 pub(crate) fn generation(response: &mut ck_stream::Writer, attempt: &Attempt<'_>) -> Result<CodexIngress, ExecError> {
-    let ingress = Ingress::new(
+    let mut ingress = Ingress::new(
         response,
         attempt.identity,
         Operation::Generate,
@@ -306,6 +307,7 @@ pub(crate) fn generation(response: &mut ck_stream::Writer, attempt: &Attempt<'_>
         SCANNER_MAX_LINE as u64,
     )
     .map_err(encoding)?;
+    ingress.classified_failures();
     Ok(CodexIngress::Responses(Box::new(ingress)))
 }
 

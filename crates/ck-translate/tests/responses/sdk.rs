@@ -186,8 +186,9 @@ fn native_tool_settings_and_buffered_text_survive_the_defaults() {
 }
 
 /// A real OpenAI `error` event (nested `error`, no `response`) is the upstream's own failure:
-/// a Responses client receives the official `error` event, which the SDK raises, and a Chat
-/// client an upstream failure. Both carry the gateway's sanitized values, never upstream detail.
+/// a Responses client receives the official `error` event, with `code`, `message` and `param` at
+/// its top level as the SDK reads them, and a Chat client an upstream failure. Both carry the
+/// gateway's sanitized values, never upstream detail.
 #[test]
 fn openai_error_event_reaches_clients_as_a_sanitized_upstream_failure() {
     let created = json!({"type":"response.created","response":{"id":"resp_1","object":"response","created_at":1,"model":"m","status":"in_progress","output":[]},"sequence_number":0});
@@ -198,7 +199,6 @@ fn openai_error_event_reaches_clients_as_a_sanitized_upstream_failure() {
     let input = format!(
         "event: response.created\ndata: {created}\n\nevent: error\ndata: {event}\n\nevent: response.failed\ndata: {failed}\n\n"
     );
-    let sanitized = json!({"type":"server_error","code":"server_error","message":"Response failed"});
     for (client, mode) in [
         ("responses", BodyMode::Streaming),
         ("responses", BodyMode::Buffered),
@@ -219,7 +219,12 @@ fn openai_error_event_reaches_clients_as_a_sanitized_upstream_failure() {
                 assert!(text.contains("event: error\n"), "{text}");
                 let events = super::cross::client_events(text.as_bytes());
                 let official = events.iter().find(|e| e["type"] == "error").unwrap();
-                assert_eq!(official["error"], sanitized);
+                assert_eq!(
+                    official,
+                    &json!({"type":"error","sequence_number":official["sequence_number"],
+                        "code":"server_error","message":"Response failed","param":null})
+                );
+                assert!(official["sequence_number"].is_u64(), "{official}");
                 let last = events.last().unwrap();
                 assert_eq!(last["type"], "response.failed");
                 assert_eq!(last["response"]["error"]["code"], "server_error");
@@ -380,5 +385,43 @@ fn input_after_an_upstream_error_is_ignored_at_every_split() {
             (&json!("server_error"), &json!("upstream")),
             "split {split}"
         );
+    }
+}
+
+/// With classified failures the executor's error ends a failed response: the response's usage
+/// comes first, whatever its member order, then one `error` record with the executor's status,
+/// or the default 502 when the body ends instead. No upstream error detail is published.
+#[test]
+fn a_classified_failure_takes_the_executors_status() {
+    let failed = b"event: response.failed\ndata: {\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":2,\"total_tokens\":9},\"error\":{\"code\":\"server_error\",\"message\":\"https://vendor.invalid/x\"},\"status\":\"failed\",\"id\":\"resp_up\"},\"type\":\"response.failed\"}\n\n";
+    for (executor, status) in [(Some(429), 429), (None, 502)] {
+        let mut m = Mapped::new();
+        let mut ingress = responses::response::Ingress::new(
+            &mut m.writer,
+            identity(Direction::Response),
+            Operation::Generate,
+            BodyMode::Streaming,
+            1024 * 1024,
+        )
+        .unwrap();
+        ingress.classified_failures();
+        ingress.advance(&mut m.writer, failed).unwrap();
+        match executor {
+            Some(status) => ingress.fail(&mut m.writer, status, "upstream").unwrap(),
+            None => assert!(ingress.finish(&mut m.writer).is_err()),
+        }
+        let events = events(&m);
+        let text = serde_json::to_string(&events).unwrap();
+        assert!(!text.contains("vendor.invalid"), "{text}");
+        let errors: Vec<usize> = (0..events.len())
+            .filter(|&i| events[i]["code"] == "stream.invalid_input")
+            .collect();
+        assert_eq!(errors.len(), 1, "{text}");
+        assert_eq!(events[errors[0]]["status"], status, "{text}");
+        let usage = events
+            .iter()
+            .position(|e| e["usage"].to_string().contains("\"input_tokens\":7"))
+            .unwrap_or_else(|| panic!("no usage: {text}"));
+        assert!(usage < errors[0], "{text}");
     }
 }
