@@ -193,11 +193,11 @@ impl Index {
 
     /// Reserves a slot for `id`. A full table first drops every entry whose streams are gone
     /// and every background turn that ended without a response; `false` when it is still full.
-    /// A background turn keeps the slot reserved at its start, and finds none once it was
-    /// deleted.
-    pub(crate) fn reserve(&self, capacity: usize, id: ResponseId, background: bool) -> bool {
+    /// A `pending` turn, a buffered background one, keeps the slot reserved at its start, and
+    /// finds none once it was deleted.
+    pub(crate) fn reserve(&self, capacity: usize, id: ResponseId, pending: bool) -> bool {
         self.slots(capacity, |slots| {
-            if background {
+            if pending {
                 return matches!(slots.entries.get(&id), Some(Slot::Background(_)));
             }
             slots.insert(id, Slot::Reserved)
@@ -377,7 +377,8 @@ pub(crate) struct Publication {
     index: Arc<Index>,
     capacity: usize,
     id: ResponseId,
-    background: bool,
+    /// The turn's slot was reserved at its start ([`background`]).
+    pending: bool,
     entry: Mutex<Progress>,
     decided: watch::Sender<bool>,
 }
@@ -404,7 +405,7 @@ impl Publication {
             index: streams.responses().clone(),
             capacity,
             id: turn.id,
-            background: turn.background,
+            pending: pending_turn(exchange).is_some(),
             entry: Mutex::new(Progress {
                 reserved: false,
                 ended: None,
@@ -434,8 +435,8 @@ impl Publication {
         if progress.reserved || *self.decided.borrow() {
             return;
         }
-        if !self.index.reserve(self.capacity, self.id, self.background) {
-            if !self.background {
+        if !self.index.reserve(self.capacity, self.id, self.pending) {
+            if !self.pending {
                 tracing::warn!(target: "ck_dispatch", "history not retained: the response index is full");
             }
             self.decided.send_replace(true);
@@ -716,10 +717,13 @@ fn conversation(doc: &Document, x: usize) -> codec::Result<bool> {
     })
 }
 
-/// Removes `background` from the request every candidate gets: cooker runs a background turn
-/// itself, and the upstream serves an ordinary one, streamed or not as its transport needs.
+/// Removes `background` from the request every candidate gets, the first decode and every
+/// document an attempt rebuilds from the request stream: cooker runs a background turn itself,
+/// and the upstream serves an ordinary one, streamed or not as its transport needs.
 pub fn withdraw_background(doc: &mut Document) -> codec::Result<()> {
-    let x = doc.required(doc.root(), "x_ck")?;
+    let Some(x) = doc.member(doc.root(), "x_ck")? else {
+        return Ok(());
+    };
     let Some(providers) = doc.member(x, "provider_parameters")? else {
         return Ok(());
     };
@@ -806,10 +810,7 @@ pub struct Pending {
 /// stream is delivered live and is retrieved like any stored turn. `model` is the model the
 /// client asked for.
 pub fn background(streams: &Registry, exchange: &Exchange, model: &str) -> Result<Option<Pending>, Refused> {
-    let Some(turn) = exchange
-        .turn
-        .filter(|turn| turn.background && exchange.output.framing == Framing::Json)
-    else {
+    let Some(turn) = pending_turn(exchange) else {
         return Ok(None);
     };
     let capacity = streams.store().map_err(stored_error)?.limits().header_slots as usize;
@@ -828,6 +829,14 @@ pub fn background(streams: &Registry, exchange: &Exchange, model: &str) -> Resul
         model: model.into(),
         created_at,
     }))
+}
+
+/// The turn of `exchange` that runs under a slot reserved from its start: a buffered
+/// `background` turn. A streamed one is published as any stored turn.
+fn pending_turn(exchange: &Exchange) -> Option<Turn> {
+    exchange
+        .turn
+        .filter(|turn| turn.background && exchange.output.framing == Framing::Json)
 }
 
 impl Pending {

@@ -788,6 +788,14 @@ async fn every_miss_is_the_same_not_found() {
 /// it and logged, and the conversation's text goes on (Settled 73).
 #[tokio::test]
 async fn another_credential_continues_without_foreign_reasoning() {
+    for background in [false, true] {
+        continues_without_foreign_reasoning(background).await;
+    }
+}
+
+/// The rebuilt request of a `background` continuation carries no `background`, which a Chat
+/// destination would refuse.
+async fn continues_without_foreign_reasoning(background: bool) {
     let fixture = fixture(|_| {});
     let fake = Fake::new();
     fake.set("a", Script::Signed("signed"));
@@ -803,12 +811,14 @@ async fn another_credential_continues_without_foreign_reasoning() {
         .with_max_level(tracing::Level::INFO)
         .with_writer(move || writer.clone())
         .finish();
-    let text = read(committed(
-        send(&fixture, &fake, Ask::new("more").after(&first))
-            .with_subscriber(subscriber)
-            .await,
-    ))
-    .await;
+    let mut ask = Ask::new("more").after(&first);
+    ask.body["background"] = json!(background);
+    let answer = send(&fixture, &fake, ask).with_subscriber(subscriber).await;
+    let text = match answer {
+        Answer::Committed(response) => read(response).await,
+        Answer::Refused(refused) => panic!("background {background}: refused {refused:?}"),
+        Answer::Failed(status) => panic!("background {background}: failed with {status}"),
+    };
     assert!(text.contains("again"), "{text}");
     let sent = fake.sent();
     let (_, body) = sent.iter().find(|(credential, _)| credential == "b").unwrap();
@@ -961,13 +971,23 @@ async fn resource(fixture: &Fixture, key: &str, method: &str, id: &str, suffix: 
     )
 }
 
-/// Only the owner retrieves, cancels or deletes a stored response; every other id gets the one
-/// not-found answer, and a deleted response is neither found nor continued.
+/// Only the owner retrieves, cancels or deletes a stored response, streamed in the background or
+/// not; every other id gets the one not-found answer, and a deleted response is neither found
+/// nor continued. Cancelling a completed background response shows it as it is.
 #[tokio::test]
 async fn a_stored_response_is_served_to_its_owner_only() {
+    for background in [false, true] {
+        stored_response_rows(background).await;
+    }
+}
+
+async fn stored_response_rows(background: bool) {
     let fixture = fixture(|_| {});
     let fake = Fake::new();
-    let id = turn(&fixture, &fake, Ask::new("hi")).await;
+    let mut ask = Ask::new("hi");
+    ask.body["background"] = json!(background);
+    let id = turn(&fixture, &fake, ask).await;
+    let cancelled = if background { 200 } else { 400 };
     let unknown = "resp_0123456789abcdef0123456789abcdef";
     let (_, not_found) = resource(&fixture, KEY, "GET", unknown, "").await;
     assert_eq!(not_found["error"]["type"], "invalid_request_error", "{not_found}");
@@ -977,21 +997,22 @@ async fn a_stored_response_is_served_to_its_owner_only() {
         (KEY, "GET", "not-an-id", "", 404),
         (OTHER, "DELETE", &id, "", 404),
         (OTHER, "POST", &id, "/cancel", 404),
-        (KEY, "POST", &id, "/cancel", 400),
+        (KEY, "POST", &id, "/cancel", cancelled),
         (KEY, "DELETE", &id, "", 200),
         (KEY, "GET", &id, "", 404),
         (KEY, "DELETE", &id, "", 404),
         (KEY, "POST", &id, "/cancel", 404),
     ] {
         let (actual, body) = resource(&fixture, key, method, id, suffix).await;
-        let row = format!("{key} {method} {id}{suffix}: {body}");
+        let row = format!("background {background}, {key} {method} {id}{suffix}: {body}");
         assert_eq!(actual.as_u16(), status, "{row}");
         match (status, method) {
             (404, _) => assert_eq!(body, not_found, "{row}"),
-            (200, "GET") => {
+            (200, "GET" | "POST") => {
                 assert_eq!(body["id"], id, "{row}");
                 assert_eq!(body["status"], "completed", "{row}");
                 assert_eq!(body["output"][0]["content"][0]["text"], "hello", "{row}");
+                assert_eq!(body["background"] == json!(true), background, "{row}");
             }
             (200, "DELETE") => assert_eq!(body, json!({"id": id, "object": "response", "deleted": true})),
             _ => assert_eq!(body["error"]["type"], "invalid_request_error", "{row}"),
