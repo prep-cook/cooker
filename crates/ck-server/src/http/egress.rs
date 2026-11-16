@@ -98,7 +98,7 @@ pub async fn deliver(
 ) -> Result<Response, Box<Failed>> {
     let output = exchange.output;
     let reader = streams
-        .with_store(|store| store.reader(response.id(), 0))
+        .with_store(|store| store.egress_reader(response.id(), 0))
         .and_then(|reader| reader)
         .map_err(codec::Error::Storage);
     let publication = exchange.publication.clone();

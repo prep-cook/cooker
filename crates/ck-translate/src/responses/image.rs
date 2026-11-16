@@ -40,7 +40,7 @@ pub(super) fn publish(
     scope.media_id = Some(id);
     let mut publisher = start(owner, emitter, scope, partial)?;
     let mut hash = Sha256::new();
-    let mut chunk = [0; 36_864];
+    let mut chunk = [0; crate::codec::DATA_CHUNK_BYTES];
     let (mut used, mut index, mut offset) = (0, 0, 0);
     let mut ceiling = emitter.data_capacity(scope, index, offset)?;
     media::bytes(doc, descriptor(doc, data, id)?, |bytes| {

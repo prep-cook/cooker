@@ -13,8 +13,12 @@ mod os;
 #[cfg(test)]
 mod tests;
 
-const EXTENT: u32 = 21;
-const WARM: usize = 8;
+/// Frames backed at open and per growth step: 1 MiB, close to the 21 × 50,000-byte extent
+/// it replaces (owner W0-1, 2026-11-16: initial frames 256).
+const EXTENT: u32 = 256;
+/// Idle free frames decay keeps per worker list: the 400,000-byte budget of 8 × 50,000-byte
+/// frames rounded up to whole 4,096-byte frames (INTERNAL-STREAM §6.5) until measured.
+const WARM: usize = 98;
 static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static THREAD_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
@@ -200,6 +204,34 @@ impl FrameStates {
     }
 }
 
+impl FrameStates {
+    /// Zero the states of frames `first..=last`, which are free and cold, by dropping the
+    /// whole pages that hold only them; the next touch maps a zero page. Without this, one
+    /// cache line per frame of a past burst stays resident.
+    fn discard(&self, first: u32, last: u32, page: usize) -> io::Result<()> {
+        let size = std::mem::size_of::<FrameState>();
+        let start = (first as usize * size).next_multiple_of(page);
+        let end = (last as usize + 1) * size / page * page;
+        if end <= start {
+            return Ok(());
+        }
+        // SAFETY: the page-aligned range lies inside this private anonymous mapping. Zero
+        // bytes are the state of a free, cold frame, which every frame in it already holds,
+        // and the decay pass calling this holds the cold list, so no other thread writes them.
+        let result = unsafe {
+            libc::madvise(
+                self.mapping.base.as_ptr().add(start).cast(),
+                end - start,
+                libc::MADV_DONTNEED,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 impl Deref for FrameStates {
     type Target = [FrameState];
     fn deref(&self) -> &[FrameState] {
@@ -346,9 +378,8 @@ impl Pool {
             Some(frame) => frame,
             None => self.reclaim(local)?,
         };
-        // Populate outside every lock: the frame is this caller's alone. A resident frame may
-        // be populated only for smaller records, a cold one not at all; on refusal it joins
-        // the cold list, and eviction may free better ones.
+        // Populate outside every lock: the frame is this caller's alone. A cold frame is not
+        // populated; on refusal it joins the cold list, and eviction may free better ones.
         if let Err(error) = self.prefault(frame, needed) {
             lock(&self.slow.0).cold.push(frame);
             return Err(error);
@@ -405,12 +436,7 @@ impl Pool {
             return Ok(());
         }
         assert!(frame < self.backed_frames() && needed <= FRAME_BYTES);
-        // A frame written in small records grows its prefix by doubling, so filling it costs
-        // a few calls rather than one per page. Near exhaustion only `needed` must succeed.
-        let ahead = needed.max(ready * 2).min(FRAME_BYTES);
-        if ahead > needed && self.populate(frame, ready, ahead).is_ok() {
-            return Ok(());
-        }
+        // A frame is at most one page, so this populates it whole in one call.
         self.populate(frame, ready, needed)
     }
 
@@ -553,6 +579,9 @@ impl Pool {
             if end > start
                 && let Err(error) = self.file.punch(start, end - start)
             {
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = self.states.discard(first, last, self.page) {
                 first_error.get_or_insert(error);
             }
         }

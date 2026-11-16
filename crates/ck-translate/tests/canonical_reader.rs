@@ -244,7 +244,7 @@ fn records_straddling_a_frame_boundary_decode_like_contiguous_ones() {
     let frame = ck_stream::FRAME_BYTES;
     let mut straddled = 0;
     for before in 1..240 {
-        let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 16);
+        let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 192);
         let (start, record) = straddle(&mut mapped, frame - before);
         let r = record.record();
         straddled += usize::from(r.start.frame != r.end.frame && r.end.offset != 0);
@@ -330,8 +330,8 @@ fn under_budget(
 ) -> Result<Vec<String>, String> {
     let directory = std::env::temp_dir().join(format!("ck-reader-{}", uuid::Uuid::new_v4()));
     let mut config = ck_stream::Config::new(directory.clone());
-    config.pool_bytes = Some(16 * ck_stream::FRAME_BYTES);
-    config.max_event_bytes = 16 * ck_stream::FRAME_BYTES;
+    config.pool_bytes = Some(192 * ck_stream::FRAME_BYTES);
+    config.max_event_bytes = 192 * ck_stream::FRAME_BYTES;
     config.max_metadata_bytes = budget;
     config.header_slots = 8;
     config.workers = 1;

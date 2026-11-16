@@ -242,7 +242,7 @@ fn invalidation_racing_append_and_reservation_rollback_releases_frames_once() {
         std::thread::scope(|scope| {
             let reserved = &reserved;
             scope.spawn(move || {
-                let mut reservation = writer.begin_record(FRAME_BYTES, false, 0, 0).unwrap();
+                let mut reservation = writer.begin_record(FRAME_BYTES, 0, 0).unwrap();
                 reservation.write(&[2; FRAME_BYTES]).unwrap();
                 reserved.wait();
                 invalidation.recv().unwrap();

@@ -14,7 +14,7 @@ const METADATA: usize = 4096;
 const DEPENDENCY: usize = std::mem::size_of::<usize>();
 /// The first growth of the frame table and of the run index: five entries each.
 const FRAME_TABLE: usize = 5 * 8;
-const RUN_INDEX: usize = 5 * 48;
+const RUN_INDEX: usize = 5 * 40;
 
 #[derive(Clone, Copy)]
 enum Fault {

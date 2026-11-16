@@ -253,6 +253,8 @@ fn local_count(attempt: &Attempt<'_>, writer: Writer, input_tokens: u64) -> Star
 /// Feeds `body` into `ingress` until the ingress publishes a terminal record or the stream
 /// stops. A due flush deadline is served before any wait, so a ready body cannot postpone
 /// it; a stopped stream goes before the body, and so does an expired upstream deadline.
+/// While the ingress holds payload, a client egress reader waiting at the published end
+/// flushes it at once (`Writer::demand`).
 async fn produce<I: ResponseIngress>(
     mut body: Body,
     mut ingress: I,
@@ -262,6 +264,7 @@ async fn produce<I: ResponseIngress>(
 ) -> Result<(), ExecError> {
     let mut stopped = pin!(writer.cancelled());
     let mut last = Instant::now();
+    let mut served = 0;
     loop {
         let flush = match ingress.flush_deadline() {
             Some(deadline) if deadline <= writer.now() => {
@@ -280,6 +283,10 @@ async fn produce<I: ResponseIngress>(
                 return cut(ingress, writer, timed_out(expired)).await;
             }
             () = until(flush) => (ingress.flush(&mut writer), false),
+            waits = writer.demand(served), if flush.is_some() => {
+                served = waits;
+                (ingress.flush(&mut writer), false)
+            }
             chunk = body.next() => match chunk {
                 Some(Ok(bytes)) => {
                     last = Instant::now();

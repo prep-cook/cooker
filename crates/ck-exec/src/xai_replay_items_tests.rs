@@ -12,7 +12,7 @@ const ENC: &str = "TKwE++a7qP4CXIXITJIj2DYyQCSyR3JuUSrOe758M0CwwzrC2cbGVuOaEQaBq
 fn pool() -> (ck_stream::Store, std::path::PathBuf) {
     let directory = std::env::temp_dir().join(format!("ck-exec-replay-items-{}", uuid::Uuid::new_v4()));
     let mut config = ck_stream::Config::new(directory.clone());
-    config.pool_bytes = Some(512 * ck_stream::FRAME_BYTES);
+    config.pool_bytes = Some(6_144 * ck_stream::FRAME_BYTES);
     config.header_slots = 8;
     config.workers = 1;
     (ck_stream::Store::open(config).expect("open the test store"), directory)

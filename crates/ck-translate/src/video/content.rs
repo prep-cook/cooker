@@ -21,7 +21,6 @@ use crate::{
     },
 };
 
-const DATA_BYTES: usize = 36_864;
 const FLUSH_DELAY: Duration = Duration::from_millis(100);
 const MAX_JOB_ID: usize = 256;
 const MAX_MIME: usize = 255;
@@ -35,7 +34,7 @@ pub struct Download {
     publisher: Publisher,
     expected: Option<u64>,
     received: u64,
-    buffer: [u8; DATA_BYTES],
+    buffer: [u8; crate::codec::DATA_CHUNK_BYTES],
     buffered: usize,
     deadline: Option<Instant>,
     closed: bool,
@@ -89,7 +88,7 @@ impl Download {
             publisher,
             expected,
             received: 0,
-            buffer: [0; DATA_BYTES],
+            buffer: [0; crate::codec::DATA_CHUNK_BYTES],
             buffered: 0,
             deadline: None,
             closed: false,
@@ -123,7 +122,10 @@ impl Download {
             return Err(Error::Limit);
         }
         while !bytes.is_empty() {
-            let capacity = self.publisher.capacity(&self.emitter)?.min(DATA_BYTES);
+            let capacity = self
+                .publisher
+                .capacity(&self.emitter)?
+                .min(crate::codec::DATA_CHUNK_BYTES);
             let take = bytes.len().min(capacity - self.buffered);
             self.buffer[self.buffered..self.buffered + take].copy_from_slice(&bytes[..take]);
             self.buffered += take;

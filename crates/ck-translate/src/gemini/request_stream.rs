@@ -151,7 +151,7 @@ impl Ingress {
                 end: scanned.validated_end,
             },
         )?;
-        let mut chunk = [0; 36_864];
+        let mut chunk = [0; crate::codec::DATA_CHUNK_BYTES];
         let mut used = 0;
         while let Some(c) = chars.next_scalar()? {
             pending.decoder.push(c, |bytes| {
@@ -236,7 +236,17 @@ struct Sink<'a> {
 impl StringState {
     fn flush(&mut self, sink: &mut Sink<'_>) -> Result<()> {
         if let Some(buffer) = self.buffer.take() {
-            self.publisher.append(buffer.chunk(0)?, sink.emitter, sink.owner)?;
+            let held = self.buffered;
+            // The held scratch may span frames; each of its chunks ends at a frame boundary.
+            self.publisher.collect(sink.emitter, sink.owner, |emit| {
+                let mut copied = 0;
+                while copied < held {
+                    let chunk = buffer.chunk(copied)?;
+                    emit(chunk)?;
+                    copied += chunk.len();
+                }
+                Ok(())
+            })?;
             sink.registry
                 .retain_record(sink.doc, self.media, sink.owner, sink.reader)?;
         }

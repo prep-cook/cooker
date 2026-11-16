@@ -6,7 +6,8 @@ use crate::{
 };
 
 pub const MAX_POOL_BYTES: usize = 4 * 1024 * 1024 * 1024;
-pub const MAX_STREAM_FRAMES: u32 = 5_368;
+/// 256 MiB per exchange (Settled 41).
+pub const MAX_STREAM_FRAMES: u32 = 65_536;
 const HEAP_HEADROOM: usize = 64 * 1024 * 1024;
 
 /// Deploy-only settings. `None` selects the capped default, not an unlimited pool.
@@ -97,7 +98,7 @@ impl Config {
         let startup_reserve_frames = reserve_bytes.div_ceil(FRAME_BYTES) as u32;
         let max_frames = self.max_frames.unwrap_or(MAX_STREAM_FRAMES.min(pool_frames));
         if !(4..=MAX_STREAM_FRAMES).contains(&max_frames) || max_frames > pool_frames {
-            return Err(invalid("max_frames must be between 4 and min(5368, pool_frames)"));
+            return Err(invalid("max_frames must be between 4 and min(65536, pool_frames)"));
         }
         if self.max_event_bytes == 0
             || self.max_event_bytes > max_frames as usize * FRAME_BYTES
@@ -173,25 +174,56 @@ fn cgroup_cap() -> io::Result<Option<usize>> {
 mod tests {
     use super::*;
 
+    const F: usize = FRAME_BYTES;
+
     #[test]
     fn small_pool_derives_quota_and_rejects_explicit_overcommit() {
         let mut config = Config::new(PathBuf::from("/unused"));
-        config.max_event_bytes = 100_000;
-        let limits = config.resolve_caps(500_000, None).unwrap();
+        config.max_event_bytes = 2 * F;
+        let limits = config.resolve_caps(10 * F, None).unwrap();
         assert_eq!(limits.pool_frames, 10);
         assert_eq!(limits.max_frames, 10);
         config.max_frames = Some(11);
-        assert!(config.resolve_caps(500_000, None).is_err());
+        assert!(config.resolve_caps(10 * F, None).is_err());
         config.max_frames = None;
-        assert_eq!(config.resolve_caps(500_000, Some(300_000)).unwrap().max_frames, 6);
-        assert!(config.resolve_caps(150_000, None).is_err());
-        config.startup_reserve_bytes = Some(500_000);
-        assert_eq!(config.resolve_caps(500_000, None).unwrap().startup_reserve_frames, 10);
-        config.startup_reserve_bytes = Some(500_001);
-        assert!(config.resolve_caps(500_000, None).is_err());
-        config.startup_reserve_bytes = Some(50_001);
-        assert_eq!(config.resolve_caps(500_000, None).unwrap().startup_reserve_frames, 2);
+        assert_eq!(config.resolve_caps(10 * F, Some(6 * F)).unwrap().max_frames, 6);
+        assert!(config.resolve_caps(3 * F, None).is_err());
+        config.startup_reserve_bytes = Some(10 * F);
+        assert_eq!(config.resolve_caps(10 * F, None).unwrap().startup_reserve_frames, 10);
+        config.startup_reserve_bytes = Some(10 * F + 1);
+        assert!(config.resolve_caps(10 * F, None).is_err());
+        config.startup_reserve_bytes = Some(F + 1);
+        assert_eq!(config.resolve_caps(10 * F, None).unwrap().startup_reserve_frames, 2);
         config.startup_reserve_bytes = Some(0);
-        assert_eq!(config.resolve_caps(500_000, None).unwrap().startup_reserve_frames, 0);
+        assert_eq!(config.resolve_caps(10 * F, None).unwrap().startup_reserve_frames, 0);
+    }
+
+    #[test]
+    fn stream_limits_are_exact_frame_multiples() {
+        // (bytes, frames): the per-stream limit and the pool ceiling are whole frames.
+        for (bytes, frames) in [(256 << 20, 65_536), (MAX_POOL_BYTES, 1_048_576)] {
+            assert_eq!(bytes % F, 0, "{bytes}");
+            assert_eq!(bytes / F, frames);
+        }
+        assert_eq!(MAX_STREAM_FRAMES as usize, 65_536);
+        let config = Config::new(PathBuf::from("/unused"));
+        let limits = config.resolve_caps(MAX_POOL_BYTES, None).unwrap();
+        assert_eq!((limits.pool_frames, limits.max_frames), (1_048_576, MAX_STREAM_FRAMES));
+        let mut config = config;
+        config.max_frames = Some(4);
+        config.max_event_bytes = F;
+        for (pool_bytes, accepted) in [
+            (4 * F, true),
+            (4 * F + 1, false),
+            (MAX_POOL_BYTES, true),
+            (MAX_POOL_BYTES + F, false),
+        ] {
+            config.pool_bytes = Some(pool_bytes);
+            assert_eq!(
+                config.resolve_caps(MAX_POOL_BYTES, None).is_ok(),
+                accepted,
+                "{pool_bytes}"
+            );
+        }
     }
 }

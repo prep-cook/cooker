@@ -37,7 +37,7 @@ fn free(store: &Store) -> u32 {
 
 #[test]
 fn small_leases_share_frames_and_read_back_only_their_own_bytes() {
-    const LEASES: usize = 10_000;
+    const LEASES: usize = 1_000;
     let (_dir, store) = store(16, 16);
     let mut writer = store.create().unwrap();
     let body = |index: usize| format!("{index:040}").into_bytes();
@@ -59,9 +59,10 @@ fn a_shared_frame_returns_to_the_pool_only_after_its_last_lease_drops() {
     let (_dir, store) = store(8, 4);
     let capacity = store.capacity_frames();
     let mut writer = store.create().unwrap();
-    // Five 10,000 B leases fill a frame exactly, so ten take two frames.
-    let mut leases: Vec<_> = (0..10u8)
-        .map(|byte| Some(lease(&mut writer, &[byte; 10_000]).unwrap()))
+    // Four leases of a quarter frame fill a frame exactly, so eight take two frames.
+    const QUARTER: usize = FRAME_BYTES / 4;
+    let mut leases: Vec<_> = (0..8u8)
+        .map(|byte| Some(lease(&mut writer, &[byte; QUARTER]).unwrap()))
         .collect();
     assert_eq!(free(&store), capacity - 2);
     // A reservation in a shared frame exposes only its own written prefix.
@@ -72,18 +73,18 @@ fn a_shared_frame_returns_to_the_pool_only_after_its_last_lease_drops() {
     assert_eq!(pending.chunk(0).unwrap(), b"ab");
     drop(pending);
     assert_eq!(free(&store), capacity - 2);
-    for index in [0, 2, 4, 1] {
+    for index in [0, 2, 1] {
         leases[index] = None;
         assert_eq!(free(&store), capacity - 2);
     }
     leases[3] = None;
     assert_eq!(free(&store), capacity - 1);
-    for index in [9, 5, 7, 6] {
+    for index in [7, 4, 6] {
         leases[index] = None;
         assert_eq!(free(&store), capacity - 1);
-        assert_eq!(contents(leases[8].as_ref().unwrap()), [8; 10_000]);
+        assert_eq!(contents(leases[5].as_ref().unwrap()), [5; QUARTER]);
     }
-    leases[8] = None;
+    leases[5] = None;
     assert_eq!(free(&store), capacity);
     // The freed open frame is forgotten: the next lease takes a fresh one.
     let fresh = lease(&mut writer, b"fresh").unwrap();
@@ -96,14 +97,7 @@ fn a_shared_frame_returns_to_the_pool_only_after_its_last_lease_drops() {
 /// Leases taken in order: small ones pack, big ones keep whole frames.
 fn mixed(writer: &mut Writer) -> Vec<(ScratchLease, Vec<u8>)> {
     let mut leases = Vec::new();
-    for (len, byte) in [
-        (100, 1),
-        (FRAME_BYTES + 1, 2),
-        (100, 3),
-        (49_000, 4),
-        (1_000, 5),
-        (500, 6),
-    ] {
+    for (len, byte) in [(100, 1), (FRAME_BYTES + 1, 2), (100, 3), (3_700, 4), (300, 5), (150, 6)] {
         let bytes = vec![byte; len];
         leases.push((lease(writer, &bytes).unwrap(), bytes));
     }
@@ -114,7 +108,7 @@ fn mixed(writer: &mut Writer) -> Vec<(ScratchLease, Vec<u8>)> {
 fn mixed_leases_fail_at_the_frame_cap_and_roll_back() {
     let (_dir, store) = store(6, 4);
     let mut writer = store.create().unwrap();
-    // 100 + 100 + 49,000 B share one frame, the big lease takes two, 1,000 + 500 B a fourth.
+    // 100 + 100 + 3,700 B share one frame, the big lease takes two, 300 + 150 B a fourth.
     let leases = mixed(&mut writer);
     assert_eq!(store.used_frames(), 4);
     drop(leases);

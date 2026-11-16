@@ -276,6 +276,10 @@ impl Fenced {
 /// [`ClientCapability`]'s destination key.
 pub const CLIENT: &str = "client";
 
+/// Decoded bytes in a full custom `data` chunk: 49,152 base64 bytes, a multiple of 3 so only
+/// the last chunk of an object carries base64 padding (INTERNAL-STREAM §3.4).
+pub const DATA_CHUNK_BYTES: usize = 36_864;
+
 /// The capability the client fence closes against (contract §4, G8). It adds no check to the
 /// fence's own document and media checks, and no request egress encodes a request validated
 /// against it: every attempt re-fences the view for its own destination first.

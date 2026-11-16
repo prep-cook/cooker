@@ -6,8 +6,8 @@ use codec::{BodyMode, ResponseIngress, event::Direction};
 fn snapshot_under_budget(budget: usize) -> (Option<(usize, codec::Error)>, usize) {
     let directory = std::env::temp_dir().join(format!("ck-budget-{}", uuid::Uuid::new_v4()));
     let mut config = ck_stream::Config::new(directory.clone());
-    config.pool_bytes = Some(64 * ck_stream::FRAME_BYTES);
-    config.max_event_bytes = 16 * ck_stream::FRAME_BYTES;
+    config.pool_bytes = Some(768 * ck_stream::FRAME_BYTES);
+    config.max_event_bytes = 192 * ck_stream::FRAME_BYTES;
     config.max_metadata_bytes = budget;
     config.header_slots = 8;
     config.workers = 1;
@@ -65,6 +65,6 @@ fn snapshot_index_table_quota_lasts_until_suffix_edits_apply() {
         (Some((step, error)), _) => panic!("step {step} failed with {error:?}"),
         (None, records) => (None, records),
     };
-    assert_eq!(outcome(310_151), (Some(1), 71));
-    assert_eq!(outcome(310_152), (Some(2), 88));
+    assert_eq!(outcome(310_987), (Some(1), 71));
+    assert_eq!(outcome(310_988), (Some(2), 88));
 }

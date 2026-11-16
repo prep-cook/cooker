@@ -38,14 +38,13 @@ pub(crate) struct Frame {
     pool: Option<u32>,
 }
 
-// A run represents exact record boundaries, not a byte range including padding.
+/// A run of consecutive records of one length, kind and correlation, laid end to end.
 #[derive(Clone, Copy)]
 pub(crate) struct Index {
     start: u64,
     sequence: u64,
     next_sequence: u64,
     len: u64,
-    stride: u64,
     kind: u32,
     correlation: u32,
 }
@@ -54,11 +53,10 @@ impl Index {
     fn extends(&self, next: &Self) -> bool {
         self.next_sequence == next.sequence
             && self.len == next.len
-            && self.stride == next.stride
             && self.kind == next.kind
             && self.correlation == next.correlation
             && (self.next_sequence - self.sequence)
-                .checked_mul(self.stride)
+                .checked_mul(self.len)
                 .and_then(|offset| self.start.checked_add(offset))
                 == Some(next.start)
     }
@@ -68,7 +66,7 @@ impl Index {
             return None;
         }
         let start = (sequence - self.sequence)
-            .checked_mul(self.stride)?
+            .checked_mul(self.len)?
             .checked_add(self.start)?;
         let end = start.checked_add(self.len)?;
         Some(Record {
@@ -225,6 +223,11 @@ pub(crate) struct Stream {
     detached: AtomicU64,
     notify: Wakeup,
     stopped: Wakeup,
+    /// Client egress readers waiting at the published end, and how many such waits began.
+    /// Only these readers ask the producer to publish what it holds early (`Writer::demand`).
+    egress_waiting: AtomicUsize,
+    egress_waits: AtomicU64,
+    demand: tokio::sync::Notify,
     /// Dependent streams holding this one: while nonzero it neither expires nor is evicted
     /// on its own; evicting its last holders frees it with them.
     held: AtomicUsize,
@@ -250,6 +253,9 @@ impl Stream {
             limits,
             notify: Wakeup::new(),
             stopped: Wakeup::new(),
+            egress_waiting: AtomicUsize::new(0),
+            egress_waits: AtomicU64::new(0),
+            demand: tokio::sync::Notify::new(),
             invalidated: AtomicBool::new(false),
             kept: AtomicBool::new(false),
             last_read: AtomicU64::new(millis(now)),
@@ -350,6 +356,14 @@ impl Stream {
             .filter(|frame| frame.pool.is_some_and(|index| self.pool.references(index) > 1))
             .count();
         owned as u64 + self.detached.load(Ordering::Acquire)
+    }
+
+    /// Record that a client egress reader waits at the published end until the guard drops.
+    fn egress_wait(&self) -> EgressWait<'_> {
+        self.egress_waiting.fetch_add(1, Ordering::SeqCst);
+        self.egress_waits.fetch_add(1, Ordering::SeqCst);
+        self.demand.notify_waiters();
+        EgressWait(&self.egress_waiting)
     }
 
     pub(crate) fn last_read(&self) -> Duration {
@@ -571,6 +585,14 @@ impl Drop for Stream {
                 "exchange metadata leaked"
             );
         }
+    }
+}
+
+struct EgressWait<'a>(&'a AtomicUsize);
+
+impl Drop for EgressWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

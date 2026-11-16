@@ -20,7 +20,7 @@ pub(super) fn fits(rounds: usize, budget: usize) -> bool {
     let body = history(rounds);
     let directory = std::env::temp_dir().join(format!("ck-metadata-{}", uuid::Uuid::new_v4()));
     let mut config = ck_stream::Config::new(directory.clone());
-    config.pool_bytes = Some(64 * ck_stream::FRAME_BYTES);
+    config.pool_bytes = Some(768 * ck_stream::FRAME_BYTES);
     config.max_metadata_bytes = budget;
     config.header_slots = 8;
     config.workers = 1;
@@ -61,7 +61,7 @@ pub(super) fn fits(rounds: usize, budget: usize) -> bool {
 /// accounting change and must then be re-measured against the previous behaviour.
 #[test]
 fn tool_history_metadata_need() {
-    const NEED: usize = 733_860;
+    const NEED: usize = 722_216;
     assert!(fits(30, NEED), "30 rounds no longer fit in {NEED} bytes");
     assert!(!fits(30, NEED - 1), "30 rounds now fit in less than {NEED} bytes");
 }

@@ -157,7 +157,7 @@ async fn malformed_json_is_no_error() {
 
 /// Replay takes no storage the delivery needs: at every pool size, an exchange ends the same
 /// way with replay off (no caller) and on. A 240,000-character event before the completion
-/// once failed with replay on only, at 17 to 21 frames.
+/// once failed with replay on only, at pools of 17 to 21 × 50,000 bytes.
 #[tokio::test]
 async fn replay_takes_no_storage_from_delivery() {
     let blob = event(json!({"type":"provider.extra","blob":"x".repeat(240_000)}));
@@ -165,7 +165,7 @@ async fn replay_takes_no_storage_from_delivery() {
     let body = format!("{blob}{completed}");
     let executors = executors();
     let mut completions = 0;
-    for frames in 16..=32 {
+    for frames in (192..=384).step_by(12) {
         let mut ends = Vec::new();
         for principal in ["", "sk-a"] {
             let streams = Streams::with_frames(frames);

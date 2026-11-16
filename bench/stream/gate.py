@@ -92,7 +92,8 @@ def evaluate(row, runs, expected):
                         fail(f"{kind}: invalid worker count or decay timing")
                     if kind == "pool":
                         for metric in ("VmRSS", "tmpfs_used"):
-                            if metrics["after"][metric] > metrics["baseline"][metric]+4*1024*1024+3_200_000:
+                            # 4 MiB plus the 98 free 4,096-byte frames that each of the 8 lists keeps (§6.5).
+                            if metrics["after"][metric] > metrics["baseline"][metric]+4*1024*1024+8*98*4096:
                                 fail(f"pool {metric}: post-decay baseline allowance exceeded")
             for phase in ("baseline", "held", "after"):
                 result["metrics"][phase] = {
@@ -103,7 +104,7 @@ def evaluate(row, runs, expected):
         if row == "totalcap":
             metrics = samples["pool"][0]["metrics"]
             counts = metrics["stream_frames"]
-            if len(counts) != 17 or counts != [5368]*16+[11] or not metrics["survived"] or len(metrics["errors"]) != 17:
+            if len(counts) != 17 or counts != [65536]*16+[0] or not metrics["survived"] or len(metrics["errors"]) != 17:
                 fail("invalid total-cap evidence")
             result["metrics"] = metrics
         if row == "enospc":
@@ -176,10 +177,10 @@ def self_test():
               for k, values in (("heap", [50, 100, 110, 120]), ("pool", [80]*4)) for v in values]
     strict = evaluate(row, spread, 4)
     assert "pool median below heap P25" in strict["failures"]
-    cap = {"stream_frames": [5368]*16+[11], "survived": True, "errors": ["cap"]*17}
+    cap = {"stream_frames": [65536]*16+[0], "survived": True, "errors": ["cap"]*17}
     assert evaluate("totalcap", [{"backend": "pool", "status": "ok", "metrics": cap}], 1)["status"] == "pass"
-    for short in (0, 10):
-        leaked = dict(cap, stream_frames=[5368]*16+[short])
+    for counts in ([65536]*16+[1], [65535]+[65536]*15+[0]):
+        leaked = dict(cap, stream_frames=counts)
         assert evaluate("totalcap", [{"backend": "pool", "status": "ok", "metrics": leaked}], 1)["status"] == "fail"
     root = Path(__file__).resolve().parents[2]
     for bad_out in (root, root/"bench/out"):

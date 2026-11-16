@@ -546,7 +546,7 @@ impl Publisher {
         owner: &mut Writer,
         decode: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>,
     ) -> Result<()> {
-        let mut chunk = [0; 36_864];
+        let mut chunk = [0; super::DATA_CHUNK_BYTES];
         let mut len = 0;
         let mut ceiling = self.capacity(emitter)?;
         decode(&mut |bytes| {

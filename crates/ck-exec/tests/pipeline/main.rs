@@ -95,6 +95,33 @@ async fn a_flush_deadline_is_served_while_the_upstream_is_idle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_client_egress_reader_is_served_before_the_flush_deadline() {
+    // (client egress reader, flushed early): held payload waits for its deadline, an hour of
+    // the paused store clock away, unless a client egress reader waits at the published end.
+    for (egress, flushed) in [(true, true), (false, false)] {
+        let fixture = Fixture::new(4 * 1024 * 1024);
+        let (stub, upstream) = Stub::new(Answer::Stream);
+        *stub.deadline.lock().unwrap() = Some(Duration::from_secs(3600));
+        let (started, _upload, id) = fixture.launch(&stub, Operation::Generate).await;
+        let started = started.unwrap();
+        let mut reader = if egress {
+            fixture.store.egress_reader(id, 0)
+        } else {
+            fixture.store.reader(id, 0)
+        }
+        .unwrap();
+        let reading = tokio::spawn(async move { while let Some(ck_stream::Read::Record(_)) = reader.next().await {} });
+        let wait = if flushed { WAIT } else { Duration::from_millis(300) };
+        let served = tokio::time::timeout(wait, stub.flushed.notified()).await;
+        assert_eq!(served.is_ok(), flushed, "egress {egress}");
+        assert!(!started.producer.is_finished());
+        drop(upstream);
+        finished(started).await.ok();
+        reading.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_attempt_ends_its_response_stream_for_the_caller_to_discard() {
     let fixture = Fixture::new(4 * 1024 * 1024);
     let (stub, _upstream) = Stub::new(Answer::Refuse);

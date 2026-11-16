@@ -8,7 +8,7 @@ use ck_translate::codec::{
 #[test]
 fn unfinished_string_releases_source_and_survives_unicode_tails() {
     let clock = std::sync::Arc::new(ck_stream::ManualClock::default());
-    let mut mapped = Mapped::configured(clock.clone(), 48);
+    let mut mapped = Mapped::configured(clock.clone(), 576);
     let mut ingress = Ingress::new(
         &mut mapped.writer,
         &mapped.store,
@@ -161,7 +161,7 @@ fn unfinished_native_media_publishes_one_lifetime_and_exact_bytes() {
             "data:application/pdf;base64,",
         ),
     ] {
-        let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 64);
+        let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 768);
         let mut ingress = Ingress::new(
             &mut mapped.writer,
             &mapped.store,
@@ -451,7 +451,7 @@ fn payload_before_type_and_opaque_media_lookalikes_preserve_native_values() {
 /// frame-aligned record per piece.
 #[test]
 fn small_pieces_of_a_streamed_string_share_data_records() {
-    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 64);
+    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 768);
     let mut ingress = Ingress::new(
         &mut mapped.writer,
         &mapped.store,

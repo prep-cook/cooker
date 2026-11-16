@@ -35,7 +35,7 @@ fn a_producer_and_an_allocator_never_exceed_the_frame_quota_together() {
             // Each reservation stays charged until both threads have tried theirs.
             let record = scope.spawn(|| {
                 start.wait();
-                producer.begin_record(QUOTA as usize * FRAME_BYTES, false, 0, 0)
+                producer.begin_record(QUOTA as usize * FRAME_BYTES, 0, 0)
             });
             let scratch = scope.spawn(|| {
                 start.wait();

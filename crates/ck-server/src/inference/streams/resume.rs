@@ -193,7 +193,7 @@ impl Replay {
         } = attached;
         let (reader, mut first, mut records) = streams.with_store(|store| {
             Ok::<_, ck_stream::Error>((
-                store.reader(response.id(), 0)?,
+                store.egress_reader(response.id(), 0)?,
                 store.reader(response.id(), 0)?,
                 store.reader(request.id(), 0)?,
             ))

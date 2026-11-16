@@ -18,10 +18,13 @@ pub struct Reader {
     available: u64,
     committed: u64,
     terminal_seen: bool,
+    /// A client egress reader: waiting in `next` at the published end is demand
+    /// (`Writer::demand`). Runtime readers, such as usage readers, wait without it.
+    egress: bool,
 }
 
 impl Reader {
-    pub(crate) fn new(stream: Arc<Stream>, after: u64) -> Result<Self, Error> {
+    pub(crate) fn new(stream: Arc<Stream>, after: u64, egress: bool) -> Result<Self, Error> {
         let result = stream.retention.reading(&stream, |state| {
             if stream.invalidated.load(Ordering::Acquire) || after < state.base_sequence {
                 return (Err(Error::Gone), false);
@@ -45,6 +48,7 @@ impl Reader {
             available: 0,
             committed: 0,
             terminal_seen: false,
+            egress,
         })
     }
 
@@ -124,6 +128,7 @@ impl Reader {
             if let Poll::Ready(value) = self.try_next() {
                 return value;
             }
+            let _demand = self.egress.then(|| stream.egress_wait());
             notified.await;
             if let Poll::Ready(value) = self.try_next() {
                 return value;

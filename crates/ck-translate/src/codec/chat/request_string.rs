@@ -250,7 +250,7 @@ impl Ingress {
             end: wire.validated_end,
         })?;
         let mut decoder = json::StringDecoder::default();
-        let mut chunk = [0; 36_864];
+        let mut chunk = [0; crate::codec::DATA_CHUNK_BYTES];
         let mut used = 0;
         while let Some(byte) = cursor.next_byte()? {
             if let Some(c) = decoder.push(byte)? {

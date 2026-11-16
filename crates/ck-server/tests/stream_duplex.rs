@@ -36,7 +36,7 @@ fn field(payload: &[u8], name: &str) -> Option<String> {
 }
 
 /// The record a `fill` message projects to, in bytes.
-const FILL: usize = 10_000;
+const FILL: usize = ck_stream::FRAME_BYTES / 2;
 
 const FORBIDDEN: Refusal = Refusal {
     code: "unknown_event_type",

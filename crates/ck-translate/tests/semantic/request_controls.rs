@@ -121,7 +121,7 @@ impl Capability for Signed {
 }
 
 pub(super) fn canonical(input: &serde_json::Value, policy: &impl Capability) -> (Mapped, Document, Registry) {
-    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 256);
+    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 3072);
     let mut ingress = Ingress::new(
         &mut mapped.writer,
         &mapped.store,

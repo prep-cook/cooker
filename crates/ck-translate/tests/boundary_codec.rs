@@ -30,7 +30,10 @@ fn fragmented_source_packs_frames_without_losing_parser_positions() {
         assert_eq!(scratch_bytes(&output), bytes);
         drop(output);
         mapped.source.release_before(ck_stream::FRAME_BYTES as u64).unwrap();
-        assert_eq!(mapped.store.used_frames(), 1);
+        assert_eq!(
+            mapped.store.used_frames() as usize,
+            bytes.len().div_ceil(ck_stream::FRAME_BYTES) - 1
+        );
         assert!(matches!(
             mapped
                 .source
@@ -719,7 +722,7 @@ fn canonical_media_data_obeys_chunk_ceiling_and_failed_output_is_not_published()
         base64::engine::general_purpose::STANDARD
             .decode(value["bytes"].as_str().unwrap())
             .unwrap(),
-        vec![0; 36_864]
+        vec![0; ck_translate::codec::DATA_CHUNK_BYTES]
     );
 }
 

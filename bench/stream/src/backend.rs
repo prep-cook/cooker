@@ -84,17 +84,12 @@ impl Writer {
             Self::Heap(w) => w.id(),
         }
     }
-    pub fn append(&mut self, bytes: &[u8], aligned: bool) -> Result<()> {
+    pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
         match self {
-            Self::Pool(w) if aligned => {
-                let mut reservation = w.begin_record(bytes.len(), true, 0, 0)?;
-                reservation.write(bytes)?;
-                reservation.commit()?;
-            }
             Self::Pool(w) => {
                 w.append(bytes)?;
             }
-            Self::Heap(w) => w.append(bytes, aligned)?,
+            Self::Heap(w) => w.append(bytes)?,
         }
         Ok(())
     }

@@ -78,7 +78,7 @@ fn bytes(lease: &ck_stream::ScratchLease) -> Vec<u8> {
     bytes
 }
 fn request(input: &[u8]) -> (serde_json::Value, Vec<serde_json::Value>) {
-    request_with_frames(input, 64)
+    request_with_frames(input, 768)
 }
 fn request_with_frames(input: &[u8], frames: usize) -> (serde_json::Value, Vec<serde_json::Value>) {
     let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), frames);

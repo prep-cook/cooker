@@ -40,10 +40,14 @@ fn unfinished_text_retires_raw_frames_and_preserves_late_unicode() {
         let raw = String::from_utf8(mapped.output(&mapped.writer)).unwrap();
         assert!(!raw.contains("event: x_ck.request.end\n"));
         assert!(!raw.contains("event: x_ck.media.end\n"));
-        // The first frame retains native names; the tail retains unconsumed bytes.
+        // Beyond the committed records: the first frame's native names, the scratch of one held
+        // data chunk and the unconsumed tail; the raw payload itself is retired.
+        let held = ck_translate::codec::DATA_CHUNK_BYTES.div_ceil(ck_stream::FRAME_BYTES) as u64 + 3;
         assert!(
-            u64::from(mapped.store.used_frames()) <= mapped.writer.committed().frame + 3,
-            "raw payload remains charged"
+            u64::from(mapped.store.used_frames()) <= mapped.writer.committed().frame + held,
+            "raw payload remains charged: {} frames used, committed end {:?}",
+            mapped.store.used_frames(),
+            mapped.writer.committed()
         );
         for tail in [br#"\uD83D"#.as_slice(), br#"\uDE80"#, b"\xc3", b"\xa9", br#"\n"#] {
             ingress.advance(&mut mapped.writer, tail).unwrap();

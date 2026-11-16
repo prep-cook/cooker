@@ -162,18 +162,33 @@ impl Writer {
         }
     }
 
-    /// Reserve the whole record before writing. `aligned` excludes tail padding from the record.
-    /// The caller's codec must finish its framing before committing this reservation.
-    /// Invalid length/alignment is rejected without terminating the stream; storage failures are terminal.
-    pub fn begin_record(
-        &mut self,
-        len: usize,
-        aligned: bool,
-        kind: u32,
-        correlation: u32,
-    ) -> Result<Reservation<'_>, Error> {
+    /// Client egress demand. Resolves with a new count once a client egress reader
+    /// ([`Store::egress_reader`](crate::Store::egress_reader)) waits at the published end and
+    /// has begun a wait since `served`, the count this producer last acted on (0 at first).
+    /// Publishing nothing new leaves that reader waiting without a new wait, so a producer
+    /// passing the count back is not woken again until a new wait. Owned and cancellation-safe.
+    pub fn demand(&self, served: u64) -> impl Future<Output = u64> + Send + 'static {
+        let stream = self.stream.clone();
+        async move {
+            loop {
+                let notified = stream.demand.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let waits = stream.egress_waits.load(Ordering::SeqCst);
+                if waits > served && stream.egress_waiting.load(Ordering::SeqCst) > 0 {
+                    return waits;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    /// Reserve the whole record before writing. It starts at the published end and may span
+    /// frames. The caller's codec must finish its framing before committing this reservation.
+    /// An invalid length is rejected without terminating the stream; storage failures are terminal.
+    pub fn begin_record(&mut self, len: usize, kind: u32, correlation: u32) -> Result<Reservation<'_>, Error> {
         self.publishes()?;
-        let (record, index, old_count, state) = self.reserve(len, aligned, kind, correlation)?;
+        let (record, index, old_count, state) = self.reserve(len, kind, correlation)?;
         drop(state);
         Ok(Reservation {
             writer: self,
@@ -188,11 +203,10 @@ impl Writer {
     fn reserve(
         &self,
         len: usize,
-        aligned: bool,
         kind: u32,
         correlation: u32,
     ) -> Result<(Record, Index, usize, MutexGuard<'_, State>), Error> {
-        let result = self.reserve_locked(len, aligned, kind, correlation);
+        let result = self.reserve_locked(len, kind, correlation);
         if matches!(result, Err(Error::StorageExhausted | Error::Io(_))) {
             self.stream.exhausted();
         }
@@ -202,11 +216,10 @@ impl Writer {
     fn reserve_locked(
         &self,
         len: usize,
-        aligned: bool,
         kind: u32,
         correlation: u32,
     ) -> Result<(Record, Index, usize, MutexGuard<'_, State>), Error> {
-        if len == 0 || len > self.inner.limits.max_event_bytes || (aligned && len > FRAME_BYTES) {
+        if len == 0 || len > self.inner.limits.max_event_bytes {
             return Err(Error::InvalidRecord);
         }
         let mut state = self.stream.state.lock();
@@ -221,8 +234,7 @@ impl Writer {
         if state.final_next && !into_room {
             self.stream.free_final(&mut state);
         }
-        let aligned = aligned || into_room;
-        let start = if aligned {
+        let start = if into_room {
             state
                 .end
                 .div_ceil(FRAME_BYTES as u64)
@@ -248,7 +260,6 @@ impl Writer {
             sequence: record.sequence,
             next_sequence: record.sequence.checked_add(1).ok_or(Error::StorageExhausted)?,
             len: len as u64,
-            stride: if aligned { FRAME_BYTES as u64 } else { len as u64 },
             kind,
             correlation,
         };
@@ -385,7 +396,7 @@ impl Writer {
             return Ok(record);
         }
         drop(state);
-        let (record, index, old_count, mut state) = self.reserve(bytes.len(), false, 0, 0)?;
+        let (record, index, old_count, mut state) = self.reserve(bytes.len(), 0, 0)?;
         if let Err(error) = self.stream.write_reserved(&state, record.start, bytes) {
             drop(state);
             self.rollback(old_count);
@@ -425,7 +436,6 @@ impl Writer {
             sequence,
             next_sequence: sequence.checked_add(1)?,
             len,
-            stride: len,
             kind: 0,
             correlation: 0,
         };
@@ -466,13 +476,13 @@ impl Writer {
             if end < first_end {
                 break;
             }
-            let removed = ((end - first_end) / run.stride + 1).min(run.next_sequence - run.sequence);
+            let removed = ((end - first_end) / run.len + 1).min(run.next_sequence - run.sequence);
             if removed == run.next_sequence - run.sequence {
                 state.base_sequence = run.next_sequence;
                 state.records.pop_front();
             } else {
                 // Retained records were checked at append; this advances within that run.
-                run.start += removed * run.stride;
+                run.start += removed * run.len;
                 run.sequence += removed;
                 state.base_sequence = run.sequence;
                 break;

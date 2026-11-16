@@ -475,7 +475,15 @@ impl Store {
     /// Attach at the number of complete records already consumed. Authorization belongs to the caller.
     pub fn reader(&self, id: u64, after: u64) -> Result<Reader, Error> {
         let stream = self.inner.cache.lock().get(id).ok_or(Error::Gone)?;
-        Reader::new(stream, after)
+        Reader::new(stream, after, false)
+    }
+
+    /// A [`reader`](Self::reader) that delivers the stream to a client: while it waits at the
+    /// published end, [`Writer::demand`](crate::Writer::demand) asks the producer to publish
+    /// the complete prefix it holds rather than wait for its batch timer.
+    pub fn egress_reader(&self, id: u64, after: u64) -> Result<Reader, Error> {
+        let stream = self.inner.cache.lock().get(id).ok_or(Error::Gone)?;
+        Reader::new(stream, after, true)
     }
 
     /// Expire with the injected clock and perform one decay pass; errors remain visible.
