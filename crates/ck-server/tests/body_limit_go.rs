@@ -1,5 +1,5 @@
 //! Request body limits through the binary's middleware stack in-process.
-//! Unchanged routes retain recorded answers; config writes use the admin apply API.
+//! Success and management answers retain their recordings; inference errors follow F13/F14.
 //! Plugin routes are gone with the plugin host; their first-JSON-value vectors replay on
 //! `/v0/management/reset-quota` (see `reference/body_limit/README.md`). admin_contract
 //! covers admin bodies.
@@ -57,13 +57,24 @@ impl HttpBody for Counted {
 }
 
 fn app(dir: &std::path::Path, yaml: &str) -> (axum::Router, Arc<ck_server::Runtime>, Arc<ConfigStore>) {
+    app_to(dir, yaml, "http://127.0.0.1:1")
+}
+
+/// The Claude executor and any `api-keys.claude` entries in `yaml` talk to `upstream`.
+fn app_to(
+    dir: &std::path::Path,
+    yaml: &str,
+    upstream: &str,
+) -> (axum::Router, Arc<ck_server::Runtime>, Arc<ConfigStore>) {
     std::fs::create_dir_all(dir.join("auth")).unwrap();
     let store = Arc::new(ConfigStore::memory_with(yaml));
+    let config = store.load().unwrap().config;
+    let credentials = ck_core::config::credentials::load(&config);
     let rt = Arc::new(ck_server::testing::runtime(
-        store.load().unwrap().config,
-        vec![],
+        config,
+        credentials,
         Executors {
-            claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            claude: ClaudeExecutor::new(upstream).unwrap(),
             codex: Default::default(),
             devices: Default::default(),
             openai: Default::default(),
@@ -89,6 +100,54 @@ fn normalize(body: &str) -> String {
         Ok(v) => v.to_string(),
         Err(_) => body.to_owned(),
     }
+}
+
+fn assert_inference_error(path: &str, status: u16, body: &str, request_id: Option<&axum::http::HeaderValue>) {
+    let value: Value = serde_json::from_str(body).expect("inference error is JSON");
+    let error = value["error"].as_object().expect("error is an object");
+    assert!(error["message"].as_str().is_some_and(|s| !s.is_empty()), "{body}");
+    if path.starts_with("/v1/messages") {
+        assert_eq!(value["type"], "error");
+        let kind = match status {
+            401 => "authentication_error",
+            413 => "request_too_large",
+            _ => "invalid_request_error",
+        };
+        assert_eq!(error["type"], kind);
+        let id = value["request_id"].as_str().expect("local request_id");
+        assert!(!id.is_empty());
+        assert_eq!(Some(id), request_id.map(|v| v.to_str().unwrap()));
+    } else if path.starts_with("/v1beta/") {
+        assert_eq!(error["code"], status);
+        let kind = match status {
+            401 => "UNAUTHENTICATED",
+            413 => "RESOURCE_EXHAUSTED",
+            _ => "INVALID_ARGUMENT",
+        };
+        assert_eq!(error["status"], kind);
+    } else {
+        let kind = if status == 401 {
+            "authentication_error"
+        } else {
+            "invalid_request_error"
+        };
+        assert_eq!(error["type"], kind, "{body}");
+        assert_eq!(error.get("param"), Some(&Value::Null));
+        let code = error.get("code").expect("nullable code is required");
+        assert!(code.is_null() || code.is_string(), "{body}");
+    }
+}
+
+fn uses_inference_error(case: &Value) -> bool {
+    let path = case["path"].as_str().unwrap();
+    case["status"].as_u64().unwrap() >= 400
+        && (path.starts_with("/v1/")
+            || path.starts_with("/v1beta/")
+            || path.starts_with("/backend-api/codex/")
+            || (path.starts_with("/openai/v1/videos")
+                && serde_json::from_str::<Value>(case["response"].as_str().unwrap()).unwrap()["object"] != "video"))
+        && !path.starts_with("/v1/realtime/")
+        && path != "/v1/live"
 }
 
 #[tokio::test]
@@ -133,6 +192,7 @@ async fn body_limit_answers_match_go() {
             .get("content-type")
             .map(|v| v.to_str().unwrap().to_owned())
             .unwrap_or_default();
+        let request_id = response.headers().get("request-id").cloned();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8_lossy(&body).into_owned();
         let got = (status, content_type, normalize(&body));
@@ -141,9 +201,11 @@ async fn body_limit_answers_match_go() {
             case["content_type"].as_str().unwrap().to_owned(),
             normalize(case["response"].as_str().unwrap()),
         );
-        // `/admin/v1` is cooker's own API: its cases record this server's
-        // body-limit and authentication responses.
-        if got != want {
+        if uses_inference_error(case) {
+            assert_eq!(status, want.0, "{name}: {body}");
+            assert!(got.1.starts_with("application/json"), "{name}: {}", got.1);
+            assert_inference_error(case["path"].as_str().unwrap(), status, &body, request_id.as_ref());
+        } else if got != want {
             failures.push(format!("{name}: got {got:?}, want {want:?}"));
         }
         // Go reads at most the limit plus one byte; frames arrive whole here.
@@ -226,12 +288,145 @@ async fn a_reload_during_a_request_keeps_its_limit() {
     let response = response.await.unwrap().unwrap();
     let status = response.status().as_u16();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(
-        (status, String::from_utf8_lossy(&body).as_ref()),
-        (
-            413,
-            r#"{"error":{"message":"Invalid request: http: request body too large","type":"invalid_request_error"}}"#
-        )
+    assert_eq!(status, 413);
+    assert_inference_error("/v1/responses", status, &String::from_utf8_lossy(&body), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const ANTHROPIC_PATHS: [&str; 2] = ["/v1/messages", "/v1/messages/count_tokens"];
+const KEYED: &str = "config-version: 8\naccess:\n  api-keys:\n    - test-key\n";
+
+async fn answer(
+    app: &axum::Router,
+    path: &str,
+    key: bool,
+    body: Body,
+) -> (u16, Option<axum::http::HeaderValue>, String) {
+    let mut request = axum::http::Request::post(path).header("content-type", "application/json");
+    if key {
+        request = request.header("authorization", "Bearer test-key");
+    }
+    let response = app.clone().oneshot(request.body(body).unwrap()).await.unwrap();
+    let status = response.status().as_u16();
+    let request_id = response.headers().get("request-id").cloned();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, request_id, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Authentication, body-read and routing failures answer in the client's protocol.
+#[tokio::test]
+async fn local_failures_use_the_clients_error_shape() {
+    let dir = std::env::temp_dir().join(format!("cooker-local-errors-{}", std::process::id()));
+    let (app, _, _) = app(&dir, KEYED);
+    let broken = || {
+        Body::from_stream(futures_util::stream::once(async {
+            Err::<Bytes, _>(std::io::Error::other("broken body"))
+        }))
+    };
+    for path in [
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/chat/completions",
+        "/v1beta/models/gemini-2.5-flash:generateContent",
+        "/v1beta/interactions",
+    ] {
+        // (case, key, body, status)
+        let rows: [(&str, bool, Body, u16); 4] = [
+            ("no key", false, Body::empty(), 401),
+            ("unreadable body", true, broken(), 400),
+            ("invalid JSON", true, Body::from("{"), 400),
+            (
+                "unknown model",
+                true,
+                Body::from(r#"{"model":"no-such-model-xyz","messages":[],"input":"hi","contents":[]}"#),
+                400,
+            ),
+        ];
+        for (case, key, body, want) in rows {
+            let (status, request_id, text) = answer(&app, path, key, body).await;
+            assert_eq!(status, want, "{path} {case}: {text}");
+            assert_inference_error(path, status, &text, request_id.as_ref());
+            if case == "unknown model" && !path.starts_with("/v1beta/models/") {
+                assert!(
+                    text.contains("unknown provider for model no-such-model-xyz"),
+                    "{path}: {text}"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Anthropic Messages and token counting admit up to 128 MB unless a smaller limit is
+/// set; one buffer serves every row.
+#[tokio::test]
+async fn anthropic_body_ceiling_is_128_mb_unless_configured_lower() {
+    const MAX: usize = 128_000_000;
+    let request = r#"{"model":"claude-sonnet-4-6","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+    let mut buffer = request.as_bytes().to_vec();
+    buffer.resize(MAX + 1, b' ');
+    let buffer = Bytes::from(buffer);
+    let dir = std::env::temp_dir().join(format!("cooker-anthropic-ceiling-{}", std::process::id()));
+    // (server settings, size, rejected)
+    let rows = [
+        ("", MAX + 1, true),
+        ("", MAX, false),
+        ("server:\n  max-request-body-bytes: 256000000\n", MAX + 1, true),
+        ("server:\n  max-request-body-bytes: 200\n", 201, true),
+        ("server:\n  max-request-body-bytes: 200\n", 200, false),
+    ];
+    for (settings, size, rejected) in rows {
+        let (app, _, _) = app(&dir, &format!("{KEYED}{settings}"));
+        for path in ANTHROPIC_PATHS {
+            for chunked in [false, true] {
+                let bytes = buffer.slice(..size);
+                let body = if chunked {
+                    Body::from_stream(futures_util::stream::once(
+                        async move { Ok::<_, std::io::Error>(bytes) },
+                    ))
+                } else {
+                    Body::from(bytes)
+                };
+                let (status, request_id, text) = answer(&app, path, true, body).await;
+                let case = format!("{settings:?} {path} {size} chunked={chunked}");
+                assert_eq!(status == 413, rejected, "{case}: {status} {text}");
+                if rejected {
+                    assert_inference_error(path, status, &text, request_id.as_ref());
+                    assert!(text.contains("request_too_large"), "{case}: {text}");
+                }
+            }
+        }
+    }
+    // An admitted request must also get through the executor: a read or limit failure after
+    // admission would still pass the status check above.
+    let seen = Arc::new(AtomicU64::new(0));
+    let counter = seen.clone();
+    let upstream = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let counter = counter.clone();
+        async move {
+            let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+            assert!(serde_json::from_slice::<Value>(&body).is_ok_and(|v| v["model"] == "claude-sonnet-4-6"));
+            counter.fetch_add(1, Ordering::Relaxed);
+            (
+                [("content-type", "application/json")],
+                r#"{"id":"msg_test","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let yaml = format!(
+        "{KEYED}api-keys:\n  claude:\n    - name: local\n      base-url: {url}\n      keys: [{{api-key: sk-fake}}]\n"
     );
+    let (app, _, _) = app_to(&dir, &yaml, &url);
+    let (status, _, text) = answer(&app, "/v1/messages", true, Body::from(buffer.slice(..MAX))).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(
+        seen.load(Ordering::Relaxed),
+        1,
+        "the admitted request reached the upstream once"
+    );
+    server.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,7 +1,6 @@
 //! End-to-end: client -> cooker -> mock Anthropic upstream.
 //!
-//! Expectations come from CLIProxyAPI's handlers (sdk/api/handlers/claude/code_handlers.go),
-//! not from this implementation.
+//! Success recordings retain their Go contracts; HTTP errors follow F13/F14.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -18,6 +17,17 @@ use ck_server::router;
 const SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
                    event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 const JSON_REPLY: &str = r#"{"id":"msg_1","type":"message","content":[]}"#;
+
+async fn assert_http_error(response: wreq::Response, kind: &str) -> serde_json::Value {
+    let id = response.headers()["request-id"].to_str().unwrap().to_owned();
+    assert!(!id.is_empty());
+    let value: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], kind);
+    assert!(value["error"]["message"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(value["request_id"], id);
+    value
+}
 
 #[derive(Clone, Debug)]
 struct Seen {
@@ -167,18 +177,15 @@ async fn claude_messages_end_to_end() {
     // Client auth (sdk/access errors).
     let missing = client.post(&url).body("{}").send().await.unwrap();
     assert_eq!(missing.status().as_u16(), 401);
-    assert_eq!(missing.text().await.unwrap(), r#"{"error":"Missing API key"}"#);
+    assert_http_error(missing, "authentication_error").await;
     let wrong = client
         .post(format!("{url}?key=nope&key=client-key-1"))
         .body("{}")
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        wrong.text().await.unwrap(),
-        r#"{"error":"Invalid API key"}"#,
-        "first query value wins"
-    );
+    assert_eq!(wrong.status().as_u16(), 401, "first query value wins");
+    assert_http_error(wrong, "authentication_error").await;
     assert!(
         log.lock().unwrap().is_empty(),
         "rejected requests must not reach upstream"
@@ -214,10 +221,8 @@ async fn claude_messages_end_to_end() {
         .unwrap();
     assert_eq!(res.status().as_u16(), 429);
     assert!(res.headers().get("retry-after").is_none());
-    assert_eq!(
-        res.text().await.unwrap(),
-        r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
-    );
+    let error = assert_http_error(res, "rate_limit_error").await;
+    assert_eq!(error["error"]["message"], "slow down");
 
     // Upstream dies mid-stream: events so far, then a terminal error event.
     let res = post(r#"{"model":"claude-opus-5-5","stream":true,"x":"MODE_BREAK"}"#)
@@ -227,13 +232,12 @@ async fn claude_messages_end_to_end() {
     let text = res.text().await.unwrap();
     let (first, rest) = text.split_at("event: message_start\ndata: {}\n\n".len());
     assert_eq!(first, "event: message_start\ndata: {}\n\n");
-    assert!(
-        rest.starts_with(
-            r#"event: error
-data: {"type":"error","error":{"type":"api_error","message":"unexpected EOF"#
-        ),
-        "got {rest:?}"
-    );
+    let data = rest.strip_prefix("event: error\ndata: ").expect("terminal error event");
+    let error: serde_json::Value = serde_json::from_str(data.trim()).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "api_error");
+    assert!(error["error"]["message"].is_string());
+    assert!(error.get("request_id").is_none(), "SSE has no HTTP request_id");
     assert!(rest.ends_with("\n\n"));
 
     let seen = log.lock().unwrap().clone();
@@ -302,7 +306,7 @@ data: {"type":"error","error":{"type":"api_error","message":"unexpected EOF"#
 }
 
 #[tokio::test]
-async fn unregistered_and_unserved_models_follow_go_error_contracts() {
+async fn unregistered_and_unserved_models_follow_anthropic_errors() {
     let _registry = REGISTRY.lock().await;
     let dir = auth_dir(
         "empty",
@@ -329,19 +333,15 @@ async fn unregistered_and_unserved_models_follow_go_error_contracts() {
     // models, so the model has no provider: 400, not auth_not_found.
     let res = post(r#"{"model":"claude-opus-5"}"#).await.unwrap();
     assert_eq!(res.status().as_u16(), 400);
-    assert_eq!(
-        res.text().await.unwrap(),
-        r#"{"type":"error","error":{"type":"invalid_request_error","message":"unknown provider for model claude-opus-5"}}"#
-    );
+    let error = assert_http_error(res, "invalid_request_error").await;
+    assert_eq!(error["error"]["message"], "unknown provider for model claude-opus-5");
     // An Antigravity credential without a project or refresh token: Go's
     // PrepareRequestAuth fails in ensureAccessToken (`missing refresh token`, 401)
     // before any request leaves, and the conductor answers that last error.
     let res = post(r#"{"model":"gemini-3-flash"}"#).await.unwrap();
     assert_eq!(res.status().as_u16(), 401);
-    assert_eq!(
-        res.text().await.unwrap(),
-        r#"{"type":"error","error":{"type":"authentication_error","message":"missing refresh token"}}"#
-    );
+    let error = assert_http_error(res, "authentication_error").await;
+    assert!(!error.to_string().contains("missing refresh token"));
     // Go v8.0.35 (f62d4d28) dropped these Antigravity models from the catalog, so the
     // credential no longer registers them and they have no provider.
     for model in ["gemini-pro-agent", "gemini-3.1-pro-low", "gemini-3.7-flash-high"] {
@@ -349,12 +349,7 @@ async fn unregistered_and_unserved_models_follow_go_error_contracts() {
             .await
             .unwrap();
         assert_eq!(res.status().as_u16(), 400, "{model}");
-        assert_eq!(
-            res.text().await.unwrap(),
-            format!(
-                r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"unknown provider for model {model}"}}}}"#
-            )
-        );
+        assert_http_error(res, "invalid_request_error").await;
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

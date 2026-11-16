@@ -518,6 +518,9 @@ impl OAuth {
                 )
             };
             let mut error = crate::gemini::status_err(status, message);
+            // A refused refresh leaves the credential unusable whatever the status: it
+            // fails over, and routes that hide local detail hide this text.
+            error.scope = FailureScope::Credential;
             if status == 429 {
                 error.retry_after = parse_retry_delay(&data);
             }

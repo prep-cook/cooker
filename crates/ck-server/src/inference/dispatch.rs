@@ -219,7 +219,7 @@ impl Failure {
             Failure::UnknownModel(model) => {
                 let message = gojson::sjson_string(&format!("unknown provider for model {model}"));
                 format!(
-                    r#"{{"error":{{"message":{message},"type":"invalid_request_error","code":"model_not_found","param":"model"}}}}"#
+                    r#"{{"error":{{"message":{message},"type":"invalid_request_error","code":"model_not_found","param":null}}}}"#
                 )
             }
             Failure::ImageOnly(model) => format!(
@@ -283,7 +283,8 @@ impl Failure {
         }
     }
 
-    /// An error the route returns untouched (claude_executor_fast_error.go).
+    /// A fast-mode error (claude_executor_fast_error.go): the route keeps its status and
+    /// filtered headers, and renders the body in the client's error shape.
     pub fn direct(&self) -> Option<&ExecError> {
         match self {
             Failure::Exec(e) if e.direct => Some(e),
@@ -2077,10 +2078,10 @@ mod tests {
     }
 
     #[test]
-    fn failure_texts_match_go_shapes() {
+    fn failure_texts_preserve_error_details() {
         assert_eq!(
             Failure::UnknownModel("claude-sonnet-4-6".into()).text(),
-            r#"{"error":{"message":"unknown provider for model claude-sonnet-4-6","type":"invalid_request_error","code":"model_not_found","param":"model"}}"#
+            r#"{"error":{"message":"unknown provider for model claude-sonnet-4-6","type":"invalid_request_error","code":"model_not_found","param":null}}"#
         );
         let cooldown = Failure::Cooldown {
             model: "m".into(),

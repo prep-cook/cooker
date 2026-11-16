@@ -3,7 +3,7 @@
 //! against goldens from v8.0.35, as are the passthrough error headers
 //! (`passthrough_errors_go.json`), by tests/reference/media: the same config, client
 //! requests and scripted upstream replies, compared on status, the kept response headers,
-//! the response body and every raw upstream request.
+//! success bodies and every raw upstream request. HTTP error bodies follow F13/F14.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -70,31 +70,38 @@ const KEEP: [&str; 6] = [
     "Last-Modified",
 ];
 
-/// Scenarios whose Go error message is Go's own dial error text: the status, headers and
-/// the error envelope's `type` and `code` are compared, and the message must be a string.
-const STATUS_ONLY: [&str; 1] = ["video_content_connect_refused"];
-
-/// Scenarios whose Go error copied the stream's own `Content-Length: 0` from its
-/// passthrough headers, which cuts Go's error body to nothing. Rust drops framing
-/// headers from them (`respond::write_error_headers`), so length and body are skipped.
-const ADDON_FRAMING: [&str; 1] = ["compat_stream_empty"];
-
-/// The error envelope check for a [`STATUS_ONLY`] scenario, `None` when it matches Go.
-fn gateway_error_diff(go: &str, rust: &str) -> Option<String> {
-    let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s).ok();
-    let want = parse(go).expect("Go error body is JSON");
+fn assert_error(scenario: &Scenario, body: &str, request_id: Option<&str>) {
+    let value: serde_json::Value = serde_json::from_str(body).expect("HTTP error is JSON");
+    let error = value["error"].as_object().expect("HTTP error object");
     assert!(
-        want["error"]["type"].is_string() && want["error"]["code"].is_string(),
-        "{go}"
+        error["message"].as_str().is_some_and(|s| !s.is_empty()),
+        "{}: {body}",
+        scenario.name
     );
-    let Some(got) = parse(rust) else {
-        return Some(format!("body is not JSON: {rust}"));
-    };
-    let stable = |v: &serde_json::Value| (v["error"]["type"].clone(), v["error"]["code"].clone());
-    if stable(&got) != stable(&want) || !got["error"]["message"].is_string() {
-        return Some(format!("error envelope:\n  go   {go}\n  rust {rust}"));
+    let old: serde_json::Value = serde_json::from_str(&scenario.response).unwrap_or_default();
+    let kind = old["error"]["type"].as_str().unwrap_or(match scenario.status {
+        401 => "authentication_error",
+        404 => "invalid_request_error",
+        429 => "rate_limit_error",
+        500.. => "server_error",
+        _ => "invalid_request_error",
+    });
+    assert_eq!(error["type"], kind, "{}: {body}", scenario.name);
+    if scenario.path == "/v1/messages" {
+        assert_eq!(value["type"], "error");
+        let id = value["request_id"].as_str().expect("local request_id");
+        assert!(!id.is_empty());
+        assert_eq!(Some(id), request_id);
+    } else {
+        assert_eq!(
+            error.get("param"),
+            Some(&serde_json::Value::Null),
+            "{}: {body}",
+            scenario.name
+        );
+        let code = error.get("code").expect("nullable code is required");
+        assert!(code.is_null() || code.is_string(), "{}: {body}", scenario.name);
     }
-    None
 }
 
 /// Answers each connection with the next scripted reply and records the raw request,
@@ -264,6 +271,11 @@ async fn media_routes_match_go() {
         if s.name.starts_with("models_grok_shell") {
             s.response
                 .replace(PREVIEW_ENTRY, &format!("{PREVIEW_ENTRY},{speech_entries}"))
+        } else if s.name == "slow_gen_compat_error" {
+            // OpenAI's SDK error envelope includes nullable param/code, also after
+            // a JSON keepalive: openai-python/src/openai/_exceptions.py (APIError).
+            "\n{\"error\":{\"message\":\"nope\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}"
+                .into()
         } else {
             s.response.clone()
         }
@@ -312,6 +324,13 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
     // (docs/DIFFERENCES-FROM-GO.md "Default routing strategy"), so Go's is set.
     assert!(!config.contains("strategy:"), "the fixture leaves the strategy unset");
     let config = format!("{config}\nrouting:\n  strategy: round-robin\n");
+    // Undelayed recordings expect no keepalive; host load must not select their mode.
+    let quiet = Config::parse(
+        &config
+            .replace("nonstream-keepalive-interval: 1", "nonstream-keepalive-interval: 0")
+            .replace("keepalive-seconds: 1", "keepalive-seconds: 0"),
+    )
+    .expect("config without keepalives parses");
     let config = Config::parse(&config).expect("config parses");
     let credentials = ck_core::config::credentials::load(&config);
     let executors = Executors {
@@ -321,11 +340,12 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
         openai: Default::default(),
         google: Default::default(),
     };
-    let rt = Arc::new(ck_server::testing::runtime(config, credentials, executors));
+    let rt = Arc::new(ck_server::testing::runtime(quiet.clone(), credentials, executors));
     ck_server::install_registry(&rt);
     let server = wide_listener().await;
     let base = format!("http://{}", server.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(server, router(rt)).await.unwrap() });
+    let app = router(rt.clone());
+    tokio::spawn(async move { axum::serve(server, app).await.unwrap() });
 
     let norm = Normalizer {
         addr: addr.clone(),
@@ -337,7 +357,13 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
     };
     let client = wreq::Client::new();
     let mut failures = Vec::new();
+    let mut keepalive = false;
     for s in &fixture.scenarios {
+        let delayed = s.upstreams.iter().any(|reply| reply.delay_ms > 0);
+        if delayed != keepalive {
+            assert!(rt.publish_config(if delayed { config.clone() } else { quiet.clone() }));
+            keepalive = delayed;
+        }
         *upstream.replies.lock().unwrap() = s.upstreams.iter().cloned().collect();
         upstream.requests.lock().unwrap().clear();
         let method = wreq::Method::from_bytes(s.method.as_bytes()).unwrap();
@@ -381,6 +407,7 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
                 }
             }
         }
+        let request_id = res.headers().get("request-id").map(|v| v.to_str().unwrap().to_owned());
         let body = res.bytes().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let (response, response_b64) = match std::str::from_utf8(&body) {
@@ -399,25 +426,20 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
         if status != s.status {
             diffs.push(format!("status: go {} rust {status}", s.status));
         }
-        let framing = ADDON_FRAMING.contains(&s.name.as_str());
-        let compare_body = !STATUS_ONLY.contains(&s.name.as_str()) && !framing;
+        let want = expected(s);
+        let video_failure = serde_json::from_str::<serde_json::Value>(&want).is_ok_and(|v| v["object"] == "video");
+        let protocol_error = s.status >= 400 && !video_failure;
         let mut want_headers = s.response_headers.clone();
-        if !compare_body {
-            headers.remove("Content-Length");
-            want_headers.remove("Content-Length");
+        if protocol_error && want_headers.contains_key("Content-Length") {
+            want_headers.insert("Content-Length".into(), body.len().to_string());
         }
         if headers != want_headers {
-            diffs.push(format!("headers:\n  go   {:?}\n  rust {headers:?}", s.response_headers));
+            diffs.push(format!("headers:\n  want {want_headers:?}\n  rust {headers:?}"));
         }
-        let want = expected(s);
-        if compare_body && (response != want || response_b64 != s.response_b64) {
+        if protocol_error {
+            assert_error(s, &response, request_id.as_deref());
+        } else if response != want || response_b64 != s.response_b64 {
             diffs.push(format!("body:\n  go   {want}\n  rust {response}"));
-        }
-        if !compare_body
-            && !framing
-            && let Some(diff) = gateway_error_diff(&s.response, &response)
-        {
-            diffs.push(diff);
         }
         let want_requests: Vec<String> = s
             .requests
@@ -443,13 +465,6 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
         }
     }
     if tag == "speech" {
-        // Past the shared request limit: Go has none by default, reads an identity body
-        // whole and answers its decoded 1 MiB check.
-        let want = fixture
-            .scenarios
-            .iter()
-            .find(|s| s.name == "speech_zstd_decoded_too_large")
-            .expect("the oversize scenario");
         let res = client
             .post(format!("{base}/v1/tts"))
             .header("Authorization", "Bearer client-key-1")
@@ -460,12 +475,14 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
             .unwrap();
         let status = res.status().as_u16();
         let body = res.text().await.unwrap();
-        if (status, body.as_str()) != (want.status, want.response.as_str()) {
-            failures.push(format!(
-                "== speech/identity_body_over_request_limit\n  go   {} {}\n  rust {status} {body}",
-                want.status, want.response
-            ));
+        if status != 413 {
+            failures.push(format!("== speech/identity_body_over_request_limit: {status} {body}"));
         }
+        let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert!(error["error"]["message"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(error["error"].get("param"), Some(&serde_json::Value::Null));
+        assert_eq!(error["error"].get("code"), Some(&serde_json::Value::Null));
     }
     failures
 }

@@ -2,5 +2,6 @@
 
 pub mod body_limit;
 pub mod egress;
+pub(crate) mod errors;
 pub(crate) mod gojson;
 pub(crate) mod respond;

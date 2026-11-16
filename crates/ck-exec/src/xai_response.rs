@@ -808,12 +808,12 @@ const FREE_USAGE_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
 pub(crate) fn status_error(status: u16, body: &[u8]) -> ExecError {
     let message = String::from_utf8_lossy(body).into_owned();
     if body.is_empty() {
-        return crate::openai_compat::status_err(status, message);
+        return crate::openai_compat::status_err(status, message).from_upstream();
     }
     if status == 403 && is_bad_credentials(body) {
-        return crate::openai_compat::status_err(401, message);
+        return crate::openai_compat::status_err(401, message).from_upstream();
     }
-    let mut error = crate::openai_compat::status_err(status, message);
+    let mut error = crate::openai_compat::status_err(status, message).from_upstream();
     if status != 429 {
         return error;
     }

@@ -557,7 +557,7 @@ fn stream_error_event(status: u16, text: &str) -> Bytes {
     let text = crate::inference::openai::sanitize_error_text(status, text);
     Bytes::from(format!(
         "event: error\ndata: {}\n\n",
-        errors::openai_body(status, &text)
+        errors::openai_stream_body(status, &text)
     ))
 }
 

@@ -170,6 +170,7 @@ pub(crate) async fn refused(upstream: proxy::Upstream) -> ExecError {
         retry_after: None,
         direct: false,
         addon: None,
+        upstream: true,
     }
 }
 

@@ -446,7 +446,7 @@ impl Writer for ChatSse {
 
     fn error(&mut self, error: &ExecError) -> Vec<Bytes> {
         let status = crate::scheduling::classify::response_status(error);
-        let body = errors::openai_body(status, &crate::scheduling::classify::error_text(error));
+        let body = errors::openai_stream_body(status, &crate::scheduling::classify::error_text(error));
         vec![Bytes::from(format!("data: {body}\n\n"))]
     }
 
@@ -454,7 +454,7 @@ impl Writer for ChatSse {
         // Go 97dd9eec: a stream that closes cleanly before any chunk carried a
         // finish_reason was truncated; report it instead of completing with [DONE].
         if self.delivered && !self.finished {
-            let body = errors::openai_body(502, "upstream stream closed before any chunk carried finish_reason");
+            let body = errors::openai_stream_body(502, "upstream stream closed before any chunk carried finish_reason");
             return vec![Bytes::from(format!("data: {body}\n\n"))];
         }
         vec![Bytes::from_static(b"data: [DONE]\n\n")]

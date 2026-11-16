@@ -772,7 +772,7 @@ impl Runtime {
             .ok_or_else(|| {
                 ExecError::local(
                     409,
-                    FailureScope::Request,
+                    FailureScope::Credential,
                     "credential removed or disabled during preparation",
                 )
             })?;
@@ -781,7 +781,7 @@ impl Runtime {
         if !management && self.store.tokens_refused(&current) {
             return Err(ExecError::local(
                 401,
-                FailureScope::Request,
+                FailureScope::Credential,
                 "credential tokens were refused; sign in again",
             ));
         }
@@ -864,7 +864,7 @@ impl Runtime {
         if current.disabled {
             return Err(ExecError::local(
                 409,
-                FailureScope::Request,
+                FailureScope::Credential,
                 "credential disabled during preparation",
             ));
         }
@@ -6071,7 +6071,7 @@ pub(crate) mod tests {
         rt.store.reconcile(Vec::new());
         drop(guard);
         let error = worker.await.unwrap().unwrap_err();
-        assert_eq!(error.scope, FailureScope::Request);
+        assert_eq!(error.scope, FailureScope::Credential);
         assert!(rt.store.snapshot().is_empty());
         rt.start_auto_refresh();
         let first = rt.refresh_task.lock().unwrap().clone().unwrap();

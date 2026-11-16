@@ -363,6 +363,7 @@ pub(crate) fn upstream_error(status: u16, body: &[u8]) -> ExecError {
         retry_after,
         direct: false,
         addon: None,
+        upstream: true,
     }
 }
 

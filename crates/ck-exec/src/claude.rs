@@ -859,6 +859,7 @@ fn upstream_error(
             body,
             direct: true,
             addon: None,
+            upstream: true,
         };
     }
     let error = ExecError {
@@ -873,6 +874,7 @@ fn upstream_error(
         },
         direct: false,
         addon: None,
+        upstream: true,
     };
     quota::classify(error, model_level_cooling)
 }

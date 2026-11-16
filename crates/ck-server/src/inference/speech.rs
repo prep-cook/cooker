@@ -58,11 +58,6 @@ pub async fn speech(
 ) -> Response {
     let body = match body {
         Ok(body) => body,
-        // Past the shared request limit: Go (no limit by default) reads an identity body
-        // whole and fails the 1 MiB check. A compressed body's decoded size is unknown.
-        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE && identity(&headers) => {
-            return bad_request("request body is larger than 1MB");
-        }
         Err(rejection) => return read_failed(&rejection),
     };
     let body = match crate::inference::openai::read_body(&headers, body, limit.0) {
@@ -116,14 +111,6 @@ pub async fn speech(
         }
     })
     .await
-}
-
-/// No `Content-Encoding`, or `identity` (Go `ReadRequestBody` returns such a body raw).
-fn identity(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::CONTENT_ENCODING)
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned())
-        .is_none_or(|e| e.is_empty() || e.eq_ignore_ascii_case("identity"))
 }
 
 /// The audio response: the upstream Content-Type unless it names no audio type
