@@ -10,7 +10,7 @@ use crate::http::egress::Framing;
 pub enum Cursor {
     /// `v1.e.<n>`: the client consumed the first `n` complete SSE events.
     Events(u64),
-    /// `v1.b.<n>`: the client consumed the first `n` entity-body bytes of a JSON body.
+    /// `v1.b.<n>`: the client consumed the first `n` entity-body bytes of a JSON or raw body.
     Bytes(u64),
 }
 
@@ -19,7 +19,7 @@ impl Cursor {
     pub fn start(framing: Framing) -> Self {
         match framing {
             Framing::Sse => Self::Events(0),
-            Framing::Json | Framing::JsonArray => Self::Bytes(0),
+            Framing::Json | Framing::JsonArray | Framing::Raw => Self::Bytes(0),
         }
     }
 
@@ -40,7 +40,7 @@ impl Cursor {
     pub fn fits(self, framing: Framing) -> bool {
         matches!(
             (self, framing),
-            (Self::Events(_), Framing::Sse) | (Self::Bytes(_), Framing::Json | Framing::JsonArray)
+            (Self::Events(_), Framing::Sse) | (Self::Bytes(_), Framing::Json | Framing::JsonArray | Framing::Raw)
         )
     }
 
@@ -154,5 +154,6 @@ mod tests {
         }
         assert_eq!(Cursor::Events(7).to_string(), "v1.e.7");
         assert!(Cursor::Bytes(0).fits(Framing::JsonArray) && !Cursor::Bytes(0).fits(Framing::Sse));
+        assert!(Cursor::Bytes(3).fits(Framing::Raw) && !Cursor::Events(3).fits(Framing::Raw));
     }
 }

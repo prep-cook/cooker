@@ -554,7 +554,7 @@ fn failed(error: ExecError) -> Ran {
 }
 
 /// Contract §9 for a storage error before commitment.
-fn stored(error: &ck_stream::Error) -> ExecError {
+pub(crate) fn stored(error: &ck_stream::Error) -> ExecError {
     match error {
         ck_stream::Error::StorageExhausted | ck_stream::Error::Io(_) => {
             ExecError::local(503, FailureScope::Request, "stream.storage_exhausted")

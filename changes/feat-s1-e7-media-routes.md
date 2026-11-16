@@ -1,0 +1,4 @@
+Changed
+
+- `POST /v1/audio/speech` and `/v1/tts` stream the audio from its first byte instead of buffering it. Nothing is sent before that byte, so an upstream failure before it moves to the next credential. The response carries `X-Ck-Stream-Id` and `Cache-Control: no-store`, has no `Content-Length`, and resumes with `GET /v1/streams?after=v1.b.<bytes>`.
+- A video job id is found only with the client key that created it; another key gets 404. Cooker tracks at most 4096 video jobs and pending creates. A create while the table is full gets 503 and nothing is sent upstream. A job is forgotten three hours after its last create or poll; `multimedia.video-result-auth-cache-ttl` no longer has any effect.

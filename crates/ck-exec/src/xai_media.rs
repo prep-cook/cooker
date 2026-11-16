@@ -15,6 +15,7 @@ use ck_wire::gostr::GoStr;
 use ck_wire::json as gj;
 use http::HeaderMap;
 
+use ck_translate::codec::document::Document;
 use ck_translate::codec::{self, BodyMode, Media, RequestView};
 use ck_translate::{audio, images, video};
 use ck_wire::thinking::parse_suffix;
@@ -638,6 +639,35 @@ fn speech_model_unavailable(body: &[u8]) -> bool {
     .any(|path| names(&gj::get(body, path).str()))
 }
 
+/// The audio format a speech request asks for: `output_format.codec`, else `response_format`,
+/// lower case; empty for neither, which is MP3.
+fn speech_format(doc: &Document) -> codec::Result<String> {
+    let x = doc.required(doc.root(), "x_ck")?;
+    let audio = doc.required(doc.required(x, "provider_parameters")?, "audio")?;
+    let format = match doc.member(audio, "output_format")? {
+        Some(output) => doc.member(output, "codec")?,
+        None => doc.member(audio, "response_format")?,
+    };
+    Ok(match format {
+        Some(node) => media_exec::text(doc, node)?.trim().to_ascii_lowercase(),
+        None => String::new(),
+    })
+}
+
+/// The audio's media type (`speechResponseContentType`): the upstream's unless it names no
+/// audio (`speechContentTypeNeedsDefault`), then the requested format's own.
+fn speech_type<'a>(upstream: Option<&'a str>, format: &str) -> &'a str {
+    let media = upstream.unwrap_or_default().split(';').next().unwrap_or_default();
+    match media.trim().to_ascii_lowercase().as_str() {
+        "" | "application/json" | "application/octet-stream" | "text/plain" => match format {
+            "wav" => "audio/wav",
+            "pcm" => "audio/pcm",
+            _ => "audio/mpeg",
+        },
+        _ => upstream.unwrap_or_default(),
+    }
+}
+
 /// The limit of one speech body: the audio file itself.
 const SPEECH_LIMIT: u64 = 64 << 20;
 /// The limit of one video job body; the video itself is a separate download.
@@ -732,9 +762,16 @@ impl XaiExecutor {
                     )
                     .await?;
                 let (content_type, length) = media_exec::entity(&upstream.headers);
-                let ingress =
-                    audio::Ingress::new(streams.response, attempt.identity, content_type, length, SPEECH_LIMIT)
-                        .map_err(xai_exec::encoding)?;
+                let format = speech_format(request.validated.view().document).map_err(xai_exec::encoding)?;
+                let content_type = speech_type(content_type, &format);
+                let ingress = audio::Ingress::new(
+                    streams.response,
+                    attempt.identity,
+                    Some(content_type),
+                    length,
+                    SPEECH_LIMIT,
+                )
+                .map_err(xai_exec::encoding)?;
                 (
                     upstream.status,
                     upstream.headers,
