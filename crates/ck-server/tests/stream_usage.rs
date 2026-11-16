@@ -90,6 +90,85 @@ async fn the_last_snapshot_is_the_usage_once_however_often_the_stream_is_read() 
     assert_eq!(again.attempt(), Some(&usage));
 }
 
+/// Kimi reports usage in each choice's last chunk, with the same prompt and that choice's
+/// completion: the attempt's usage counts the prompt once and every completion, an aggregate
+/// replaces it, and a stream cut short keeps what its choices reported.
+#[tokio::test]
+async fn choice_usage_counts_the_shared_prompt_once() {
+    let choice = |index: u64, delta: &str, finish: &str, usage: Option<u64>| {
+        let usage = usage.map_or(String::new(), |completion| {
+            format!(
+                r#","usage":{{"prompt_tokens":10,"completion_tokens":{completion},"total_tokens":{}}}"#,
+                10 + completion
+            )
+        });
+        bytes::Bytes::from(format!(
+            "data: {{\"id\":\"r\",\"model\":\"m\",\"created\":1,\"choices\":[{{\"index\":{index},\"delta\":{delta},\"finish_reason\":{finish}{usage}}}]}}\n\n"
+        ))
+    };
+    let opening = || {
+        vec![
+            choice(0, r#"{"role":"assistant","content":"a"}"#, "null", None),
+            choice(1, r#"{"role":"assistant","content":"b"}"#, "null", None),
+        ]
+    };
+    let both = || {
+        let mut chunks = opening();
+        chunks.push(choice(0, "{}", r#""stop""#, Some(5)));
+        chunks.push(choice(1, "{}", r#""stop""#, Some(7)));
+        chunks
+    };
+    // (label, upstream chunks, whether the body completes, (input, output, total)).
+    type Row = (&'static str, Vec<bytes::Bytes>, bool, (u64, u64, u64));
+    let rows: Vec<Row> = vec![
+        ("two choices without an aggregate", both(), true, (10, 12, 22)),
+        (
+            "an aggregate replaces the choices' usage",
+            {
+                let mut chunks = both();
+                chunks.push(usage_chunk(
+                    r#"{"prompt_tokens":10,"completion_tokens":13,"total_tokens":23}"#,
+                    "null",
+                ));
+                chunks
+            },
+            true,
+            (10, 13, 23),
+        ),
+        (
+            "a cut stream keeps the usage its choices reported",
+            {
+                let mut chunks = opening();
+                chunks.push(choice(0, "{}", r#""stop""#, Some(5)));
+                chunks
+            },
+            false,
+            (10, 5, 15),
+        ),
+    ];
+    for (label, chunks, complete, expected) in rows {
+        let fixture = Fixture::new(|_| {});
+        let mut live = commit(&fixture, owner(KEY), Framing::Sse, STREAMED);
+        let accounting = usage_reader(&fixture, &live);
+        for chunk in chunks {
+            live.send(chunk);
+        }
+        if complete {
+            live.send(done());
+            live.end();
+        } else {
+            live.fail();
+        }
+        let (usage, _) = accounting.await.unwrap();
+        let usage = usage.attempt().cloned().unwrap_or_default();
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (Some(expected.0), Some(expected.1), Some(expected.2)),
+            "{label}: {usage:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_stream_without_usage_reports_none_not_zero() {
     let fixture = Fixture::new(|_| {});
