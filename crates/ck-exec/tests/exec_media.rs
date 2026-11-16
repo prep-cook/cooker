@@ -472,7 +472,7 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
             "POST",
             "/videos/generations",
             json!({"model":"grok-imagine-video","prompt":"waves","duration":5}),
-            &[("x-idempotency-key", Some("idem-1"))],
+            &[("x-idempotency-key", None)],
         ),
         (
             "xAI video poll",
@@ -490,9 +490,9 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
         let upstream = StreamUpstream::start([reply]).await;
         let streams = Streams::new();
         let mut exchange = exchange(provider, &upstream, model);
-        exchange
-            .headers
-            .insert("idempotency-key", http::HeaderValue::from_static("idem-1"));
+        for name in ["idempotency-key", "x-idempotency-key"] {
+            exchange.headers.insert(name, http::HeaderValue::from_static("idem-1"));
+        }
         exchange
             .headers
             .insert("user-agent", http::HeaderValue::from_static("client-ua/1"));
@@ -1116,5 +1116,53 @@ async fn video_job_usage_is_charged_once_whichever_route_polls_it() {
             charged.push(video_step(&xai, &upstream, route, job, body).await);
         }
         assert_eq!(charged, expected, "{label}");
+    }
+}
+
+/// A video job id belongs to the caller that created it, and the job table is bounded (E-Q5):
+/// another caller's poll is not found and a create while the table is full is refused with 503,
+/// both before anything is sent.
+#[tokio::test]
+async fn video_jobs_belong_to_their_caller_and_a_full_table_sends_nothing() {
+    let callers = ["sk-client-a", "sk-client-b"];
+    // (caller, job, create or poll, refusal status, upstream requests after the step)
+    let steps: [(usize, &str, bool, Option<u16>, usize); 6] = [
+        (0, "vid_1", true, None, 1),
+        (1, "vid_1", false, Some(404), 1),
+        (0, "vid_1", false, None, 2),
+        (1, "", true, Some(503), 2),
+        (0, "", true, Some(503), 2),
+        (0, "vid_1", false, None, 3),
+    ];
+    let upstream = StreamUpstream::start([
+        Reply::json(r#"{"request_id":"vid_1"}"#),
+        Reply::json(r#"{"status":"pending"}"#),
+        Reply::json(r#"{"status":"pending"}"#),
+    ])
+    .await;
+    let xai = XaiExecutor::with_client(wreq::Client::new()).with_video_capacity(1);
+    for (i, (who, job, create, refused, sent)) in steps.into_iter().enumerate() {
+        let streams = Streams::new();
+        let mut exchange = exchange(Provider::Xai, &upstream, "grok-imagine-video");
+        exchange.caller.principal = callers[who].into();
+        let ask = if create {
+            ask(Media::VideoCreate, VIDEO)
+        } else {
+            foreign(Media::VideoRetrieve, job)
+        };
+        let mut held = decoded(&streams, ask);
+        let operation = Operation::Media(ask.op);
+        let (outcome, records, ..) = run_on(&xai, &streams, &exchange, &mut held, operation, false)
+            .await
+            .unwrap();
+        match refused {
+            None => outcome.unwrap_or_else(|e| panic!("step {i}: {e:?}")),
+            Some(status) => {
+                let error = outcome.expect_err("refused");
+                assert_eq!((error.status, error.scope), (status, FailureScope::Request), "step {i}");
+                assert!(records.is_empty(), "step {i}: nothing published");
+            }
+        }
+        assert_eq!(upstream.requests(), sent, "step {i}");
     }
 }

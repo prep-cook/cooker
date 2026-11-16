@@ -284,7 +284,7 @@ async fn go_reference_scenarios() {
                 // recorded poll's job had been here.
                 let polled = gj::get(&req.body, "request_id").str().into_owned();
                 if !path.ends_with("/generations") && !polled.is_empty() {
-                    drop(executor.jobs.created(&polled));
+                    drop(executor.jobs.created(&req.caller, &polled));
                 }
                 executor.videos(&cred, req, &path, &cfg).await
             }
@@ -654,7 +654,10 @@ async fn media_usage_is_charged_once_per_response_or_job() {
             redirect(url, &target.lock().unwrap())
         });
         let now = time.clone();
-        executor.jobs = crate::xai_media::VideoJobs::with_clock(Arc::new(move || base + now.lock().unwrap().0));
+        executor.jobs = crate::xai_media::VideoJobs::with_clock(
+            Arc::new(move || base + now.lock().unwrap().0),
+            crate::xai_media::JOB_CAPACITY,
+        );
         executor
     });
     let charged =
@@ -733,7 +736,7 @@ async fn media_usage_is_charged_once_per_response_or_job() {
     // A replay of vid_9's create, with its idempotency key, after the restart. The key never
     // reaches xAI, which documents none, so the upstream answers with a new job.
     create(1, r#"{"request_id":"vid_21"}"#);
-    const DAY: u64 = 24 * 3600;
+    const H: u64 = 3 * 3600;
     for (process, id, body, expected, clock) in [
         (0, "vid_9", r#"{"status":"pending","usage":null}"#, Some(false), None),
         (0, "vid_9", charged, Some(true), None),
@@ -766,14 +769,15 @@ async fn media_usage_is_charged_once_per_response_or_job() {
         (1, "vid_20", charged, Some(true), None),
         (1, "vid_21", charged, Some(true), None),
         (1, "vid_9", charged, None, None),
-        // A day after creation and charge: vid_30 was charged at second 0. A poll admitted at
-        // 86,399 s and answered at 86,401 s settles as charged; the next poll finds it expired.
-        // vid_31, created at second 0 and never charged, is charged once by such a poll.
+        // Expiry runs three hours from the last poll: vid_30 was charged at second 0. A poll
+        // admitted at 10,799 s and answered at 10,801 s settles as charged. vid_31, created at
+        // second 0 and never charged, is charged once by such a poll. A poll restarts the clock,
+        // so vid_30 is still live at 10,802 s; three hours after vid_31's last poll it is gone.
         (0, "vid_30", charged, Some(true), None),
-        (0, "vid_30", charged, Some(false), Some((DAY - 1, DAY + 1))),
-        (0, "vid_31", charged, Some(true), Some((DAY - 1, DAY + 1))),
-        (0, "vid_30", charged, None, Some((DAY + 2, DAY + 2))),
-        (0, "vid_31", charged, Some(false), Some((DAY + 2, DAY + 2))),
+        (0, "vid_30", charged, Some(false), Some((H - 1, H + 1))),
+        (0, "vid_31", charged, Some(true), Some((H - 1, H + 1))),
+        (0, "vid_30", charged, Some(false), Some((H + 2, H + 2))),
+        (0, "vid_31", charged, None, Some((2 * H, 2 * H))),
     ] {
         let (path, payload) = poll(id);
         rows.push((process, "videos", path, payload, body.into(), expected, clock));
@@ -869,7 +873,7 @@ async fn media_usage_is_charged_once_per_response_or_job() {
         .videos(&credential(&s, &cfg), req, &path, &cfg)
         .await
         .expect("the second poll");
-    time.lock().unwrap().0 += Duration::from_secs(DAY + 2);
+    time.lock().unwrap().0 += Duration::from_secs(3 * 3600 + 2);
     let (s, _, req) = media_request("videos", &path, &payload);
     let refused = executor.videos(&credential(&s, &cfg), req, &path, &cfg).await;
     assert_eq!(refused.err().map(|e| e.status), Some(404), "vid_40 expired");
@@ -944,83 +948,160 @@ async fn held_upstream(
     (addr, arrived, release)
 }
 
-/// A video job's charge is claimed once whatever order its admitted polls settle in. Expiry
-/// refuses new polls only: a record stays while an admitted poll holds it.
+/// The video job table (E-Q5, E-Q13): a job's charge is claimed once whatever order its admitted
+/// polls settle in; a job id is found only by the caller that created it; a record expires three
+/// hours after its last create or poll, though an admitted poll keeps it; and the table holds at
+/// most its capacity of jobs and pending creates, refusing the next create until one frees.
 #[test]
-fn video_job_charge_is_claimed_once_across_interleavings() {
-    use crate::xai_media::VideoJobs;
+fn video_job_table_scopes_bounds_and_charges_once() {
+    use crate::xai_media::{JobBinding, Slot, VideoJobs};
     enum Step {
         Clock(u64),
-        Create(&'static str),
-        /// (slot, job, admitted)
-        Admit(usize, &'static str, bool),
+        /// A create by caller `who` answered with the job.
+        Create(usize, &'static str),
+        /// (slot, caller, job, admitted)
+        Admit(usize, usize, &'static str, bool),
         /// (slot, charged)
         Settle(usize, bool),
         Release(usize),
+        /// A create reserves its place before sending: (pending, caller, reserved).
+        Reserve(usize, usize, bool),
+        /// The pending create's response names the job.
+        Named(usize, &'static str),
+        /// The pending create failed.
+        Failed(usize),
     }
     use Step::*;
-    const DAY: u64 = 24 * 3600;
+    const H: u64 = 3 * 3600;
     let rows = [
         (
             "two polls admitted uncharged; one charges, a poll past expiry is refused, the other settles",
+            2,
             vec![
-                Create("a"),
-                Admit(0, "a", true),
-                Admit(1, "a", true),
+                Create(0, "a"),
+                Admit(0, 0, "a", true),
+                Admit(1, 0, "a", true),
                 Clock(1),
                 Settle(0, true),
                 Release(0),
-                Clock(DAY + 2),
-                Admit(2, "a", false),
+                Clock(H + 2),
+                Admit(2, 0, "a", false),
                 Settle(1, false),
                 Release(1),
-                Admit(2, "a", false),
+                Admit(2, 0, "a", false),
             ],
         ),
         (
-            "an expired job admitted before expiry: no new poll, its first settlement charges",
+            "a job admitted before expiry: no new poll after it, its first settlement charges",
+            2,
             vec![
-                Create("b"),
-                Admit(0, "b", true),
-                Clock(DAY + 1),
-                Admit(1, "b", false),
+                Create(0, "b"),
+                Admit(0, 0, "b", true),
+                Clock(H + 1),
+                Admit(1, 0, "b", false),
                 Settle(0, true),
                 Release(0),
-                Admit(1, "b", true),
-                Settle(1, false),
+                Admit(1, 0, "b", false),
             ],
         ),
         (
             "two first settlements: one charges",
+            2,
             vec![
-                Create("c"),
-                Admit(0, "c", true),
-                Admit(1, "c", true),
+                Create(0, "c"),
+                Admit(0, 0, "c", true),
+                Admit(1, 0, "c", true),
                 Settle(1, true),
                 Settle(0, false),
             ],
         ),
-        ("a job never created", vec![Admit(0, "d", false)]),
+        ("a job never created", 2, vec![Admit(0, 0, "d", false)]),
+        (
+            "another caller's job is not found, and its own caller's still is",
+            2,
+            vec![Create(0, "e"), Admit(0, 1, "e", false), Admit(1, 0, "e", true)],
+        ),
+        (
+            "a poll restarts expiry: three hours after creation a polled job is live, three after its poll it is gone",
+            2,
+            vec![
+                Create(0, "f"),
+                Clock(H - 1),
+                Admit(0, 0, "f", true),
+                Release(0),
+                Clock(H + 1),
+                Admit(0, 0, "f", true),
+                Release(0),
+                Clock(2 * H + 1),
+                Admit(0, 0, "f", false),
+            ],
+        ),
+        (
+            "a full table refuses a create; a failed create frees its place",
+            2,
+            vec![
+                Reserve(0, 0, true),
+                Reserve(1, 1, true),
+                Reserve(2, 0, false),
+                Failed(0),
+                Reserve(2, 0, true),
+                Named(1, "g"),
+                Reserve(0, 1, false),
+            ],
+        ),
+        (
+            "an expired job frees its place for the next create; an admitted one does not",
+            2,
+            vec![
+                Create(0, "h"),
+                Create(1, "i"),
+                Admit(0, 0, "h", true),
+                Clock(H),
+                Reserve(0, 0, true),
+                Reserve(1, 1, false),
+            ],
+        ),
     ];
-    for (name, steps) in rows {
+    let callers: [ck_core::exec::Caller; 2] = std::array::from_fn(|i| ck_core::exec::Caller {
+        principal: format!("client-key-{i}"),
+        source: "authorization",
+        provider: "config-inline".into(),
+    });
+    for (name, capacity, steps) in rows {
         let time: Arc<Mutex<Duration>> = Arc::default();
         let base = std::time::Instant::now();
         let now = time.clone();
-        let jobs = VideoJobs::with_clock(Arc::new(move || base + *now.lock().unwrap()));
+        let jobs = VideoJobs::with_clock(Arc::new(move || base + *now.lock().unwrap()), capacity);
         let mut held: [Option<crate::xai_media::Admission>; 3] = [None, None, None];
+        let mut pending: [Option<Slot>; 3] = [None, None, None];
+        let binding = || JobBinding {
+            credential: "xai-1".into(),
+            model: "grok-imagine-video".into(),
+        };
         for (i, step) in steps.into_iter().enumerate() {
             match step {
                 Clock(seconds) => *time.lock().unwrap() = Duration::from_secs(seconds),
-                Create(job) => drop(jobs.created(job)),
-                Admit(slot, job, admitted) => {
-                    held[slot] = jobs.admit(job);
+                Create(who, job) => drop(jobs.reserve(&callers[who], binding()).unwrap().created(job)),
+                Admit(slot, who, job, admitted) => {
+                    held[slot] = jobs.admit(&callers[who], job);
                     assert_eq!(held[slot].is_some(), admitted, "{name}: step {i}");
+                    assert_eq!(
+                        jobs.binding(&callers[who], job).is_some(),
+                        admitted,
+                        "{name}: step {i}, binding"
+                    );
                 }
                 Settle(slot, charged) => {
                     let admission = held[slot].as_ref().expect("an admitted poll");
                     assert_eq!(admission.settle(), charged, "{name}: step {i}");
                 }
                 Release(slot) => held[slot] = None,
+                Reserve(slot, who, reserved) => {
+                    pending[slot] = jobs.reserve(&callers[who], binding());
+                    assert_eq!(pending[slot].is_some(), reserved, "{name}: step {i}");
+                }
+                Named(slot, job) => drop(pending[slot].take().unwrap().created(job)),
+                Failed(slot) => pending[slot] = None,
             }
         }
     }

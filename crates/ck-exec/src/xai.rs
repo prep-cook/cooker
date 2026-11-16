@@ -384,6 +384,13 @@ impl XaiExecutor {
         }
     }
 
+    /// The executor with a video job table that holds at most `capacity` jobs and pending creates
+    /// (E-Q5; the default is 4096).
+    pub fn with_video_capacity(mut self, capacity: usize) -> Self {
+        self.jobs = crate::xai_media::VideoJobs::with_clock(std::sync::Arc::new(std::time::Instant::now), capacity);
+        self
+    }
+
     /// Sends every upstream request to `rewrite(url)` instead of `url`.
     #[cfg(test)]
     pub(crate) fn with_url_rewrite(mut self, rewrite: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
