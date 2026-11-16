@@ -7,6 +7,7 @@ import os
 import math
 from pathlib import Path
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -125,13 +126,23 @@ def command_output(command):
         return {"command": command, "error": str(error)}
 
 
+def frame_bytes(root):
+    """The frame size the measured source declares; its hash is recorded with the others."""
+    source = (root/"crates/ck-stream/src/lib.rs").read_text()
+    found = re.search(r"pub const FRAME_BYTES: usize = ([0-9_]+);", source)
+    if not found:
+        raise ValueError("FRAME_BYTES not found in crates/ck-stream/src/lib.rs")
+    return int(found.group(1).replace("_", ""))
+
+
 def provenance(root, tmpfs, binary):
+    frame = frame_bytes(root)
     paths = list((root/"bench/stream").rglob("*.rs"))+list((root/"crates/ck-stream").rglob("*.rs"))
     paths += [root/"bench/stream/Cargo.toml", root/"bench/stream/Cargo.lock", root/"bench/stream/gate.py", root/"bench/stream-gate.sh", binary]
     return {"timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "host": platform.node(), "kernel": platform.platform(), "architecture": platform.machine(),
             "page_size": os.sysconf("SC_PAGE_SIZE"), "affinity": sorted(os.sched_getaffinity(0)),
-            "load": os.getloadavg(), "workers": 8, "frame_bytes": 50000,
+            "load": os.getloadavg(), "workers": 8, "frame_bytes": frame,
             "rustflags": os.environ.get("RUSTFLAGS", ""), "cargo_target_dir": os.environ.get("CARGO_TARGET_DIR"),
             "build": "cargo build --release --locked --offline --manifest-path bench/stream/Cargo.toml; thin LTO; codegen-units=1; default features",
             "revision": command_output(["git", "-C", str(root), "rev-parse", "HEAD"]),
@@ -141,8 +152,8 @@ def provenance(root, tmpfs, binary):
             "hashes": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths if path.is_file()},
             "notes": ["Fresh process per sample; alternating backend order on successive pairs.",
                       "Small requests expire in untimed batches of at most 2048; response delivery never releases bytes.",
-                      "49152-byte records are frame-aligned in both backends; other appends are packed.",
-                      "Heap: S0 shape; uninitialised 50000-byte frames from the system allocator, lock-free committed reads (Release/Acquire record count), locks only for frame-table growth, run-index updates and pointer lookup; Notify wakeups; payloads retained until expiry.",
+                      f"Every append is packed at the published end in both backends; a 49152-byte record spans 12 or 13 {frame}-byte frames.",
+                      f"Heap: S0 shape; uninitialised {frame}-byte frames from the system allocator, lock-free committed reads (Release/Acquire record count), locks only for frame-table growth, run-index updates and pointer lookup; Notify wakeups; payloads retained until expiry.",
                       "Comparison rows run one identical untimed warmup pass and expiry in the same process for both backends; minor_faults counts the measured pass.",
                       "Payload bytes follow a per-stream, per-offset pattern; every reader compares every byte.",
                       "No production event, metadata, stream, header or pool quota is increased.",

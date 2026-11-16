@@ -80,18 +80,21 @@ pub enum Answer {
 }
 
 /// A response ingress with a test-controlled panic and flush deadline. `early` counts the
-/// input it took while its deadline was set.
+/// input it took while its deadline was set. `postpone` moves the inner ingress's own
+/// deadline later, so that only demand flushes what it holds.
 pub struct Probe {
     inner: Box<dyn ResponseIngress + Send>,
     panic: bool,
     deadline: Option<Instant>,
+    postpone: Duration,
     flushed: Arc<Notify>,
     early: Arc<AtomicUsize>,
 }
 
 impl ResponseIngress for Probe {
     fn flush_deadline(&self) -> Option<Instant> {
-        self.deadline.or(self.inner.flush_deadline())
+        self.deadline
+            .or(self.inner.flush_deadline().map(|deadline| deadline + self.postpone))
     }
     fn flush(&mut self, owner: &mut Writer) -> codec::Result<()> {
         self.deadline = None;
@@ -119,6 +122,8 @@ pub struct Stub {
     body: Mutex<Option<mpsc::UnboundedReceiver<Result<Bytes, ExecError>>>>,
     /// Store-clock time from the upstream answer to the probe's flush deadline.
     pub deadline: Mutex<Option<Duration>>,
+    /// Added to the inner ingress's flush deadline.
+    pub postpone: Mutex<Duration>,
     pub flushed: Arc<Notify>,
     pub early: Arc<AtomicUsize>,
 }
@@ -130,6 +135,7 @@ impl Stub {
             answer,
             body: Mutex::new(Some(receiver)),
             deadline: Mutex::new(None),
+            postpone: Mutex::new(Duration::ZERO),
             flushed: Arc::new(Notify::new()),
             early: Arc::new(AtomicUsize::new(0)),
         };
@@ -213,6 +219,7 @@ impl Execute for Stub {
                     .lock()
                     .unwrap()
                     .map(|delay| streams.response.now() + delay),
+                postpone: *self.postpone.lock().unwrap(),
                 flushed: self.flushed.clone(),
                 early: self.early.clone(),
             },

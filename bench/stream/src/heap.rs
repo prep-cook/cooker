@@ -1,4 +1,4 @@
-//! Benchmark-only heap comparator in the S0 shape: uninitialised 50,000-byte
+//! Benchmark-only heap comparator in the S0 shape: uninitialised `FRAME_BYTES`
 //! frames from the global allocator, lock-free copies of committed bytes and a
 //! run-length record index. Locks cover only the frame-table growth, index
 //! updates and pointer lookups, never a payload copy or a reader's visitor.
