@@ -127,6 +127,16 @@ fn response_fragmented(
     downstream: codec::BodyMode,
     fragment: usize,
 ) -> (Vec<u8>, Vec<serde_json::Value>) {
+    response_with_usage(input, upstream, downstream, fragment, true)
+}
+
+fn response_with_usage(
+    input: &[u8],
+    upstream: codec::BodyMode,
+    downstream: codec::BodyMode,
+    fragment: usize,
+    include_usage: bool,
+) -> (Vec<u8>, Vec<serde_json::Value>) {
     use codec::{ResponseEgress, ResponseIngress};
     use std::task::Poll;
     let mut mapped = Mapped::new();
@@ -145,7 +155,7 @@ fn response_fragmented(
         identity(Direction::Response),
         Operation::Generate,
         downstream,
-        true,
+        include_usage,
         |_| panic!("unexpected projection loss"),
     )
     .unwrap();
