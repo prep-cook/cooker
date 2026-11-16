@@ -375,6 +375,7 @@ pub fn restore_bindings(doc: &mut Document) -> Result<()> {
 /// [`restore_bindings`] for a canonical request imported as the subtree `base`, whose `x_ck` is
 /// `x`: each binding resolves inside that subtree.
 pub(crate) fn restore_bindings_from(doc: &mut Document, base: usize, x: usize) -> Result<()> {
+    let replay = doc.member(x, "replay")?;
     for list in bound_lists(doc, x)?.into_iter().flatten() {
         let mut next = doc.node(list)?.first;
         while let Some(entry) = next {
@@ -384,7 +385,7 @@ pub(crate) fn restore_bindings_from(doc: &mut Document, base: usize, x: usize) -
             };
             let parent = resolve_to(doc, base, doc.chars(binding)?, false, &mut |_, _| Ok(None))?;
             let carrier = match doc.member(entry, "carrier")? {
-                Some(carrier) => Some(carrier_name(doc, carrier)?),
+                Some(carrier) => Some(carrier_name(doc, carrier, (Some(list) == replay).then_some(entry))?),
                 None => None,
             };
             doc.bind_origin(entry, parent, carrier)?;
@@ -393,11 +394,33 @@ pub(crate) fn restore_bindings_from(doc: &mut Document, base: usize, x: usize) -
     Ok(())
 }
 
-fn carrier_name(doc: &Document, carrier: usize) -> Result<&'static str> {
+/// The carrier `carrier` names. `replay`: the entry, when it sits in `x_ck.replay`.
+fn carrier_name(doc: &Document, carrier: usize, replay: Option<usize>) -> Result<&'static str> {
+    if let Some(entry) = replay
+        && doc.string_is(carrier, GEMINI_SIGNATURE)?
+        && produced_gemini_signature(doc, entry)?
+    {
+        return Ok(GEMINI_SIGNATURE);
+    }
     for name in CARRIERS {
         if doc.string_is(carrier, name)? {
             return Ok(name);
         }
     }
     Err(Error::Schema)
+}
+
+/// Carrier of a Gemini `thoughtSignature` that history projection binds to the part it rides on.
+const GEMINI_SIGNATURE: &str = "signature";
+
+/// Whether replay `entry` is a Gemini signature tagged with the account that produced it. Only
+/// such an entry may name [`GEMINI_SIGNATURE`]: admission returns it to that account alone and
+/// withholds it from every other (Settled 73).
+fn produced_gemini_signature(doc: &Document, entry: usize) -> Result<bool> {
+    let Some(kind) = doc.member(entry, "kind")? else {
+        return Ok(false);
+    };
+    Ok(doc.string_is(kind, "gemini")?
+        && doc.member(entry, "signature")?.is_some()
+        && doc.member(entry, "producer")?.is_some())
 }
