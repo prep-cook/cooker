@@ -472,7 +472,7 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
             "POST",
             "/videos/generations",
             json!({"model":"grok-imagine-video","prompt":"waves","duration":5}),
-            &[("x-idempotency-key", Some("idem-1"))],
+            &[("x-idempotency-key", None)],
         ),
         (
             "xAI video poll",
@@ -490,9 +490,9 @@ async fn media_requests_reach_the_upstream_in_the_official_shape() {
         let upstream = StreamUpstream::start([reply]).await;
         let streams = Streams::new();
         let mut exchange = exchange(provider, &upstream, model);
-        exchange
-            .headers
-            .insert("idempotency-key", http::HeaderValue::from_static("idem-1"));
+        for name in ["idempotency-key", "x-idempotency-key"] {
+            exchange.headers.insert(name, http::HeaderValue::from_static("idem-1"));
+        }
         exchange
             .headers
             .insert("user-agent", http::HeaderValue::from_static("client-ua/1"));
@@ -682,48 +682,66 @@ async fn media_answers_become_canonical_records_with_scoped_usage() {
     }
 }
 
-/// The speech answer reaches the client byte for byte with the upstream's MIME type.
+/// The speech answer reaches the client byte for byte, with the upstream's media type when it
+/// names audio and the requested format's own when it names none.
 #[tokio::test]
 async fn speech_audio_passes_through_byte_exact() {
     let audio_bytes: Vec<u8> = (0..=255u8).cycle().take(120_000).collect();
-    let upstream = StreamUpstream::start([Reply::ok("audio/wav; rate=24000", audio_bytes.clone())]).await;
-    let streams = Streams::new();
-    let exchange = exchange(Provider::Xai, &upstream, "grok-tts");
-    let ask = ask(Media::Speech, SPEECH);
-    let mut held = decoded(&streams, ask);
-    let (outcome, records, _, mut stream) = run(Provider::Xai, &streams, &exchange, &mut held, ask).await.unwrap();
-    outcome.unwrap();
-    assert!(usages(&records).is_empty());
-    let id = stream.id();
-    let mut egress = audio::Egress::new(&stream, Some(identity(Direction::Response)));
-    let mut out = Vec::new();
-    let mut reader = streams.reader(id);
-    while let Some(read) = reader.next().await {
-        if let Read::Record(lease) = read {
-            egress
-                .advance(&mut stream, lease, |bytes| {
-                    let mut at = 0;
-                    while at < bytes.len() {
-                        let chunk = bytes.chunk(at).unwrap();
-                        out.extend_from_slice(chunk);
-                        at += chunk.len();
-                    }
-                    Ok(())
-                })
-                .unwrap();
+    // (upstream Content-Type, request, client media type)
+    let cases = [
+        ("audio/wav; rate=24000", SPEECH, "audio/wav; rate=24000"),
+        (" Application/JSON ; charset=utf-8", SPEECH, "audio/wav"),
+        (
+            "text/plain",
+            r#"{"model":"tts-1","input":"hello","voice":"alloy","response_format":"pcm"}"#,
+            "audio/pcm",
+        ),
+        (
+            "application/octet-stream",
+            r#"{"model":"tts-1","input":"hello","voice":"alloy"}"#,
+            "audio/mpeg",
+        ),
+    ];
+    for (upstream_type, request, expected) in cases {
+        let upstream = StreamUpstream::start([Reply::ok(upstream_type, audio_bytes.clone())]).await;
+        let streams = Streams::new();
+        let exchange = exchange(Provider::Xai, &upstream, "grok-tts");
+        let ask = ask(Media::Speech, request);
+        let mut held = decoded(&streams, ask);
+        let (outcome, records, _, mut stream) = run(Provider::Xai, &streams, &exchange, &mut held, ask).await.unwrap();
+        outcome.unwrap();
+        assert!(usages(&records).is_empty(), "{upstream_type}");
+        let id = stream.id();
+        let mut egress = audio::Egress::new(&stream, Some(identity(Direction::Response)));
+        let mut out = Vec::new();
+        let mut reader = streams.reader(id);
+        while let Some(read) = reader.next().await {
+            if let Read::Record(lease) = read {
+                egress
+                    .advance(&mut stream, lease, |bytes| {
+                        let mut at = 0;
+                        while at < bytes.len() {
+                            let chunk = bytes.chunk(at).unwrap();
+                            out.extend_from_slice(chunk);
+                            at += chunk.len();
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
         }
+        egress.finish().unwrap();
+        assert_eq!(out, audio_bytes, "{upstream_type}");
+        let mime = egress.content_type().unwrap().map(|(doc, node)| {
+            let mut chars = doc.chars(node).unwrap();
+            let mut s = String::new();
+            while let Some(c) = chars.next_scalar().unwrap() {
+                s.push(c);
+            }
+            s
+        });
+        assert_eq!(mime.as_deref(), Some(expected), "{upstream_type}");
     }
-    egress.finish().unwrap();
-    assert_eq!(out, audio_bytes);
-    let mime = egress.content_type().unwrap().map(|(doc, node)| {
-        let mut chars = doc.chars(node).unwrap();
-        let mut s = String::new();
-        while let Some(c) = chars.next_scalar().unwrap() {
-            s.push(c);
-        }
-        s
-    });
-    assert_eq!(mime.as_deref(), Some("audio/wav; rate=24000"));
 }
 
 /// A request the destination cannot express, or a fence that is not this destination's, is
@@ -1116,5 +1134,53 @@ async fn video_job_usage_is_charged_once_whichever_route_polls_it() {
             charged.push(video_step(&xai, &upstream, route, job, body).await);
         }
         assert_eq!(charged, expected, "{label}");
+    }
+}
+
+/// A video job id belongs to the caller that created it, and the job table is bounded (E-Q5):
+/// another caller's poll is not found and a create while the table is full is refused with 503,
+/// both before anything is sent.
+#[tokio::test]
+async fn video_jobs_belong_to_their_caller_and_a_full_table_sends_nothing() {
+    let callers = ["sk-client-a", "sk-client-b"];
+    // (caller, job, create or poll, refusal status, upstream requests after the step)
+    let steps: [(usize, &str, bool, Option<u16>, usize); 6] = [
+        (0, "vid_1", true, None, 1),
+        (1, "vid_1", false, Some(404), 1),
+        (0, "vid_1", false, None, 2),
+        (1, "", true, Some(503), 2),
+        (0, "", true, Some(503), 2),
+        (0, "vid_1", false, None, 3),
+    ];
+    let upstream = StreamUpstream::start([
+        Reply::json(r#"{"request_id":"vid_1"}"#),
+        Reply::json(r#"{"status":"pending"}"#),
+        Reply::json(r#"{"status":"pending"}"#),
+    ])
+    .await;
+    let xai = XaiExecutor::with_client(wreq::Client::new()).with_video_capacity(1);
+    for (i, (who, job, create, refused, sent)) in steps.into_iter().enumerate() {
+        let streams = Streams::new();
+        let mut exchange = exchange(Provider::Xai, &upstream, "grok-imagine-video");
+        exchange.caller.principal = callers[who].into();
+        let ask = if create {
+            ask(Media::VideoCreate, VIDEO)
+        } else {
+            foreign(Media::VideoRetrieve, job)
+        };
+        let mut held = decoded(&streams, ask);
+        let operation = Operation::Media(ask.op);
+        let (outcome, records, ..) = run_on(&xai, &streams, &exchange, &mut held, operation, false)
+            .await
+            .unwrap();
+        match refused {
+            None => outcome.unwrap_or_else(|e| panic!("step {i}: {e:?}")),
+            Some(status) => {
+                let error = outcome.expect_err("refused");
+                assert_eq!((error.status, error.scope), (status, FailureScope::Request), "step {i}");
+                assert!(records.is_empty(), "step {i}: nothing published");
+            }
+        }
+        assert_eq!(upstream.requests(), sent, "step {i}");
     }
 }

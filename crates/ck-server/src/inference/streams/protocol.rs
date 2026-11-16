@@ -1,11 +1,12 @@
 //! The client protocol's response egress for a stream's [`Output`]. Live delivery and resume
 //! build it the same way, so a resume re-encodes exactly the bytes the live client got.
 
+use axum::http::HeaderValue;
 use ck_stream::{Lease, Reader, ScratchLease, Writer};
 use ck_translate::codec::document::{Document, Value};
 use ck_translate::codec::event::{Direction, Identity, LocalId};
 use ck_translate::codec::{self, BodyMode, Operation, RequestView, ResponseEgress, internal};
-use ck_translate::{anthropic, gemini, responses};
+use ck_translate::{anthropic, audio, gemini, responses};
 
 use crate::http::egress::{Framing, Output, Protocol};
 
@@ -14,6 +15,7 @@ pub enum ProtocolEgress {
     Anthropic(Box<anthropic::egress::Egress>),
     Responses(responses::egress::Egress<fn(&'static str, u64)>),
     Gemini(gemini::egress::Egress),
+    Speech(audio::Egress),
 }
 
 impl ProtocolEgress {
@@ -30,7 +32,7 @@ impl ProtocolEgress {
         id: Option<LocalId>,
     ) -> codec::Result<Self> {
         let mode = match output.framing {
-            Framing::Json => BodyMode::Buffered,
+            Framing::Json | Framing::Raw => BodyMode::Buffered,
             Framing::Sse | Framing::JsonArray => BodyMode::Streaming,
         };
         let operation = output.operation;
@@ -75,9 +77,10 @@ impl ProtocolEgress {
                 }
                 Self::Responses(egress)
             }
+            Protocol::Speech => Self::speech(stream, identity),
             Protocol::Gemini => {
                 let framing = match output.framing {
-                    Framing::Json => gemini::response::Framing::Json,
+                    Framing::Json | Framing::Raw => gemini::response::Framing::Json,
                     Framing::Sse => gemini::response::Framing::Sse,
                     Framing::JsonArray => gemini::response::Framing::JsonArray,
                 };
@@ -88,6 +91,39 @@ impl ProtocolEgress {
                     |_| {},
                 )?)
             }
+        })
+    }
+}
+
+impl ProtocolEgress {
+    /// The speech egress: the audio's bytes, which need no request view.
+    pub fn speech(stream: &Writer, identity: Identity) -> Self {
+        Self::Speech(audio::Egress::new(stream, Some(identity)))
+    }
+
+    /// Whether the body's `Content-Type` is known: a media egress learns it from the stream's
+    /// `media.start`, before its first byte.
+    pub fn typed(&self) -> bool {
+        match self {
+            Self::Speech(egress) => egress.content_type().is_ok_and(|mime| mime.is_some()),
+            _ => true,
+        }
+    }
+
+    /// The body's `Content-Type`: the media type the upstream named for raw media, else the
+    /// framing's own.
+    pub fn content_type(&self, framing: Framing) -> HeaderValue {
+        if let Self::Speech(egress) = self
+            && let Ok(Some((doc, node))) = egress.content_type()
+            && let Ok(mime) = text(doc, node)
+            && let Ok(value) = HeaderValue::from_str(&mime)
+        {
+            return value;
+        }
+        HeaderValue::from_static(match framing {
+            Framing::Sse => "text/event-stream",
+            Framing::Raw => "application/octet-stream",
+            Framing::Json | Framing::JsonArray => "application/json",
         })
     }
 }
@@ -104,6 +140,7 @@ impl ResponseEgress for ProtocolEgress {
             Self::Anthropic(egress) => egress.advance(owner, input, output),
             Self::Responses(egress) => egress.advance(owner, input, output),
             Self::Gemini(egress) => egress.advance(owner, input, output),
+            Self::Speech(egress) => egress.advance(owner, input, output),
         }
     }
 
@@ -113,6 +150,7 @@ impl ResponseEgress for ProtocolEgress {
             Self::Anthropic(egress) => egress.finish(),
             Self::Responses(egress) => egress.finish(),
             Self::Gemini(egress) => egress.finish(),
+            Self::Speech(egress) => egress.finish(),
         }
     }
 }
@@ -136,12 +174,17 @@ pub async fn response_identity(stream: &mut Writer, reader: &mut Reader) -> code
 }
 
 fn local(doc: &Document, node: usize) -> codec::Result<LocalId> {
+    LocalId::new(&text(doc, node)?)
+}
+
+/// The string at `node`.
+fn text(doc: &Document, node: usize) -> codec::Result<String> {
     let mut text = String::new();
     let mut chars = doc.chars(node)?;
     while let Some(c) = chars.next_scalar()? {
         text.push(c);
     }
-    LocalId::new(&text)
+    Ok(text)
 }
 
 /// Chat `stream_options.include_usage`; absent or `null` options are `false`.

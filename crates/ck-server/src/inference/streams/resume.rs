@@ -19,7 +19,7 @@ use ck_translate::codec::{self, RequestView, ResponseEgress};
 use super::protocol::response_identity;
 use super::{Attached, CURSOR_HEADER, Cursor, Owner, ProtocolEgress, Registry, STREAM_ID_HEADER, StreamId, Units};
 use crate::Runtime;
-use crate::http::egress::Framing;
+use crate::http::egress::{Framing, Protocol};
 use crate::http::respond::error_detail;
 use crate::inference::responses_state::{Publication, passed};
 
@@ -109,16 +109,10 @@ async fn start(rt: &Runtime, caller: Caller, query: &str, headers: &HeaderMap) -
 /// A client response delivering `replay` after `cursor`, which `first` begins. Live delivery
 /// and resume answer with the same headers.
 pub(crate) fn delivery(replay: Replay, first: Vec<Bytes>, framing: Framing, id: &StreamId, cursor: Cursor) -> Response {
+    let content_type = replay.egress.content_type(framing);
     let mut response = Response::new(body(replay, first));
     let set = response.headers_mut();
-    set.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(if framing == Framing::Sse {
-            "text/event-stream"
-        } else {
-            "application/json"
-        }),
-    );
+    set.insert(header::CONTENT_TYPE, content_type);
     set.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     set.insert(STREAM_ID_HEADER, id.header_value());
     set.insert(
@@ -187,14 +181,18 @@ impl Replay {
             ))
         })??;
         let identity = response_identity(&mut response, &mut first).await?;
-        // The request view is rebuilt from the request stream's records (contract §2).
-        let (document, media) = codec::chat::request::read_request(&mut request, &mut records)?;
-        let view = RequestView {
-            document: &document,
-            media: &media,
-            operation: output.operation,
+        let egress = if output.protocol == Protocol::Speech {
+            ProtocolEgress::speech(&response, identity)
+        } else {
+            // The request view is rebuilt from the request stream's records (contract §2).
+            let (document, media) = codec::chat::request::read_request(&mut request, &mut records)?;
+            let view = RequestView {
+                document: &document,
+                media: &media,
+                operation: output.operation,
+            };
+            ProtocolEgress::new(output, &mut response, identity, view, shown.id)?
         };
-        let egress = ProtocolEgress::new(output, &mut response, identity, view, shown.id)?;
         Ok(Self {
             response,
             reader,
@@ -257,11 +255,12 @@ impl Replay {
     }
 
     /// Produces the body up to the cursor from the records already published and returns
-    /// the bytes past it. A cursor past the published output is a client error.
+    /// the bytes past it. A cursor past the published output is a client error. A raw body
+    /// also reads its media type, which a committed stream published before its first byte.
     fn catch_up(&mut self) -> Result<Vec<Bytes>, Failure> {
         let mut out = Vec::new();
         let mut gone = false;
-        while !self.units.reached() && self.ended.is_none() {
+        while !(self.units.reached() && self.egress.typed()) && self.ended.is_none() {
             match self.reader.try_next() {
                 Poll::Ready(Some(Read::Record(lease))) => self.advance(lease, &mut out)?,
                 Poll::Ready(Some(Read::Terminal(terminal))) => {

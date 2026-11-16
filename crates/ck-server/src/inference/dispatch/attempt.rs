@@ -43,6 +43,7 @@ use crate::inference::streams::{Exchange, Settled, Uncommitted};
 use crate::observability::usage_record::{Facts, Tracker};
 use crate::observability::usage_snapshot;
 use crate::runtime::state::{Lease, Outcome, Runtime};
+use crate::scheduling::classify;
 
 /// The contract arm's executor selector: [`ck_exec::Executors`] in the server.
 pub trait Arms: Send + Sync {
@@ -554,7 +555,7 @@ fn failed(error: ExecError) -> Ran {
 }
 
 /// Contract §9 for a storage error before commitment.
-fn stored(error: &ck_stream::Error) -> ExecError {
+pub(crate) fn stored(error: &ck_stream::Error) -> ExecError {
     match error {
         ck_stream::Error::StorageExhausted | ck_stream::Error::Io(_) => {
             ExecError::local(503, FailureScope::Request, "stream.storage_exhausted")
@@ -575,7 +576,10 @@ fn ended(terminal: Terminal) -> ExecError {
         Terminal::Shutdown => ExecError::local(503, FailureScope::Request, "stream.shutdown"),
         Terminal::Gone => stored(&ck_stream::Error::Gone),
         Terminal::StorageExhausted => stored(&ck_stream::Error::StorageExhausted),
-        Terminal::Done | Terminal::UpstreamError | Terminal::ProducerLost => defective(),
+        // A complete answer that gave the client nothing ended before its first payload: the
+        // upstream's failure, which fails over (contract §6).
+        Terminal::Done => classify::empty_stream(),
+        Terminal::UpstreamError | Terminal::ProducerLost => defective(),
     }
 }
 
