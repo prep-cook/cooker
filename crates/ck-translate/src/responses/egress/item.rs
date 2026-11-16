@@ -404,7 +404,10 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let At { node, item, index, .. } = at;
         let doc = &mut self.document;
         if let Some(server) = super::super::response::Server::from_item(doc, item)?
-            && (server != super::super::response::Server::Mcp || doc.member(item, "arguments")?.is_none())
+            && !matches!(
+                server,
+                super::super::response::Server::Mcp | super::super::response::Server::XSearch
+            )
         {
             return Ok(());
         }

@@ -415,7 +415,7 @@ impl State {
                 gj::set_str(&mut out, "responseId", root.get("response.id").bytes());
                 self.response_id = root.get("response.id").bytes().into_owned();
             }
-            b"response.reasoning_summary_text.delta" => {
+            b"response.reasoning_summary_text.delta" | b"response.reasoning_text.delta" => {
                 let mut part = br#"{"thought":true,"text":""}"#.to_vec();
                 gj::set_str(&mut part, "text", root.get("delta").bytes());
                 gj::set_items(&mut out, "candidates.0.content.parts", &[part]);

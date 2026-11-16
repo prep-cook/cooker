@@ -77,6 +77,9 @@ pub(super) fn capture(doc: &mut Document, owner: &mut Writer, node: usize) -> Re
         return Ok(None);
     }
     let name = doc.node(node)?.name.ok_or(Error::Schema)?;
+    if let Some(entry) = crate::codec::provenance::capture_xai(doc, owner, node)? {
+        return Ok(Some(entry));
+    }
     if doc.name_is(name, "cache_control")?
         && matches!(
             context(doc, parent)?,

@@ -73,6 +73,8 @@ impl Ingress {
                 next_media: 0,
                 audio: None,
                 completed: None,
+                xai: false,
+                client_declared_tools: 0,
             },
             failed: false,
         })
@@ -80,6 +82,21 @@ impl Ingress {
     /// Hands the completion that ends this streamed body to `observer`; see [`Completed`].
     pub fn on_completed(&mut self, observer: Completed) {
         self.state.completed = Some(observer);
+    }
+    /// xAI's hosted X Search calls must not shadow tools declared by the client.
+    pub fn xai(&mut self, request: &[u8]) {
+        self.state.xai = true;
+        ck_wire::json::get(request, "tools").each(|_, tool| {
+            for field in ["name", "function.name", "custom.name"] {
+                let name = tool.get(field);
+                for (index, hosted) in tools::X_SEARCH_NAMES.iter().enumerate() {
+                    if name.str() == *hosted {
+                        self.state.client_declared_tools |= 1 << index;
+                    }
+                }
+            }
+            true
+        });
     }
     fn handle(&mut self, owner: &mut Writer, result: Result<()>) -> Result<()> {
         if let Err(error) = result {
@@ -207,6 +224,8 @@ struct State {
     next_media: u64,
     audio: Option<super::audio::Ingress>,
     completed: Option<Completed>,
+    xai: bool,
+    client_declared_tools: u8,
 }
 impl Item {
     fn scope(&self, block: Option<u64>) -> Scope {

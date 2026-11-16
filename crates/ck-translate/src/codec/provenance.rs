@@ -24,7 +24,7 @@ pub const BOUND_LISTS: [&str; 5] = ["original", "replay", "tools", "chat_legacy_
 /// Bound lists inside `x_ck.isolated`, as (provider, list). A provider's isolated map holds its
 /// own members that other protocols cannot express (owner ruling Q3, 2026-11-16): only that
 /// provider's request egress reads it, and no other destination writes or refuses it.
-pub const ISOLATED_LISTS: [(&str, &str); 1] = [("anthropic", "cache_control")];
+pub const ISOLATED_LISTS: [(&str, &str); 2] = [("anthropic", "cache_control"), ("xai", "parameters")];
 
 /// The isolated list `key` of `provider`, if ingress recorded one.
 pub fn isolated(doc: &Document, provider: &str, key: &str) -> Result<Option<usize>> {
@@ -56,6 +56,31 @@ pub fn isolated_list(doc: &mut Document, provider: &'static str, key: &'static s
         Some(list) => Ok(list),
         None => doc.set(own, key, Value::Array),
     }
+}
+
+/// Capture xAI-only root controls before generic protocol provenance can forward them
+/// to another provider speaking the same protocol.
+pub(crate) fn capture_xai(doc: &mut Document, owner: &mut Writer, field: usize) -> Result<Option<usize>> {
+    let root = doc.root();
+    if doc.node(field)?.parent != Some(root) {
+        return Ok(None);
+    }
+    let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+    if !doc.name_is(name, "search_parameters")? && !doc.name_is(name, "compaction_trigger")? {
+        return Ok(None);
+    }
+    let lease = encode::scratch(owner, |e| pointer(doc, field, e))?;
+    let path = doc.import_json(owner, lease)?;
+    let list = isolated_list(doc, "xai", "parameters")?;
+    let entry = doc.add(None, Value::Object)?;
+    doc.append(list, entry)?;
+    doc.bind_origin(entry, root, None)?;
+    doc.rename(path, "pointer")?;
+    doc.append(entry, path)?;
+    doc.detach(root, field)?;
+    doc.rename(field, "value")?;
+    doc.append(entry, field)?;
+    Ok(Some(entry))
 }
 
 /// Every bound list present in `x`: [`BOUND_LISTS`], then [`ISOLATED_LISTS`].

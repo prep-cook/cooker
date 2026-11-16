@@ -1,14 +1,26 @@
 use super::*;
 
+pub(super) const X_SEARCH_NAMES: [&str; 4] = [
+    "x_keyword_search",
+    "x_semantic_search",
+    "x_user_search",
+    "x_thread_fetch",
+];
+
 #[derive(Clone, Copy, PartialEq)]
 pub(in super::super) enum Server {
     Code,
     Web,
     File,
     Mcp,
+    XSearch,
 }
 impl Server {
     pub(in super::super) fn from_item(doc: &Document, node: usize) -> Result<Option<Self>> {
+        Self::classify(doc, node, 0)
+    }
+
+    pub(super) fn classify(doc: &Document, node: usize, client_declared: u8) -> Result<Option<Self>> {
         for (name, kind) in [
             ("code_interpreter_call", Self::Code),
             ("web_search_call", Self::Web),
@@ -19,6 +31,28 @@ impl Server {
                 return Ok(Some(kind));
             }
         }
+        let custom = is(doc, node, "type", "custom_tool_call")?;
+        let mut hosted = false;
+        if (custom || is(doc, node, "type", "function_call")?)
+            && let Some(call_id) = doc.member(node, "call_id")?
+            && matches!(doc.node(call_id)?.value, Value::String(_) | Value::Text(_))
+        {
+            let mut chars = doc.chars(call_id)?;
+            hosted = true;
+            for expected in "xs_call".chars() {
+                if chars.next_scalar()? != Some(expected) {
+                    hosted = false;
+                    break;
+                }
+            }
+        }
+        if (hosted || custom) && doc.member(node, "namespace")?.is_none() {
+            for (index, name) in X_SEARCH_NAMES.iter().enumerate() {
+                if (hosted || client_declared & (1 << index) == 0) && is(doc, node, "name", name)? {
+                    return Ok(Some(Self::XSearch));
+                }
+            }
+        }
         Ok(None)
     }
     pub(super) fn name(self) -> &'static str {
@@ -27,6 +61,7 @@ impl Server {
             Self::Web => "web_search",
             Self::File => "file_search",
             Self::Mcp => "mcp",
+            Self::XSearch => "x_search",
         }
     }
     pub(in super::super) fn fields(self) -> &'static [&'static str] {
@@ -35,6 +70,7 @@ impl Server {
             Self::Web => &["action", "results"],
             Self::File => &["results"],
             Self::Mcp => &["output", "error"],
+            Self::XSearch => &[],
         }
     }
 }
@@ -113,8 +149,15 @@ impl State {
         node: usize,
         close: bool,
     ) -> Result<()> {
-        if server == Server::Mcp
-            && let Some(arguments) = doc.member(node, "arguments")?
+        if matches!(server, Server::Mcp | Server::XSearch)
+            && let Some(arguments) = doc.member(
+                node,
+                if server == Server::XSearch {
+                    "input"
+                } else {
+                    "arguments"
+                },
+            )?
         {
             self.arguments(owner, at, doc, arguments, close)?;
         }
@@ -188,7 +231,7 @@ impl State {
         node: usize,
     ) -> Result<()> {
         let item = &mut self.items[at];
-        if server == Server::Mcp && item.arguments.is_some() && !item.arguments_done {
+        if matches!(server, Server::Mcp | Server::XSearch) && item.arguments.is_some() && !item.arguments_done {
             validate_arguments(owner, item)?;
             item.arguments_done = true;
         }

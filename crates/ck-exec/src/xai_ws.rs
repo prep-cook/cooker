@@ -573,7 +573,7 @@ impl Turns for XaiExecutor {
             MAX_LINE as u64,
         )
         .map_err(encoding)?;
-        let events = Events::new(ingress, prepared, self.replay.clone());
+        let events = Events::new(ingress, prepared, self.replay.clone(), &upload);
 
         let session = self.ws.pool.session(session_id);
         let guard = session.turn.clone().lock_owned().await;

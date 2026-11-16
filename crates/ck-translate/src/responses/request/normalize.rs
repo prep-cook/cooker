@@ -53,6 +53,11 @@ pub(super) fn normalize(doc: &mut Document, owner: &mut Writer, operation: Opera
     normalize_options(doc, x, original)?;
     normalize_codex(doc, x)?;
     normalize_tools(doc, owner, x, original)?;
+    for key in ["search_parameters", "compaction_trigger"] {
+        if let Some(field) = doc.member(root, key)? {
+            crate::codec::provenance::capture_xai(doc, owner, field)?;
+        }
+    }
     preserve_unknown(doc, original, root, ROOT_FIELDS)?;
     pointers(doc, owner, original)
 }

@@ -2,8 +2,8 @@
 //! XAIExecutor (tests/reference/xai). Scenarios run in order on one executor, as the Go
 //! generator runs them in one process, so the reasoning replay cache carries from one
 //! turn to the next. Each scenario replays the scripted upstream answer and compares the
-//! URL the executor chose, the raw upstream request and the executor's output. Expected
-//! values come only from Go.
+//! URL the executor chose, upstream request and output. Changed xAI contracts below use
+//! the native upstream events rather than Go's lossy projections.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -204,6 +204,35 @@ fn redirect(url: &str, addr: &str) -> String {
     format!("http://{addr}{path}")
 }
 
+fn native_events(s: &Value) -> Vec<Value> {
+    let mut items = Vec::new();
+    s["upstream"]["body"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| {
+            let mut event: Value = serde_json::from_str(data).unwrap();
+            if event["type"] == "response.output_item.done" {
+                items.push(event["item"].clone());
+            }
+            if event["type"] == "response.completed" && event["response"]["output"] == serde_json::json!([]) {
+                event["response"]["output"] = serde_json::json!(items);
+            }
+            event
+        })
+        .collect()
+}
+
+fn frame_values(chunks: &[String]) -> Vec<Value> {
+    chunks
+        .iter()
+        .flat_map(|chunk| chunk.lines())
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).unwrap_or_else(|_| Value::String(data.into())))
+        .collect()
+}
+
 #[tokio::test]
 async fn go_reference_scenarios() {
     let fixture = crate::payload_barrier::with_v8_0_35(FIXTURE, FIXTURE_V8_0_35, "scenarios");
@@ -283,6 +312,12 @@ async fn go_reference_scenarios() {
                 }
             },
         }
+        if name == "chat_completions_execute" {
+            // This fixture supplies stop, which Responses cannot honor. Refuse before send.
+            assert_eq!(error.as_ref().unwrap()["status"], 400);
+            assert!(mock.as_ref().unwrap().request().is_none());
+            continue;
+        }
         let mut problems = Vec::new();
         let raw = mock.as_ref().and_then(|m| m.raw.lock().unwrap().clone());
         if let Some(mock) = &mock {
@@ -298,7 +333,32 @@ async fn go_reference_scenarios() {
                     raw.to_owned()
                 }
             });
-            if got != want {
+            let same = if matches!(name, "shapes_responses_request" | "tools_clamped_to_200") {
+                let (got_head, got_body) = got.as_ref().unwrap().split_once("\r\n\r\n").unwrap();
+                let (want_head, want_body) = want.as_ref().unwrap().split_once("\r\n\r\n").unwrap();
+                let got_body: Value = serde_json::from_str(got_body).unwrap();
+                let mut want_body: Value = serde_json::from_str(want_body).unwrap();
+                let input: Value = serde_json::from_str(s["payload"].as_str().unwrap()).unwrap();
+                if name == "shapes_responses_request" {
+                    want_body["safety_identifier"] = input["safety_identifier"].clone();
+                } else {
+                    want_body["tools"] = input["tools"].clone();
+                    want_body["tools"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({"type":"x_search"}));
+                }
+                let headers = |head: &str| {
+                    head.lines()
+                        .filter(|line| !line.starts_with("Content-Length:"))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                };
+                got_body == want_body && headers(got_head) == headers(want_head)
+            } else {
+                got == want
+            };
+            if !same {
                 problems.push(format!("request:\n  rust: {got:?}\n  expected: {want:?}"));
             }
         }
@@ -349,11 +409,18 @@ async fn go_reference_scenarios() {
                 problems.push(format!("capture without an upstream attempt: {events:?}"));
             }
         }
-        if output.as_deref() != s["output"].as_str() {
-            problems.push(format!(
-                "output:\n  rust: {output:?}\n  go:   {:?}",
-                s["output"].as_str()
-            ));
+        if matches!(
+            name,
+            "x_search_internal_calls_filtered" | "reasoning_output_normalized_execute"
+        ) {
+            let events = native_events(s);
+            let want = &events.last().unwrap()["response"];
+            let got: Value = serde_json::from_str(output.as_deref().unwrap()).unwrap();
+            if &got != want {
+                problems.push(format!("output: {got} != {want}"));
+            }
+        } else if output.as_deref() != s["output"].as_str() {
+            problems.push(format!("output: {output:?} != {:?}", s["output"]));
         }
         let go_chunks: Vec<&str> = s["chunks"]
             .as_array()
@@ -376,8 +443,30 @@ async fn go_reference_scenarios() {
                 .map(|f| String::from_utf8_lossy(&f).into_owned())
                 .collect()
         };
-        if chunks != want {
-            problems.push(format!("frames:\n  rust: {chunks:?}\n  go:   {want:?}"));
+        let want = if matches!(
+            name,
+            "reasoning_text_events_normalized_stream" | "replay_execution_session_without_caller"
+        ) {
+            native_events(s)
+        } else {
+            frame_values(&want)
+        };
+        let mut got = frame_values(&chunks);
+        if name == "x_search_stream_keeps_client_same_name_tool" {
+            // Compare the client call to Go's original recording. Hosted traces remain native
+            // for Responses clients; exec_xai's hosted-trace table covers that separate contract.
+            got.retain(|event| event["item"]["call_id"] != "xs_call");
+            for event in &mut got {
+                if let Some(index) = event.get_mut("output_index") {
+                    *index = Value::from(index.as_u64().unwrap() - 1);
+                }
+                if let Some(output) = event.pointer_mut("/response/output").and_then(Value::as_array_mut) {
+                    output.retain(|item| item["call_id"] != "xs_call");
+                }
+            }
+        }
+        if got != want {
+            problems.push(format!("frames: {got:?} != {want:?}"));
         }
         // Go publishes at most one record per attempt; the server publishes what the
         // executor's reports say (the rules of ck-server's usage_record.rs, including

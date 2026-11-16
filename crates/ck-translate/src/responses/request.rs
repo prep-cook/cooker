@@ -222,6 +222,64 @@ pub(crate) const ANTIGRAVITY: &str = "antigravity";
 /// never writes a client's own member of this name.
 pub(crate) const PROVEN: &str = "_ck_proven";
 
+/// Canonical, snake_case and camelCase names refused by the xAI Responses transport.
+/// Shared with the legacy executor so translation cannot silently discard a constraint.
+pub const XAI_REFUSED_CONTROLS: &[(&str, &str, &str)] = &[
+    ("n", "candidate_count", "candidateCount"),
+    ("seed", "seed", "seed"),
+    ("stop", "stop_sequences", "stopSequences"),
+    ("presence_penalty", "presence_penalty", "presencePenalty"),
+    ("frequency_penalty", "frequency_penalty", "frequencyPenalty"),
+    ("logit_bias", "logit_bias", "logitBias"),
+    ("logprobs", "response_logprobs", "responseLogprobs"),
+    ("response_format", "response_format", "responseFormat"),
+    ("web_search_options", "web_search_options", "webSearchOptions"),
+];
+
+fn xai_control(doc: &Document, field: &str, node: usize) -> Result<()> {
+    if matches!(doc.node(node)?.value, Value::Null) {
+        return Ok(());
+    }
+    let refused = match field {
+        "n" => doc.unsigned(node)? != 1,
+        "logprobs" => !matches!(doc.node(node)?.value, Value::Bool(false)),
+        "response_format" => super::is(doc, node, "type", "json_object")?,
+        _ => true,
+    };
+    if refused { Err(Error::Unsupported) } else { Ok(()) }
+}
+
+/// xAI uses Responses for every generation; Chat-only constraints must fail the fence.
+pub fn validate_xai(view: RequestView<'_>) -> Result<()> {
+    let doc = view.document;
+    for &(canonical, snake, camel) in XAI_REFUSED_CONTROLS {
+        for field in [canonical, snake, camel] {
+            if let Some(node) = doc.member(doc.root(), field)? {
+                xai_control(doc, canonical, node)?;
+            }
+        }
+    }
+    if let Some(x) = doc.member(doc.root(), "x_ck")?
+        && let Some(original) = doc.member(x, "original")?
+    {
+        for entry in doc.children(original)? {
+            if doc.origin(entry)? != Some((doc.root(), None)) {
+                continue;
+            }
+            let Value::String(pointer) = doc.node(doc.required(entry, "pointer")?)?.value else {
+                return Err(Error::Schema);
+            };
+            let name = doc.pointer_name(pointer)?;
+            for &(canonical, snake, camel) in XAI_REFUSED_CONTROLS {
+                if doc.name_is(name, canonical)? || doc.name_is(name, snake)? || doc.name_is(name, camel)? {
+                    xai_control(doc, canonical, doc.required(entry, "value")?)?;
+                }
+            }
+        }
+    }
+    validate(view, "xai")
+}
+
 /// Responses semantics with the isolated Codex request controls enabled.
 pub struct CodexCapability;
 impl Capability for CodexCapability {
@@ -241,7 +299,9 @@ impl codec::RequestEgress for Egress {
     fn encode(&self, request: &ValidatedRequest<'_>, owner: &mut Writer) -> Result<ScratchLease> {
         let view = request.for_destination(self.destination)?;
         view.document.check_owner(owner)?;
-        if self.destination == "meta" {
+        if self.destination == "xai" {
+            validate_xai(view)?;
+        } else if self.destination == "meta" {
             meta::validate(view)?;
         } else {
             validate(view, self.destination)?;
