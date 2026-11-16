@@ -78,12 +78,26 @@ async fn request_controls_are_preserved_or_refused_before_send() {
                 (json!({"seed":42}), false),
                 (json!({"stop":["END"]}), false),
                 (json!({"web_search_options":{"search_context_size":"high"}}), false),
+                (json!({"presence_penalty":0.5}), false),
+                (json!({"frequency_penalty":0.5}), false),
+                (json!({"logit_bias":{"42":1}}), false),
+                (json!({"logprobs":true}), false),
+                (json!({"response_format":{"type":"json_object"}}), false),
             ],
             Client::Anthropic => &[(json!({"stop_sequences":["END"]}), false)],
             Client::Gemini => &[
                 (json!({"generationConfig":{"stopSequences":["END"]}}), false),
                 (json!({"generationConfig":{"seed":42}}), false),
                 (json!({"generationConfig":{"candidateCount":2}}), false),
+                (json!({"generation_config":{"candidate_count":2}}), false),
+                (json!({"generation_config":{"seed":3}}), false),
+                (json!({"generation_config":{"stop_sequences":["END"]}}), false),
+                (json!({"generationConfig":{"presencePenalty":0.5}}), false),
+                (json!({"generationConfig":{"frequencyPenalty":0.5}}), false),
+                (json!({"generationConfig":{"responseLogprobs":true}}), false),
+                (json!({"generation_config":{"presence_penalty":0.5}}), false),
+                (json!({"generation_config":{"frequency_penalty":0.5}}), false),
+                (json!({"generation_config":{"response_logprobs":true}}), false),
             ],
         };
         for (control, accepted) in controls {
@@ -297,7 +311,7 @@ async fn reasoning_text_keeps_native_content() {
     ]
     .concat();
     let streams = Streams::new();
-    let upstream = StreamUpstream::start([Reply::sse(body)]).await;
+    let upstream = StreamUpstream::start([Reply::sse(body.clone())]).await;
     let run = run(&streams, &upstream, Client::Responses, RESPONSES, 64).await;
     let (outcome, _, mut owner) = produce(&streams, run.started.unwrap()).await;
     outcome.unwrap();
@@ -314,6 +328,16 @@ async fn reasoning_text_keeps_native_content() {
         let event = events.iter().find(|event| event["type"] == kind).expect(kind);
         assert_eq!(event["content_index"], 0);
         assert!(event.get("summary_index").is_none());
+    }
+    for kind in ["reasoning_text", "reasoning_summary_text"] {
+        let body = body.replace("response.reasoning_text", &format!("response.{kind}"));
+        let upstream = StreamUpstream::start([Reply::sse(body)]).await;
+        let out = legacy(&upstream, Client::Gemini, GEMINI, true).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("think") && out.contains("\"thought\":true"),
+            "{kind}: {out}"
+        );
     }
 }
 
@@ -381,6 +405,19 @@ async fn x_search_traces_remain_server_tools() {
             .unwrap();
             let out = deliver(&streams, &mut owner, &mut egress);
             assert!(!out.contains("functionCall"), "{out}");
+            for mode in [BodyMode::Streaming, BodyMode::Buffered] {
+                let mut egress = anthropic::egress::Egress::new(
+                    &mut owner,
+                    identity(Direction::Response),
+                    Operation::Generate,
+                    mode,
+                    |_| {},
+                )
+                .unwrap();
+                let out = deliver(&streams, &mut owner, &mut egress);
+                assert!(!out.contains(name) && !out.contains("tool_use"), "{out}");
+                assert!(out.contains("end_turn"), "{out}");
+            }
             for client in [Client::Responses, Client::Chat] {
                 for stream in [false, true] {
                     let upstream = StreamUpstream::start([Reply::sse(body.clone())]).await;
@@ -416,6 +453,81 @@ async fn x_search_traces_remain_server_tools() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn same_name_client_tools_are_not_hosted_search() {
+    for (name, call_id, declared, hosted) in [
+        ("x_user_search", "call_9", true, false),
+        ("x_user_search", "call_9", false, true),
+        ("x_user_search", "xs_call_9", true, true),
+        ("my_tool", "call_9", true, false),
+    ] {
+        let item = json!({"type":"custom_tool_call","id":"fc_1","call_id":call_id,"name":name,"input":"query","status":"completed"});
+        let body = event(json!({"type":"response.created","response":response("in_progress", json!([]))}))
+            + &event(
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"fc_1","call_id":call_id,"name":name,"input":"","status":"in_progress"}}),
+            )
+            + &event(
+                json!({"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"fc_1","delta":"query"}),
+            )
+            + &event(
+                json!({"type":"response.custom_tool_call_input.done","output_index":0,"item_id":"fc_1","input":"query"}),
+            )
+            + &event(json!({"type":"response.output_item.done","output_index":0,"item":item}))
+            + &event(json!({"type":"response.completed","response":response("completed", json!([item]))}));
+        let mut request: Value = serde_json::from_str(CHAT).unwrap();
+        request["search_parameters"] = json!({"mode":"on"});
+        if declared {
+            request["tools"] = json!([{"type":"custom","custom":{"name":name}}]);
+        }
+        for old in [false, true] {
+            let upstream = StreamUpstream::start([Reply::sse(body.clone())]).await;
+            let streams = Streams::new();
+            let mut owner = if old {
+                None
+            } else {
+                let run = run(&streams, &upstream, Client::Chat, &request.to_string(), 7).await;
+                let (result, _, owner) = produce(&streams, run.started.unwrap()).await;
+                result.unwrap();
+                Some(owner)
+            };
+            for mode in [BodyMode::Buffered, BodyMode::Streaming] {
+                let text = if let Some(owner) = &mut owner {
+                    let mut egress = chat::egress::Egress::new(
+                        owner,
+                        identity(Direction::Response),
+                        Operation::Generate,
+                        mode,
+                        true,
+                        |_| {},
+                    )
+                    .unwrap();
+                    deliver(&streams, owner, &mut egress)
+                } else {
+                    let upstream = StreamUpstream::start([Reply::sse(body.clone())]).await;
+                    String::from_utf8(
+                        legacy(
+                            &upstream,
+                            Client::Chat,
+                            &request.to_string(),
+                            mode == BodyMode::Streaming,
+                        )
+                        .await
+                        .unwrap(),
+                    )
+                    .unwrap()
+                };
+                assert_eq!(
+                    text.contains(name),
+                    !hosted,
+                    "{name} {call_id} declared={declared} old={old} {mode:?}: {text}"
+                );
+                assert_eq!(text.contains("query"), !hosted, "{text}");
+                assert_eq!(text.contains("\"finish_reason\":\"tool_calls\""), !hosted, "{text}");
             }
         }
     }

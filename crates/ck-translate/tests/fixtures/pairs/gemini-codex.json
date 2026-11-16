@@ -2180,7 +2180,9 @@
      "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"thought\":true,\"text\":\"think \u003cx\u003e\"}]}}],\"usageMetadata\":{\"trafficType\":\"PROVISIONED_THROUGHPUT\"},\"modelVersion\":\"requested-model\",\"createTime\":\"2025-08-15T02:52:03.884209Z\",\"responseId\":\"resp_1\"}"
     ],
     [],
-    [],
+    [
+     "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"thought\":true,\"text\":\"raw\"}]}}],\"usageMetadata\":{\"trafficType\":\"PROVISIONED_THROUGHPUT\"},\"modelVersion\":\"requested-model\",\"createTime\":\"2025-08-15T02:52:03.884209Z\",\"responseId\":\"resp_1\"}"
+    ],
     [
      "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello é\"}]}}],\"usageMetadata\":{\"trafficType\":\"PROVISIONED_THROUGHPUT\"},\"modelVersion\":\"requested-model\",\"createTime\":\"2025-08-15T02:52:03.884209Z\",\"responseId\":\"resp_1\"}"
     ],

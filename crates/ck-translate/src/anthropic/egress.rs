@@ -60,6 +60,8 @@ pub struct Egress {
     tools: Index,
     texts: Index,
     text_lists: Table<TextList>,
+    /// Foreign hosted calls have no Anthropic server-tool carrier.
+    server_tools: Table<LocalId>,
     usage: Option<Document>,
     finish: Option<Document>,
     start_origin: Option<Document>,
@@ -96,6 +98,7 @@ impl Egress {
             tools: Index::new(owner)?,
             texts: Index::new(owner)?,
             text_lists: Table::new(owner)?,
+            server_tools: Table::new(owner)?,
             usage: None,
             finish: None,
             start_origin: None,
@@ -232,6 +235,23 @@ impl Egress {
             return Ok(());
         }
         self.buffered_envelope_loss(&doc, x, kind, choice)?;
+        if let Some(id) = doc.member(x, "tool_call_id")? {
+            let id = local(&doc, id)?;
+            if kind == Kind::ToolStart
+                && is(&doc, root, "kind", "server")?
+                && let Some(source) = doc.member(x, "source")?
+                && !is(&doc, source, "protocol", "anthropic")?
+            {
+                self.server_tools.push(id)?;
+            }
+            if let Some(at) = self.server_tools.iter().position(|tool| *tool == id) {
+                if kind == Kind::ToolEnd {
+                    self.server_tools.swap_remove(at);
+                }
+                self.drop_event(kind, choice, "foreign hosted tool has no Anthropic carrier");
+                return Ok(());
+            }
+        }
         match kind {
             Kind::ResponseStart => {
                 if self.base.is_some() {

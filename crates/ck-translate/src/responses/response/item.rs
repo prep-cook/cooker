@@ -24,7 +24,8 @@ impl State {
         let native = super::super::mapped(owner, |e| item_metadata(doc, node, e))?;
         let root = native.root();
         let id = media::local_id(b'i', index)?;
-        let server = Server::from_item(&native, root)?.filter(|s| *s != Server::XSearch || self.xai);
+        let server =
+            Server::classify(&native, root, self.client_declared_tools)?.filter(|s| *s != Server::XSearch || self.xai);
         let tool = server.is_some()
             || is(&native, root, "type", "function_call")?
             || is(&native, root, "type", "custom_tool_call")?;

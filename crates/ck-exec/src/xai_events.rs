@@ -119,8 +119,8 @@ pub struct Events {
 }
 
 impl Events {
-    pub(crate) fn new(mut inner: Ingress, prepared: Prepared, store: Arc<replay::Store>) -> Self {
-        inner.xai();
+    pub(crate) fn new(mut inner: Ingress, prepared: Prepared, store: Arc<replay::Store>, declarations: &[u8]) -> Self {
+        inner.xai(declarations);
         let scope = prepared.replay_scope;
         if scope.valid() {
             inner.on_completed(Box::new(move |doc, response| {

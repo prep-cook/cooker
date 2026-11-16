@@ -118,13 +118,25 @@ fn has_x_search(body: &[u8]) -> bool {
         || gj::get(body, "search_parameters").exists()
 }
 
-fn x_search_call(item: &Res<'_>) -> bool {
+fn x_search_call(item: &Res<'_>, original: &[u8]) -> bool {
     item.get("namespace").str().is_empty()
         && matches!(
             item.get("name").str().as_ref(),
             "x_keyword_search" | "x_semantic_search" | "x_user_search" | "x_thread_fetch"
         )
-        && (item.get("type").str() == "custom_tool_call" || item.get("call_id").str().starts_with("xs_call"))
+        && (item.get("call_id").str().starts_with("xs_call")
+            || (item.get("type").str() == "custom_tool_call" && !client_declared_tool(original, &item.get("name"))))
+}
+
+fn client_declared_tool(original: &[u8], name: &Res<'_>) -> bool {
+    let mut declared = false;
+    gj::get(original, "tools").each(|_, tool| {
+        declared = ["name", "function.name", "custom.name"]
+            .iter()
+            .any(|field| tool.get(field).str() == name.str());
+        !declared
+    });
+    declared
 }
 
 /// isOriginalCustomPatch: a custom call whose winning declaration is the apply_patch
@@ -387,7 +399,7 @@ impl State {
                 if !item.exists() || !is_tool_call(&item.get("type").bytes()) {
                     return None;
                 }
-                if self.x_search && x_search_call(&item) {
+                if self.x_search && x_search_call(&item, &self.original) {
                     self.register(
                         &root,
                         &item,
@@ -453,7 +465,7 @@ impl State {
                 if !item.exists() {
                     return None;
                 }
-                if self.x_search && x_search_call(&item) {
+                if self.x_search && x_search_call(&item, &self.original) {
                     return None;
                 }
                 let item_kind = item.get("type").bytes().into_owned();
@@ -677,7 +689,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, raw: &[u8]) -> Result<Vec<u8>, Error> {
                     }
                 }
                 b"function_call" | b"custom_tool_call" => {
-                    if x_search && x_search_call(&item) {
+                    if x_search && x_search_call(&item, ctx.original_request) {
                         continue;
                     }
                     let mut call = br#"{"id":"","type":"function","function":{"name":"","arguments":""}}"#.to_vec();

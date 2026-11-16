@@ -104,7 +104,7 @@ impl Execute for XaiExecutor {
             MAX_LINE as u64,
         )
         .map_err(encoding)?;
-        let events = Events::new(ingress, prepared, self.replay.clone());
+        let events = Events::new(ingress, prepared, self.replay.clone(), &upload);
         let upstream = self.send(&call, url, headers, body).await?;
         Ok(Upstream {
             status: upstream.status,

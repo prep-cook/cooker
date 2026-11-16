@@ -74,23 +74,31 @@ fn bad_request(message: impl Into<String>) -> ExecError {
 
 /// Refuse generation constraints before translation can discard their native spelling.
 fn validate_controls(body: &[u8], source: Format) -> Result<(), ExecError> {
-    let (choices, seed, stop) = match source {
-        Format::Gemini => (
-            "generationConfig.candidateCount",
-            "generationConfig.seed",
-            "generationConfig.stopSequences",
-        ),
-        Format::Claude => ("n", "seed", "stop_sequences"),
-        _ => ("n", "seed", "stop"),
-    };
-    let n = gj::get(body, choices);
-    if n.exists() && n.kind != Kind::Null && n.int() != 1 {
-        return Err(bad_request("xAI Responses cannot generate multiple choices"));
-    }
-    for field in [seed, stop, "web_search_options"] {
-        let value = gj::get(body, field);
-        if value.exists() && value.kind != Kind::Null {
-            return Err(bad_request(format!("xAI Responses cannot preserve {field}")));
+    let root = gj::parse(body);
+    for &(canonical, snake, camel) in ck_translate::responses::request::XAI_REFUSED_CONTROLS {
+        let parents: &[&str] = if source == Format::Gemini {
+            &["generation_config", "generationConfig"]
+        } else {
+            &[""]
+        };
+        for parent in parents {
+            let nested = (!parent.is_empty()).then(|| root.get(parent));
+            let controls = nested.as_ref().unwrap_or(&root);
+            for field in [canonical, snake, camel] {
+                let value = controls.get(field);
+                if !value.exists() || value.kind == Kind::Null {
+                    continue;
+                }
+                let refused = match canonical {
+                    "n" => value.int() != 1,
+                    "logprobs" => value.kind != Kind::False,
+                    "response_format" => value.get("type").str() == "json_object",
+                    _ => true,
+                };
+                if refused {
+                    return Err(bad_request(format!("xAI Responses cannot preserve {field}")));
+                }
+            }
         }
     }
     Ok(())

@@ -445,16 +445,28 @@ async fn go_reference_scenarios() {
         };
         let want = if matches!(
             name,
-            "reasoning_text_events_normalized_stream"
-                | "replay_execution_session_without_caller"
-                | "x_search_stream_keeps_client_same_name_tool"
+            "reasoning_text_events_normalized_stream" | "replay_execution_session_without_caller"
         ) {
             native_events(s)
         } else {
             frame_values(&want)
         };
-        if frame_values(&chunks) != want {
-            problems.push(format!("frames: {:?} != {want:?}", frame_values(&chunks)));
+        let mut got = frame_values(&chunks);
+        if name == "x_search_stream_keeps_client_same_name_tool" {
+            // Compare the client call to Go's original recording. Hosted traces remain native
+            // for Responses clients; exec_xai's hosted-trace table covers that separate contract.
+            got.retain(|event| event["item"]["call_id"] != "xs_call");
+            for event in &mut got {
+                if let Some(index) = event.get_mut("output_index") {
+                    *index = Value::from(index.as_u64().unwrap() - 1);
+                }
+                if let Some(output) = event.pointer_mut("/response/output").and_then(Value::as_array_mut) {
+                    output.retain(|item| item["call_id"] != "xs_call");
+                }
+            }
+        }
+        if got != want {
+            problems.push(format!("frames: {got:?} != {want:?}"));
         }
         // Go publishes at most one record per attempt; the server publishes what the
         // executor's reports say (the rules of ck-server's usage_record.rs, including
