@@ -412,7 +412,8 @@ pub(crate) fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
     })
 }
 
-/// The counts of one upstream usage object, each only when the upstream sent it.
+/// The latest value the upstream sent for each usage count, zero included; `None` until a
+/// usage object carries that count.
 #[derive(Clone, Copy, Default, PartialEq)]
 struct Sent {
     prompt: Option<i64>,
@@ -422,22 +423,27 @@ struct Sent {
 }
 
 impl Sent {
-    /// The line's usage object: terminal (`usageMetadata`) or non-terminal (`cpaUsageMetadata`).
-    fn of(raw: &[u8]) -> Option<Self> {
-        let usage = ["response.usageMetadata", "response.cpaUsageMetadata"]
+    /// Takes each count the line's usage object carries, terminal (`usageMetadata`) or
+    /// non-terminal (`cpaUsageMetadata`); a count the object leaves out keeps its last value.
+    fn merge(&mut self, raw: &[u8]) {
+        let Some(usage) = ["response.usageMetadata", "response.cpaUsageMetadata"]
             .into_iter()
             .map(|path| gj::get(raw, path))
-            .find(|usage| usage.exists())?;
-        let count = |key: &str| {
-            let value = usage.get(key);
-            value.exists().then(|| value.int())
+            .find(|usage| usage.exists())
+        else {
+            return;
         };
-        Some(Self {
-            prompt: count("promptTokenCount"),
-            cached: count("cachedContentTokenCount"),
-            candidates: count("candidatesTokenCount"),
-            thoughts: count("thoughtsTokenCount"),
-        })
+        for (field, key) in [
+            (&mut self.prompt, "promptTokenCount"),
+            (&mut self.cached, "cachedContentTokenCount"),
+            (&mut self.candidates, "candidatesTokenCount"),
+            (&mut self.thoughts, "thoughtsTokenCount"),
+        ] {
+            let value = usage.get(key);
+            if value.exists() {
+                *field = Some(value.int());
+            }
+        }
     }
 
     /// The Anthropic usage object of these counts: input leaves the cache out (Go 912a038b)
@@ -478,7 +484,7 @@ struct Stream {
     web_search_mode: bool,
     /// Usage events hold only the counts the upstream sent (`report_usage_only`).
     reported_usage: bool,
-    /// The latest usage object the upstream sent, in reported-only mode.
+    /// The latest count of each usage field the upstream sent, in reported-only mode.
     sent: Sent,
     /// What the last usage event carried, in reported-only mode.
     emitted: Option<Sent>,
@@ -802,10 +808,8 @@ impl Stream {
             return vec![std::mem::take(&mut self.out)];
         }
         let root = gj::parse(raw);
-        if self.reported_usage
-            && let Some(sent) = Sent::of(raw)
-        {
-            self.sent = sent;
+        if self.reported_usage {
+            self.sent.merge(raw);
         }
         if !self.has_first_response {
             let mut start = br#"{"type": "message_start", "message": {"id": "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY", "type": "message", "role": "assistant", "content": [], "model": "claude-3-5-sonnet-20241022", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}"#.to_vec();

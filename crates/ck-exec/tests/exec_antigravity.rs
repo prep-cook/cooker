@@ -1010,13 +1010,14 @@ fn usage_event(counts: &str, finished: bool) -> String {
 /// the scenario's body, as (usage object, finish reason) (`None` keeps the recording); and the
 /// input, output and cache-read counts the canonical stream holds afterwards. After a cut, a
 /// count is present exactly when the upstream sent it in a complete line, zero included, and
-/// holds the latest such report; no estimate, default or derivation fills the gap. A complete
+/// holds the latest report of that field, even when a later usage object leaves it out; no
+/// estimate, default or derivation fills the gap. A complete
 /// answer keeps Go's final usage (owner question P7-4-1).
 #[tokio::test]
 async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
     type Counts = (Option<u64>, Option<u64>, Option<u64>);
     type Row = (&'static str, End, Option<&'static [(&'static str, bool)]>, Counts);
-    let rows: [Row; 16] = [
+    let rows: [Row; 19] = [
         ("gemini_stream", End::InLastLine, None, (Some(5), None, None)),
         ("openai_stream", End::InLastLine, None, (None, None, None)),
         ("responses_stream", End::InLastLine, None, (None, None, None)),
@@ -1083,6 +1084,35 @@ async fn an_upstream_answer_publishes_its_outcome_and_reported_usage() {
                 false,
             )]),
             (Some(5), Some(3), Some(2)),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::AfterEvents(2),
+            Some(&[
+                (r#"{"promptTokenCount":5,"cachedContentTokenCount":2}"#, false),
+                (r#"{"promptTokenCount":5}"#, true),
+            ]),
+            (Some(5), None, Some(2)),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::AfterEvents(3),
+            Some(&[
+                ("{}", false),
+                (r#"{"promptTokenCount":5,"candidatesTokenCount":3}"#, false),
+                (r#"{"promptTokenCount":6}"#, true),
+            ]),
+            (Some(6), Some(3), None),
+        ),
+        (
+            "claude_stream_gemini_model",
+            End::AfterEvents(3),
+            Some(&[
+                ("{}", false),
+                (r#"{"candidatesTokenCount":0}"#, false),
+                (r#"{"promptTokenCount":6}"#, true),
+            ]),
+            (Some(6), Some(0), None),
         ),
         ("gemini_stream", End::AfterEvents(1), None, (Some(5), None, None)),
         ("gemini_stream", End::Short, None, (Some(5), None, None)),
