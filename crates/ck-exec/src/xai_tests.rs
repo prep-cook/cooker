@@ -255,7 +255,7 @@ async fn go_reference_scenarios() {
                 // recorded poll's job had been here.
                 let polled = gj::get(&req.body, "request_id").str().into_owned();
                 if !path.ends_with("/generations") && !polled.is_empty() {
-                    executor.jobs.created(&polled);
+                    drop(executor.jobs.created(&polled));
                 }
                 executor.videos(&cred, req, &path, &cfg).await
             }
@@ -696,19 +696,7 @@ async fn media_usage_is_charged_once_per_response_or_job() {
         )
         .await;
         *target.lock().unwrap() = mock.addr.clone();
-        let s = serde_json::json!({
-            "config_auth": -1,
-            "attributes": {"api_key": "sk-fake-xai"},
-            "op": op,
-            "source": "openai",
-            "payload": payload,
-            "model": "grok-imagine",
-            "request_path": path,
-            // Every create carries the same client idempotency key.
-            "headers": {"Idempotency-Key": "replay-1", "x-idempotency-key": "replay-1"},
-        });
-        let (recorder, _capture, sink) = crate::openai_compat_usage::sinks();
-        let req = request(&s, sink);
+        let (s, recorder, req) = media_request(op, &path, &payload);
         let executor = &processes[process];
         let result = match op {
             "images" => executor.images(&credential(&s, &cfg), req, &path, &cfg).await,
@@ -754,6 +742,196 @@ async fn media_usage_is_charged_once_per_response_or_job() {
         };
         assert_eq!(bodies, want, "{row}");
         assert_eq!(charged_now, expected == Some(true), "{row}");
+    }
+    // Two polls of vid_40 admitted before its charge: the first is held upstream while the
+    // second charges. Past the job's expiry a new poll is refused, and the held poll then settles
+    // and charges nothing.
+    let executor = &processes[0];
+    let created = Mock::start(
+        &serde_json::json!({"status": 200, "headers": [["Content-Type", "application/json"]], "body": r#"{"request_id":"vid_40"}"#}),
+    )
+    .await;
+    *target.lock().unwrap() = created.addr.clone();
+    let (s, _, req) = media_request("videos", CREATE, r#"{"prompt":"a"}"#);
+    executor
+        .videos(&credential(&s, &cfg), req, CREATE, &cfg)
+        .await
+        .expect("the create");
+    let (path, payload) = poll("vid_40");
+    let (held, arrived, release) = held_upstream(charged).await;
+    *target.lock().unwrap() = held;
+    let (s, first, req) = media_request("videos", &path, &payload);
+    let held_credential = credential(&s, &cfg);
+    let held_poll = executor.videos(&held_credential, req, &path, &cfg);
+    tokio::pin!(held_poll);
+    tokio::select! {
+        _ = &mut held_poll => panic!("the held poll answered before its release"),
+        _ = arrived => {}
+    }
+    let answered = Mock::start(
+        &serde_json::json!({"status": 200, "headers": [["Content-Type", "application/json"]], "body": charged}),
+    )
+    .await;
+    *target.lock().unwrap() = answered.addr.clone();
+    let (s, second, req) = media_request("videos", &path, &payload);
+    executor
+        .videos(&credential(&s, &cfg), req, &path, &cfg)
+        .await
+        .expect("the second poll");
+    time.lock().unwrap().0 += Duration::from_secs(DAY + 2);
+    let (s, _, req) = media_request("videos", &path, &payload);
+    let refused = executor.videos(&credential(&s, &cfg), req, &path, &cfg).await;
+    assert_eq!(refused.err().map(|e| e.status), Some(404), "vid_40 expired");
+    release.send(()).unwrap();
+    held_poll.await.expect("the held poll");
+    let charges = |recorder: &crate::openai_compat_usage::Recorder| {
+        let reports = recorder.0.lock().unwrap();
+        reports
+            .iter()
+            .filter(
+                |r| matches!(r, crate::openai_compat_usage::Report::Body(_, data) if gj::get(data, "usage").exists()),
+            )
+            .count()
+    };
+    assert_eq!((charges(&second), charges(&first)), (1, 0), "vid_40 is charged once");
+}
+
+/// A media request in the shape the scenarios use; every create carries the same client
+/// idempotency key.
+fn media_request(
+    op: &str,
+    path: &str,
+    payload: &str,
+) -> (Value, Arc<crate::openai_compat_usage::Recorder>, ExecRequest) {
+    let s = serde_json::json!({
+        "config_auth": -1,
+        "attributes": {"api_key": "sk-fake-xai"},
+        "op": op,
+        "source": "openai",
+        "payload": payload,
+        "model": "grok-imagine",
+        "request_path": path,
+        "headers": {"Idempotency-Key": "replay-1", "x-idempotency-key": "replay-1"},
+    });
+    let (recorder, _capture, sink) = crate::openai_compat_usage::sinks();
+    let req = request(&s, sink);
+    (s, recorder, req)
+}
+
+/// An upstream that answers one request with `body` once released, and reports when the request
+/// arrived.
+async fn held_upstream(
+    body: &'static str,
+) -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (read, mut write) = socket.into_split();
+        let mut reader = BufReader::new(read);
+        loop {
+            let mut line = Vec::new();
+            if reader.read_until(b'\n', &mut line).await.unwrap_or(0) == 0 || line == b"\r\n" {
+                break;
+            }
+        }
+        let _ = arrived_tx.send(());
+        let _ = released.await;
+        let out = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = write.write_all(out.as_bytes()).await;
+        let _ = write.shutdown().await;
+    });
+    (addr, arrived, release)
+}
+
+/// A video job's charge is claimed once whatever order its admitted polls settle in. Expiry
+/// refuses new polls only: a record stays while an admitted poll holds it.
+#[test]
+fn video_job_charge_is_claimed_once_across_interleavings() {
+    use crate::xai_media::VideoJobs;
+    enum Step {
+        Clock(u64),
+        Create(&'static str),
+        /// (slot, job, admitted)
+        Admit(usize, &'static str, bool),
+        /// (slot, charged)
+        Settle(usize, bool),
+        Release(usize),
+    }
+    use Step::*;
+    const DAY: u64 = 24 * 3600;
+    let rows = [
+        (
+            "two polls admitted uncharged; one charges, a poll past expiry is refused, the other settles",
+            vec![
+                Create("a"),
+                Admit(0, "a", true),
+                Admit(1, "a", true),
+                Clock(1),
+                Settle(0, true),
+                Release(0),
+                Clock(DAY + 2),
+                Admit(2, "a", false),
+                Settle(1, false),
+                Release(1),
+                Admit(2, "a", false),
+            ],
+        ),
+        (
+            "an expired job admitted before expiry: no new poll, its first settlement charges",
+            vec![
+                Create("b"),
+                Admit(0, "b", true),
+                Clock(DAY + 1),
+                Admit(1, "b", false),
+                Settle(0, true),
+                Release(0),
+                Admit(1, "b", true),
+                Settle(1, false),
+            ],
+        ),
+        (
+            "two first settlements: one charges",
+            vec![
+                Create("c"),
+                Admit(0, "c", true),
+                Admit(1, "c", true),
+                Settle(1, true),
+                Settle(0, false),
+            ],
+        ),
+        ("a job never created", vec![Admit(0, "d", false)]),
+    ];
+    for (name, steps) in rows {
+        let time: Arc<Mutex<Duration>> = Arc::default();
+        let base = std::time::Instant::now();
+        let now = time.clone();
+        let jobs = VideoJobs::with_clock(Arc::new(move || base + *now.lock().unwrap()));
+        let mut held: [Option<crate::xai_media::Admission<'_>>; 3] = [None, None, None];
+        for (i, step) in steps.into_iter().enumerate() {
+            match step {
+                Clock(seconds) => *time.lock().unwrap() = Duration::from_secs(seconds),
+                Create(job) => drop(jobs.created(job)),
+                Admit(slot, job, admitted) => {
+                    held[slot] = jobs.admit(job);
+                    assert_eq!(held[slot].is_some(), admitted, "{name}: step {i}");
+                }
+                Settle(slot, charged) => {
+                    let admission = held[slot].as_ref().expect("an admitted poll");
+                    assert_eq!(admission.settle(), charged, "{name}: step {i}");
+                }
+                Release(slot) => held[slot] = None,
+            }
+        }
     }
 }
 

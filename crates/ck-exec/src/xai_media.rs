@@ -97,10 +97,10 @@ impl XaiExecutor {
             None => (wreq::Method::POST, VIDEOS_GENERATIONS.to_owned()),
         };
         let job = if method == wreq::Method::GET {
-            let Some(charged) = self.jobs.admit(&request_id) else {
+            let Some(admission) = self.jobs.admit(&request_id) else {
                 return Err(unknown_job(&request_id));
             };
-            VideoJob::Poll(request_id, charged)
+            VideoJob::Poll(admission)
         } else {
             VideoJob::Create
         };
@@ -120,7 +120,7 @@ impl XaiExecutor {
         method: wreq::Method,
         path: &str,
         payload: Vec<u8>,
-        video: Option<VideoJob>,
+        video: Option<VideoJob<'_>>,
     ) -> Result<ExecResponse, ExecError> {
         let logged = payload.as_slice();
         let body = (method == wreq::Method::POST).then(|| payload.clone());
@@ -139,11 +139,11 @@ impl XaiExecutor {
             return Err(error);
         }
         // A video is a job: its usage is that of the job, which a poll repeats. A create names
-        // it as the server's `video_id` reads it; a poll settles with the charge state it was
-        // admitted with, never one looked up again after the response.
-        let (job, charged) = match video {
-            None => (String::new(), false),
-            Some(VideoJob::Poll(job, charged)) => (job, charged),
+        // it as the server's `video_id` reads it; a poll settles against the job its admission
+        // holds, so only the first settlement that finds the job uncharged charges it.
+        let admission = match video {
+            None => None,
+            Some(VideoJob::Poll(admission)) => Some(admission),
             Some(VideoJob::Create) => {
                 let id = text(&gj::get(&data, "request_id"));
                 let job = if id.trim().is_empty() {
@@ -151,12 +151,12 @@ impl XaiExecutor {
                 } else {
                     id
                 };
-                let charged = self.jobs.created(&job);
-                (job, charged)
+                self.jobs.created(&job)
             }
         };
         if req.usage.enabled() {
-            if reports_usage(&data) && self.jobs.settle(&job, charged) {
+            // An image, or a create naming no job, has nothing a later report could repeat.
+            if reports_usage(&data) && admission.as_ref().is_none_or(Admission::settle) {
                 // The top-level usage of an image or video body, read as a Responses body's.
                 req.usage.response_body(Format::Codex, &data);
             } else {
@@ -208,26 +208,35 @@ fn reports_usage(body: &[u8]) -> bool {
 /// How long a job is remembered: well past the binding TTL a client polls within.
 const JOB_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// What a video request is to its job: a create, whose response names the job, or a poll of a
-/// job admitted with its charge state.
-pub(crate) enum VideoJob {
+/// What a video request is to its job: a create, whose response names the job, or a poll
+/// admitted against it.
+pub(crate) enum VideoJob<'a> {
     Create,
-    Poll(String, bool),
+    Poll(Admission<'a>),
 }
 
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
+/// One job's record: whether it was charged, when it was created or charged, and how many
+/// requests hold an [`Admission`] to it.
+struct Job {
+    charged: bool,
+    at: Instant,
+    in_flight: usize,
+}
+
 /// The video jobs this process created or charged (E-Q13): a job is charged at the first poll
 /// that reports usage and never again, however often it is polled after. A job missing here may
 /// already have been charged by an earlier process, so its poll is refused rather than risk a
-/// second charge. Admission reads a job's charge state once and settlement uses it, so expiry
-/// can only refuse a later poll, never charge an admitted one again.
+/// second charge. A record older than [`JOB_TTL`] admits no new poll, but stays while any
+/// admitted request holds it, so expiry can only refuse a poll, never erase a charge another
+/// admitted poll settles against.
 // ponytail: process memory, so a job created before a restart cannot be polled through cooker.
 // No store on this path outlives the process: the usage queue is in memory, and SQLite holds
 // configuration and credentials only. A durable job ledger (F06-1) lifts this; its store awaits
 // an owner decision.
 pub(crate) struct VideoJobs {
-    jobs: Mutex<HashMap<String, (bool, Instant)>>,
+    jobs: Mutex<HashMap<String, Job>>,
     clock: Clock,
 }
 
@@ -245,52 +254,80 @@ impl VideoJobs {
         }
     }
 
-    /// The live jobs: records older than [`JOB_TTL`] are dropped first.
-    fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, (bool, Instant)>> {
-        let mut jobs = self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
-        jobs.retain(|_, (_, at)| now.saturating_duration_since(*at) < JOB_TTL);
-        jobs
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Job>> {
+        self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records a job this process created and returns its charge state, keeping a charge it
-    /// already has.
-    pub(crate) fn created(&self, job: &str) -> bool {
+    /// An admission to `job`, or `None` for a job without an ID. A create records the job if it
+    /// is new, keeping a charge it already has; a poll needs a record younger than [`JOB_TTL`].
+    fn enter(&self, job: &str, create: bool) -> Option<Admission<'_>> {
         let job = job.trim();
         if job.is_empty() {
-            return false;
+            return None;
         }
         let now = (self.clock)();
-        self.live().entry(job.to_owned()).or_insert((false, now)).0
+        let live = |record: &Job| now.saturating_duration_since(record.at) < JOB_TTL;
+        let mut jobs = self.lock();
+        jobs.retain(|_, record| record.in_flight > 0 || live(record));
+        let record = if create {
+            jobs.entry(job.to_owned()).or_insert(Job {
+                charged: false,
+                at: now,
+                in_flight: 0,
+            })
+        } else {
+            jobs.get_mut(job).filter(|record| live(record))?
+        };
+        record.in_flight += 1;
+        Some(Admission {
+            jobs: self,
+            job: job.to_owned(),
+        })
     }
 
-    /// A poll's admission: the job's charge state, or `None` when this process neither created
-    /// nor charged it, or its record expired.
-    fn admit(&self, job: &str) -> Option<bool> {
-        self.live().get(job.trim()).map(|(charged, _)| *charged)
+    /// Records a job this process created; its admission settles a usage the create reported.
+    pub(crate) fn created(&self, job: &str) -> Option<Admission<'_>> {
+        self.enter(job, true)
     }
 
-    /// Settles a report of `job`'s usage, admitted with `charged`: whether to charge it now. A
-    /// job charged at admission is never charged again, whatever its record became since;
-    /// otherwise the first settlement charges it and marks it, and a later one finds the mark,
-    /// which the charge refreshed. A job without an ID cannot be matched with a later poll, so its
-    /// every report is charged.
-    fn settle(&self, job: &str, charged: bool) -> bool {
-        let job = job.trim();
-        if job.is_empty() {
-            return true;
-        }
-        if charged {
+    /// A poll's admission, or `None` when this process neither created nor charged the job, or
+    /// its record expired.
+    pub(crate) fn admit(&self, job: &str) -> Option<Admission<'_>> {
+        self.enter(job, false)
+    }
+}
+
+/// One request's hold on a job's record: the record outlives expiry until every admission to it
+/// is dropped.
+pub(crate) struct Admission<'a> {
+    jobs: &'a VideoJobs,
+    job: String,
+}
+
+impl Admission<'_> {
+    /// Claims the job's charge: true only for the first settlement that finds the job uncharged,
+    /// which marks it charged and refreshes its record.
+    pub(crate) fn settle(&self) -> bool {
+        let now = (self.jobs.clock)();
+        let mut jobs = self.jobs.lock();
+        // The admission keeps the record; a missing one charges nothing.
+        let Some(record) = jobs.get_mut(&self.job) else {
+            return false;
+        };
+        if record.charged {
             return false;
         }
-        let now = (self.clock)();
-        let mut jobs = self.live();
-        let entry = jobs.entry(job.to_owned()).or_insert((false, now));
-        if entry.0 {
-            return false;
-        }
-        *entry = (true, now);
+        record.charged = true;
+        record.at = now;
         true
+    }
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        if let Some(record) = self.jobs.lock().get_mut(&self.job) {
+            record.in_flight = record.in_flight.saturating_sub(1);
+        }
     }
 }
 
