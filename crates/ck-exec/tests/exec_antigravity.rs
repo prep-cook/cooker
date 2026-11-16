@@ -982,3 +982,60 @@ async fn response_usage_reaches_accounting_only_through_the_canonical_stream() {
         assert_eq!(*facts.0.lock().unwrap(), ["request"], "{name}: request-side facts only");
     }
 }
+
+/// Where an upstream answer ends before its body does.
+#[derive(Clone, Copy, Debug)]
+enum Early {
+    /// A chunked body closed after its first event, with no terminating chunk.
+    AfterFirstEvent,
+    /// A chunked body closed inside its last line, which holds whole JSON but no newline.
+    InLastLine,
+    /// A `content-length` body closed after its first event with bytes still owed.
+    Short,
+}
+
+/// An answer that ends before its body does fails the attempt with exactly one error on
+/// every client protocol. Rows: scenario, cut, and the input usage the upstream reported
+/// before the cut, which stays published (checked where the client protocol publishes
+/// usage as it arrives).
+#[tokio::test]
+async fn an_upstream_body_that_ends_early_fails_the_attempt() {
+    let rows = [
+        ("gemini_stream", Early::InLastLine, Some(5)),
+        ("openai_stream", Early::InLastLine, None),
+        ("responses_stream", Early::InLastLine, None),
+        ("claude_stream_claude_model", Early::InLastLine, None),
+        ("gemini_stream", Early::AfterFirstEvent, Some(5)),
+        ("gemini_stream", Early::Short, Some(5)),
+    ];
+    for (name, early, kept) in rows {
+        let s = scenario(name);
+        let body = s["upstream"]["body"].as_str().unwrap().to_owned();
+        let first = body.find("\r\n\r\n").unwrap() + 4;
+        let reply = match early {
+            Early::AfterFirstEvent => Reply::sse(body).cut_after(first),
+            Early::InLastLine => {
+                let last = body.trim_end().len();
+                Reply::sse(body).cut_after(last)
+            }
+            Early::Short => Reply::sse(body[..first].to_owned()).short_by(body.len() - first),
+        };
+        let streams = Streams::new();
+        let upstream = StreamUpstream::start([reply]).await;
+        let run = run_on(&streams, &s, &upstream, UsageSink::default()).await;
+        let started = run.started.unwrap_or_else(|e| panic!("{name} {early:?}: {}", e.status));
+        let (outcome, published, _) = produce(&streams, started).await;
+        assert!(outcome.is_err(), "{name} {early:?}: an early end fails the attempt");
+        assert_eq!(published.terminal, Some(Terminal::UpstreamError), "{name} {early:?}");
+        let errors = published
+            .records
+            .iter()
+            .filter(|r| r.starts_with(b"event: x_ck.error\n"))
+            .count();
+        assert_eq!(errors, 1, "{name} {early:?}: one error record");
+        if let Some(kept) = kept {
+            let input = usage(&published).map(|u| u["input_tokens"].as_u64().unwrap());
+            assert_eq!(input, Some(kept), "{name} {early:?}: the reported input usage stays");
+        }
+    }
+}
