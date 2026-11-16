@@ -116,18 +116,25 @@ fn has_original(doc: &Document, value: usize, protocol: &str, name: &str) -> Res
     Ok(found)
 }
 
-/// Native extras of `dialect`, except those an operation field now supersedes.
+/// Native extras of `dialect`, except those an operation field now supersedes and the members
+/// already `written`.
 fn write_originals(
     doc: &Document,
     value: usize,
     dialect: Dialect,
     superseded: &[&str],
+    written: &[&str],
     members: &mut Members,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
     for_each_original(doc, value, dialect.name(), |entry, leaf| {
         for &key in superseded {
             if leaf.is(key)? && (doc.member(value, key)?.is_some() || key == "id" || key == "request_id") {
+                return Ok(());
+            }
+        }
+        for &key in written {
+            if leaf.is(key)? {
                 return Ok(());
             }
         }
@@ -146,9 +153,10 @@ fn write_originals(
 /// storage has no empty lease. For content, `variant` is a query parameter of the download URL,
 /// not a body: the executor must read it from the operation value.
 ///
-/// A job encodes its operation fields and its own dialect's native extras only. Fields an
-/// OpenAI-shaped route also shows (`model`, `prompt`, `seconds`, `size`, `video_url`) come from
-/// the request binding or the job table (E6, E7), not from this encoder.
+/// A job encodes its operation fields and its own dialect's native extras. An xAI job encoded for
+/// OpenAI also names the members an OpenAI video object shares with xAI's (`model`, `video_url`,
+/// `seconds` …); what xAI's answer lacks (a create's `prompt`, `size`) comes from the fields the
+/// route kept for an OpenAI client ([`super::with_originals`]).
 pub fn encode(owner: &mut Writer, operation: &Document, dialect: Dialect) -> Result<Option<ScratchLease>> {
     operation.check_owner(owner)?;
     let root = operation.root();
@@ -231,7 +239,7 @@ fn write_request(
     for &key in known(action) {
         members.copy(doc, value, key, e)?;
     }
-    write_originals(doc, value, dialect, known(action), &mut members, e)?;
+    write_originals(doc, value, dialect, known(action), &[], &mut members, e)?;
     e.bytes(b"}")
 }
 
@@ -271,6 +279,76 @@ fn write_job(doc: &Document, value: usize, dialect: Dialect, e: &mut Encoder<'_,
     for key in ["created_at", "completed_at", "error"] {
         members.copy(doc, value, key, e)?;
     }
-    write_originals(doc, value, dialect, &JOB_FIELDS, &mut members, e)?;
+    let mut written = Vec::new();
+    if dialect == Dialect::OpenAi && boundary::is(doc, x, "original_protocol", Dialect::Xai.name())? {
+        written = write_xai_projection(doc, value, &mut members, e)?;
+    }
+    write_originals(doc, value, dialect, &JOB_FIELDS, &written, &mut members, e)?;
     e.bytes(b"}")
+}
+
+/// The xAI job members an OpenAI video object also names, in its words: `model`, `prompt`,
+/// `size`, `seconds`, `expires_at` and `remixed_from_video_id` as sent, `video.url` as `video_url`,
+/// `video.duration` as `seconds` (a string, as OpenAI writes it) when xAI sent no `seconds`, and an
+/// `error` string as the error's message. Returns the members written; they supersede the same
+/// members a route kept for an OpenAI client ([`super::with_originals`]).
+fn write_xai_projection(
+    doc: &Document,
+    value: usize,
+    members: &mut Members,
+    e: &mut Encoder<'_, '_>,
+) -> Result<Vec<&'static str>> {
+    const AS_SENT: [&str; 6] = [
+        "model",
+        "prompt",
+        "size",
+        "seconds",
+        "expires_at",
+        "remixed_from_video_id",
+    ];
+    let xai = Dialect::Xai.name();
+    let seconds = has_original(doc, value, xai, "seconds")?;
+    let mut written = Vec::new();
+    for_each_original(doc, value, xai, |entry, leaf| {
+        let node = doc.required(entry, "value")?;
+        for key in AS_SENT {
+            if leaf.is(key)? {
+                members.key(e, key)?;
+                doc.write(node, e)?;
+                written.push(key);
+            }
+        }
+        if leaf.is("video")? && matches!(doc.node(node)?.value, Value::Object) {
+            if let Some(url) = doc.member(node, "url")?
+                && matches!(doc.node(url)?.value, Value::String(_))
+            {
+                members.key(e, "video_url")?;
+                doc.write(url, e)?;
+                written.push("video_url");
+            }
+            if let Some(duration) = doc.member(node, "duration")?
+                && !seconds
+                && matches!(doc.node(duration)?.value, Value::Unsigned(_) | Value::Number(_))
+            {
+                // A JSON number's text needs no escaping inside a string.
+                members.key(e, "seconds")?;
+                e.bytes(b"\"")?;
+                doc.write(duration, e)?;
+                e.bytes(b"\"")?;
+                written.push("seconds");
+            }
+        }
+        if leaf.is("error")?
+            && doc.member(value, "error")?.is_none()
+            && matches!(doc.node(node)?.value, Value::String(_))
+        {
+            members.key(e, "error")?;
+            e.bytes(b"{\"code\":\"video_generation_failed\",\"message\":")?;
+            doc.write(node, e)?;
+            e.bytes(b"}")?;
+            written.push("error");
+        }
+        Ok(())
+    })?;
+    Ok(written)
 }

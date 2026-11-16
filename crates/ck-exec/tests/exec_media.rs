@@ -812,10 +812,10 @@ async fn refused_media_requests_send_nothing() {
             false,
         ),
         (
-            "video content is not an xAI request",
+            "xAI video content has no variant",
             Provider::Xai,
             "grok-imagine-video",
-            job(Media::VideoContent, "", "vid_1"),
+            job(Media::VideoContent, r#"{"variant":"thumbnail"}"#, "vid_1"),
             false,
         ),
         (

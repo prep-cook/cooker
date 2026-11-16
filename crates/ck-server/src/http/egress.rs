@@ -29,6 +29,8 @@ pub enum Protocol {
     Images(ck_translate::images::Delivery),
     /// Codex Alpha Search: the result JSON.
     Search,
+    /// Video jobs in the client's dialect (JSON), or a finished video's file (`Raw`).
+    Video(ck_translate::video::Dialect),
 }
 
 /// Client body framing. `Json` is a buffered body; `Sse` and `JsonArray` stream, the latter

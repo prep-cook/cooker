@@ -45,7 +45,7 @@ impl Capability for XaiCapability {
 
     fn admits(&self, operation: Operation) -> bool {
         match operation {
-            Operation::Media(media) => crate::xai_media::admits(media),
+            Operation::Media(_) => true,
             operation => operation.is_text(),
         }
     }

@@ -1,6 +1,8 @@
 //! Finished video bytes as one media lifetime: `response.start`, `media.start` with the MIME
-//! the upstream sent (none when it sent none; a MIME is never guessed), data records of at most one record's capacity, `media.end` with the
-//! byte count, then `done`. Bytes are published exactly as received; nothing is re-encoded.
+//! the upstream sent (none when it sent none; a MIME is never guessed), the job's usage snapshot
+//! when the poll that found the file reports one ([`Download::charge`]), data records of at most
+//! one record's capacity, `media.end` with the byte count, then `done`. Bytes are published
+//! exactly as received; nothing is re-encoded.
 //!
 //! A body that ends short of its declared length, runs past it, or is cut by the transport is
 //! an error event and an error result, never a shorter success.
@@ -9,10 +11,11 @@ use std::time::{Duration, Instant};
 
 use ck_stream::Writer;
 
+use super::{Decoded, Dialect, Ledger};
 use crate::{
     boundary,
     codec::{
-        Error, Result,
+        self, Error, ResponseIngress, Result,
         event::{Direction, Emitter, Identity, Kind, Scope},
         media::{Publisher, local_id},
     },
@@ -27,6 +30,7 @@ const MAX_MIME: usize = 255;
 /// buffered byte, so the published records do not depend on how the network sliced the body.
 pub struct Download {
     owner: u64,
+    job: String,
     emitter: Emitter,
     publisher: Publisher,
     expected: Option<u64>,
@@ -80,6 +84,7 @@ impl Download {
         })?;
         Ok(Self {
             owner: owner.id(),
+            job: job_id.to_owned(),
             emitter,
             publisher,
             expected,
@@ -91,15 +96,25 @@ impl Download {
         })
     }
 
-    /// When buffered bytes must be published; call [`Self::advance`] with no bytes then.
-    pub fn flush_deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
-
-    pub fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
+    /// Publishes the usage `decoded`, the poll that found the file, reported in `dialect`, when
+    /// `ledger` finds it the job's charge (E-Q13), and answers whether it was.
+    pub fn charge(
+        &mut self,
+        owner: &mut Writer,
+        decoded: &Decoded,
+        dialect: Dialect,
+        ledger: &mut dyn Ledger,
+    ) -> Result<bool> {
         boundary::enter(self.owner, owner, self.closed)?;
-        let result = self.append(owner, bytes);
-        result.map_err(|error| self.fail(owner, error))
+        let Some(usage) = decoded.usage else {
+            return Ok(false);
+        };
+        let pending = super::response::pending(&decoded.operation)?;
+        let Self { job, emitter, .. } = self;
+        let job = job.as_str();
+        ledger.charge(job, &mut || {
+            super::response::usage(emitter, owner, job, dialect, &usage, pending)
+        })
     }
 
     fn append(&mut self, owner: &mut Writer, mut bytes: &[u8]) -> Result<()> {
@@ -134,9 +149,33 @@ impl Download {
         Ok(())
     }
 
-    /// Completes the download and returns its byte count. A shorter body than declared is
-    /// [`Error::Truncated`].
-    pub fn finish(mut self, owner: &mut Writer) -> Result<u64> {
+    fn failed(&mut self, owner: &mut Writer, error: Error) -> Error {
+        self.closed = true;
+        self.deadline = None;
+        boundary::reported(Err::<(), _>(error), &mut self.emitter, owner, false)
+            .err()
+            .unwrap_or(Error::Closed)
+    }
+}
+
+impl ResponseIngress for Download {
+    fn flush_deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Appends `bytes`; no bytes publish what is buffered.
+    fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
+        boundary::enter(self.owner, owner, self.closed)?;
+        let result = if bytes.is_empty() {
+            self.flush(owner)
+        } else {
+            self.append(owner, bytes)
+        };
+        result.map_err(|error| self.failed(owner, error))
+    }
+
+    /// Completes the download. A shorter body than declared is [`Error::Truncated`].
+    fn finish(&mut self, owner: &mut Writer) -> Result<()> {
         boundary::enter(self.owner, owner, self.closed)?;
         let result = (|| {
             if self.expected.is_some_and(|expected| self.received != expected) {
@@ -145,32 +184,25 @@ impl Download {
             self.flush(owner)?;
             self.publisher.end(&mut self.emitter, owner)?;
             self.emitter
-                .emit(owner, Kind::Done, Scope::default(), |_| Ok(()), |_| Ok(()))?;
-            Ok(self.received)
+                .emit(owner, Kind::Done, Scope::default(), |_| Ok(()), |_| Ok(()))
+                .map(drop)
         })();
         match result {
-            Ok(received) => {
+            Ok(()) => {
                 self.closed = true;
-                Ok(received)
+                Ok(())
             }
-            Err(error) => Err(self.fail(owner, error)),
+            Err(error) => Err(self.failed(owner, error)),
         }
     }
 
-    /// The transport failed before the body ended.
-    pub fn abort(mut self, owner: &mut Writer) -> Error {
-        if let Err(error) = boundary::enter(self.owner, owner, self.closed) {
-            return error;
-        }
-        self.fail(owner, Error::Truncated)
-    }
-
-    fn fail(&mut self, owner: &mut Writer, error: Error) -> Error {
+    /// The transport failed before the body ended: the bytes received so far, then the failure.
+    fn fail(&mut self, owner: &mut Writer, status: u16, scope: &'static str) -> Result<()> {
+        boundary::enter(self.owner, owner, self.closed)?;
         self.closed = true;
         self.deadline = None;
-        boundary::reported(Err::<(), _>(error), &mut self.emitter, owner, false)
-            .err()
-            .unwrap_or(Error::Closed)
+        self.flush(owner)?;
+        codec::upstream_failure(&mut self.emitter, owner, status, scope)
     }
 }
 

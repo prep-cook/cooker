@@ -43,6 +43,8 @@ pub struct Ingress {
     dialect: Dialect,
     phase: Phase,
     ledger: Box<dyn Ledger>,
+    /// The request's native fields in other protocols, returned with the job ([`Self::echo`]).
+    echo: Option<Document>,
     closed: bool,
 }
 
@@ -78,8 +80,33 @@ impl Ingress {
             dialect,
             phase,
             ledger,
+            echo: None,
             closed: false,
         })
+    }
+
+    /// Returns `request`'s native fields of other protocols than this ingress's dialect with the
+    /// job, so a client of that protocol sees the values its route kept there
+    /// ([`super::with_originals`]); the upstream's own dialect never does.
+    pub fn echo(&mut self, owner: &mut Writer, request: &Document) -> Result<()> {
+        boundary::enter(self.owner, owner, self.closed)?;
+        let original = request.required(request.required(request.root(), "x_ck")?, "original")?;
+        let own = self.dialect.name();
+        self.echo = Some(boundary::mapped(owner, |e| {
+            e.bytes(b"[")?;
+            let mut first = true;
+            for entry in request.children(original)? {
+                if boundary::is(request, entry, "protocol", own)? {
+                    continue;
+                }
+                if !std::mem::replace(&mut first, false) {
+                    e.bytes(b",")?;
+                }
+                request.write(entry, e)?;
+            }
+            e.bytes(b"]")
+        })?);
+        Ok(())
     }
 
     fn publish(&mut self, owner: &mut Writer, operation: &Document, usage: Option<Usage>) -> Result<()> {
@@ -90,34 +117,11 @@ impl Ingress {
         if self.phase == Phase::Accepted {
             self.ledger.accepted(&id);
         }
-        let pending = ["queued", "running"].iter().try_fold(false, |found, status| {
-            Ok::<_, Error>(found || boundary::is(operation, value, "status", status)?)
-        })?;
         if let Some(usage) = usage {
-            let protocol = self.dialect.name();
+            let pending = pending(operation)?;
+            let dialect = self.dialect;
             let Self { ledger, emitter, .. } = self;
-            ledger.charge(&id, &mut || {
-                emitter
-                    .emit(
-                        owner,
-                        Kind::Usage,
-                        Scope::default(),
-                        |e| {
-                            e.bytes(b",\"scope\":\"job:")?;
-                            operation.write_contents(job, e)?;
-                            e.bytes(b"\",\"usage\":{\"native\":{\"protocol\":")?;
-                            e.string(protocol)?;
-                            e.bytes(b",\"value\":{")?;
-                            counts(&usage, true, e)?;
-                            e.bytes(b"}},\"final\":")?;
-                            e.bytes(if pending { b"false" } else { b"true" })?;
-                            counts(&usage, false, e)?;
-                            e.bytes(b"}")
-                        },
-                        |_| Ok(()),
-                    )
-                    .map(drop)
-            })?;
+            ledger.charge(&id, &mut || self::usage(emitter, owner, &id, dialect, &usage, pending))?;
         }
         let x = operation.required(root, "x_ck")?;
         self.emitter.emit(
@@ -153,6 +157,45 @@ impl Ingress {
         }
         result
     }
+}
+
+/// Whether the job `operation` names is still queued or running.
+pub(super) fn pending(operation: &Document) -> Result<bool> {
+    let value = operation.required(operation.root(), "value")?;
+    ["queued", "running"].iter().try_fold(false, |found, status| {
+        Ok::<_, Error>(found || boundary::is(operation, value, "status", status)?)
+    })
+}
+
+/// Publishes `usage` as `job`'s snapshot, `final` once the job is no longer `pending`.
+pub(super) fn usage(
+    emitter: &mut Emitter,
+    owner: &mut Writer,
+    job: &str,
+    dialect: Dialect,
+    usage: &Usage,
+    pending: bool,
+) -> Result<()> {
+    emitter
+        .emit(
+            owner,
+            Kind::Usage,
+            Scope::default(),
+            |e| {
+                e.bytes(b",\"scope\":")?;
+                e.string(&format!("job:{job}"))?;
+                e.bytes(b",\"usage\":{\"native\":{\"protocol\":")?;
+                e.string(dialect.name())?;
+                e.bytes(b",\"value\":{")?;
+                counts(usage, true, e)?;
+                e.bytes(b"}},\"final\":")?;
+                e.bytes(if pending { b"false" } else { b"true" })?;
+                counts(usage, false, e)?;
+                e.bytes(b"}")
+            },
+            |_| Ok(()),
+        )
+        .map(drop)
 }
 
 /// The reported counts, comma-separated after a first member unless `first`; `cost_in_usd_ticks`
@@ -191,7 +234,7 @@ impl ResponseIngress for Ingress {
             .decoder
             .take()
             .ok_or(Error::Closed)
-            .and_then(|decoder| decoder.finish(owner))
+            .and_then(|decoder| decoder.finish_with(owner, self.echo.as_ref()))
             .and_then(|decoded| self.publish(owner, &decoded.operation, decoded.usage));
         let result = self.report(owner, result);
         self.closed = true;

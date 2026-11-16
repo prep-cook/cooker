@@ -26,6 +26,8 @@ pub enum MediaIngress {
     Images(Box<images::Ingress>),
     Speech(Box<audio::Ingress>),
     Video(Box<video::Ingress>),
+    /// A finished video's bytes.
+    VideoContent(Box<video::content::Download>),
 }
 
 impl ResponseIngress for MediaIngress {
@@ -34,6 +36,7 @@ impl ResponseIngress for MediaIngress {
             Self::Images(ingress) => ingress.flush_deadline(),
             Self::Speech(ingress) => ingress.flush_deadline(),
             Self::Video(ingress) => ingress.flush_deadline(),
+            Self::VideoContent(ingress) => ingress.flush_deadline(),
         }
     }
 
@@ -42,6 +45,7 @@ impl ResponseIngress for MediaIngress {
             Self::Images(ingress) => ingress.flush(owner),
             Self::Speech(ingress) => ingress.flush(owner),
             Self::Video(ingress) => ingress.flush(owner),
+            Self::VideoContent(ingress) => ingress.flush(owner),
         }
     }
 
@@ -50,6 +54,7 @@ impl ResponseIngress for MediaIngress {
             Self::Images(ingress) => ingress.advance(owner, bytes),
             Self::Speech(ingress) => ingress.advance(owner, bytes),
             Self::Video(ingress) => ingress.advance(owner, bytes),
+            Self::VideoContent(ingress) => ingress.advance(owner, bytes),
         }
     }
 
@@ -58,6 +63,7 @@ impl ResponseIngress for MediaIngress {
             Self::Images(ingress) => ingress.finish(owner),
             Self::Speech(ingress) => ingress.finish(owner),
             Self::Video(ingress) => ingress.finish(owner),
+            Self::VideoContent(ingress) => ingress.finish(owner),
         }
     }
 
@@ -66,6 +72,7 @@ impl ResponseIngress for MediaIngress {
             Self::Images(ingress) => ingress.fail(owner, status, scope),
             Self::Speech(ingress) => ingress.fail(owner, status, scope),
             Self::Video(ingress) => ingress.fail(owner, status, scope),
+            Self::VideoContent(ingress) => ingress.fail(owner, status, scope),
         }
     }
 }

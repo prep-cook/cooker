@@ -128,11 +128,6 @@ pub(crate) fn text(body: &[u8], path: &str) -> String {
     gj::get(body, path).str().into_owned()
 }
 
-/// `WriteErrorResponse` for a handler-side failure.
-pub(crate) fn gateway_error(message: &str) -> Response {
-    respond::json(502, "application/json", errors::openai_body(502, message))
-}
-
 /// Image generation turned off for every route (`disable-image-generation: true`).
 fn disabled(rt: &Runtime) -> bool {
     ck_wire::payload::Rules::of(&rt.config()).image_generation == ck_wire::payload::ImageGeneration::All

@@ -725,10 +725,18 @@ const SPEECH_LIMIT: u64 = 64 << 20;
 /// The limit of one video job body; the video itself is a separate download.
 const VIDEO_LIMIT: u64 = 1 << 20;
 
-/// Whether xAI serves `media`. A finished video's bytes are fetched from the URL its job names,
-/// which the job table holds (E7), not through an xAI endpoint.
-pub(crate) const fn admits(media: Media) -> bool {
-    !matches!(media, Media::VideoContent)
+/// The finished file's URL a job body names (`xaiVideoContentURLFromPayload`): an absolute http(s)
+/// URL with a host. Without one the content request fails as the old route's did, with 502.
+fn content_url(polled: &[u8]) -> Result<String, ExecError> {
+    let raw = text(&gj::get(polled, "video.url")).trim().to_owned();
+    let message = if raw.is_empty() {
+        "xAI video response did not include video.url"
+    } else if !crate::xai::is_http_url(&raw) {
+        "xAI video response included invalid video.url"
+    } else {
+        return Ok(raw);
+    };
+    Err(ExecError::local(502, FailureScope::Request, message))
 }
 
 /// The fence check of an xAI media request.
@@ -856,6 +864,7 @@ impl XaiExecutor {
                 )
             }
             Media::ImageRetrieve => self.image_poll(&call, streams).await?,
+            Media::VideoContent => self.video_content(&call, streams).await?,
             media => self.video(&call, streams, media).await?,
         };
         Ok(Upstream {
@@ -960,7 +969,7 @@ impl XaiExecutor {
         };
         let upstream = self.media_send(call, method, &path, body, false).await?;
         let polled = (phase == video::Phase::Job).then_some(job.as_deref()).flatten();
-        let ingress = video::Ingress::new(
+        let mut ingress = video::Ingress::new(
             streams.response,
             call.attempt.identity,
             video::Dialect::Xai,
@@ -970,11 +979,95 @@ impl XaiExecutor {
             Box::new(JobLedger { slot, admission }),
         )
         .map_err(xai_exec::encoding)?;
+        let request = call.request.validated.view().document;
+        ingress.echo(streams.response, request).map_err(xai_exec::encoding)?;
         Ok((
             upstream.status,
             upstream.headers,
             upstream.body,
             MediaIngress::Video(Box::new(ingress)),
+        ))
+    }
+
+    /// A finished video's bytes, as the old route fetched them: a poll of the job, admitted against
+    /// the job table like any poll, names the file's URL, which is downloaded through this
+    /// credential's HTTP client and proxy without its credentials. The poll's usage is the job's
+    /// charge when the table finds the job uncharged, as a poll's is.
+    async fn video_content(
+        &self,
+        call: &MediaCall<'_>,
+        streams: Streams<'_>,
+    ) -> Result<(u16, HeaderMap, crate::types::Body, MediaIngress), ExecError> {
+        let (_, job) = media_exec::video_upload(
+            call.request,
+            xai_exec::DESTINATION,
+            video::Dialect::Xai,
+            streams.request,
+        )?;
+        let job = job.ok_or_else(|| xai_exec::encoding(codec::Error::Schema))?;
+        let admission = self
+            .jobs
+            .admit(call.request.client.caller, JobKind::Video, &job)
+            .ok_or_else(|| unknown_job(JobKind::Video, &job))?;
+        let path = format!("/videos/{}", path_escape(&job));
+        let polled = self.media_send(call, wreq::Method::GET, &path, None, false).await?;
+        let polled = crate::proxy::read_all(polled.body, VIDEO_LIMIT as usize, true).await?;
+        let url = content_url(&polled)?;
+        let client = self.clients.for_credential(call.attempt.credential, call.cfg);
+        let usage = call.request.client.usage;
+        // `HTTPStatusFromErrorOr(err, http.StatusBadGateway)`: a failed download is a 502 unless
+        // the error carries its own status.
+        let download = match crate::proxy::request(&client, wreq::Method::GET, &url, GoHeaders::new(), None, None).await
+        {
+            Ok(download) => track_first_byte(download, usage),
+            Err(error) if error.scope == FailureScope::Transport => {
+                let message = String::from_utf8_lossy(&error.body).into_owned();
+                return Err(ExecError::local(502, FailureScope::Request, message));
+            }
+            Err(error) => return Err(error),
+        };
+        if !(200..300).contains(&download.status) {
+            let status = download.status;
+            let body = crate::proxy::read_all(download.body, VIDEO_LIMIT as usize, true)
+                .await
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&body).trim().to_owned();
+            let message = if text.is_empty() {
+                let reason = http::StatusCode::from_u16(status)
+                    .ok()
+                    .and_then(|s| s.canonical_reason())
+                    .unwrap_or("");
+                format!("video content download failed: {status} {reason}")
+            } else {
+                format!("video content download failed: {text}")
+            };
+            return Err(ExecError::local(status, FailureScope::Request, message));
+        }
+        let (mime, length) = media_exec::entity(&download.headers);
+        let mut ingress = video::content::Download::new(streams.response, call.attempt.identity, &job, mime, length)
+            .map_err(xai_exec::encoding)?;
+        // A poll body the codec refuses still names the file; it reports no usage.
+        let decoded = (|| {
+            let phase = video::Phase::Job;
+            let mut decoder =
+                video::Decoder::new(streams.response, video::Dialect::Xai, phase, Some(&job), VIDEO_LIMIT)?;
+            decoder.advance(streams.response, &polled)?;
+            decoder.finish(streams.response)
+        })();
+        if let Ok(decoded) = decoded {
+            let mut ledger = JobLedger {
+                slot: None,
+                admission: Some(admission),
+            };
+            ingress
+                .charge(streams.response, &decoded, video::Dialect::Xai, &mut ledger)
+                .map_err(xai_exec::encoding)?;
+        }
+        Ok((
+            download.status,
+            download.headers,
+            download.body,
+            MediaIngress::VideoContent(Box::new(ingress)),
         ))
     }
 
@@ -1067,7 +1160,7 @@ impl MediaCall<'_> {
     fn with_model(&self, mut upload: Vec<u8>) -> Vec<u8> {
         let model = parse_suffix(self.attempt.model).model_name;
         if !model.trim().is_empty() {
-            crate::openai_compat_payload::set_str_if_different(&mut upload, "model", model.trim());
+            crate::openai_compat_payload::set_str_if_different(&mut upload, "model", upstream_model(model.trim()));
         }
         upload
     }
@@ -1117,5 +1210,15 @@ impl MediaCall<'_> {
             headers.set("Accept", "*/*");
         }
         headers
+    }
+}
+
+/// The model xAI is sent for a routed one: the 1.5 preview alias selects credentials under its
+/// own name, but xAI receives `grok-imagine-video-1.5` (Go `canonicalXAIVideosModel`).
+fn upstream_model(model: &str) -> &str {
+    if model.go_eq_fold("grok-imagine-video-1.5-preview") {
+        "grok-imagine-video-1.5"
+    } else {
+        model
     }
 }

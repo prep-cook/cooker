@@ -1,8 +1,9 @@
 //! Media routes on the execution contract (E-PLAN §2.3, E7), through the real router against a
 //! local upstream: speech commits at its first audio byte and resumes from a byte cursor; images
-//! commit once the answer holds an image and resume from an event cursor; video job ids belong to
-//! the caller that created them, and a full job table refuses a create before anything is sent;
-//! a deferred image job is polled by its caller on its credential and charged once.
+//! commit once the answer holds an image and resume from an event cursor; video jobs belong to
+//! the caller that created them, are polled and downloaded on their credential and charged once,
+//! and a full job table refuses a create before anything is sent; a deferred image job is polled
+//! by its caller on its credential and charged once.
 
 #[path = "support/stream_upstream.rs"]
 mod stream_upstream;
@@ -32,9 +33,17 @@ async fn proxy(upstream: &StreamUpstream, capacity: usize) -> Proxy {
 
 /// [`proxy`] with `extra` configuration appended.
 async fn proxy_with(upstream: &StreamUpstream, capacity: usize, extra: &str) -> Proxy {
-    let config = Config::parse(&format!(
-        "access:\n  api-keys: [client-a, client-b]\napi-keys:\n  xai:\n    - name: xai-1\n      base-url: {}/v1\n      keys:\n        - api-key: sk-fake-xai-a\n        - api-key: sk-fake-xai-b\nrouting:\n  strategy: round-robin\n{extra}",
+    let xai = format!(
+        "    - name: xai-1\n      base-url: {}/v1\n      keys:\n        - api-key: sk-fake-xai-a\n        - api-key: sk-fake-xai-b\n",
         upstream.url()
+    );
+    proxy_over(&xai, capacity, extra).await
+}
+
+/// The router over a runtime whose xAI credentials are `xai` (entries of `api-keys.xai`).
+async fn proxy_over(xai: &str, capacity: usize, extra: &str) -> Proxy {
+    let config = Config::parse(&format!(
+        "access:\n  api-keys: [client-a, client-b]\napi-keys:\n  xai:\n{xai}routing:\n  strategy: round-robin\n{extra}"
     ))
     .unwrap();
     let credentials = ck_core::config::credentials::load(&config);
@@ -172,40 +181,355 @@ async fn raw_audio_resumes_from_a_byte_cursor() {
     assert_eq!(upstream.requests(), 1, "a resume sends nothing upstream");
 }
 
-/// A video job id is found only by the caller that created it, and a create while the job table
-/// is full is refused with 503 (E-Q5): neither sends anything upstream.
+const VIDEO_FILE: &[u8] = b"\x00\x00\x00\x18ftypmp42video";
+
+/// The job's usage records, after the usage queue drained.
+async fn job_usage(proxy: &Proxy, job: &str) -> Vec<serde_json::Value> {
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        records.extend(proxy.rt.usage_queue().pop_oldest(100));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    records
+        .iter()
+        .map(|r| serde_json::from_slice::<serde_json::Value>(r).unwrap())
+        .filter(|r| r["usage_scope"] == format!("job:{job}"))
+        .collect()
+}
+
+/// A video job belongs to the caller that created it: its polls go to the credential that created
+/// it and answer the job as xAI sent it or as an OpenAI video object, pending or finished; its
+/// content is the finished file with its host's media type, resumable from a byte cursor; its
+/// usage is charged once, whichever request first reports it. Another caller's poll or content is
+/// not found, a content request before the file exists fails as before, and a create while the job
+/// table is full is refused with 503 (E-Q5): none of these sends anything.
 #[tokio::test]
-async fn video_jobs_belong_to_their_caller_and_a_full_table_sends_nothing() {
+async fn video_jobs_are_served_to_their_caller_on_their_credential_and_charged_once() {
+    let files = StreamUpstream::start([Reply::ok("video/mp4", VIDEO_FILE), Reply::ok("video/mp4", VIDEO_FILE)]).await;
+    let url = format!("{}/v.mp4", files.url());
+    let done = serde_json::json!({
+        "status": "done",
+        "model": "grok-imagine-video",
+        "video": {"url": url, "duration": 8},
+        "usage": {"cost_in_usd_ticks": 7}
+    });
+    let pending = r#"{"status":"pending","progress":40}"#;
     let upstream = StreamUpstream::start([
         Reply::json(r#"{"request_id":"vid_1"}"#),
+        Reply::json(pending),
+        Reply::json(pending),
         Reply::json(r#"{"status":"pending"}"#),
+        Reply::json(done.to_string()),
+        Reply::json(done.to_string()),
+        Reply::json(done.to_string()),
+        Reply::json(done.to_string()),
     ])
     .await;
     let proxy = proxy(&upstream, 1).await;
-    let create = r#"{"model":"grok-imagine-video","prompt":"waves"}"#;
-    // (case, client key, method, path, status, upstream requests after the step)
-    let steps = [
-        ("a create", "client-a", "POST", "/v1/videos/generations", 200, 1),
-        ("another caller's poll", "client-b", "GET", "/v1/videos/vid_1", 404, 1),
-        ("the creator's poll", "client-a", "GET", "/v1/videos/vid_1", 200, 2),
+    let usage = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
+    proxy.rt.usage_queue().configure(true, &usage);
+    let finished = serde_json::json!({
+        "id": "vid_1",
+        "object": "video",
+        "status": "completed",
+        "model": "grok-imagine-video",
+        "video_url": url,
+        "seconds": "8"
+    });
+    type Body = Option<serde_json::Value>;
+    // (case, client key, method, path, status, client body, upstream requests after the step)
+    let steps: [(&str, &str, &str, &str, u16, Body, usize); 13] = [
+        (
+            "an OpenAI create answers the job",
+            "client-a",
+            "POST",
+            "/openai/v1/videos",
+            200,
+            Some(serde_json::json!({
+                "id": "vid_1",
+                "object": "video",
+                "status": "queued",
+                "model": "grok-imagine-video",
+                "prompt": "waves",
+                "seconds": "4",
+                "size": "720x1280",
+                "created_at": "<now>",
+                "progress": 0
+            })),
+            1,
+        ),
+        (
+            "another caller's poll",
+            "client-b",
+            "GET",
+            "/v1/videos/vid_1",
+            404,
+            None,
+            1,
+        ),
+        (
+            "another caller's content",
+            "client-b",
+            "GET",
+            "/openai/v1/videos/vid_1/content",
+            404,
+            None,
+            1,
+        ),
+        (
+            "a pending native poll",
+            "client-a",
+            "GET",
+            "/v1/videos/vid_1",
+            200,
+            Some(serde_json::from_str(pending).unwrap()),
+            2,
+        ),
+        (
+            "a pending OpenAI poll",
+            "client-a",
+            "GET",
+            "/openai/v1/videos/vid_1",
+            200,
+            Some(serde_json::json!({
+                "id": "vid_1",
+                "object": "video",
+                "status": "queued",
+                "progress": 40,
+                "model": "grok-imagine-video"
+            })),
+            3,
+        ),
+        (
+            "content before the file exists",
+            "client-a",
+            "GET",
+            "/openai/v1/videos/vid_1/content",
+            502,
+            None,
+            4,
+        ),
+        (
+            "a finished OpenAI poll",
+            "client-a",
+            "GET",
+            "/openai/v1/videos/vid_1",
+            200,
+            Some(finished),
+            5,
+        ),
+        (
+            "the content",
+            "client-a",
+            "GET",
+            "/openai/v1/videos/vid_1/content",
+            200,
+            None,
+            6,
+        ),
+        (
+            "a finished native poll",
+            "client-a",
+            "GET",
+            "/v1/videos/vid_1",
+            200,
+            Some(done.clone()),
+            7,
+        ),
+        (
+            "the content again",
+            "client-a",
+            "GET",
+            "/openai/v1/videos/vid_1/content",
+            200,
+            None,
+            8,
+        ),
         (
             "a create while the table is full",
             "client-b",
             "POST",
             "/v1/videos/generations",
             503,
-            2,
+            None,
+            8,
+        ),
+        (
+            "an OpenAI create while full",
+            "client-b",
+            "POST",
+            "/openai/v1/videos",
+            503,
+            None,
+            8,
+        ),
+        (
+            "an edit with an option xAI's edit lacks",
+            "client-a",
+            "POST",
+            "/v1/videos/edits",
+            400,
+            None,
+            8,
         ),
     ];
-    for (case, key, method, path, status, sends) in steps {
+    let mut content = None;
+    for (case, key, method, path, status, body, sends) in steps {
         let mut request = proxy.request(wreq::Method::from_bytes(method.as_bytes()).unwrap(), key, path);
         if method == "POST" {
+            let model = if path.starts_with("/openai") {
+                "sora-2"
+            } else {
+                "grok-imagine-video"
+            };
+            let mut create = serde_json::json!({"model": model, "prompt": "waves"});
+            if path.ends_with("/edits") {
+                create["duration"] = 5.into();
+                create["video"] = serde_json::json!({"url": "https://v.x/a.mp4"});
+            }
+            let create = create.to_string();
             request = request.header("content-type", "application/json").body(create);
         }
         let response = request.send().await.unwrap();
         assert_eq!(response.status(), status, "{case}");
+        if path.ends_with("/content") && status == 200 {
+            assert_eq!(response.headers()["content-type"], "video/mp4", "{case}");
+            let id = response.headers()["x-ck-stream-id"].to_str().unwrap().to_owned();
+            assert_eq!(&response.bytes().await.unwrap()[..], VIDEO_FILE, "{case}");
+            // The finished OpenAI poll charged the job, and its record drains here; a content
+            // request does not charge the job again.
+            let jobs = job_usage(&proxy, "vid_1").await;
+            let charged = usize::from(content.is_none());
+            assert_eq!(jobs.len(), charged, "{case}: the job's usage records: {jobs:?}");
+            content = Some(id);
+        } else if let Some(body) = body {
+            let mut got: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+            if got["created_at"].as_i64().is_some_and(|at| at > 1_700_000_000) {
+                got["created_at"] = "<now>".into();
+            }
+            assert_eq!(got, body, "{case}");
+        }
         assert_eq!(upstream.requests(), sends, "{case}");
     }
+    let captured = upstream.captured();
+    for poll in &captured[1..] {
+        assert_eq!(poll.path, "/v1/videos/vid_1");
+        assert_eq!(
+            poll.header("authorization"),
+            captured[0].header("authorization"),
+            "a poll goes to the job's credential"
+        );
+    }
+    let download = &files.captured()[0];
+    assert_eq!(download.path, "/v.mp4");
+    assert_eq!(
+        download.header("authorization"),
+        None,
+        "the download carries no credential"
+    );
+    let jobs = job_usage(&proxy, "vid_1").await;
+    assert!(jobs.is_empty(), "a later poll does not charge the job again: {jobs:?}");
+
+    // The file resumes from a byte cursor, for its caller only, with nothing sent upstream.
+    let id = content.expect("the content was served");
+    // (case, client key, query, status, body after the cursor)
+    type Resume = (&'static str, &'static str, &'static str, u16, Option<&'static [u8]>);
+    let resumes: [Resume; 2] = [
+        (
+            "after four bytes",
+            "client-a",
+            "after=v1.b.4",
+            200,
+            Some(&VIDEO_FILE[4..]),
+        ),
+        ("another caller", "client-b", "after=v1.b.4", 410, None),
+    ];
+    for (case, key, query, status, body) in resumes {
+        let resumed = proxy
+            .request(wreq::Method::GET, key, &format!("/v1/streams?{query}"))
+            .header("x-ck-stream-id", &id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resumed.status(), status, "{case}");
+        if let Some(body) = body {
+            assert_eq!(resumed.headers()["content-type"], "video/mp4", "{case}");
+            assert_eq!(&resumed.bytes().await.unwrap()[..], body, "{case}");
+        }
+    }
+    assert_eq!(
+        (upstream.requests(), files.requests()),
+        (8, 2),
+        "a resume sends nothing"
+    );
+}
+
+/// A job's content is downloaded through the proxy of the credential that created the job: of two
+/// xAI credentials behind different proxies, only the job's sees the poll and the download. The
+/// poll that found the file charges the job when no earlier poll did.
+#[tokio::test]
+async fn video_content_downloads_through_the_job_credentials_proxy() {
+    let replies = || {
+        [
+            Reply::json(r#"{"request_id":"vid_p"}"#),
+            Reply::json(
+                r#"{"status":"done","video":{"url":"http://files.test/v.mp4"},"usage":{"cost_in_usd_ticks":7}}"#,
+            ),
+            Reply::ok("video/mp4", VIDEO_FILE),
+        ]
+    };
+    let proxies = [
+        StreamUpstream::start(replies()).await,
+        StreamUpstream::start(replies()).await,
+    ];
+    let xai: String = proxies
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            format!(
+                "    - name: xai-{i}\n      base-url: http://xai.test/v1\n      proxy-url: {}\n      keys:\n        - api-key: sk-fake-xai-{i}\n",
+                p.url()
+            )
+        })
+        .collect();
+    let proxy = proxy_over(&xai, 4096, "").await;
+    let usage = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
+    proxy.rt.usage_queue().configure(true, &usage);
+    let response = proxy
+        .request(wreq::Method::POST, "client-a", "/v1/videos/generations")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"grok-imagine-video","prompt":"waves"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let response = proxy
+        .request(wreq::Method::GET, "client-a", "/openai/v1/videos/vid_p/content")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(&response.bytes().await.unwrap()[..], VIDEO_FILE);
+    assert_eq!(
+        job_usage(&proxy, "vid_p").await.len(),
+        1,
+        "the content's poll charges the job"
+    );
+    let (job, other) = if proxies[0].requests() > 0 {
+        (&proxies[0], &proxies[1])
+    } else {
+        (&proxies[1], &proxies[0])
+    };
+    let paths: Vec<String> = job.captured().into_iter().map(|c| c.path).collect();
+    assert_eq!(
+        paths,
+        [
+            "http://xai.test/v1/videos/generations",
+            "http://xai.test/v1/videos/vid_p",
+            "http://files.test/v.mp4"
+        ]
+    );
+    assert_eq!(other.requests(), 0, "the other credential's proxy sees nothing");
 }
 
 const IMAGES: &str = r#"{"created":1700000001,"data":[{"b64_json":"QUJD"},{"url":"https://img.x/2.png"}]}"#;
@@ -400,16 +724,7 @@ async fn deferred_image_jobs_belong_to_their_caller_and_charge_once() {
             "a poll goes to the job's credential"
         );
     }
-    let mut records = Vec::new();
-    for _ in 0..50 {
-        records.extend(proxy.rt.usage_queue().pop_oldest(100));
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let jobs: Vec<serde_json::Value> = records
-        .iter()
-        .map(|r| serde_json::from_slice::<serde_json::Value>(r).unwrap())
-        .filter(|r| r["usage_scope"] == "job:img_1")
-        .collect();
+    let jobs = job_usage(&proxy, "img_1").await;
     assert_eq!(jobs.len(), 1, "the job's usage is recorded once: {jobs:?}");
     assert_eq!(jobs[0]["tokens"]["total_tokens"], 3);
 

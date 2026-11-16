@@ -1,29 +1,36 @@
-//! `/v1/videos*` (xAI-native passthrough) and `/openai/v1/videos*` (OpenAI Videos API over
-//! xAI) (sdk/api/handlers/openai/openai_videos_handlers.go).
+//! `/v1/videos*` (xAI-native) and `/openai/v1/videos*` (OpenAI Videos API over xAI)
+//! (sdk/api/handlers/openai/openai_videos_handlers.go) on the execution contract.
 //!
-//! A created video is bound to the credential that created it (and its routing model) for
-//! `multimedia.video-result-auth-cache-ttl`, so polling and downloads reach the same xAI
-//! account.
-// ponytail: the non-streaming keep-alive (`requests.nonstream-keepalive-interval`) and
-// upstream header passthrough are not applied, like the other Rust routes.
+//! Each route keeps Go's request checks and, for the OpenAI routes, the OpenAI-to-xAI create
+//! mapping, then decodes the xAI-shaped request with the video codec into the exchange and serves
+//! it: the client gets the job as xAI sent it (native routes) or as an OpenAI video object, once
+//! the answer is complete. A job's polls and its content go only to the credential and model it
+//! was created on (E-Q5, `VideoJobs`); another caller's, an expired or an unknown job is 404 with
+//! nothing sent. The content is the finished file, streamed from its first byte with the media
+//! type its host sent, fetched through the job credential's proxy.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use axum::Extension;
-use axum::body::{Body, Bytes};
+use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{MatchedPath, OriginalUri, Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, header};
 use axum::response::Response;
 use ck_core::exec::{Caller, Operation};
 use ck_core::format::Format;
+use ck_stream::{Store, Writer};
+use ck_translate::codec::document::Document;
+use ck_translate::codec::{self, Media as MediaOp};
+use ck_translate::video::{self, Action, Dialect};
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Kind};
-use futures_util::StreamExt;
 
+use crate::http::egress::{Framing, Output, Protocol};
 use crate::inference::claude::read_failed;
-use crate::inference::dispatch::{self, Call, Done, Failure, Media, MediaKind};
-use crate::inference::images::{bad_request, gateway_error, model_parts, multipart_form, text};
+use crate::inference::dispatch::{self, Call, Failure, Media, MediaKind};
+use crate::inference::images::{bad_request, model_parts, multipart_form, refused, text};
+use crate::inference::media::Decoded;
 use crate::{Runtime, http::respond, inference::errors};
 
 const OPENAI_VIDEOS_PATH: &str = "/openai/v1/videos";
@@ -94,6 +101,22 @@ struct CreateMeta {
     seconds: String,
     size: String,
     created_at: i64,
+}
+
+impl CreateMeta {
+    /// The members of the OpenAI video object xAI's answer lacks, kept for the client
+    /// (`video::with_originals`); the job's own `progress` and `created_at` win when xAI reports
+    /// them.
+    fn echo(&self) -> Vec<u8> {
+        let mut out = b"{}".to_vec();
+        gj::set_str(&mut out, "model", self.model);
+        gj::set_str(&mut out, "prompt", &self.prompt);
+        gj::set_str(&mut out, "seconds", &self.seconds);
+        gj::set_str(&mut out, "size", &self.size);
+        gj::set_int(&mut out, "created_at", self.created_at);
+        gj::set_raw(&mut out, "progress", "0");
+        out
+    }
 }
 
 fn now_unix() -> i64 {
@@ -366,52 +389,7 @@ fn create_request_from_form(
     Ok(out)
 }
 
-// --- responses ----------------------------------------------------------------------------
-
-/// `openAIVideoStatus`.
-fn status(raw: &str) -> &'static str {
-    match raw.trim().go_lower().as_str() {
-        "queued" | "pending" => "queued",
-        "in_progress" | "processing" | "running" => "in_progress",
-        "completed" | "done" | "succeeded" | "success" => "completed",
-        "failed" | "error" | "expired" | "cancelled" | "canceled" => "failed",
-        _ => "",
-    }
-}
-
-/// `videoIDFromPayload`.
-fn video_id(payload: &[u8]) -> String {
-    let id = text(payload, "request_id").trim().to_owned();
-    if id.is_empty() {
-        text(payload, "id").trim().to_owned()
-    } else {
-        id
-    }
-}
-
-/// `buildVideosCreateAPIResponseFromXAI`.
-fn create_response(payload: &[u8], meta: &CreateMeta) -> Result<Vec<u8>, String> {
-    let id = video_id(payload);
-    if id.is_empty() {
-        return Err("xAI video response did not include request_id".into());
-    }
-    let mut out = br#"{"object":"video","progress":0,"status":"queued"}"#.to_vec();
-    gj::set_str(&mut out, "id", &id);
-    gj::set_str(&mut out, "model", meta.model);
-    gj::set_str(&mut out, "prompt", &meta.prompt);
-    gj::set_str(&mut out, "seconds", &meta.seconds);
-    gj::set_str(&mut out, "size", &meta.size);
-    gj::set_int(&mut out, "created_at", meta.created_at);
-    let mapped = status(&text(payload, "status"));
-    if !mapped.is_empty() {
-        gj::set_str(&mut out, "status", mapped);
-    }
-    let progress = gj::get(payload, "progress");
-    if progress.exists() {
-        gj::set_raw(&mut out, "progress", progress.raw());
-    }
-    Ok(out)
-}
+// --- responses ---------------------------------------------------------------------------
 
 /// `buildVideosFailedAPIResponse`.
 fn failed_response(model: &str, code: &str, message: &str) -> Vec<u8> {
@@ -437,108 +415,6 @@ fn failed(status: u16, model: &str, message: &str) -> Response {
     )
 }
 
-/// `markOpenAIVideoFailed`.
-fn mark_failed(out: &mut Vec<u8>) {
-    if !gj::get(out, "status").exists() {
-        gj::set_str(out, "status", "failed");
-    }
-    if !gj::get(out, "progress").exists() {
-        gj::set_raw(out, "progress", "0");
-    }
-}
-
-/// `setOpenAIVideoErrorFromXAI`.
-fn set_error(out: &mut Vec<u8>, payload: &[u8]) {
-    let error = gj::get(payload, "error");
-    let code = text(payload, "code").trim().to_owned();
-    if error.exists() {
-        mark_failed(out);
-        let (message, nested_code) = if error.kind == Kind::Json {
-            if !gj::std_valid(error.raw()) {
-                return;
-            }
-            (
-                error.get("message").str().trim().to_owned(),
-                error.get("code").str().trim().to_owned(),
-            )
-        } else {
-            (error.str().trim().to_owned(), String::new())
-        };
-        if message.is_empty() {
-            return;
-        }
-        let code = [code, nested_code]
-            .into_iter()
-            .find(|c| !c.is_empty())
-            .unwrap_or_else(|| "video_generation_failed".into());
-        gj::set_str(out, "error.code", code);
-        gj::set_str(out, "error.message", message);
-        return;
-    }
-    if !code.is_empty() {
-        mark_failed(out);
-        gj::set_str(out, "error.code", &code);
-        gj::set_str(out, "error.message", &code);
-    }
-}
-
-/// `buildVideosRetrieveAPIResponseFromXAI`.
-fn retrieve_response(id: &str, payload: &[u8], fallback_model: &str) -> Vec<u8> {
-    let mut out = br#"{"object":"video"}"#.to_vec();
-    gj::set_str(&mut out, "id", id);
-    let mut model = text(payload, "model").trim().to_owned();
-    if model.is_empty() {
-        model = canonical(fallback_model).to_owned();
-    }
-    gj::set_str(&mut out, "model", model);
-    for field in [
-        "created_at",
-        "completed_at",
-        "expires_at",
-        "prompt",
-        "remixed_from_video_id",
-        "size",
-    ] {
-        let value = gj::get(payload, field);
-        if value.exists() {
-            gj::set_raw(&mut out, field, value.raw());
-        }
-    }
-    let mapped = status(&text(payload, "status"));
-    if !mapped.is_empty() {
-        gj::set_str(&mut out, "status", mapped);
-    }
-    let progress = gj::get(payload, "progress");
-    if progress.exists() {
-        gj::set_raw(&mut out, "progress", progress.raw());
-    }
-    let seconds = gj::get(payload, "seconds");
-    let duration = gj::get(payload, "video.duration");
-    if seconds.exists() {
-        gj::set_raw(&mut out, "seconds", seconds.raw());
-    } else if duration.exists() {
-        gj::set_str(&mut out, "seconds", &*duration.str());
-    }
-    let url = text(payload, "video.url").trim().to_owned();
-    if !url.is_empty() {
-        gj::set_str(&mut out, "video_url", url);
-    }
-    set_error(&mut out, payload);
-    out
-}
-
-/// `xaiVideoContentURLFromPayload`: an absolute http(s) URL with a host.
-fn content_url(payload: &[u8]) -> Result<String, String> {
-    let raw = text(payload, "video.url").trim().to_owned();
-    if raw.is_empty() {
-        return Err("xAI video response did not include video.url".into());
-    }
-    if !ck_exec::xai::is_http_url(&raw) {
-        return Err("xAI video response included invalid video.url".into());
-    }
-    Ok(raw)
-}
-
 // --- execution ----------------------------------------------------------------------------
 
 struct Request {
@@ -549,28 +425,66 @@ struct Request {
     path: String,
 }
 
-/// One buffered execution of `body` on `model` (`ExecuteWithAuthManager` with the
-/// `openai-video` handler type), pinned to `pinned` when set. `render` gets the payload or
-/// the failure.
-async fn execute<F, Fut>(r: &Request, model: &str, body: Vec<u8>, pinned: Option<String>, render: F) -> Response
-where
-    F: FnOnce(Result<Bytes, Failure>) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Response> + Send,
-{
+/// What the client gets: the job in `dialect`'s JSON, or the finished file's bytes (`Raw`).
+fn output(dialect: Dialect, operation: MediaOp, framing: Framing) -> Output {
+    Output {
+        protocol: Protocol::Video(dialect),
+        operation: codec::Operation::Media(operation),
+        framing,
+    }
+}
+
+/// The xAI-shaped request `body` of `action` on `job` as the video codec decodes it, with the
+/// members `echo` names kept for an OpenAI client.
+fn decode<'a>(
+    action: Action,
+    job: Option<&'a str>,
+    body: &'a [u8],
+    echo: Option<Vec<u8>>,
+) -> impl FnOnce(&mut Writer, &Store) -> Result<Document, Failure> + 'a {
+    move |writer, _| {
+        let phase = video::Phase::Request(action);
+        let limit = body.len().max(1) as u64;
+        let mut decoder = video::Decoder::new(writer, Dialect::Xai, phase, job, limit).map_err(refused)?;
+        if !body.is_empty() {
+            decoder.advance(writer, body).map_err(refused)?;
+        }
+        let operation = decoder.finish(writer).map_err(refused)?.operation;
+        match echo {
+            Some(echo) => video::with_originals(writer, &operation, Dialect::OpenAi, &echo).map_err(refused),
+            None => Ok(operation),
+        }
+    }
+}
+
+/// Serves the request `decode` writes as `output` on the execution contract, routed by `model`
+/// and, for a job's poll or content, only on the `pinned` credential.
+async fn serve(
+    r: Request,
+    output: Output,
+    model: &str,
+    pinned: Option<String>,
+    body: Bytes,
+    decode: impl FnOnce(&mut Writer, &Store) -> Result<Document, Failure>,
+) -> Response {
+    let decoded = match Decoded::new(&r.rt, &r.caller, output, decode, refused) {
+        Ok(decoded) => decoded,
+        Err(failure) => return errors::openai(&failure),
+    };
     let call = Call {
         entry: Format::OpenAI,
         response: Format::OpenAI,
         operation: Operation::Generate,
         model: model.trim().to_owned(),
-        body: Bytes::from(body),
+        body,
         stream: false,
         alt: None,
-        headers: r.headers.clone(),
-        caller: r.caller.clone(),
+        headers: r.headers,
+        caller: r.caller,
         forced_provider: None,
         selection_model: None,
         execution_session: None,
-        request_path: r.path.clone(),
+        request_path: r.path,
         peer: r.peer,
         turn: None,
         media: Some(Arc::new(Media {
@@ -581,18 +495,14 @@ where
             disallow_free: false,
         })),
     };
-    dispatch::serve(&r.rt, call, move |result| async move {
-        let payload = result.map(|done| match done {
-            Done::Buffered { body, .. } => body,
-            Done::Stream { .. } => unreachable!("a non-stream call is buffered"),
-        });
-        render(payload).await
-    })
-    .await
-}
-
-fn json_body(body: impl Into<Body>) -> Response {
-    respond::json(200, "application/json", body)
+    decoded
+        .serve(&r.rt, call, |result| async move {
+            match result {
+                Err(failure) => errors::openai(&failure),
+                Ok(_) => unreachable!("video requests are served on the execution contract"),
+            }
+        })
+        .await
 }
 
 /// The credential and routing model a poll of `video` is pinned to: those its job was created on
@@ -610,122 +520,6 @@ fn pinned_and_model(r: &Request, video: &str, fallback: &str) -> (Option<String>
         }
         None => (None, fallback.to_owned()),
     }
-}
-
-/// `collectXAIVideosNative`: the upstream body as is. A create's job is recorded by the
-/// executor; a poll goes to the credential that created it.
-async fn native(r: Request, body: Vec<u8>, model: &str, create: bool) -> Response {
-    let (pinned, model) = if create {
-        (None, model.to_owned())
-    } else {
-        pinned_and_model(&r, &video_id(&body), model)
-    };
-    execute(&r, routing(&model), body, pinned, |result| async move {
-        match result {
-            Ok(payload) => json_body(payload),
-            Err(failure) => errors::openai(&failure),
-        }
-    })
-    .await
-}
-
-/// `VideosRetrieve` and `VideosContent`: polls `id` on the credential and model its job was
-/// created on.
-async fn poll<F, Fut>(r: &Request, id: &str, render: F) -> Response
-where
-    F: FnOnce(Bytes) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Response> + Send,
-{
-    let mut payload = b"{}".to_vec();
-    gj::set_str(&mut payload, "request_id", id);
-    let (pinned, model) = pinned_and_model(r, id, XAI_MODEL);
-    execute(r, &model, payload, pinned, move |result| async move {
-        match result {
-            Ok(payload) => render(payload).await,
-            Err(failure) => errors::openai(&failure),
-        }
-    })
-    .await
-}
-
-/// The HTTP client the video download uses: the bound credential's proxy, else the
-/// global one (`videoContentHTTPClient`).
-static DOWNLOADS: LazyLock<ck_exec::proxy::GoClients> =
-    LazyLock::new(|| ck_exec::proxy::GoClients::new(Default::default()));
-
-/// `writeVideoContentFromURL`.
-async fn download(rt: &Runtime, caller: &Caller, video: &str, url: &str) -> Response {
-    let cfg = rt.config();
-    let credential = rt
-        .executors
-        .video_binding(caller, video)
-        .and_then(|bound| rt.store().get(&bound.credential));
-    let proxy = match &credential {
-        Some(c) => ck_exec::proxy::Proxy::effective(c, &cfg),
-        None => ck_exec::proxy::Proxy::parse(
-            cfg.document
-                .get("requests")
-                .and_then(|r| r.get("proxy-url"))
-                .and_then(serde_yaml_ng::Value::as_str)
-                .unwrap_or_default(),
-        ),
-    };
-    let client = DOWNLOADS.get(&proxy);
-    let headers = ck_exec::proxy::GoHeaders::new();
-    // `HTTPStatusFromErrorOr(err, http.StatusBadGateway)`: a failed download is a 502
-    // unless the error carries its own status.
-    let upstream = match ck_exec::proxy::request(&client, wreq::Method::GET, url, headers, None, None).await {
-        Ok(upstream) => upstream,
-        Err(error) if error.scope == ck_core::exec::FailureScope::Transport => {
-            return gateway_error(&String::from_utf8_lossy(&error.body));
-        }
-        Err(error) => return errors::openai(&Failure::Exec(error)),
-    };
-    if !(200..300).contains(&upstream.status) {
-        let status = upstream.status;
-        let body = ck_exec::proxy::read_all(upstream.body, usize::MAX, true)
-            .await
-            .unwrap_or_default();
-        let text = String::from_utf8_lossy(&body).trim().to_owned();
-        let message = if text.is_empty() {
-            let reason = StatusCode::from_u16(status)
-                .ok()
-                .and_then(|s| s.canonical_reason())
-                .unwrap_or("");
-            format!("video content download failed: {status} {reason}")
-        } else {
-            format!("video content download failed: {text}")
-        };
-        let body = errors::openai_body(status, &message);
-        return respond::json(status, "application/json", body);
-    }
-    let mut response = Response::new(Body::from_stream(
-        upstream.body.map(|r| r.map_err(std::io::Error::other)),
-    ));
-    *response.status_mut() = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::OK);
-    let out = response.headers_mut();
-    for name in [
-        "Content-Type",
-        "Content-Length",
-        "Content-Disposition",
-        "Cache-Control",
-        "ETag",
-        "Last-Modified",
-    ] {
-        if let Some(value) = upstream.headers.get(name).filter(|v| !v.is_empty()) {
-            out.insert(
-                header::HeaderName::from_bytes(name.as_bytes()).expect("static name"),
-                value.clone(),
-            );
-        }
-    }
-    if !out.contains_key(header::CONTENT_TYPE) {
-        out.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-    }
-    response
 }
 
 // --- routes -------------------------------------------------------------------------------
@@ -824,17 +618,10 @@ pub async fn create(
         Err(e) => return failed(400, canonical(&model), &format!("Invalid request: {e}")),
     };
     let r = request(rt, caller, peer, matched, &uri, headers);
-    execute(&r, meta.routing, req, None, move |result| async move {
-        let payload = match result {
-            Ok(payload) => payload,
-            Err(failure) => return errors::openai(&failure),
-        };
-        match create_response(&payload, &meta) {
-            Ok(out) => json_body(out),
-            Err(message) => gateway_error(&message),
-        }
-    })
-    .await
+    let output = output(Dialect::OpenAi, MediaOp::VideoCreate, Framing::Json);
+    let body = Bytes::from(req);
+    let decode = decode(Action::Create, None, &body, Some(meta.echo()));
+    serve(r, output, meta.routing, None, body.clone(), decode).await
 }
 
 /// `POST /v1/videos`, `/v1/videos/generations`, `/edits`, `/extensions`
@@ -869,8 +656,16 @@ pub async fn native_post(
     }
     let mut raw = body.to_vec();
     gj::set_str(&mut raw, "model", canonical(&model));
+    let (action, operation) = match uri.path() {
+        XAI_EDITS_API => (Action::Edit, MediaOp::VideoEdit),
+        XAI_EXTENSIONS_API => (Action::Extend, MediaOp::VideoExtend),
+        _ => (Action::Create, MediaOp::VideoCreate),
+    };
     let r = request(rt, caller, peer, matched, &uri, headers);
-    native(r, raw, &model, true).await
+    let output = output(Dialect::Xai, operation, Framing::Json);
+    let body = Bytes::from(raw);
+    let decode = decode(action, None, &body, None);
+    serve(r, output, routing(&model), None, body.clone(), decode).await
 }
 
 /// `GET /v1/videos/{request_id}` (`XAIVideosRetrieve`).
@@ -887,10 +682,11 @@ pub async fn native_retrieve(
     if id.is_empty() {
         return bad_request("Invalid request: request_id is required");
     }
-    let mut payload = b"{}".to_vec();
-    gj::set_str(&mut payload, "request_id", &id);
     let r = request(rt, caller, peer, matched, &uri, headers);
-    native(r, payload, XAI_MODEL, false).await
+    let (pinned, model) = pinned_and_model(&r, &id, XAI_MODEL);
+    let output = output(Dialect::Xai, MediaOp::VideoRetrieve, Framing::Json);
+    let decode = decode(Action::Retrieve, Some(&id), b"", None);
+    serve(r, output, &model, pinned, Bytes::new(), decode).await
 }
 
 /// `GET /openai/v1/videos/{video_id}` (`VideosRetrieve`).
@@ -908,15 +704,17 @@ pub async fn retrieve(
         return bad_request("Invalid request: video_id is required");
     }
     let r = request(rt, caller, peer, matched, &uri, headers);
-    let video = id.clone();
-    poll(&r, &id, |payload| async move {
-        json_body(retrieve_response(&video, &payload, SORA_MODEL))
-    })
-    .await
+    let (pinned, model) = pinned_and_model(&r, &id, XAI_MODEL);
+    let output = output(Dialect::OpenAi, MediaOp::VideoRetrieve, Framing::Json);
+    // `buildVideosRetrieveAPIResponseFromXAI` names this model when xAI's job names none.
+    let mut echo = b"{}".to_vec();
+    gj::set_str(&mut echo, "model", canonical(SORA_MODEL));
+    let decode = decode(Action::Retrieve, Some(&id), b"", Some(echo));
+    serve(r, output, &model, pinned, Bytes::new(), decode).await
 }
 
-/// `GET /openai/v1/videos/{video_id}/content` (`VideosContent`): polls the job, then
-/// streams the finished file from its `video.url`.
+/// `GET /openai/v1/videos/{video_id}/content` (`VideosContent`): the finished file, which the
+/// xAI executor finds by polling the job and downloads from its `video.url`.
 #[allow(clippy::too_many_arguments)]
 pub async fn content(
     State(rt): State<Arc<Runtime>>,
@@ -945,15 +743,10 @@ pub async fn content(
         ));
     }
     let r = request(rt, caller, peer, matched, &uri, headers);
-    let (rt, caller) = (r.rt.clone(), r.caller.clone());
-    let video = id.clone();
-    poll(&r, &id, |payload| async move {
-        match content_url(&payload) {
-            Ok(url) => download(&rt, &caller, &video, &url).await,
-            Err(message) => gateway_error(&message),
-        }
-    })
-    .await
+    let (pinned, model) = pinned_and_model(&r, &id, XAI_MODEL);
+    let output = output(Dialect::OpenAi, MediaOp::VideoContent, Framing::Raw);
+    let decode = decode(Action::Content, Some(&id), b"", None);
+    serve(r, output, &model, pinned, Bytes::new(), decode).await
 }
 
 #[cfg(test)]
