@@ -52,7 +52,7 @@ fn messages_encode_like_go_write_json() {
 }
 
 /// A frame the route would write, decoded.
-async fn next(frames: &mut mpsc::UnboundedReceiver<String>) -> Message {
+async fn next(frames: &mut mpsc::Receiver<String>) -> Message {
     let frame = tokio::time::timeout(Duration::from_secs(5), frames.recv())
         .await
         .unwrap()
@@ -324,4 +324,22 @@ async fn dropping_a_stream_receiver_frees_its_request() {
         }
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_browser_that_stops_reading_refuses_new_requests() {
+    let relay = Arc::new(Relay::default());
+    let (session, mut frames) = relay.connect_as("aistudio-a".into());
+    let mut open = Vec::new();
+    for _ in 0..OUT_BUFFER {
+        open.push(relay.stream("aistudio-a", &HttpRequest::default()).await.unwrap());
+    }
+    // The frames the browser has not taken are bounded: the next request fails at once,
+    // before anything reaches the browser, and leaves no pending entry.
+    let error = relay.stream("aistudio-a", &HttpRequest::default()).await.unwrap_err();
+    assert_eq!(error, "wsrelay: browser is not reading");
+    assert_eq!(lock(&session.pending).len(), OUT_BUFFER);
+    // Once the browser reads a frame, requests are accepted again.
+    frames.recv().await.unwrap();
+    open.push(relay.stream("aistudio-a", &HttpRequest::default()).await.unwrap());
 }

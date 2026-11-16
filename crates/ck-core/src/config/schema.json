@@ -383,7 +383,9 @@
           "fields": {
             "aistudio": {
               "fields": {
-                "ws-auth": "bool"
+                "relay-keys": {
+                  "list": "string"
+                }
               }
             },
             "codex": {

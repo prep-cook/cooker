@@ -802,6 +802,11 @@ mod tests {
                 "unknown setting config.plugins",
             ),
             ("plugins: {}\n", "unknown setting config.plugins"),
+            // Relay registration always needs a listed relay key; the switch is gone.
+            (
+                "oauth: {providers: {aistudio: {ws-auth: false}}}\n",
+                "unknown setting config.oauth.providers.aistudio.ws-auth",
+            ),
         ] {
             let doc = ConfigDocument::parse(yaml).unwrap();
             let err = schema::validate(doc.value(), true).unwrap_err();

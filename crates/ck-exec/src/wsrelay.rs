@@ -33,6 +33,10 @@ pub const PONG: &str = "pong";
 /// `pendingChannelBuffer`: messages a request may hold before the reader waits.
 const PENDING_BUFFER: usize = 64;
 
+/// Frames waiting for the route to write them to the browser. A request that finds the
+/// queue full fails before it reaches the browser, so it can move to another credential.
+const OUT_BUFFER: usize = 64;
+
 /// The cause sessions end with when the reader stops without an error of its own.
 pub const CLOSED: &str = "websocket session closed";
 
@@ -325,13 +329,13 @@ impl Relay {
     /// `handleWebsocket` after the upgrade: a session under a new provider name, which
     /// replaces any session of that name, then `OnConnected`. Returns the session and the
     /// frames the route must write.
-    pub fn connect(self: &Arc<Self>) -> (Arc<Session>, mpsc::UnboundedReceiver<String>) {
+    pub fn connect(self: &Arc<Self>) -> (Arc<Session>, mpsc::Receiver<String>) {
         self.connect_as(random_provider_name())
     }
 
     /// [`Relay::connect`] under a given name (tests).
-    pub fn connect_as(self: &Arc<Self>, provider: String) -> (Arc<Session>, mpsc::UnboundedReceiver<String>) {
-        let (out, frames) = mpsc::unbounded_channel();
+    pub fn connect_as(self: &Arc<Self>, provider: String) -> (Arc<Session>, mpsc::Receiver<String>) {
+        let (out, frames) = mpsc::channel(OUT_BUFFER);
         let (closed, _) = watch::channel(false);
         let session = Arc::new(Session {
             provider: provider.go_lower(),
@@ -509,7 +513,7 @@ pub async fn wait_closed(closed: &mut watch::Receiver<bool>) {
 pub struct Session {
     provider: String,
     relay: Weak<Relay>,
-    out: mpsc::UnboundedSender<String>,
+    out: mpsc::Sender<String>,
     closed: watch::Sender<bool>,
     pending: Mutex<HashMap<String, Arc<Pending>>>,
 }
@@ -651,7 +655,10 @@ impl Session {
         if self.is_closed() {
             return Err(CLOSED.into());
         }
-        self.out.send(msg.encode()).map_err(|_| CLOSED.to_owned())
+        self.out.try_send(msg.encode()).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => "wsrelay: browser is not reading".to_owned(),
+            mpsc::error::TrySendError::Closed(_) => CLOSED.to_owned(),
+        })
     }
 
     /// `session.request`.

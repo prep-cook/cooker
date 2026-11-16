@@ -274,7 +274,6 @@ fn trusted_proxy_validation_errors_match_go_text() {
 #[test]
 fn oauth_only_presence_matches_go() {
     const PREFIXES: &[(&str, &str)] = &[
-        ("ws-auth", "oauth.providers.aistudio.ws-auth"),
         ("codex", "oauth.providers.codex"),
         ("codex-header-defaults", "oauth.providers.codex.header-defaults"),
         ("claude", "upstream.claude"),
@@ -312,7 +311,10 @@ fn oauth_only_presence_matches_go() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|f| to_v8(f.as_str().unwrap()))
+            .map(|f| f.as_str().unwrap())
+            // cooker removed the relay's `ws-auth` switch; only relay keys register.
+            .filter(|f| *f != "ws-auth")
+            .map(to_v8)
             .collect();
         assert_eq!(Config::parse(yaml).unwrap().oauth_only, want, "{yaml}");
     }
@@ -327,10 +329,6 @@ fn oauth_only_presence_matches_go() {
     let codex = &view.document["oauth"]["providers"]["codex"];
     assert_eq!(codex["header-defaults"]["user-agent"], serde_yaml_ng::Value::from(""));
     assert!(codex["live-media-relay"].get("ice-servers").is_none());
-    assert_eq!(
-        view.document["oauth"]["providers"]["aistudio"]["ws-auth"],
-        serde_yaml_ng::Value::Bool(false)
-    );
     assert!(view.oauth_only.is_empty());
 }
 

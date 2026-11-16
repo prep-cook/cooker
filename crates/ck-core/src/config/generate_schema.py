@@ -89,6 +89,8 @@ schema["fields"].pop("plugins")
 schema["fields"]["oauth"]["fields"].pop("auth-dir")
 # Client aliases are removed, not part of the canonical writable schema.
 schema["fields"]["oauth"]["fields"]["providers"]["fields"]["codex"]["fields"].pop("optimize-multi-agent-v2", None)
+# Only a listed relay key registers an AI Studio browser; Go's `ws-auth` switch is removed.
+schema["fields"]["oauth"]["fields"]["providers"]["fields"]["aistudio"] = {"fields": {"relay-keys": {"list": "string"}}}
 families = source.split("var v8KeyFamilies = []configPath{", 1)[1].split("func buildV8Paths", 1)[0]
 shared = ["priority", "prefix", "proxy-url", "headers", "models", "excluded-models", "disable-cooling", "request-retry", "request-scoped-errors"]
 for old, family in re.findall(r'\{"([^"]+)", "([^"]+)"\}', families):

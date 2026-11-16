@@ -3,8 +3,9 @@
 //!
 //! A browser running the AI Studio bridge connects here. Its session is registered with
 //! the executors' [`Relay`] under a random `aistudio-…` name, and a runtime-only
-//! `aistudio` credential of that name serves requests until the socket closes. Client
-//! keys are required while `ws-auth` is on (Go's default).
+//! `aistudio` credential of that name serves requests until the socket closes. Only a key
+//! listed in `oauth.providers.aistudio.relay-keys` registers a browser; client keys do
+//! not, and an empty list refuses every browser.
 //!
 //! The transport follows gorilla and session.go: a ping every 30 seconds, a read
 //! deadline of 60 seconds that only a pong extends, 10-second writes, frames up to
@@ -35,15 +36,16 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 /// `maxInboundMessageLen`.
 const MAX_MESSAGE: usize = 64 << 20;
 
-/// `ws-auth` (`oauth.providers.aistudio.ws-auth`): on unless the config turns it off.
-pub fn ws_auth(cfg: &Config) -> bool {
+/// `oauth.providers.aistudio.relay-keys`: the keys that may register a browser.
+pub fn relay_keys(cfg: &Config) -> Vec<String> {
     cfg.document
         .get("oauth")
         .and_then(|o| o.get("providers"))
         .and_then(|p| p.get("aistudio"))
-        .and_then(|a| a.get("ws-auth"))
-        .and_then(serde_yaml_ng::Value::as_bool)
-        .unwrap_or(true)
+        .and_then(|a| a.get("relay-keys"))
+        .and_then(serde_yaml_ng::Value::as_sequence)
+        .map(|keys| keys.iter().filter_map(|k| k.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default()
 }
 
 /// The route, with the relay's session events wired to the runtime's credentials.
@@ -56,7 +58,7 @@ pub(crate) fn routes(rt: &Arc<Runtime>) -> Router<Arc<Runtime>> {
         .set_observer(Arc::new(move |provider, cause| observe(&weak, provider, cause)));
     Router::new()
         .route(wsrelay::PATH, get(upgrade))
-        .route_layer(middleware::from_fn_with_state(rt.clone(), conditional_auth))
+        .route_layer(middleware::from_fn_with_state(rt.clone(), require_relay_key))
 }
 
 /// Go `wsOnConnected` / `wsOnDisconnected`.
@@ -83,12 +85,17 @@ fn observe(rt: &Weak<Runtime>, provider: &str, cause: Option<&str>) {
     }
 }
 
-/// Go's conditional auth: the client-key middleware only while `ws-auth` is on.
-async fn conditional_auth(State(rt): State<Arc<Runtime>>, req: Request, next: Next) -> Response {
-    if !ws_auth(&rt.config()) {
-        return next.run(req).await;
+/// Registration needs a listed relay key, sent like a client key. An empty list refuses
+/// every browser.
+async fn require_relay_key(State(rt): State<Arc<Runtime>>, req: Request, next: Next) -> Response {
+    let keys = relay_keys(&rt.config());
+    if keys.is_empty() {
+        return crate::http::errors::local(&req, 403, "AI Studio relay registration is disabled");
     }
-    crate::net::access::require_client_key(State(rt), req, next).await
+    match crate::net::access::authenticate(&keys, req.headers(), req.uri().query().unwrap_or_default()) {
+        Ok(_) => next.run(req).await,
+        Err(message) => crate::http::errors::local(&req, 401, message),
+    }
 }
 
 async fn upgrade(
