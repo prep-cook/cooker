@@ -385,6 +385,9 @@ fn copied_text_is_redacted_wherever_reads_end() {
             None,
         ),
         ("don't stop callback?code=sk-review-secret tail", BIG, None),
+        // A read that ends right after a reference does not make the next byte a token
+        // start.
+        ("see x<http://h/>what?yes tail", BIG, None),
         ("请访问http://127.0.0.1/?k=sk-review-secret <b \"a\\\"b\" c", BIG, None),
         (
             "see http://127.0.0.1/?code=xxxxxxxxsk-review-secret tail",
@@ -411,7 +414,7 @@ fn copied_text_is_redacted_wherever_reads_end() {
         (
             "see qqqqqqqqqqqqqqqqqqqq://u:sk-review-secret@h/ tail",
             16,
-            Some("see qqqqqqqqqqqqqqqqqqqq<redacted url> tail"),
+            Some("see qqqqqqqqqqqqqqqqqqqq:<redacted url> tail"),
         ),
     ] {
         let whole = urls_in(text).into_owned();
@@ -422,6 +425,36 @@ fn copied_text_is_redacted_wherever_reads_end() {
             assert_no_secret(&got, text);
             if hold == BIG {
                 assert_eq!(got, whole, "{text} cut at {cut}");
+            }
+        }
+    }
+    // Every URL shape right after a token past the hold limit, whatever byte ends that
+    // token, wherever a read ends.
+    let urls = [
+        "//user:sk-review-secret@host.example/",
+        "http://user:sk-review-secret@host.example/",
+        "/p?k=sk-review-secret",
+        "?code=sk-review-secret",
+        "#sk-review-secret",
+        "\"http://h.example/?code=prefix sk-review-secret\"",
+        "'http://h.example/?code=prefix sk-review-secret'",
+        "<http://h.example/?code=prefix sk-review-secret>",
+        "`http://h.example/?code=prefix sk-review-secret`",
+    ];
+    for body in ["aaaaaaaaaaaaaaaaaaaa", "qqqqqqqqqqqqqqqqqqqq", "ab+c/dab+c/dab+c/d"] {
+        for ending in ["", "=", ",", ";", "(", "[", "{", "<", "'", "`", ":", "é", " ", "\""] {
+            for url in urls {
+                // `foo//user:…` is no reference even in a whole text.
+                if ending.is_empty() && url.starts_with("//") {
+                    continue;
+                }
+                let text = format!("see {body}{ending}{url} tail");
+                assert_no_secret(&urls_in(&text), &text);
+                let bytes_read: Vec<&[u8]> = text.as_bytes().chunks(1).collect();
+                assert_no_secret(&copied(&bytes_read, 16), &text);
+                for cut in 0..=text.len() {
+                    assert_no_secret(&copied(&[&text.as_bytes()[..cut], &text.as_bytes()[cut..]], 16), &text);
+                }
             }
         }
     }

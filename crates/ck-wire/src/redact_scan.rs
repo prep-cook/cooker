@@ -7,7 +7,7 @@ use std::io::{self, Read, Write};
 /// The longest unfinished reference [`copy`] holds back. A longer one prints as
 /// [`UNPRINTABLE`] and the rest of it is dropped, which fails closed; a longer token that
 /// cannot become a reference (no `?`, `#` or delimiter, and no `scheme://` or `/` start)
-/// is written as it is.
+/// is written up to where a token or span could start, and fails closed at a `?` or `#`.
 pub(super) const HOLD: usize = 1 << 20;
 
 /// The most [`copy`] reads at once.
@@ -15,7 +15,7 @@ const PIECE: usize = 64 << 10;
 
 /// Redacts the whole of `text` into `out`.
 pub(super) fn whole(text: &[u8], out: &mut Vec<u8>) {
-    scan(text, true, out);
+    scan(text, true, None, out);
 }
 
 /// Redacts what `input` yields into `out` as [`whole`] redacts the whole text. Only a
@@ -24,6 +24,7 @@ pub(super) fn whole(text: &[u8], out: &mut Vec<u8>) {
 pub(super) fn copy(input: &mut dyn Read, out: &mut dyn Write, hold: usize) -> io::Result<()> {
     let mut copy = Copy {
         held: Vec::new(),
+        before: None,
         skip: None,
         out: Vec::new(),
         hold,
@@ -37,7 +38,7 @@ pub(super) fn copy(input: &mut dyn Read, out: &mut dyn Write, hold: usize) -> io
         };
         if n == 0 {
             if copy.skip.is_none() {
-                whole(&copy.held, &mut copy.out);
+                scan(&copy.held, true, copy.before, &mut copy.out);
             }
             return out.write_all(&copy.out);
         }
@@ -51,6 +52,8 @@ struct Copy {
     /// Bytes read but not yet written: a reference whose end was not read yet, and
     /// what follows it.
     held: Vec<u8>,
+    /// The byte before `held`, which decides whether a token can start at `held[0]`.
+    before: Option<u8>,
     /// The token past the hold limit whose rest is being dropped or written.
     skip: Option<Skip>,
     out: Vec<u8>,
@@ -59,50 +62,76 @@ struct Copy {
 
 impl Copy {
     fn push(&mut self, mut input: &[u8]) {
-        if let Some(skip) = &mut self.skip {
+        while let Some(skip) = &mut self.skip {
             let end = skip.end(input);
+            let n = end.unwrap_or(input.len());
             if skip.write {
-                self.out.extend_from_slice(&input[..end.unwrap_or(input.len())]);
+                self.out.extend_from_slice(&input[..n]);
             }
-            let Some(at) = end else { return };
-            input = &input[at..];
+            input = &input[n..];
+            if end.is_none() {
+                return;
+            }
+            if skip.write && matches!(input[0], b'?' | b'#') {
+                // A written token that turns out to carry a query or fragment prints the
+                // rest as the placeholder, dropped up to its end.
+                self.out.extend_from_slice(UNPRINTABLE.as_bytes());
+                skip.write = false;
+                continue;
+            }
+            self.before = skip.last;
             self.skip = None;
         }
         self.held.extend_from_slice(input);
-        while let Some(at) = scan(&self.held, false, &mut self.out) {
+        while let Some(at) = scan(&self.held, false, self.before, &mut self.out) {
+            if at > 0 {
+                self.before = Some(self.held[at - 1]);
+            }
             if self.held.len() - at <= self.hold {
                 self.held.drain(..at);
                 return;
             }
-            // Past the hold limit a reference prints as the placeholder, after a span's
-            // opener and the spaces that follow it, and is dropped up to its end. A token
-            // that cannot become one is written up to where a token could start again.
             let waiting = &self.held[at..];
             let close = DELIMITERS.iter().find(|(open, _)| *open == waiting[0]).map(|d| d.1);
-            let mut skip = Skip {
-                close,
-                escaped: false,
-                write: close.is_none() && !reference(waiting) && !waiting.iter().any(|b| matches!(b, b'?' | b'#')),
-            };
-            // A scheme followed by part of `://` keeps that part, which is scanned again
-            // as the start of a token, so the bytes after it cannot slip past as text.
-            let scheme = waiting.iter().take_while(|b| scheme_byte(**b)).count();
-            if skip.write && scheme < waiting.len() && reference_prefix(waiting) {
-                self.out.extend_from_slice(&waiting[..scheme]);
-                self.held.drain(..at + scheme);
-                continue;
+            if close.is_none()
+                && waiting.len() > 1
+                && !reference(waiting)
+                && !waiting.iter().any(|b| matches!(b, b'?' | b'#'))
+            {
+                // Past the hold limit a token that cannot become a reference is written.
+                // Its last byte, which may end the token or open a span, goes through the
+                // same check as the bytes after it.
+                let (written, last) = waiting.split_at(waiting.len() - 1);
+                self.out.extend_from_slice(written);
+                let rest = last.to_vec();
+                self.skip = Some(Skip {
+                    close: None,
+                    escaped: false,
+                    write: true,
+                    last: written.last().copied(),
+                });
+                self.held.clear();
+                return self.push(&rest);
             }
+            // Past the hold limit a reference prints as the placeholder, after a span's
+            // opener and the spaces that follow it, and is dropped up to its end.
             let keep = match close {
-                _ if skip.write => waiting.len(),
                 Some(_) => 1 + waiting[1..].iter().take_while(|b| **b == b' ').count(),
                 None => 0,
             };
             self.out.extend_from_slice(&waiting[..keep]);
-            if !skip.write {
-                self.out.extend_from_slice(UNPRINTABLE.as_bytes());
-            }
+            self.out.extend_from_slice(UNPRINTABLE.as_bytes());
+            let mut skip = Skip {
+                close,
+                escaped: false,
+                write: false,
+                last: keep.checked_sub(1).map(|k| waiting[k]).or(self.before),
+            };
             match skip.end(&self.held[at + keep..]) {
-                Some(end) => drop(self.held.drain(..at + keep + end)),
+                Some(end) => {
+                    self.before = skip.last;
+                    self.held.drain(..at + keep + end);
+                }
                 None => {
                     self.held = Vec::new();
                     self.skip = Some(skip);
@@ -110,49 +139,62 @@ impl Copy {
                 }
             }
         }
+        if let Some(last) = self.held.last() {
+            self.before = Some(*last);
+        }
         self.held.clear();
     }
 }
 
 /// The end of a dropped reference (its span's closer, or the end of its token), or of a
-/// written token (where a token could start again).
+/// written token (where a token or span could start, or a `?` or `#`).
 struct Skip {
     close: Option<u8>,
     /// The last byte was a backslash escaping the next one in a `"` or `'` span.
     escaped: bool,
     /// The token is written, not dropped.
     write: bool,
+    /// The last byte skipped.
+    last: Option<u8>,
 }
 
 impl Skip {
     /// Where the skipped part ends in `bytes`; that byte itself is scanned again.
     fn end(&mut self, bytes: &[u8]) -> Option<usize> {
-        if self.write {
-            return bytes.iter().position(|b| starts_after(*b) || matches!(b, b'?' | b'#'));
-        }
         for (i, &b) in bytes.iter().enumerate() {
-            match self.close {
-                None if stop(b) => return Some(i),
-                None => {}
-                Some(_) if std::mem::take(&mut self.escaped) => {}
-                Some(close) if b == b'\\' && matches!(close, b'"' | b'\'') => self.escaped = true,
-                Some(close) if b == close => return Some(i),
-                Some(_) => {}
+            let ends = match self.close {
+                _ if self.write => {
+                    self.last.is_some_and(starts_after)
+                        || matches!(b, b'?' | b'#')
+                        || DELIMITERS.iter().any(|(open, _)| *open == b)
+                }
+                None => stop(b),
+                Some(_) if std::mem::take(&mut self.escaped) => false,
+                Some(close) if b == b'\\' && matches!(close, b'"' | b'\'') => {
+                    self.escaped = true;
+                    false
+                }
+                Some(close) => b == close,
+            };
+            if ends {
+                return Some(i);
             }
+            self.last = Some(b);
         }
         None
     }
 }
 
-/// Scans `text` into `out`. Unless the text is `complete`, a reference whose end is not
-/// in `text` stops the scan: its start is returned and nothing from there on is written.
-fn scan(text: &[u8], complete: bool, out: &mut Vec<u8>) -> Option<usize> {
+/// Scans `text`, which follows the byte `before`, into `out`. Unless the text is
+/// `complete`, a reference whose end is not in `text` stops the scan: its start is
+/// returned and nothing from there on is written.
+fn scan(text: &[u8], complete: bool, before: Option<u8>, out: &mut Vec<u8>) -> Option<usize> {
     let (mut copied, mut i) = (0, 0);
     let mut next = Next::default();
     while i < text.len() {
         let step = match DELIMITERS.iter().position(|(open, _)| *open == text[i]) {
             Some(kind) => next.span(text, i, kind, complete),
-            None if boundary(text, i) => next.token(text, i, complete),
+            None if boundary(text, i, before) => next.token(text, i, complete),
             None => Step::No,
         };
         match step {
@@ -238,7 +280,7 @@ impl Next {
         let mark = seek(text, i, &mut self.mark, |b| matches!(b, b'?' | b'#'));
         // A later delimiter before the `?` or `#` starts the token that is checked
         // instead, so a reference such as `url=//…` keeps its name.
-        if (i + 1..mark.min(end)).any(|j| boundary(text, j)) {
+        if (i + 1..mark.min(end)).any(|j| boundary(text, j, None)) {
             return Step::No;
         }
         if open {
@@ -290,10 +332,12 @@ fn stop(b: u8) -> bool {
     b.is_ascii_whitespace() || b == b'"'
 }
 
-/// Whether a token can start at `i`: an ASCII byte (so every cut falls between UTF-8
-/// characters) after whitespace, a delimiter or non-ASCII text such as `请访问http://…`.
-fn boundary(text: &[u8], i: usize) -> bool {
-    text[i].is_ascii() && (i == 0 || starts_after(text[i - 1]))
+/// Whether a token can start at `i` of a text that follows `before` (none at the start
+/// of the whole text): an ASCII byte (so every cut falls between UTF-8 characters) after
+/// whitespace, a delimiter or non-ASCII text such as `请访问http://…`.
+fn boundary(text: &[u8], i: usize, before: Option<u8>) -> bool {
+    let previous = if i == 0 { before } else { Some(text[i - 1]) };
+    text[i].is_ascii() && previous.is_none_or(starts_after)
 }
 
 fn starts_after(b: u8) -> bool {

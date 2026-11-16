@@ -247,6 +247,32 @@ async fn spools_leave_no_file_in_the_log_directory() {
     line(&content, "Upstream URL: http://127.0.0.1/v1?code=***#***");
 }
 
+/// A spooled section is redacted as it is copied into the log: a URL right after a token
+/// longer than the copy's hold limit is redacted even when a read ends between them.
+#[test]
+fn spooled_sections_redact_urls_after_long_tokens() {
+    let dir = super::tests::scratch();
+    // 17 reads of 64 KiB: the read that passes the 1 MiB hold ends with `ending`.
+    for ending in ["=", "(", "é", ":"] {
+        let mut section = super::Section::new("api-response");
+        let mut content = vec![b'a'; 17 * 65536 - ending.len()];
+        content.extend_from_slice(ending.as_bytes());
+        content.extend_from_slice(b"//user:sk-review-secret@host.example/ end");
+        section.append(&dir, &content);
+        assert!(section.spool.is_some());
+        let mut out = Vec::new();
+        section.write_to(&mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains(SECRET), "{ending}: {}", &out[out.len() - 80..]);
+        assert!(
+            out.ends_with(&format!("{ending}//host.example/ end")),
+            "{ending}: {}",
+            &out[out.len() - 80..]
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Makes every later write to the upstream response section's spool fail.
 fn fail_spool(log: &super::RequestLog) {
     let mut locked = log.0.lock().unwrap();
