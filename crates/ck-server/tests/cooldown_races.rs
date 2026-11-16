@@ -252,7 +252,12 @@ async fn a_dispatch_after_its_refresh_clears_a_cooldown_recorded_meanwhile() {
     up.token.add_permits(1);
     let (status, body) = held.await.unwrap();
     assert_eq!(status, 200, "{body}");
-    assert!(rt.store().select(selection).is_some(), "the later dispatch cleared it");
+    // A committed attempt reports its outcome after the client has the body
+    // (`dispatch::attempt::Committed::spawn`).
+    until("the later dispatch to clear it", || {
+        rt.store().select(selection.clone()).is_some()
+    })
+    .await;
     assert_eq!(
         *up.calls.lock().unwrap(),
         // Claude's refresh also reads the profile.
