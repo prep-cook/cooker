@@ -9,7 +9,7 @@ The image runs as uid and gid 10001, exposes 8317, works in `/data` and runs `co
 ```sh
 mkdir -m 700 -p data
 sudo chown -R 10001:10001 data            # the container runs as uid and gid 10001
-docker run -d --name cooker -p 127.0.0.1:8317:8317 -v "$PWD/data:/data" -e CK_MANAGEMENT_PASSWORD='REPLACE-WITH-A-STRONG-PASSWORD' ghcr.io/prep-cook/cooker:<version>
+docker run -d --name cooker -p 127.0.0.1:8317:8317 -v "$PWD/data:/data" --tmpfs /run/cooker-runtime:rw,noexec,nosuid,mode=0700,uid=10001,gid=10001 -e CK_MANAGEMENT_PASSWORD='REPLACE-WITH-A-STRONG-PASSWORD' ghcr.io/prep-cook/cooker:<version>
 ```
 
 To build the image yourself, run `docker build -t cooker .` in a checkout and use `cooker` as the image name. The build compiles BoringSSL and needs about 2 GB of memory; on a small machine add `--build-arg BUILD_JOBS=1`.

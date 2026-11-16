@@ -9,7 +9,7 @@ Run the Docker image with a data directory and a dashboard password:
 ```sh
 mkdir -m 700 -p data
 sudo chown -R 10001:10001 data
-docker run -d --name cooker -p 127.0.0.1:8317:8317 -v "$PWD/data:/data" -e CK_MANAGEMENT_PASSWORD='REPLACE-WITH-A-STRONG-PASSWORD' ghcr.io/prep-cook/cooker:latest
+docker run -d --name cooker -p 127.0.0.1:8317:8317 -v "$PWD/data:/data" --tmpfs /run/cooker-runtime:rw,noexec,nosuid,mode=0700,uid=10001,gid=10001 -e CK_MANAGEMENT_PASSWORD='REPLACE-WITH-A-STRONG-PASSWORD' ghcr.io/prep-cook/cooker:latest
 ```
 
 [INSTALL.md](INSTALL.md#docker) covers the volume, an optional initial `config.yaml` and upgrades. An empty volume starts with defaults on port 8317 and creates `/data/cooker.db`; a `/data/config.yaml` that exists is imported on that first start, and later starts use the database. Two keys matter:
