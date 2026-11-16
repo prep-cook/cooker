@@ -8,13 +8,17 @@
 //! the Images response as one JSON body or as generation or edit events, from its first
 //! deliverable byte. gpt-image models are routed to whichever provider serves them, with
 //! `WithDisallowFreeAuth`.
+//!
+//! `GET /v1/images/{request_id}` polls a deferred xAI image job (X16) on the credential and model
+//! it was created on: 202 with xAI's body while it runs, then the Images response, or xAI's
+//! `error` body when the job failed.
 
 use std::sync::Arc;
 
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{MatchedPath, OriginalUri, State};
+use axum::extract::{MatchedPath, OriginalUri, Path, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use ck_core::exec::{Caller, ExecError, FailureScope, Operation};
@@ -197,17 +201,33 @@ async fn serve(
     body: Bytes,
     decode: impl FnOnce(&mut Writer, &Store) -> Result<Document, Failure>,
 ) -> Response {
-    let decoded = match Decoded::new(&p.rt, &p.caller, ask.output(), decode, refused) {
+    let output = ask.output();
+    run(p, output, ask.model, ask.stream, None, body, decode).await
+}
+
+/// Serves the request `decode` writes as `output`, routed by `model` and, for a job's poll, only
+/// on the `pinned` credential.
+async fn run(
+    p: Prepared,
+    output: Output,
+    model: String,
+    stream: bool,
+    pinned: Option<String>,
+    body: Bytes,
+    decode: impl FnOnce(&mut Writer, &Store) -> Result<Document, Failure>,
+) -> Response {
+    let decoded = match Decoded::new(&p.rt, &p.caller, output, decode, refused) {
         Ok(decoded) => decoded,
         Err(failure) => return errors::openai(&failure),
     };
+    let disallow_free = is_codex_tool_model(&model);
     let call = Call {
         entry: Format::OpenAI,
         response: Format::OpenAI,
         operation: Operation::Generate,
-        model: ask.model.clone(),
+        model,
         body,
-        stream: ask.stream,
+        stream,
         alt: None,
         headers: p.headers,
         caller: p.caller,
@@ -219,10 +239,10 @@ async fn serve(
         turn: None,
         media: Some(Arc::new(Media {
             kind: MediaKind::Images,
-            pinned: None,
+            pinned,
             on_selected: None,
             sse: false,
-            disallow_free: is_codex_tool_model(&ask.model),
+            disallow_free,
         })),
     };
     decoded
@@ -412,6 +432,48 @@ pub async fn edits(
         return serve(p, ask, body.clone(), json(images::Mode::Edit, &request)).await;
     }
     edits_form(p, &content_type, body).await
+}
+
+/// `GET /v1/images/{request_id}`: a poll of the caller's deferred xAI image job, pinned to the
+/// credential and model the job was created on (E-Q5). A job that is not the caller's is not
+/// pinned; the xAI executor refuses it with 404 before anything is sent. The client gets 202 with
+/// xAI's body while the job runs, then the Images response, or xAI's `error` body.
+#[allow(clippy::too_many_arguments)]
+pub async fn retrieve(
+    State(rt): State<Arc<Runtime>>,
+    Extension(caller): Extension<Caller>,
+    peer: dispatch::Peer,
+    matched: Option<MatchedPath>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(job): Path<String>,
+) -> Response {
+    if disabled(&rt) {
+        return not_found();
+    }
+    let (pinned, model) = match rt.executors.image_binding(&caller, &job) {
+        Some(bound) if is_xai_model(&bound.model) => {
+            let model = canonical_xai_model(&bound.model).to_owned();
+            (Some(bound.credential), model)
+        }
+        Some(bound) => (Some(bound.credential), XAI_DEFAULT_MODEL.to_owned()),
+        None => (None, XAI_DEFAULT_MODEL.to_owned()),
+    };
+    let p = Prepared {
+        rt,
+        caller,
+        peer: dispatch::peer(peer),
+        headers,
+        path: dispatch::route_path(matched.as_ref(), &uri),
+    };
+    // The job's results come back as xAI stored them: base64 stays base64 and a URL stays a URL.
+    let output = Output {
+        protocol: Protocol::Images(images::Delivery::Base64),
+        operation: codec::Operation::Media(MediaOp::ImageRetrieve),
+        framing: Framing::Json,
+    };
+    let decode = |writer: &mut Writer, _: &Store| images::retrieve(writer, &job).map_err(|f| refused(f.error));
+    run(p, output, model, false, pinned, Bytes::new(), decode).await
 }
 
 /// A multipart edit: Go's form checks (the boundary, a supported model, a prompt and an image),

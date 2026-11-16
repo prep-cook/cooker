@@ -113,11 +113,21 @@ impl ProtocolEgress {
         })
     }
 
-    /// Whether the body's `Content-Type` is known: a media egress learns it from the stream's
-    /// `media.start`, before its first byte.
+    /// The client's HTTP status: 202 for a deferred image job xAI is still running, else 200.
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::Images(egress) => egress.status(),
+            _ => 200,
+        }
+    }
+
+    /// Whether the response head is known: a speech egress learns its `Content-Type` from the
+    /// stream's `media.start`, an images egress its status from a job record or its first result,
+    /// both before their first byte.
     pub fn typed(&self) -> bool {
         match self {
             Self::Speech(egress) => egress.content_type().is_ok_and(|mime| mime.is_some()),
+            Self::Images(egress) => egress.decided(),
             _ => true,
         }
     }

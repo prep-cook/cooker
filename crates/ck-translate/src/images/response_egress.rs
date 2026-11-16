@@ -76,6 +76,8 @@ pub struct Egress {
     tool_usage: Option<Document>,
     open: Option<Open>,
     results: Table<Result_>,
+    /// A deferred job's `image.job` operation, which answers in place of results.
+    job: Option<Document>,
     delivered: u64,
     done: bool,
     closed: bool,
@@ -94,11 +96,26 @@ impl Egress {
             tool_usage: None,
             open: None,
             results: Table::new(owner)?,
+            job: None,
             delivered: 0,
             done: false,
             closed: false,
             on_drop: None,
         })
+    }
+
+    /// The client's HTTP status: 202 while a deferred job runs (xAI's own), else 200.
+    pub fn status(&self) -> u16 {
+        match &self.job {
+            Some(job) if job_status(job, "running").unwrap_or(false) => 202,
+            _ => 200,
+        }
+    }
+
+    /// Whether [`Egress::status`] is final: a deferred job's record, a result or the end was read.
+    /// Nothing before them decides between 202 and 200.
+    pub fn decided(&self) -> bool {
+        self.job.is_some() || self.delivered != 0 || self.done
     }
 
     /// Reports each record this egress has no place for: SSE fields of the source, events and
@@ -215,6 +232,10 @@ impl Egress {
                     }
                 }
             }
+            Kind::Operation if boundary::is(&doc, root, "kind", "image.job")? => {
+                self.scan(&doc)?;
+                self.job = Some(doc);
+            }
             Kind::Operation => {
                 if !boundary::is(&doc, root, "kind", "image.result")? {
                     return Ok(());
@@ -237,6 +258,10 @@ impl Egress {
                     let body = self.event(owner, media.as_ref(), Some(&doc))?;
                     output(body)?;
                 }
+            }
+            Kind::Done if self.open.is_none() && self.job.is_some() => {
+                self.done = true;
+                output(self.job_body(owner)?)?;
             }
             Kind::Done if self.open.is_none() && self.delivered != 0 => {
                 self.done = true;
@@ -453,6 +478,31 @@ impl Egress {
         })
     }
 
+    /// A deferred job's answer as xAI wrote it: `request_id` unless the poll implied it, a failed
+    /// job's `error`, then the other members of xAI's body.
+    fn job_body(&self, owner: &mut Writer) -> Result<ScratchLease> {
+        let job = self.job.as_ref().ok_or(Error::Schema)?;
+        let value = job.required(job.root(), "value")?;
+        let x = job.required(job.root(), "x_ck")?;
+        let implied = job.member(x, "id_implied")?.is_some();
+        encode::scratch(owner, |e| {
+            e.bytes(b"{")?;
+            let mut first = true;
+            if !implied {
+                sep(e, &mut first)?;
+                e.bytes(b"\"request_id\":")?;
+                job.write(job.required(value, "job_id")?, e)?;
+            }
+            if let Some(error) = job.member(value, "error")? {
+                sep(e, &mut first)?;
+                e.bytes(b"\"error\":")?;
+                job.write(error, e)?;
+            }
+            self.extras(job, e, &mut first)?;
+            e.bytes(b"}")
+        })
+    }
+
     fn buffered(&mut self, owner: &mut Writer) -> Result<ScratchLease> {
         let this = &*self;
         let settings = this.first_settings(&SETTINGS)?;
@@ -484,6 +534,11 @@ impl Egress {
 
 /// Settings of an image the response reports.
 const SETTINGS: [&str; 4] = ["size", "quality", "background", "output_format"];
+
+/// Whether an `image.job` operation has `status`.
+fn job_status(job: &Document, status: &str) -> Result<bool> {
+    boundary::is(job, job.required(job.root(), "value")?, "status", status)
+}
 
 fn sep(e: &mut Encoder<'_, '_>, first: &mut bool) -> Result<()> {
     if !std::mem::replace(first, false) {

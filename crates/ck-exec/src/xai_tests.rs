@@ -951,10 +951,11 @@ async fn held_upstream(
 /// The video job table (E-Q5, E-Q13): a job's charge is claimed once whatever order its admitted
 /// polls settle in; a job id is found only by the caller that created it; a record expires three
 /// hours after its last create or poll, though an admitted poll keeps it; and the table holds at
-/// most its capacity of jobs and pending creates, refusing the next create until one frees.
+/// most its capacity of jobs and pending creates, refusing the next create until one frees. Image
+/// and video jobs share the table and its capacity, and a poll of one kind never finds the other.
 #[test]
 fn video_job_table_scopes_bounds_and_charges_once() {
-    use crate::xai_media::{JobBinding, Slot, VideoJobs};
+    use crate::xai_media::{JobBinding, JobKind, Slot, VideoJobs};
     enum Step {
         Clock(u64),
         /// A create by caller `who` answered with the job.
@@ -963,6 +964,8 @@ fn video_job_table_scopes_bounds_and_charges_once() {
         Admit(usize, usize, &'static str, bool),
         /// (slot, charged)
         Settle(usize, bool),
+        /// Poll `a` fails to publish its charge while poll `b` settles the same job: (a, b).
+        FailWhileSettling(usize, usize),
         Release(usize),
         /// A create reserves its place before sending: (pending, caller, reserved).
         Reserve(usize, usize, bool),
@@ -970,6 +973,12 @@ fn video_job_table_scopes_bounds_and_charges_once() {
         Named(usize, &'static str),
         /// The pending create failed.
         Failed(usize),
+        /// A create of an image job by caller `who` answered with the job.
+        CreateImage(usize, &'static str),
+        /// (slot, caller, kind, job, admitted)
+        AdmitAs(usize, usize, JobKind, &'static str, bool),
+        /// An image create reserves its place: (pending, caller, reserved).
+        ReserveImage(usize, usize, bool),
     }
     use Step::*;
     const H: u64 = 3 * 3600;
@@ -1002,6 +1011,17 @@ fn video_job_table_scopes_bounds_and_charges_once() {
                 Settle(0, true),
                 Release(0),
                 Admit(1, 0, "b", false),
+            ],
+        ),
+        (
+            "a charge whose publication fails while another poll settles is that poll's",
+            2,
+            vec![
+                Create(0, "z"),
+                Admit(0, 0, "z", true),
+                Admit(1, 0, "z", true),
+                FailWhileSettling(0, 1),
+                Settle(0, false),
             ],
         ),
         (
@@ -1061,6 +1081,30 @@ fn video_job_table_scopes_bounds_and_charges_once() {
                 Reserve(1, 1, false),
             ],
         ),
+        (
+            "an image job is not found on a video poll, nor a video job on an image poll",
+            2,
+            vec![
+                CreateImage(0, "j"),
+                AdmitAs(0, 0, JobKind::Video, "j", false),
+                AdmitAs(0, 0, JobKind::Image, "j", true),
+                Create(0, "k"),
+                AdmitAs(1, 0, JobKind::Image, "k", false),
+                AdmitAs(1, 0, JobKind::Video, "k", true),
+            ],
+        ),
+        (
+            "image and video jobs share one capacity",
+            2,
+            vec![
+                CreateImage(0, "l"),
+                Reserve(0, 1, true),
+                ReserveImage(1, 0, false),
+                Reserve(2, 1, false),
+                Failed(0),
+                ReserveImage(1, 0, true),
+            ],
+        ),
     ];
     let callers: [ck_core::exec::Caller; 2] = std::array::from_fn(|i| ck_core::exec::Caller {
         principal: format!("client-key-{i}"),
@@ -1081,12 +1125,30 @@ fn video_job_table_scopes_bounds_and_charges_once() {
         for (i, step) in steps.into_iter().enumerate() {
             match step {
                 Clock(seconds) => *time.lock().unwrap() = Duration::from_secs(seconds),
-                Create(who, job) => drop(jobs.reserve(&callers[who], binding()).unwrap().created(job)),
+                Create(who, job) => drop(
+                    jobs.reserve(&callers[who], JobKind::Video, binding())
+                        .unwrap()
+                        .created(job),
+                ),
+                CreateImage(who, job) => drop(
+                    jobs.reserve(&callers[who], JobKind::Image, binding())
+                        .unwrap()
+                        .created(job),
+                ),
                 Admit(slot, who, job, admitted) => {
-                    held[slot] = jobs.admit(&callers[who], job);
+                    held[slot] = jobs.admit(&callers[who], JobKind::Video, job);
                     assert_eq!(held[slot].is_some(), admitted, "{name}: step {i}");
                     assert_eq!(
-                        jobs.binding(&callers[who], job).is_some(),
+                        jobs.binding(&callers[who], JobKind::Video, job).is_some(),
+                        admitted,
+                        "{name}: step {i}, binding"
+                    );
+                }
+                AdmitAs(slot, who, kind, job, admitted) => {
+                    held[slot] = jobs.admit(&callers[who], kind, job);
+                    assert_eq!(held[slot].is_some(), admitted, "{name}: step {i}");
+                    assert_eq!(
+                        jobs.binding(&callers[who], kind, job).is_some(),
                         admitted,
                         "{name}: step {i}, binding"
                     );
@@ -1095,9 +1157,27 @@ fn video_job_table_scopes_bounds_and_charges_once() {
                     let admission = held[slot].as_ref().expect("an admitted poll");
                     assert_eq!(admission.settle(), charged, "{name}: step {i}");
                 }
+                FailWhileSettling(a, b) => {
+                    let other = held[b].take().expect("an admitted poll");
+                    let mut racer = None;
+                    let failed = held[a].as_ref().expect("an admitted poll").settle_with(|| {
+                        let settling = std::thread::spawn(move || other.settle());
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        assert!(!settling.is_finished(), "{name}: step {i}, the other poll waits");
+                        racer = Some(settling);
+                        Err(())
+                    });
+                    assert_eq!(failed, Err(()), "{name}: step {i}");
+                    let charged = racer.unwrap().join().unwrap();
+                    assert!(charged, "{name}: step {i}, the waiting poll charges the job");
+                }
                 Release(slot) => held[slot] = None,
                 Reserve(slot, who, reserved) => {
-                    pending[slot] = jobs.reserve(&callers[who], binding());
+                    pending[slot] = jobs.reserve(&callers[who], JobKind::Video, binding());
+                    assert_eq!(pending[slot].is_some(), reserved, "{name}: step {i}");
+                }
+                ReserveImage(slot, who, reserved) => {
+                    pending[slot] = jobs.reserve(&callers[who], JobKind::Image, binding());
                     assert_eq!(pending[slot].is_some(), reserved, "{name}: step {i}");
                 }
                 Named(slot, job) => drop(pending[slot].take().unwrap().created(job)),

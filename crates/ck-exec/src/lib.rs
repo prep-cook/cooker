@@ -138,7 +138,7 @@ use ck_core::config::Config;
 use ck_core::credential::{Credential, MetadataPatch};
 use ck_core::exec::{ExecError, ExecRequest, ExecResponse, ExecSession, FailureScope};
 
-pub use xai_media::JobBinding;
+pub use xai_media::{JobBinding, JobKind};
 pub use xai_ws::websockets_enabled;
 
 /// What a credential needs before or around use. See the module docs.
@@ -356,7 +356,13 @@ impl Executors {
     /// Where `caller`'s video job `job` is polled: the credential and model it was created on
     /// (E-Q5). `None` when the job is another caller's, expired or unknown.
     pub fn video_binding(&self, caller: &ck_core::exec::Caller, job: &str) -> Option<JobBinding> {
-        self.openai.xai.jobs.binding(caller, job)
+        self.openai.xai.jobs.binding(caller, JobKind::Video, job)
+    }
+
+    /// Where `caller`'s deferred image job `job` is polled, as [`Executors::video_binding`] finds
+    /// a video job's.
+    pub fn image_binding(&self, caller: &ck_core::exec::Caller, job: &str) -> Option<JobBinding> {
+        self.openai.xai.jobs.binding(caller, JobKind::Image, job)
     }
 
     /// The OpenAI speech routes (`/v1/audio/speech`, `/v1/tts`): Go's `openai-speech`
