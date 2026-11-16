@@ -395,8 +395,9 @@ impl Egress {
         Ok(())
     }
 
-    /// Extras of the response or the image that came from an Images source, at their own place.
-    fn extras(&self, doc: &Document, e: &mut Encoder<'_, '_>, first: &mut bool, item: bool) -> Result<()> {
+    /// The canonical carrier determines placement: response.start holds response extras;
+    /// image.result and preview media.start hold image extras, regardless of native pointer shape.
+    fn extras(&self, doc: &Document, e: &mut Encoder<'_, '_>, first: &mut bool) -> Result<()> {
         let x = doc.required(doc.root(), "x_ck")?;
         let Some(original) = doc.member(x, "original")? else {
             return Ok(());
@@ -407,10 +408,6 @@ impl Egress {
             }
             let pointer = doc.required(entry, "pointer")?;
             let name = crate::codec::provenance::leaf(doc.chars(pointer)?)?;
-            // Top-level extras have a pointer of one segment, item extras start with `/data/`.
-            if starts_with(doc, pointer, "/data/")? != item {
-                continue;
-            }
             sep(e, first)?;
             crate::codec::provenance::write_segment(name, e)?;
             e.bytes(b":")?;
@@ -443,9 +440,9 @@ impl Egress {
             this.settings(open, operation, e, &SETTINGS)?;
             if let Some(op) = operation {
                 this.usage_member(e)?;
-                this.extras(op, e, &mut first, true)?;
+                this.extras(op, e, &mut first)?;
             } else if let Some(open) = open {
-                this.extras(&open.start, e, &mut first, true)?;
+                this.extras(&open.start, e, &mut first)?;
             }
             e.bytes(b"}\n\n")
         })
@@ -462,7 +459,7 @@ impl Egress {
             }
             this.usage_member(e)?;
             if let Some(start) = &this.start {
-                this.extras(start, e, &mut false, false)?;
+                this.extras(start, e, &mut false)?;
             }
             e.bytes(b",\"data\":[")?;
             for (i, result) in this.results.iter().enumerate() {
@@ -472,7 +469,7 @@ impl Egress {
                 e.bytes(b"{")?;
                 let mut first = true;
                 this.result(e, &mut first, result.media.as_ref(), Some(&result.operation))?;
-                this.extras(&result.operation, e, &mut first, true)?;
+                this.extras(&result.operation, e, &mut first)?;
                 e.bytes(b"}")?;
             }
             e.bytes(b"]}")
@@ -488,16 +485,6 @@ fn sep(e: &mut Encoder<'_, '_>, first: &mut bool) -> Result<()> {
         e.bytes(b",")?;
     }
     Ok(())
-}
-
-fn starts_with(doc: &Document, node: usize, prefix: &str) -> Result<bool> {
-    let mut chars = doc.chars(node)?;
-    for expected in prefix.chars() {
-        if chars.next_scalar()? != Some(expected) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 impl ResponseEgress for Egress {

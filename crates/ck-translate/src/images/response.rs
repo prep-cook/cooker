@@ -1,4 +1,4 @@
-use ck_stream::Writer;
+use ck_stream::{ScratchLease, Writer};
 
 mod usage;
 
@@ -101,6 +101,10 @@ struct Image<'a> {
     created: Option<(&'a Document, usize)>,
     /// The record the image came from.
     sse: Option<Sse<'a>>,
+    /// Encoded SSE fields retained with a delayed Codex result.
+    provenance: Option<&'a ScratchLease>,
+    /// Native objects whose unknown members are encoded only when the image is published.
+    original: Option<&'a [(usize, &'a str, &'a [&'a str])]>,
     /// Known names of `item`; its other members are kept in `X.original`.
     known: &'a [&'a str],
 }
@@ -150,9 +154,9 @@ struct State {
     usage: bool,
     completed: bool,
     terminal: bool,
-    /// Codex `output_item.done` documents of finished image calls, held until `response.completed`
+    /// Codex `output_item.done` documents and provenance, held until `response.completed`
     /// brings the usage that precedes their media.
-    calls: Table<Document>,
+    calls: Table<(Document, ScratchLease)>,
 }
 
 /// One image response: buffered JSON, or SSE events. `finish` means complete framing.
@@ -460,6 +464,8 @@ impl State {
                 partial,
                 created,
                 sse,
+                provenance: None,
+                original: None,
                 known: ITEM,
             },
         )
@@ -495,6 +501,8 @@ impl State {
                     partial: false,
                     created: None,
                     sse: None,
+                    provenance: None,
+                    original: None,
                     known: ITEM,
                 },
             )?;
@@ -523,17 +531,25 @@ impl State {
                     partial: true,
                     created: None,
                     sse,
+                    provenance: None,
+                    original: None,
                     known: CODEX_ITEM,
                 },
             )
         } else if is("response.output_item.done")? {
             let item = doc.required(root, "item")?;
             if boundary::is(&doc, item, "type", IMAGE_CALL)? && has_result(&doc, item)? {
-                self.calls.push(doc)?;
+                let provenance = encode::scratch(owner, |e| {
+                    if let Some((source, event)) = sse {
+                        sse_provenance(self.wire.protocol(), source, event, e)?;
+                    }
+                    Ok(())
+                })?;
+                self.calls.push((doc, provenance))?;
             }
             Ok(())
         } else if is("response.completed")? {
-            self.codex_completed(owner, &doc)
+            self.codex_completed(owner, &doc, sse)
         } else if is("response.failed")? || is("response.incomplete")? || is("error")? {
             Err(Error::Schema)
         } else if doc.string_is(kind, "response.in_progress")?
@@ -551,7 +567,7 @@ impl State {
         }
     }
 
-    fn codex_completed(&mut self, owner: &mut Writer, doc: &Document) -> Result<()> {
+    fn codex_completed(&mut self, owner: &mut Writer, doc: &Document, sse: Option<Sse<'_>>) -> Result<()> {
         let root = doc.root();
         let response = doc.required(root, "response")?;
         let created = present(doc, response, "created_at")?.map(|node| (doc, node));
@@ -567,14 +583,48 @@ impl State {
         }
         let calls = std::mem::replace(&mut self.calls, Table::new(owner)?);
         if !calls.is_empty() {
-            for call in calls.iter() {
+            for (call, provenance) in calls.iter() {
                 let item = call.required(call.root(), "item")?;
-                self.call(owner, call, item, created)?;
+                self.image(
+                    owner,
+                    &Image {
+                        doc: call,
+                        item,
+                        top: item,
+                        b64: present(call, item, "result")?,
+                        url: None,
+                        partial: false,
+                        created,
+                        sse: None,
+                        provenance: Some(provenance),
+                        original: Some(&[(call.root(), "", &["type", "item"]), (item, "/item", CODEX_ITEM)]),
+                        known: CODEX_ITEM,
+                    },
+                )?;
             }
         } else if let Some(output) = present(doc, response, "output")? {
-            for item in doc.children(output)? {
+            let mut sse = sse;
+            for (index, item) in doc.children(output)?.enumerate() {
                 if boundary::is(doc, item, "type", IMAGE_CALL)? && has_result(doc, item)? {
-                    self.call(owner, doc, item, created)?;
+                    let mut pointer = [0u8; 48];
+                    let prefix = pointer_prefix(&mut pointer, "/response/output", index)?;
+                    self.image(
+                        owner,
+                        &Image {
+                            doc,
+                            item,
+                            top: item,
+                            b64: present(doc, item, "result")?,
+                            url: None,
+                            partial: false,
+                            created,
+                            // One completion record supplies all these images; keep its fields once.
+                            sse: sse.take(),
+                            provenance: None,
+                            original: Some(&[(item, prefix, CODEX_ITEM)]),
+                            known: CODEX_ITEM,
+                        },
+                    )?;
                 }
             }
         }
@@ -583,29 +633,6 @@ impl State {
         }
         self.completed = true;
         Ok(())
-    }
-
-    fn call(
-        &mut self,
-        owner: &mut Writer,
-        doc: &Document,
-        item: usize,
-        created: Option<(&Document, usize)>,
-    ) -> Result<()> {
-        self.image(
-            owner,
-            &Image {
-                doc,
-                item,
-                top: item,
-                b64: present(doc, item, "result")?,
-                url: None,
-                partial: false,
-                created,
-                sse: None,
-                known: CODEX_ITEM,
-            },
-        )
     }
 
     /// Publishes one image: its media lifetime when it carries base64, and for a finished image
@@ -624,9 +651,12 @@ impl State {
             _ => self.partials,
         };
         let protocol = self.wire.protocol();
-        let codex = self.wire == Wire::Codex;
         let mut pointer = [0u8; 32];
-        let prefix = pointer_prefix(&mut pointer, index as usize)?;
+        let prefix = if image.item == doc.root() {
+            ""
+        } else {
+            pointer_prefix(&mut pointer, "/data", index as usize)?
+        };
         match (image.b64, image.url) {
             (Some(_), Some(_)) | (None, None) => return Err(Error::Schema),
             (None, Some(url)) => {
@@ -672,10 +702,7 @@ impl State {
                         if let Some((source, event)) = image.sse {
                             sse_provenance(protocol, source, event, e)?;
                         }
-                        if !codex {
-                            boundary::original(doc, protocol, &[(image.item, prefix, image.known)], e)?;
-                        }
-                        Ok(())
+                        boundary::original(doc, protocol, &[(image.item, prefix, image.known)], e)
                     },
                 )?;
                 publisher.collect(&mut self.emitter, owner, |emit| media::decode_base64(doc, text, emit))?;
@@ -736,10 +763,16 @@ impl State {
                 if let Some((source, event)) = image.sse {
                     sse_provenance(protocol, source, event, e)?;
                 }
-                if codex {
-                    return Ok(());
+                if let Some(provenance) = image.provenance {
+                    let mut offset = 0;
+                    while offset < provenance.len() {
+                        let bytes = provenance.chunk(offset)?;
+                        e.bytes(bytes)?;
+                        offset += bytes.len();
+                    }
                 }
-                boundary::original(doc, protocol, &[(image.item, prefix, image.known)], e)
+                let fallback = [(image.item, prefix, image.known)];
+                boundary::original(doc, protocol, image.original.unwrap_or(&fallback), e)
             },
         )?;
         self.images += 1;
@@ -792,10 +825,10 @@ fn has_result(doc: &Document, item: usize) -> Result<bool> {
     Ok(doc.chars(result)?.next_scalar()?.is_some())
 }
 
-fn pointer_prefix(out: &mut [u8; 32], index: usize) -> Result<&str> {
+fn pointer_prefix<'a>(out: &'a mut [u8], parent: &str, index: usize) -> Result<&'a str> {
     use std::io::Write;
     let mut cursor = std::io::Cursor::new(&mut out[..]);
-    write!(cursor, "/data/{index}").map_err(|_| Error::Limit)?;
+    write!(cursor, "{parent}/{index}").map_err(|_| Error::Limit)?;
     let len = cursor.position() as usize;
     std::str::from_utf8(&out[..len]).map_err(|_| Error::Schema)
 }
