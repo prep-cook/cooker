@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use base64::Engine;
 use ck_wire::json::{self as gj, GoValue, Res};
 use ck_wire::signature::{self as sig, Provider};
 use sha2::{Digest, Sha256};
@@ -40,38 +39,15 @@ fn model_name(translated: &[u8]) -> String {
     String::from_utf8_lossy(&gj::get(translated, "model").bytes()).into_owned()
 }
 
-/// decodeSignature: an `R` (double base64) signature decoded once; undecodable ones
-/// become empty.
-fn decode_signature(signature: &[u8]) -> Vec<u8> {
-    if signature.starts_with(b"R") {
-        return crate::gemini_responses::go_base64(true)
-            .decode(
-                signature
-                    .iter()
-                    .copied()
-                    .filter(|&c| c != b'\r' && c != b'\n')
-                    .collect::<Vec<u8>>(),
-            )
-            .unwrap_or_default();
-    }
-    signature.to_vec()
-}
-
-/// formatClaudeSignatureValue: Claude-group models get the provider-native `E` form.
-fn claude_signature_value(model: &str, signature: &[u8]) -> Vec<u8> {
-    if model_group(model) == "claude" {
-        decode_signature(signature)
-    } else {
-        signature.to_vec()
-    }
-}
-
-/// formatGeminiClaudeCarrierValue: Gemini targets wrap the signature in a carrier.
+/// formatGeminiClaudeCarrierValue: Gemini targets wrap the signature in a carrier; others get
+/// it unchanged.
 fn carrier_value(model: &str, signature: &[u8], direction: &str, target: &str) -> Vec<u8> {
     if sig::provider_from_model_name(model) == Provider::Gemini {
         encode_carrier(signature, direction, target)
     } else {
-        claude_signature_value(model, signature)
+        // Owner ruling 68: a Claude client gets the upstream's signature as sent;
+        // CLIProxyAPI's `formatClaudeSignatureValue` decodes the double-layer form here.
+        signature.to_vec()
     }
 }
 
@@ -655,11 +631,7 @@ impl Stream {
         );
         gj::set_str(&mut data, "content_block.name", &name);
         if model_group(&self.model) == "claude" && !signature_bytes.is_empty() {
-            gj::set_str(
-                &mut data,
-                "content_block.signature",
-                claude_signature_value(&self.model, &signature_bytes),
-            );
+            gj::set_str(&mut data, "content_block.signature", &signature_bytes);
         }
         self.event("content_block_start", &data);
         let args = call.get("args");
@@ -925,7 +897,7 @@ pub(crate) fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, 
                 );
                 gj::set_str(&mut block, "name", &name);
                 if claude_target && !signature.is_empty() {
-                    gj::set_str(&mut block, "signature", claude_signature_value(&model, &signature));
+                    gj::set_str(&mut block, "signature", &signature);
                 }
                 let args = call.get("args");
                 if args.exists() && !args.raw.is_empty() && gj::valid(&args.raw) && args.is_object() {

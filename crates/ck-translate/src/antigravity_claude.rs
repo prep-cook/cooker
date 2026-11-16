@@ -377,21 +377,27 @@ fn provider(model: &str) -> Provider {
     sig::provider_from_model_name(model)
 }
 
-/// resolveProviderCompatibleSignature.
+/// resolveProviderCompatibleSignature, except that a valid Claude signature, on a thinking
+/// block or a tool call, goes upstream as the client holds it (ruling 68): only CLIProxyAPI's
+/// legacy `<group>#` prefix comes off, without its double-layer rewrite.
 fn provider_compatible(target: Provider, raw: &[u8], kind: BlockKind) -> Vec<u8> {
     if raw.is_empty() {
         return vec![];
     }
-    let signature = if target == Provider::Claude {
-        compatible_antigravity_claude_thinking_signature(raw)
-    } else {
-        sig::compatible_signature_for_provider_block(target, raw, kind)
-    };
-    signature.map(String::into_bytes).unwrap_or_default()
+    if target == Provider::Claude {
+        return match compatible_antigravity_claude_thinking_signature(raw) {
+            Some(_) => sig::payload_without_provider_prefix(raw).to_vec(),
+            None => vec![],
+        };
+    }
+    sig::compatible_signature_for_provider_block(target, raw, kind)
+        .map(String::into_bytes)
+        .unwrap_or_default()
 }
 
-/// resolveThinkingSignature: Gemini targets unwrap carriers; others use the client
-/// signature or, without one, the signature cache (cache mode), or the bypass rules.
+/// resolveThinkingSignature: Gemini targets unwrap carriers; Claude targets keep a valid
+/// client signature (ruling 68); others use the client signature or, without one, the signature
+/// cache (cache mode), or the bypass rules.
 fn resolve_thinking_signature(model: &str, text: &[u8], raw: &[u8]) -> Vec<u8> {
     let target = provider(model);
     if target == Provider::Gemini {
@@ -401,6 +407,11 @@ fn resolve_thinking_signature(model: &str, text: &[u8], raw: &[u8]) -> Vec<u8> {
         }
         return provider_compatible(target, &carrier.signature, block_kind(carrier.marked, &carrier.target));
     }
+    // Owner ruling 68: an unsigned block for a Claude model gets no cached signature.
+    // CLIProxyAPI and OmniRoute both drop unsigned and invalid blocks.
+    if target == Provider::Claude {
+        return provider_compatible(target, raw, BlockKind::Unknown);
+    }
     if replay_cache::signature_cache_enabled() {
         if !raw.is_empty() {
             return provider_compatible(target, raw, BlockKind::Unknown);
@@ -408,11 +419,6 @@ fn resolve_thinking_signature(model: &str, text: &[u8], raw: &[u8]) -> Vec<u8> {
         if !text.is_empty() {
             let cached = replay_cache::cached_signature(model, text);
             if !cached.is_empty() {
-                if target == Provider::Claude {
-                    return compatible_antigravity_claude_thinking_signature(&cached)
-                        .map(String::into_bytes)
-                        .unwrap_or_default();
-                }
                 return cached;
             }
         }
@@ -431,9 +437,6 @@ fn bypass_signature(target: Provider, raw: &[u8]) -> Vec<u8> {
         return vec![];
     }
     match target {
-        Provider::Claude => compatible_antigravity_claude_thinking_signature(raw)
-            .map(String::into_bytes)
-            .unwrap_or_default(),
         Provider::Unknown => {
             let options = ClaudeValidation {
                 strict: replay_cache::signature_bypass_strict(),

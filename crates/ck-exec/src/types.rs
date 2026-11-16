@@ -44,6 +44,12 @@ pub struct Client<'a> {
     pub headers: &'a HeaderMap,
     /// Matched route template (Go `request_path`), or the URI path when none matched.
     pub route: &'a str,
+    /// The route's `alt` query value (Go `opts.Alt`), for executors whose upstream URL carries
+    /// it; `None` when the client sent none.
+    pub alt: Option<&'a str>,
+    /// Whether the route itself asks for a stream, as a Gemini `:streamGenerateContent` or
+    /// `:generateContent` action does; `None` when only the body's `stream` member says so.
+    pub streaming: Option<bool>,
     /// Session key for affinity and provider session identity (`ck_wire::session`).
     pub session: Option<&'a str>,
     /// Long-lived execution session of the transport that owns one (Responses WebSocket).

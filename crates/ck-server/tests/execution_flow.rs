@@ -239,6 +239,8 @@ impl Fixture {
             caller: &self.caller,
             headers: &self.headers,
             route: "/v1/chat/completions",
+            alt: None,
+            streaming: None,
             session: None,
             execution_session: None,
             derived_session: None,

@@ -418,6 +418,47 @@ const SUPERSEDED: &[(&str, &str)] = &[(
          the same fixture recorded at v8.0.35 matches",
 )];
 
+/// Fixtures whose Go output an owner ruling replaced, with the ruling. Every listed fixture
+/// must still fail, so an entry cannot outlive the difference it records.
+const RULED: &[(&str, &[&str], &str)] = &[(
+    "claude->antigravity",
+    &[
+        "claude-antigravity/seed-cache",
+        "claude-antigravity/sig/cache-hit@claude-sonnet-4-6",
+        "claude-antigravity/sig/cache-hit@claude-opus-4-6-thinking",
+        "claude-antigravity/sig/empty-text@claude-sonnet-4-6",
+        "claude-antigravity/sig/empty-text@claude-opus-4-6-thinking",
+        "claude-antigravity/sig/native@claude-sonnet-4-6",
+        "claude-antigravity/sig/native@claude-opus-4-6-thinking",
+        "claude-antigravity/sig/gpt@claude-sonnet-4-6",
+        "claude-antigravity/sig/gpt@claude-opus-4-6-thinking",
+        "antigravity-claude/thinking@claude-sonnet-4-6",
+        "antigravity-claude/non-stream/0@claude-sonnet-4-6",
+        "TestConvertClaudeRequestToAntigravity_ThinkingBlocks:973",
+        "TestConvertClaudeRequestToAntigravity_BypassModeNormalizesESignature:1349",
+        "TestConvertClaudeRequestToAntigravity_BypassModePreservesShortValidSignature:1385",
+        "TestConvertClaudeRequestToAntigravity_CacheModeAcceptsNativeSignature:1470",
+        "TestConvertClaudeRequestToAntigravity_ToolUse_DoesNotReuseThinkingSignature:2068",
+        "TestConvertClaudeRequestToAntigravity_ReorderThinking:2106",
+        "TestConvertClaudeRequestToAntigravity_ReorderThinkingAndTextBeforeFunctionCall:2313",
+        "TestConvertClaudeRequestToAntigravity_ClaudeThinkingPreservesToolResultAdjacency:2499",
+        "TestConvertClaudeRequestToAntigravity_TrailingSignedThinking_Kept:2843",
+        "TestConvertClaudeRequestToAntigravity_BypassMode_KeepsNonEmptyThinking:3644",
+        "TestConvertAntigravityResponseToClaude_PreservesClaudeThoughtAndToolSignatures:893",
+        "TestConvertAntigravityResponseToClaude_PreservesClaudeThoughtAndToolSignatures:907",
+        "TestConvertAntigravityResponseToClaude_EmitsNativeSignaturesWithoutProviderPrefixes:1403",
+        "TestConvertAntigravityResponseToClaude_EmitsNativeSignaturesWithoutProviderPrefixes:1438",
+        "TestConvertAntigravityResponseToClaude_TextAndSignatureInSameChunk:648:stream",
+        "TestConvertAntigravityResponseToClaude_SignatureOnlyChunk:706:stream",
+        "TestConvertAntigravityResponseToClaude_SignatureOnlyChunkWithoutThoughtFlag:757:stream",
+        "TestConvertAntigravityResponseToClaude_PreservesClaudeThoughtAndToolSignatures:914:stream",
+        "TestConvertAntigravityResponseToClaude_EmitsNativeSignaturesWithoutProviderPrefixes:1425:stream",
+    ],
+    "Settled 68 (docs/OPEN-QUESTIONS.md): a Claude model's thinking and tool-call signatures pass between client \
+     and upstream unchanged, and no cached signature fills an unsigned block; \
+     ck-exec tests/exec_antigravity.rs pins the ruled behaviour",
+)];
+
 #[test]
 fn reference_goldens() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pairs");
@@ -426,6 +467,7 @@ fn reference_goldens() {
     assert!(!files.is_empty());
     let mut failures = vec![];
     let mut total = 0;
+    let mut ruled = 0;
     // Per pending entry: fixtures matched, and how many of them failed.
     let mut pending_matched = vec![0; PENDING.len()];
     let mut pending_failed = vec![0; PENDING.len()];
@@ -466,6 +508,17 @@ fn reference_goldens() {
                 continue;
             }
             let errors = check(client, upstream, f, bytes, false);
+            let pair_name = format!("{}->{}", client.as_str(), upstream.as_str());
+            if RULED
+                .iter()
+                .any(|(p, names, _)| *p == pair_name && names.contains(&f["name"].as_str().unwrap()))
+            {
+                ruled += 1;
+                if errors.is_empty() {
+                    failures.push(format!("{name}: matches Go again; remove it from RULED"));
+                }
+                continue;
+            }
             let pending = pending(&format!("{}->{}", client.as_str(), upstream.as_str()), f);
             if let Some(i) = pending {
                 pending_matched[i] += 1;
@@ -477,6 +530,10 @@ fn reference_goldens() {
                 }
             }
         }
+    }
+    let listed: usize = RULED.iter().map(|(_, names, _)| names.len()).sum();
+    if ruled != listed {
+        failures.push(format!("RULED lists {listed} fixtures but {ruled} exist"));
     }
     let keys = PENDING.iter().map(|(pair, key, _)| format!("{pair} {key}"));
     for ((key, matched), failed) in keys.zip(&pending_matched).zip(&pending_failed) {

@@ -222,6 +222,10 @@ pub struct Exchange {
     pub headers: HeaderMap,
     pub usage: UsageSink,
     pub route: String,
+    pub alt: Option<String>,
+    pub streaming: Option<bool>,
+    pub session: Option<String>,
+    pub derived_session: Option<String>,
 }
 
 impl Exchange {
@@ -240,6 +244,10 @@ impl Exchange {
             headers: HeaderMap::new(),
             usage: UsageSink::default(),
             route: route.into(),
+            alt: None,
+            streaming: None,
+            session: None,
+            derived_session: None,
         }
     }
 
@@ -268,9 +276,11 @@ impl Exchange {
                 caller: &self.caller,
                 headers: &self.headers,
                 route: &self.route,
-                session: None,
+                alt: self.alt.as_deref(),
+                streaming: self.streaming,
+                session: self.session.as_deref(),
                 execution_session: None,
-                derived_session: None,
+                derived_session: self.derived_session.as_deref(),
                 usage: &self.usage,
                 original,
             },

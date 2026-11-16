@@ -319,7 +319,7 @@ fn source(doc: &Document) -> codec::Result<&'static str> {
 }
 
 /// The request's `model`: the client's model, or a Gemini client's URL model.
-fn requested_model(doc: &Document) -> codec::Result<String> {
+pub(crate) fn requested_model(doc: &Document) -> codec::Result<String> {
     let mut chars = doc.chars(doc.required(doc.root(), "model")?)?;
     let mut model = String::new();
     while let Some(c) = chars.next_scalar()? {
