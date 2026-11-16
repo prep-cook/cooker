@@ -10,6 +10,10 @@
 //!
 //! Lifecycle: the reader task ends with the socket; [`Pool::close`] (downstream gone)
 //! aborts it and sends a close frame. No task outlives its session.
+//!
+//! [`turns`] runs a turn on the execution contract (`session::Turns`) over the same pool:
+//! expanded history every turn, one attempt per upstream response, no redial. The server's
+//! Responses WebSocket handler still drives the old turn path here until it moves to it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -45,6 +49,7 @@ mod execute;
 mod io;
 mod session;
 mod turn;
+mod turns;
 pub(crate) use io::{UpgradeError, offer_compression, read_loop, upgrade};
 use turn::{bootstrap, rest};
 
@@ -146,6 +151,12 @@ pub(crate) struct Link {
     // ponytail: grows by one ID per finished response for the socket's life, as Go's
     // does; bound it if sockets ever outlive thousands of turns.
     terminal: std::collections::HashSet<String>,
+    /// The response live on the socket: the last `response.created` the reader read whose
+    /// terminal it has not read. The reader records it before delivering the frame, so it
+    /// holds whether or not a turn has consumed that frame yet.
+    pub(crate) live: Option<String>,
+    /// A `response.create` was written and the reader has read no `response.created` since.
+    pub(crate) awaiting: bool,
 }
 
 /// A provider-recognized terminal with a non-empty response ID.
@@ -511,6 +522,7 @@ pub(crate) mod deflate;
 #[path = "codex_duplex.rs"]
 mod duplex;
 pub use duplex::{ClientFrames, SteeringInput};
+pub use turns::{Next, Successor, TurnControl};
 
 #[cfg(test)]
 #[path = "codex_ws_tests.rs"]
