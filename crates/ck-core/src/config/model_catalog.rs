@@ -42,6 +42,11 @@ enum Token {
 pub struct ModelCatalog(Vec<Rule>);
 
 impl ModelCatalog {
+    /// [`default_max_tokens`] against this catalog.
+    pub fn resolve(&self, model: &str, registry: impl FnOnce() -> Option<u64>) -> Option<u64> {
+        self.default_max_tokens(model).or_else(registry).filter(|n| *n > 0)
+    }
+
     fn from_config(cfg: &Config) -> Self {
         let entries = cfg.document.get("model-catalog").and_then(Value::as_sequence);
         Self(entries.into_iter().flatten().filter_map(Rule::parse).collect())
@@ -97,10 +102,12 @@ pub(super) fn check(doc: &Value) -> anyhow::Result<()> {
 /// `default-max-tokens`, else `registry` (the model's registered `max_completion_tokens`),
 /// else `None`. The catalog is parsed once per config snapshot.
 pub fn default_max_tokens(cfg: &Config, model: &str, registry: impl FnOnce() -> Option<u64>) -> Option<u64> {
+    catalog(cfg).resolve(model, registry)
+}
+
+/// The config snapshot's parsed catalog, for a caller that resolves later and only when needed.
+pub fn catalog(cfg: &Config) -> std::sync::Arc<ModelCatalog> {
     cfg.derived(ModelCatalog::from_config)
-        .default_max_tokens(model)
-        .or_else(registry)
-        .filter(|n| *n > 0)
 }
 
 fn tokens(pattern: &str) -> Vec<Token> {

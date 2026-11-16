@@ -172,6 +172,12 @@ fn clamp_level(level: &str, info: Option<&ModelCaps>) -> String {
         .and_then(|i| i.thinking.as_ref())
         .map(|s| s.levels.as_slice())
         .unwrap_or(&[]);
+    snap_level(level, supported)
+}
+
+/// The nearest level in `supported` to the standard `level`, the lower on a tie; `level`
+/// itself when it is supported, not a standard level, or `supported` names none.
+pub fn snap_level(level: &str, supported: &[String]) -> String {
     if supported.is_empty() || is_level_supported(level, supported) {
         return level.to_owned();
     }

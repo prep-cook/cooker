@@ -56,11 +56,25 @@ pub struct Failed {
     pub reason: Uncommitted,
 }
 
+/// One attempt's client protocol egress, built before its executor starts. The egress reads
+/// the client's request view (Chat `stream_options.include_usage`, the Responses echo) while
+/// the attempt still holds the decoded document, which the executor may release before the
+/// upstream answers. An error surfaces at [`deliver`] as an uncommitted codec failure.
+pub struct Prepared(codec::Result<(Writer, ProtocolEgress)>);
+
+/// The [`Prepared`] egress of the attempt writing `response`; `identity` is the attempt's
+/// response identity and `request` the client's request view.
+pub fn prepare(exchange: &Exchange, response: &Writer, identity: Identity, request: RequestView<'_>) -> Prepared {
+    let mut egress = response.allocator();
+    let shown = exchange.turn.map(|turn| turn.id.text());
+    let protocol = ProtocolEgress::new(exchange.output, &mut egress, identity, request, shown);
+    Prepared(protocol.map(|protocol| (egress, protocol)))
+}
+
 /// Delivers one attempt's response stream to the client and commits at its first deliverable
 /// byte. `response` is the attempt's allocation handle (`Started::stream`), which the caller
-/// keeps to discard a failed attempt; `identity` is the attempt's response identity;
-/// `request` is the client's request view; `headers` are the trace, routing and filtered
-/// upstream headers sent at commitment.
+/// keeps to discard a failed attempt; `egress` is the attempt's [`prepare`]d egress; `headers`
+/// are the trace, routing and filtered upstream headers sent at commitment.
 ///
 /// Until the egress emits bytes the client gets nothing, and an attempt that ends first is
 /// [`Failed`]. At commitment the exchange becomes a registered handle and the response
@@ -70,8 +84,7 @@ pub async fn deliver(
     streams: &Registry,
     exchange: Exchange,
     response: &Writer,
-    identity: Identity,
-    request: RequestView<'_>,
+    egress: Prepared,
     headers: HeaderMap,
 ) -> Result<Response, Box<Failed>> {
     let output = exchange.output;
@@ -79,11 +92,9 @@ pub async fn deliver(
         .with_store(|store| store.reader(response.id(), 0))
         .and_then(|reader| reader)
         .map_err(codec::Error::Storage);
-    let mut egress = response.allocator();
-    let shown = exchange.turn.map(|turn| turn.id.text());
     let publication = exchange.publication.clone();
     let replay = reader.and_then(|reader| {
-        let protocol = ProtocolEgress::new(output, &mut egress, identity, request, shown)?;
+        let (egress, protocol) = egress.0?;
         Ok(Replay::live(egress, reader, protocol, output.framing, publication))
     });
     let mut replay = match replay {

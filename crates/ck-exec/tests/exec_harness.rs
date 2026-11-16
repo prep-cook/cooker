@@ -38,14 +38,16 @@ impl Execute for Probe {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: AttemptStreams<'_>,
     ) -> Result<Upstream<response::Ingress>, ExecError> {
         let egress = Egress {
             destination: "chat",
             upstream_stream: true,
         };
-        let lease = egress.encode(&request.validated, streams.request).map_err(transport)?;
+        let lease = egress
+            .encode(&request.validated(), streams.request)
+            .map_err(transport)?;
         let mut body = Vec::with_capacity(lease.len());
         while body.len() < lease.len() {
             body.extend_from_slice(lease.chunk(body.len()).map_err(transport)?);
@@ -87,7 +89,7 @@ impl Execute for Probe {
     async fn count_tokens(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: AttemptStreams<'_>,
     ) -> Result<Counted<response::Ingress>, ExecError> {
         Err(ExecError::local(400, FailureScope::Request, "probe counts nothing"))
@@ -96,7 +98,7 @@ impl Execute for Probe {
     async fn compact(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: AttemptStreams<'_>,
     ) -> Result<Upstream<response::Ingress>, ExecError> {
         Err(ExecError::local(400, FailureScope::Request, "probe compacts nothing"))
@@ -129,12 +131,12 @@ async fn run(streams: &Streams, upstream: &StreamUpstream) -> Result<Upstream<re
         &Probe.capability(&attempt),
     )
     .unwrap();
-    let request = exchange.request(validated);
+    let mut request = exchange.request(validated);
     let attempt_streams = AttemptStreams {
         request: &mut request_stream,
         response: &mut response_stream,
     };
-    Probe.execute(&attempt, &request, attempt_streams).await
+    Probe.execute(&attempt, &mut request, attempt_streams).await
 }
 
 #[tokio::test]

@@ -197,7 +197,7 @@ async fn fenced<T>(
     exchange: &Exchange,
     executor: &XaiExecutor,
     (body, session): (&str, Option<&str>),
-    with: impl AsyncFnOnce(&ck_exec::types::Attempt<'_>, &ck_exec::types::Request<'_>, &mut Fenced) -> T,
+    with: impl AsyncFnOnce(&ck_exec::types::Attempt<'_>, &mut ck_exec::types::Request<'_>, &mut Fenced) -> T,
 ) -> (T, Writer) {
     let mut writer = streams.request();
     let response = streams.response(&writer);
@@ -221,7 +221,7 @@ async fn fenced<T>(
         writer,
         response: Some(response),
     };
-    let out = with(&attempt, &request, &mut fenced).await;
+    let out = with(&attempt, &mut request, &mut fenced).await;
     (out, fenced.writer)
 }
 

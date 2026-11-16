@@ -995,6 +995,9 @@ struct Ctx<'a> {
     today: String,
     /// The thread continuation aliases of the executor serving the request.
     thread_aliases: Arc<thread::Aliases>,
+    /// The snapshot's `model-catalog`: a request without `max_tokens` gets its default, else
+    /// the registered completion limit, as on the contract path.
+    catalog: Arc<ck_core::config::model_catalog::ModelCatalog>,
 }
 
 struct Prepared {
@@ -1349,6 +1352,7 @@ impl<'a> Ctx<'a> {
             } else {
                 exec.thread_aliases.clone()
             },
+            catalog: ck_core::config::model_catalog::catalog(cfg),
         }
         .with_today(credential, chrono::Utc::now())
     }
@@ -1735,7 +1739,15 @@ impl<'a> Ctx<'a> {
             body = strip_attribution_system(&body);
         }
         // 868e137: the payload rules match the fully prepared body and apply once. Only
-        // header extraction, signing and read-only checks follow.
+        // header extraction, signing and read-only checks follow. Their baseline carries the
+        // default `max_tokens` the body got, as the contract path's encoded baseline does, so
+        // a default rule never replaces the configured or registered limit (Settled 49).
+        let baseline = utf8(original_translated);
+        let baseline = if rawjson::get(&baseline, "max_tokens").exists() {
+            baseline
+        } else {
+            std::borrow::Cow::Owned(self.ensure_max_tokens(baseline.into_owned()))
+        };
         let (edited, touched) = ck_wire::payload::apply_tracked(
             &self.payload_rules,
             &ck_wire::payload::Request {
@@ -1745,7 +1757,7 @@ impl<'a> Ctx<'a> {
                 protocol: Format::Claude.as_str(),
                 from_protocol: req.client_format.as_str(),
                 root: "",
-                original: original_translated,
+                original: baseline.as_bytes(),
                 request_path: req.request_path,
                 headers: Some(req.headers),
             },
@@ -1755,6 +1767,13 @@ impl<'a> Ctx<'a> {
         body = text(edited);
         if touched.contains("diagnostics") {
             diagnostics = session::Continuity::default();
+        }
+        // The fence admitted a limit a payload default rule might set (`payload_max_tokens`);
+        // these rules saw the real body, and nothing guesses one when they did not set it (Q-H).
+        if !rawjson::get(&body, "max_tokens").exists()
+            && execute::payload_max_tokens(&self.payload_rules, &self.base_model, req.headers).is_some()
+        {
+            return Err(ExecError::local(400, FailureScope::Request, "max_tokens is required"));
         }
         let (extra_betas, stripped) = extract_betas(body);
         body = cloak::compaction::refuse_context(cloak::strip_prompt_cache_options(stripped))?;
@@ -2163,32 +2182,24 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// `ensureModelMaxTokens`: only a model some Claude credential registered gets a
-    /// default `max_tokens`, its registered completion limit or 1024.
+    /// `ensureModelMaxTokens` without its 1024 fallback (owner Q-H).
     fn ensure_max_tokens(&self, body: String) -> String {
-        let model = self.base_model.trim();
-        if !rawjson::valid(&body)
-            || rawjson::get(&body, "max_tokens").exists()
-            || !ck_core::registry::model_providers(model)
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case("claude"))
-        {
-            return body;
-        }
-        let max = ck_core::registry::registered_model(model, Some("claude"))
-            .and_then(|info| {
-                info.raw
-                    .get("max_completion_tokens")
-                    .and_then(serde_json::Value::as_i64)
-            })
-            .filter(|n| *n > 0)
-            .unwrap_or(DEFAULT_MAX_TOKENS);
-        rawjson::set_raw(&body, "max_tokens", &max.to_string())
+        default_max_tokens(body, || execute::max_tokens_for(&self.catalog, &self.base_model))
     }
 }
 
-/// `defaultModelMaxTokens`.
-const DEFAULT_MAX_TOKENS: i64 = 1024;
+/// Sets `limit` as `max_tokens` on a body without one; `limit` is resolved only then. Without
+/// a positive limit the body goes as the client sent it, and Anthropic answers a missing limit
+/// itself.
+fn default_max_tokens(body: String, limit: impl FnOnce() -> Option<u64>) -> String {
+    if !rawjson::valid(&body) || rawjson::get(&body, "max_tokens").exists() {
+        return body;
+    }
+    match limit().filter(|n| *n > 0) {
+        Some(max) => rawjson::set_raw(&body, "max_tokens", &max.to_string()),
+        None => body,
+    }
+}
 
 /// Fill `thinking.display: updates` for progress-display models with active thinking.
 fn cloak_thinking_display(body: String) -> String {
@@ -2374,7 +2385,7 @@ fn strip_attribution_system(body: &str) -> String {
 }
 
 #[cfg(test)]
-mod go_exec;
+pub(crate) mod go_exec;
 #[cfg(test)]
 mod go_unit;
 #[cfg(test)]

@@ -117,11 +117,22 @@ fn assert_inference_error(path: &str, status: u16, body: &str, request_id: Optio
         let id = value["request_id"].as_str().expect("local request_id");
         assert!(!id.is_empty());
         assert_eq!(Some(id), request_id.map(|v| v.to_str().unwrap()));
+    } else if path.starts_with("/v1beta/interactions") {
+        // The Interactions error names its code as a string and has no `status`.
+        let code = match status {
+            401 => "authentication",
+            413 => "payload_too_large",
+            501 => "unimplemented",
+            _ => "invalid_request",
+        };
+        assert_eq!(error["code"], code, "{body}");
+        assert!(error.get("status").is_none(), "{body}");
     } else if path.starts_with("/v1beta/") {
         assert_eq!(error["code"], status);
         let kind = match status {
             401 => "UNAUTHENTICATED",
             413 => "RESOURCE_EXHAUSTED",
+            501 => "UNIMPLEMENTED",
             _ => "INVALID_ARGUMENT",
         };
         assert_eq!(error["status"], kind);
@@ -135,6 +146,9 @@ fn assert_inference_error(path: &str, status: u16, body: &str, request_id: Optio
         assert_eq!(error.get("param"), Some(&Value::Null));
         let code = error.get("code").expect("nullable code is required");
         assert!(code.is_null() || code.is_string(), "{body}");
+        if status == 501 {
+            assert_eq!(code, "unsupported_endpoint", "{body}");
+        }
     }
 }
 
@@ -201,8 +215,12 @@ async fn body_limit_answers_match_go() {
             case["content_type"].as_str().unwrap().to_owned(),
             normalize(case["response"].as_str().unwrap()),
         );
+        // The routes without a codec refuse every authenticated request with 501 (Q8), before
+        // reading the body.
+        let refused = matches!(case["path"].as_str(), Some("/v1/completions" | "/v1beta/interactions"));
+        let want_status = if refused && want.0 == 413 { 501 } else { want.0 };
         if uses_inference_error(case) {
-            assert_eq!(status, want.0, "{name}: {body}");
+            assert_eq!(status, want_status, "{name}: {body}");
             assert!(got.1.starts_with("application/json"), "{name}: {}", got.1);
             assert_inference_error(case["path"].as_str().unwrap(), status, &body, request_id.as_ref());
         } else if got != want {
@@ -330,23 +348,32 @@ async fn local_failures_use_the_clients_error_shape() {
         "/v1beta/models/gemini-2.5-flash:generateContent",
         "/v1beta/interactions",
     ] {
+        // A request the route's codec accepts, so selection is what fails.
+        let unknown = match path {
+            "/v1/messages" => {
+                r#"{"model":"no-such-model-xyz","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#
+            }
+            p if p.starts_with("/v1beta/") => r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+            _ => r#"{"model":"no-such-model-xyz","messages":[{"role":"user","content":"hi"}]}"#,
+        };
         // (case, key, body, status)
         let rows: [(&str, bool, Body, u16); 4] = [
             ("no key", false, Body::empty(), 401),
             ("unreadable body", true, broken(), 400),
             ("invalid JSON", true, Body::from("{"), 400),
-            (
-                "unknown model",
-                true,
-                Body::from(r#"{"model":"no-such-model-xyz","messages":[],"input":"hi","contents":[]}"#),
-                400,
-            ),
+            ("unknown model", true, Body::from(unknown), 400),
         ];
         for (case, key, body, want) in rows {
+            // Q8: the route refuses every authenticated request without reading it.
+            let want = if path == "/v1beta/interactions" && key {
+                501
+            } else {
+                want
+            };
             let (status, request_id, text) = answer(&app, path, key, body).await;
             assert_eq!(status, want, "{path} {case}: {text}");
             assert_inference_error(path, status, &text, request_id.as_ref());
-            if case == "unknown model" && !path.starts_with("/v1beta/models/") {
+            if case == "unknown model" && !path.starts_with("/v1beta/") {
                 assert!(
                     text.contains("unknown provider for model no-such-model-xyz"),
                     "{path}: {text}"

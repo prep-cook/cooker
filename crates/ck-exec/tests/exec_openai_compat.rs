@@ -70,9 +70,9 @@ async fn attempt<I: RequestIngress>(
     let executor = executor();
     let attempt = exchange.attempt(&streams.store);
     let validated = fence(ingress, request, body, step, &executor.capability(&attempt)).expect("the relay accepts it");
-    let handle = exchange.request(validated);
+    let mut handle = exchange.request(validated);
     (
-        pipeline::start(&executor, &attempt, &handle, request, response).await,
+        pipeline::start(&executor, &attempt, &mut handle, request, response).await,
         id,
     )
 }
@@ -524,8 +524,8 @@ async fn a_responses_client_sees_its_tools_echoed() {
     let executor = executor();
     let attempt = exchange.attempt(&streams.store);
     let validated = fence(&mut ingress, &mut request, body, 64, &executor.capability(&attempt)).unwrap();
-    let handle = exchange.request(validated);
-    let started = pipeline::start(&executor, &attempt, &handle, &mut request, response)
+    let mut handle = exchange.request(validated);
+    let started = pipeline::start(&executor, &attempt, &mut handle, &mut request, response)
         .await
         .unwrap();
     let sent = json_body(&upstream.captured()[0]);
@@ -533,7 +533,7 @@ async fn a_responses_client_sees_its_tools_echoed() {
     let (outcome, _, mut stream) = finish(&streams, started, id).await;
     outcome.unwrap();
     let mut egress = crate::support::responses_egress(&mut stream, Operation::Generate, BodyMode::Buffered).unwrap();
-    egress.echo(&mut stream, handle.validated.view()).unwrap();
+    egress.echo(&mut stream, handle.validated().view()).unwrap();
     let out: Value = serde_json::from_str(&deliver(egress, &mut stream, streams.reader(id)).await).unwrap();
     assert_eq!(out["tools"][0]["name"], "get", "{out}");
     assert!(out["tools"][0].get("function").is_none(), "{out}");
@@ -600,9 +600,9 @@ async fn the_selector_runs_relays_through_the_executor() {
     let validated = executors.fence(&attempt, &mut ingress, &mut request).unwrap();
     let response = streams.response(&request);
     let id = response.id();
-    let handle = exchange.request(validated);
+    let mut handle = exchange.request(validated);
     let started = executors
-        .start(&attempt, &handle, &mut request, response)
+        .start(&attempt, &mut handle, &mut request, response)
         .await
         .unwrap();
     finish(&streams, started, id).await.0.unwrap();

@@ -67,14 +67,14 @@ impl Execute for MetaExecutor {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<Ingress>, ExecError> {
         let enriched = self.ensure_auth(attempt.credential, attempt.cfg).await?;
-        let doc = request.validated.view().document;
+        let doc = request.validated().view().document;
         // Go tracks only the round trip of a streaming client's response.
         let packet_only = streaming(doc).map_err(encoding)?;
-        let upload = encode(&request.validated, streams.request, true)?;
+        let upload = encode(&request.validated(), streams.request, true)?;
         let body = shape(attempt, request, upload)?;
         let usage = request.client.usage;
         usage.request(Format::Codex, &body);
@@ -144,13 +144,13 @@ impl Execute for MetaExecutor {
     async fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<Ingress>, ExecError> {
         self.ensure_auth(attempt.credential, attempt.cfg).await?;
         let view = RequestView {
             operation: Operation::Generate,
-            ..request.validated.view()
+            ..request.validated().view()
         };
         let generate = RequestFence::default().end(view, &MetaCapability).map_err(encoding)?;
         let upload = encode(&generate, streams.request, false)?;
@@ -171,7 +171,7 @@ impl Execute for MetaExecutor {
     async fn compact(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Upstream<Ingress>, ExecError> {
         // Meta has no native compact; [`MetaCapability`] refuses it at the fence.
@@ -196,7 +196,7 @@ fn encode(
 /// true for generation, false for the body a count measures. The upload is the one body, edited
 /// in place.
 fn shape(attempt: &Attempt<'_>, request: &Request<'_>, upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
-    let document = request.validated.view().document;
+    let document = request.validated().view().document;
     let source = source(document).map_err(encoding)?;
     let mut body = crate::codex_upload::normalize(upload);
     gj::set_bool(&mut body, "store", false);

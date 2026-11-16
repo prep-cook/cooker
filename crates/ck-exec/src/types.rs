@@ -14,7 +14,7 @@ use ck_core::credential::Credential;
 use ck_core::exec::{Caller, ExecError, ResolvedModel, UsageSink};
 use ck_stream::{Store, Writer};
 use ck_translate::codec::event::Identity;
-use ck_translate::codec::{Capability, ResponseIngress, ValidatedRequest};
+use ck_translate::codec::{Capability, Fenced, OwnedRequest, ResponseIngress, ValidatedRequest};
 use futures_util::stream::BoxStream;
 use http::HeaderMap;
 
@@ -57,8 +57,8 @@ pub struct Client<'a> {
     /// Derived session (`ctx:v1:<sha256>`), set only when no explicit session exists.
     pub derived_session: Option<&'a str>,
     /// Request-side usage facts and upstream capture (contract §3, G4). An executor calls only
-    /// `request`, `upstream_model`, `claude_cache`, `round_trip_started`, `first_byte` and the
-    /// capture calls; response usage comes from the canonical stream, never `response_*`.
+    /// `request`, `upstream_model`, `claude_cache`, `delegated_executor`, `round_trip_started`,
+    /// `first_byte` and the capture calls; response usage comes from the canonical stream, never `response_*`.
     pub usage: &'a UsageSink,
     /// The client's request body as the server received it (contract G5). Only the Claude
     /// executor reads it, and only for an Anthropic request the OAuth cloak or the Claude
@@ -66,14 +66,77 @@ pub struct Client<'a> {
     pub original: &'a [u8],
 }
 
-/// The request handle an attempt executes. `validated` is this attempt's fence: the client
-/// request view re-fenced against the attempt's own destination (`RequestFence::end`), so
-/// request egress encodes only what that destination accepted. Its `view()` is also the
+/// The request handle an attempt executes. [`Request::validated`] is this attempt's fence: the
+/// client request view re-fenced against the attempt's own destination (`RequestFence::end`),
+/// so request egress encodes only what that destination accepted. Its `view()` is also the
 /// request view client response egress reads (the Responses echo of `tools`), which never
 /// authorizes encoding.
 pub struct Request<'a> {
-    pub validated: ValidatedRequest<'a>,
+    pub(crate) validated: Validated<'a>,
     pub client: Client<'a>,
+}
+
+// One per attempt on the stack; boxing `Fenced` would add an allocation per attempt.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Validated<'a> {
+    Borrowed(ValidatedRequest<'a>),
+    Owned(Fenced),
+    Released,
+}
+
+impl<'a> Request<'a> {
+    /// A request whose fenced view the caller keeps.
+    pub fn new(validated: ValidatedRequest<'a>, client: Client<'a>) -> Self {
+        Self {
+            validated: Validated::Borrowed(validated),
+            client,
+        }
+    }
+
+    /// A request that owns its fenced document, so the executor can [`Self::release`] it.
+    pub fn owned(fenced: Fenced, client: Client<'a>) -> Self {
+        Self {
+            validated: Validated::Owned(fenced),
+            client,
+        }
+    }
+
+    /// This attempt's fence.
+    ///
+    /// # Panics
+    ///
+    /// After [`Self::release`]: an executor releases the document only once it reads it no more.
+    pub fn validated(&self) -> ValidatedRequest<'_> {
+        match &self.validated {
+            Validated::Borrowed(validated) => *validated,
+            Validated::Owned(fenced) => fenced.validated(),
+            Validated::Released => panic!("the request document was released"),
+        }
+    }
+
+    /// Frees an owned request document. An executor calls it once the upload is encoded and
+    /// before it waits for the upstream, so a request waiting for its first byte holds no
+    /// decoded copy of itself (the request stream keeps the records).
+    pub fn release(&mut self) {
+        self.validated.release();
+    }
+
+    /// The owned request document, unless the executor released it.
+    pub fn into_request(self) -> Option<OwnedRequest> {
+        match self.validated {
+            Validated::Owned(fenced) => Some(fenced.into_request()),
+            Validated::Borrowed(_) | Validated::Released => None,
+        }
+    }
+}
+
+impl Validated<'_> {
+    /// [`Request::release`], callable while the request's client facts are borrowed.
+    pub(crate) fn release(&mut self) {
+        if matches!(self, Self::Owned(_)) {
+            *self = Self::Released;
+        }
+    }
 }
 
 /// The two streams one attempt writes.
@@ -132,7 +195,7 @@ pub trait Execute: Send + Sync {
     fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> impl Future<Output = Result<Upstream<Self::Ingress>, ExecError>> + Send;
 
@@ -142,7 +205,7 @@ pub trait Execute: Send + Sync {
     fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> impl Future<Output = Result<Counted<Self::Ingress>, ExecError>> + Send;
 
@@ -151,7 +214,7 @@ pub trait Execute: Send + Sync {
     fn compact(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> impl Future<Output = Result<Upstream<Self::Ingress>, ExecError>> + Send;
 }

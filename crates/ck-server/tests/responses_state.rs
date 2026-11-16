@@ -26,8 +26,8 @@ use ck_translate::anthropic::request::AnthropicCapability;
 use ck_translate::codec::chat::request::{ChatCapability, Egress as ChatEgress, read_request};
 use ck_translate::codec::event::{Direction, LocalId};
 use ck_translate::codec::{
-    self, BodyMode, ClientCapability, Operation, RequestEgress, RequestFence, RequestIngress, RequestView,
-    ValidatedRequest,
+    self, BodyMode, ClientCapability, Operation, OwnedRequest, RequestEgress, RequestFence, RequestIngress,
+    RequestView, ValidatedRequest,
 };
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
@@ -112,7 +112,7 @@ impl Arms for Fake {
     async fn start(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         upload: &mut Writer,
         response: Writer,
     ) -> Result<Started, ExecError> {
@@ -126,7 +126,7 @@ impl Arms for Fake {
                     destination: "chat",
                     upstream_stream: true,
                 }
-                .encode(&request.validated, upload)
+                .encode(&request.validated(), upload)
                 .unwrap();
                 let mut out = Vec::new();
                 while out.len() < lease.len() {
@@ -182,7 +182,7 @@ impl Execute for ChatUpstream<'_> {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<Self::Ingress>, ExecError> {
         if self.refused {
@@ -239,7 +239,7 @@ impl Execute for ChatUpstream<'_> {
     async fn count_tokens(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Counted<Self::Ingress>, ExecError> {
         unreachable!("generation only")
@@ -248,7 +248,7 @@ impl Execute for ChatUpstream<'_> {
     async fn compact(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Upstream<Self::Ingress>, ExecError> {
         unreachable!("generation only")
@@ -272,7 +272,7 @@ impl Execute for AnthropicUpstream {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<Self::Ingress>, ExecError> {
         if self.refused {
@@ -305,7 +305,7 @@ impl Execute for AnthropicUpstream {
     async fn count_tokens(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Counted<Self::Ingress>, ExecError> {
         unreachable!("generation only")
@@ -314,7 +314,7 @@ impl Execute for AnthropicUpstream {
     async fn compact(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Upstream<Self::Ingress>, ExecError> {
         unreachable!("generation only")
@@ -423,9 +423,9 @@ async fn send(fixture: &Fixture, fake: &Fake, ask: Ask) -> Answer {
     let (document, media) = expanded.unwrap_or((document, media));
     let codec = Codec {
         exchange,
-        view: RequestView {
-            document: &document,
-            media: &media,
+        request: OwnedRequest {
+            document,
+            media,
             operation: Operation::Generate,
         },
         request_id,
@@ -452,7 +452,7 @@ async fn send(fixture: &Fixture, fake: &Fake, ask: Ask) -> Answer {
     let trace = Trace::with_request_id(Some("trace".into()));
     let served = tokio::time::timeout(
         Duration::from_secs(5),
-        dispatch::run_exchange(&fixture.rt, fake, call, &trace, codec),
+        dispatch::run_exchange(&fixture.rt, fake, call, &trace, codec, None),
     )
     .await
     .expect("the request is decided");

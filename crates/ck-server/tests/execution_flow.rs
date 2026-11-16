@@ -70,7 +70,7 @@ impl Execute for Probe {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<response::Ingress>, ExecError> {
         let local = |_| ExecError::local(500, FailureScope::Request, "codec");
@@ -78,7 +78,7 @@ impl Execute for Probe {
             destination: "chat",
             upstream_stream: true,
         }
-        .encode(&request.validated, streams.request)
+        .encode(&request.validated(), streams.request)
         .map_err(local)?;
         self.uploads.lock().unwrap().push(lease_bytes(&upload));
         let attempt_number = self.uploads.lock().unwrap().len() as u64;
@@ -111,7 +111,7 @@ impl Execute for Probe {
     async fn count_tokens(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Counted<response::Ingress>, ExecError> {
         unreachable!("generation only")
@@ -120,7 +120,7 @@ impl Execute for Probe {
     async fn compact(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Upstream<response::Ingress>, ExecError> {
         unreachable!("generation only")
@@ -257,18 +257,18 @@ async fn start(fixture: &Fixture, probe: &Probe, exchange: &mut Exchange, fenced
     let store = &fixture.store;
     let attempt = fixture.attempt();
     loop {
-        let request = Request {
-            validated: RequestFence::default()
+        let mut request = Request::new(
+            RequestFence::default()
                 .end(fenced, &probe.capability(&attempt))
                 .unwrap(),
-            client: fixture.client(),
-        };
+            fixture.client(),
+        );
         let mut response = store.create_dependent(&exchange.request).unwrap();
         let streams = Streams {
             request: &mut exchange.request,
             response: &mut response,
         };
-        match probe.execute(&attempt, &request, streams).await {
+        match probe.execute(&attempt, &mut request, streams).await {
             Ok(upstream) => {
                 return Started {
                     status: upstream.status,

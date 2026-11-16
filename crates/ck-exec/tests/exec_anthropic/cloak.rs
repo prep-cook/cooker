@@ -321,9 +321,12 @@ async fn a_buffered_generation_the_cloak_may_shape_takes_the_contract_path() {
             .unwrap()
             .view();
         let validated = cloak.executors.refence(&attempt, view).unwrap();
-        let handle = cloak.exchange.request_with(validated, &bytes);
+        let mut handle = cloak.exchange.request_with(validated, &bytes);
         let response = cloak.streams.response(&request);
-        let started = cloak.executors.start(&attempt, &handle, &mut request, response).await;
+        let started = cloak
+            .executors
+            .start(&attempt, &mut handle, &mut request, response)
+            .await;
         assert!(started.is_err(), "the proxy refuses every connection");
         assert_eq!(recorder.0.lock().unwrap().len(), 1, "start sends the request");
     }

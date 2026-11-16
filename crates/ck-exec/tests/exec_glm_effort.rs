@@ -131,9 +131,15 @@ async fn chat_contract(
     let validated =
         fence(&mut ingress, &mut upload, &bytes, 1, &executor.capability(&attempt)).map_err(|e| e.to_string())?;
     let response = streams.response(&upload);
-    let started = pipeline::start(executor, &attempt, &exchange.request(validated), &mut upload, response)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let started = pipeline::start(
+        executor,
+        &attempt,
+        &mut exchange.request(validated),
+        &mut upload,
+        response,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
     started.producer.await.unwrap().map_err(|e| format!("{e:?}"))
 }
 
@@ -162,7 +168,7 @@ async fn messages_explicit_high_wins_over_disabled() {
             let started = pipeline::start(
                 &executor,
                 &attempt,
-                &exchange.request_with(validated, &bytes),
+                &mut exchange.request_with(validated, &bytes),
                 &mut upload,
                 response,
             )

@@ -19,7 +19,7 @@ mod validate;
 pub use apply::*;
 pub use providers::apply_provider;
 pub use summary::*;
-pub use validate::validate_config;
+pub use validate::{snap_level, validate_config};
 
 use ck_core::registry::{ModelInfo, ThinkingSupport};
 use serde_json::Value as Json;

@@ -51,12 +51,12 @@ impl Turns for CodexExecutor {
     async fn turn(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Turn<CodexIngress, TurnControl>, ExecError> {
         crate::codex_siwc::require_token(attempt.credential)?;
         let connection = connection(request)?;
-        let upload = encode(&request.validated, streams.request, true)?;
+        let upload = encode(&request.validated(), streams.request, true)?;
         let shape = Shape::new(attempt, request, &upload)?;
         let (view, settings) = shape.view();
         let shaped = shape.generate(&view, &settings, Call::Websocket, &self.replay)?;

@@ -487,9 +487,9 @@ async fn the_selector_runs_meta_through_the_executor() {
     );
     let response = streams.response(&request);
     let id = response.id();
-    let handle = exchange.request(validated);
+    let mut handle = exchange.request(validated);
     let started = executors
-        .start(&attempt, &handle, &mut request, response)
+        .start(&attempt, &mut handle, &mut request, response)
         .await
         .unwrap();
     let (outcome, published, _stream) = finish(&streams, started, id).await;

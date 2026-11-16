@@ -1415,7 +1415,11 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
                 text.to_owned()
             }
         };
-        let mut go_body = upstream["body"].as_str().unwrap().to_owned();
+        let mut go_body = super::go_exec::without_guessed_max_tokens(
+            source,
+            scenario["body"].as_str().unwrap().as_bytes(),
+            upstream["body"].as_str().unwrap(),
+        );
         if RELOCATES_API_KEY_SYSTEM.contains(&name) {
             let relocated = with_relocated_system(&go_body);
             assert_ne!(relocated, go_body, "{name}: Go kept no caller system text top-level");
@@ -2718,4 +2722,28 @@ async fn responses_compaction_capsules_expand() {
 pub(super) fn api_key_identity(ctx: &Ctx<'_>, req: &ExecRequest, count: bool) -> bool {
     let detection = detect::detect(&req.headers, &utf8(&req.original_body), count, &ctx.settings);
     !ctx.bearer && !ctx.cli_profile && !detection.confirmed && !ctx.wire_policy(detection.confirmed).0
+}
+
+/// The old route, which force-mapped aliases still take, invents no `max_tokens` (owner Q-H):
+/// only the `model-catalog` default or a registered limit fills a missing one.
+#[test]
+fn a_missing_max_tokens_takes_only_a_configured_limit() {
+    let without = r#"{"model":"m","messages":[]}"#;
+    let with = r#"{"model":"m","max_tokens":8,"messages":[]}"#;
+    let catalog = "model-catalog: [{match: m, overrides: {default-max-tokens: 4096}}]";
+    let other = "model-catalog: [{match: n, overrides: {default-max-tokens: 4096}}]";
+    // (body, config, sent max_tokens); the unit test installs no registry.
+    let rows = [
+        (without, catalog, Some(4096)),
+        (without, other, None),
+        (without, "", None),
+        (with, catalog, Some(8)),
+    ];
+    for (body, yaml, want) in rows {
+        let cfg = Config::parse(yaml).unwrap();
+        let catalog = ck_core::config::model_catalog::catalog(&cfg);
+        let got = default_max_tokens(body.to_owned(), || execute::max_tokens_for(&catalog, "m"));
+        let got: Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(got["max_tokens"].as_i64(), want, "{body} {yaml}");
+    }
 }

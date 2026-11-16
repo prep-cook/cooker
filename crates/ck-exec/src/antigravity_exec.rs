@@ -198,7 +198,7 @@ impl Execute for AntigravityExecutor {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<AntigravityIngress>, ExecError> {
         self.run(attempt, request, streams).await
@@ -207,7 +207,7 @@ impl Execute for AntigravityExecutor {
     async fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<AntigravityIngress>, ExecError> {
         self.run(attempt, request, streams).await.map(Counted::Upstream)
@@ -217,7 +217,7 @@ impl Execute for AntigravityExecutor {
     async fn compact(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<AntigravityIngress>, ExecError> {
         self.run(attempt, request, streams).await
@@ -233,7 +233,7 @@ impl AntigravityExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<AntigravityIngress>, ExecError> {
-        let view = request.validated.view();
+        let view = request.validated().view();
         let operation = view.operation;
         let protocol = Protocol::of(view.document).map_err(encoding)?;
         let client = &request.client;

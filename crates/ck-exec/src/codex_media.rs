@@ -102,7 +102,7 @@ impl CodexExecutor {
             settings: &settings,
             cache: crate::codex_shape::sessions_uuid(request.client.execution_session, request.client.derived_session),
         };
-        let document = request.validated.view().document;
+        let document = request.validated().view().document;
         let call = match Route::of(attempt).target(document, attempt.model).map_err(encoding)? {
             Target::Direct(route) => shape.direct(streams.request, media, route)?,
             Target::Tool(model) => shape.tool(streams.request, &model)?,
@@ -157,7 +157,7 @@ impl Shape<'_> {
     /// resolves to (`directOpenAIImageModel`) and the prompt cache key; an event stream when the
     /// client asked for one.
     fn direct(&self, owner: &mut ck_stream::Writer, media: Media, route: String) -> Result<ImageCall, ExecError> {
-        let document = self.request.validated.view().document;
+        let document = self.request.validated().view().document;
         let stream = media_exec::images_stream(document).map_err(encoding)?;
         let upload = utf8(media_exec::images_upload(
             self.request,
@@ -240,7 +240,7 @@ impl Shape<'_> {
     /// The payload rules, the last change to the body (868e137), as the codex executor, with the
     /// encoded upload as the original.
     fn rules(&self, model: &str, protocol: &str, original: &str, body: String) -> Result<String, ExecError> {
-        let requested = media_exec::requested_model(self.request.validated.view().document).map_err(encoding)?;
+        let requested = media_exec::requested_model(self.request.validated().view().document).map_err(encoding)?;
         let requested = match requested.trim() {
             "" => self.attempt.model.trim(),
             requested => requested,

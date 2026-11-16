@@ -202,6 +202,7 @@ pub trait Capability {
 
 /// Constructed only after complete syntax and destination capability validation.
 /// This token authorizes encoding, not network execution or authentication.
+#[derive(Clone, Copy)]
 pub struct ValidatedRequest<'a> {
     view: RequestView<'a>,
     destination: &'static str,
@@ -220,6 +221,55 @@ impl<'a> ValidatedRequest<'a> {
             return Err(Error::Destination);
         }
         Ok(self.view)
+    }
+}
+
+/// A request document an attempt owns: the client's, handed over by its request ingress, or
+/// one rebuilt from the exchange's request stream (`chat::request::read_request`).
+pub struct OwnedRequest {
+    pub document: document::Document,
+    pub media: media::Registry,
+    pub operation: Operation,
+}
+impl OwnedRequest {
+    pub fn view(&self) -> RequestView<'_> {
+        RequestView {
+            document: &self.document,
+            media: &self.media,
+            operation: self.operation,
+        }
+    }
+    /// Keeps this request with the destination `fence` validated its view for. Only a
+    /// [`ValidatedRequest`] names a destination, so the result is as fenced as the borrowed
+    /// one; on refusal the request comes back for another destination.
+    pub fn fence(
+        self,
+        fence: impl for<'v> FnOnce(RequestView<'v>) -> Result<ValidatedRequest<'v>>,
+    ) -> std::result::Result<Fenced, Box<(Error, Self)>> {
+        match fence(self.view()).map(|validated| validated.destination) {
+            Ok(destination) => Ok(Fenced {
+                request: self,
+                destination,
+            }),
+            Err(error) => Err(Box::new((error, self))),
+        }
+    }
+}
+
+/// An [`OwnedRequest`] validated for one destination: an owned [`ValidatedRequest`].
+pub struct Fenced {
+    request: OwnedRequest,
+    destination: &'static str,
+}
+impl Fenced {
+    pub fn validated(&self) -> ValidatedRequest<'_> {
+        ValidatedRequest {
+            view: self.request.view(),
+            destination: self.destination,
+        }
+    }
+    pub fn into_request(self) -> OwnedRequest {
+        self.request
     }
 }
 

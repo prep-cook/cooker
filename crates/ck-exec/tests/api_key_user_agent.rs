@@ -78,9 +78,9 @@ async fn check(provider: &str) {
                 .unwrap();
                 ingress.advance(&mut writer, &req.body).unwrap();
                 let validated = executors.fence(&attempt, &mut ingress, &mut writer).unwrap();
-                let request = exchange.request_with(validated, &req.body);
+                let mut request = exchange.request_with(validated, &req.body);
                 let error = executors
-                    .start(&attempt, &request, &mut writer, response)
+                    .start(&attempt, &mut request, &mut writer, response)
                     .await
                     .err()
                     .unwrap();

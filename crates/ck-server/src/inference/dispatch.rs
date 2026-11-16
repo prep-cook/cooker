@@ -25,6 +25,7 @@ use crate::scheduling::scheduler::{Policy, canonical_model};
 use crate::scheduling::{classify, lcp};
 
 mod attempt;
+pub mod exchange;
 
 pub(crate) use attempt::stored;
 use attempt::{Arm, Ran};
@@ -543,17 +544,13 @@ where
     });
     // Upstream headers and the trace ID go on a rendered response; once a keep-alive
     // committed the headers they are lost, as in Go.
-    let traced = {
-        let (trace, rt) = (trace.clone(), rt.clone());
-        move |response, upstream| traced(&rt, &trace, response, upstream)
-    };
     let Some(interval) = interval else {
         let (result, upstream) = run.await;
-        return traced(render(result).await, upstream);
+        return traced(rt, &trace, render(result).await, upstream);
     };
     tokio::select! {
         biased;
-        (result, upstream) = &mut run => return traced(render(result).await, upstream),
+        (result, upstream) = &mut run => return traced(rt, &trace, render(result).await, upstream),
         () = tokio::time::sleep(interval) => {}
     }
     // Go's handlers stop the keep-alive as soon as Execute returns: no beats while the
@@ -610,18 +607,13 @@ where
 /// Serves a media request its route decoded into `codec` (E-PLAN §2.3). Nothing reaches the
 /// client before commitment: no keep-alive and no bootstrap retry rounds. A contract-arm answer
 /// is the client's response as it committed; `render` answers an old-arm result or a failure.
-pub async fn serve_exchange<F, Fut>(
-    rt: &Arc<Runtime>,
-    call: Call,
-    codec: Codec<'_>,
-    render: F,
-) -> axum::response::Response
+pub async fn serve_exchange<F, Fut>(rt: &Arc<Runtime>, call: Call, codec: Codec, render: F) -> axum::response::Response
 where
     F: FnOnce(Result<Done, Failure>) -> Fut,
     Fut: std::future::Future<Output = axum::response::Response>,
 {
     let trace = Trace::with_request_id(crate::observability::api::current_request_id());
-    let result = match run_exchange(rt, &rt.executors, call, &trace, codec).await {
+    let result = match run_exchange(rt, &rt.executors, call, &trace, codec, None).await {
         Ok(Served::Committed(response)) => return traced(rt, &trace, response, None),
         Ok(Served::Old(done)) => Ok(done),
         Err(error) => Err(error.failure),
@@ -672,6 +664,18 @@ enum Upstream {
     Error(HeaderMap),
 }
 
+/// The Kimi request proof among filtered upstream headers, which reaches the client even
+/// without header passthrough.
+fn kimi_proof(filtered: &HeaderMap) -> HeaderMap {
+    let mut proof = HeaderMap::new();
+    for name in ["msh-request-timestamp", "msh-request-signature"] {
+        for value in filtered.get_all(name) {
+            proof.append(name, value.clone());
+        }
+    }
+    proof
+}
+
 /// An error contributes only its [`ExecError::addon`] (Go `executionErrorMessage` reads
 /// `Headers()`); speech errors, like most, carry none.
 ///
@@ -687,13 +691,7 @@ fn upstream_headers(cfg: &Config, result: &Result<Done, Failure>, kimi: bool) ->
             if passthrough {
                 return Some(Upstream::Success(filtered));
             }
-            let mut proof = HeaderMap::new();
-            for name in ["msh-request-timestamp", "msh-request-signature"] {
-                for value in filtered.get_all(name) {
-                    proof.append(name, value.clone());
-                }
-            }
-            Some(Upstream::Success(proof))
+            Some(Upstream::Success(kimi_proof(&filtered)))
         }
         Err(Failure::Exec(error)) if passthrough && !error.direct => {
             error.addon.as_deref().cloned().map(Upstream::Error)
@@ -1066,16 +1064,18 @@ pub enum Served {
 /// [`run`] for a request its route decoded into `codec`. Each candidate takes the contract
 /// arm through `arms` or the old arm (D2-PLAN §3.2, §4); both share selection, retry rounds,
 /// the credits fallback and one usage `Facts`.
+/// `scope` is a model router's provider scope.
 pub async fn run_exchange<X: Arms>(
     rt: &Arc<Runtime>,
     arms: &X,
     call: Call,
     trace: &Trace,
-    codec: Codec<'_>,
+    codec: Codec,
+    scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
 ) -> Result<Served, RunError> {
     let resolved = route(rt, &rt.registry(), &call)?;
     let mut arm = Arm::new(arms, codec);
-    run_loop(rt, call, trace, resolved, None, Some(&mut arm)).await
+    run_loop(rt, call, trace, resolved, scope, Some(&mut arm)).await
 }
 
 /// [`run`] for resolved providers and model.
@@ -1100,7 +1100,7 @@ async fn run_loop<X: Arms>(
     trace: &Trace,
     (providers, model): (Vec<String>, String),
     scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
-    mut arm: Option<&mut Arm<'_, '_, X>>,
+    mut arm: Option<&mut Arm<'_, X>>,
 ) -> Result<Served, RunError> {
     let (cfg, policy) = rt.request_snapshot();
     let registry = rt.registry();
@@ -1437,7 +1437,7 @@ impl Credits<'_> {
         trace: &Trace,
         request: &ExecRequest,
         usage: Option<&Arc<crate::observability::usage_record::Facts>>,
-        mut arm: Option<&mut Arm<'_, '_, X>>,
+        mut arm: Option<&mut Arm<'_, X>>,
         error: RunError,
     ) -> Result<Served, RunError> {
         // Go's ExecuteCount has no credits fallback; Execute and ExecuteStream do.
@@ -1541,7 +1541,7 @@ async fn attempt<X: Arms>(
     trace: &Trace,
     request: &ExecRequest,
     usage: Option<&Arc<crate::observability::usage_record::Facts>>,
-    mut arm: Option<&mut Arm<'_, '_, X>>,
+    mut arm: Option<&mut Arm<'_, X>>,
     mut lease: Lease,
     target: Target<'_>,
 ) -> Attempt {
@@ -1570,10 +1570,26 @@ async fn attempt<X: Arms>(
         if let Some(on_selected) = call.on_selected() {
             on_selected(&lease.credential);
         }
+        // ponytail: a force-mapped alias takes the old arm once it passed admission and its
+        // fence, because only the old arm rewrites the response model to the client's alias;
+        // the contract arm needs the alias in its response egress first.
+        let forced_alias = target.alias.force_mapping && !target.alias.original_alias.is_empty();
         let fault = 'arm: {
             let ran = match arm.as_deref_mut() {
                 Some(arm) => loop {
-                    let ran = attempt::run(arm, rt, cfg, call, trace, &req, usage, &mut lease, upstream).await;
+                    let ran = attempt::run(
+                        arm,
+                        rt,
+                        cfg,
+                        call,
+                        trace,
+                        &req,
+                        usage,
+                        &mut lease,
+                        upstream,
+                        forced_alias,
+                    )
+                    .await;
                     // Go `tryRefreshAfterUnauthorized`, once per credential, after the failed
                     // attempt was settled and discarded.
                     if let Ran::Failed(fault) = &ran
@@ -1675,7 +1691,7 @@ async fn attempt<X: Arms>(
                 Ok(response) => match finish(call, response).await {
                     Ok(done) => {
                         let done = track_usage(done, tracker.take());
-                        let done = if target.alias.force_mapping && !target.alias.original_alias.is_empty() {
+                        let done = if forced_alias {
                             rewrite_model(done, &target.alias.original_alias)
                         } else {
                             done

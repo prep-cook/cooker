@@ -27,11 +27,9 @@ use ck_core::exec::{ExecError, ExecRequest, FailureScope};
 use ck_exec::pipeline::{Producer, Started};
 use ck_exec::types::{Attempt, Client, Request};
 use ck_stream::{Terminal, Writer};
-use ck_translate::codec::document::Document;
 use ck_translate::codec::event::{Direction, Identity, LocalId};
-use ck_translate::codec::media::Registry;
 use ck_translate::codec::provenance::{self, Admission};
-use ck_translate::codec::{self, RequestView, ValidatedRequest};
+use ck_translate::codec::{self, OwnedRequest, RequestView, ValidatedRequest};
 use futures_util::FutureExt;
 use tokio::sync::oneshot;
 
@@ -55,7 +53,7 @@ pub trait Arms: Send + Sync {
     fn start(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         upload: &mut Writer,
         response: Writer,
     ) -> impl Future<Output = Result<Started, ExecError>> + Send;
@@ -73,7 +71,7 @@ impl Arms for ck_exec::Executors {
     fn start(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         upload: &mut Writer,
         response: Writer,
     ) -> impl Future<Output = Result<Started, ExecError>> + Send {
@@ -82,30 +80,35 @@ impl Arms for ck_exec::Executors {
 }
 
 /// A client request its route decoded with the request ingress: the exchange and the
-/// client's request view, closed against the `"client"` capability (contract G8).
-pub struct Codec<'v> {
+/// client's request document, closed against the `"client"` capability (contract G8).
+pub struct Codec {
     pub exchange: Exchange,
-    pub view: RequestView<'v>,
+    /// The document the ingress closed. The first attempt takes it; an attempt whose executor
+    /// released it leaves the next one to rebuild it from the request stream.
+    pub request: OwnedRequest,
     /// The exchange's codec request id; every attempt's identity carries it (G1).
     pub request_id: LocalId,
 }
 
 /// The exchange across the selection loop. It leaves at commitment.
-pub(super) struct Arm<'v, 'x, X> {
+pub(super) struct Arm<'x, X> {
     arms: &'x X,
     exchange: Option<Exchange>,
-    view: RequestView<'v>,
+    /// The client's request document while no attempt holds or released it.
+    request: Option<OwnedRequest>,
+    operation: codec::Operation,
     request_id: LocalId,
     /// Attempts started so far; the next one is numbered one higher.
     started: u64,
 }
 
-impl<'v, 'x, X: Arms> Arm<'v, 'x, X> {
-    pub(super) fn new(arms: &'x X, codec: Codec<'v>) -> Self {
+impl<'x, X: Arms> Arm<'x, X> {
+    pub(super) fn new(arms: &'x X, codec: Codec) -> Self {
         Self {
             arms,
+            operation: codec.request.operation,
             exchange: Some(codec.exchange),
-            view: codec.view,
+            request: Some(codec.request),
             request_id: codec.request_id,
             started: 0,
         }
@@ -130,7 +133,7 @@ pub(super) enum Ran {
 /// unless it committed, settles and discards it before returning.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run<X: Arms>(
-    arm: &mut Arm<'_, '_, X>,
+    arm: &mut Arm<'_, X>,
     rt: &Arc<Runtime>,
     cfg: &Config,
     call: &Call,
@@ -139,6 +142,7 @@ pub(super) async fn run<X: Arms>(
     usage: Option<&Arc<Facts>>,
     lease: &mut Lease,
     upstream: &str,
+    old_only: bool,
 ) -> Ran {
     let store = match rt.streams().store() {
         Ok(store) => store,
@@ -168,46 +172,70 @@ pub(super) async fn run<X: Arms>(
         provider: &credential.provider,
         credential: &auth_index,
     };
-    let admission = match provenance::admit(arm.view.document, producer) {
+    // The client's document, or, once an attempt's executor released it, the same document
+    // rebuilt from the request stream as resume does.
+    let client = match arm.request.take() {
+        Some(client) => client,
+        None => match arm
+            .exchange
+            .as_mut()
+            .map(|exchange| rebuild(&store, exchange, arm.operation))
+        {
+            Some(Ok(client)) => client,
+            Some(Err(error)) => return stopped(arm.exchange.as_mut(), error).await,
+            None => return Ran::Stop(fault(defect())),
+        },
+    };
+    let admission = match provenance::admit(&client.document, producer) {
         Ok(admission) => admission,
         Err(_) => return Ran::Stop(fault(defect())),
     };
     let destination = arm.arms.destination(&attempt);
     if admission == Admission::Refuse {
+        arm.request = Some(client);
         let destination = destination.unwrap_or("old arm");
         return Ran::Skip(skip(&attempt, trace, destination, Refusal::ForeignCompaction));
     }
     let withheld = admission == Admission::Drop;
     let Some(destination) = destination else {
+        arm.request = Some(client);
         return old_arm(&attempt, trace, withheld);
     };
-    // The withheld view is rebuilt from the request stream, as resume does, so the exchange's
-    // view stays whole for the next attempt.
-    let own;
-    let view = if withheld {
+    // The withheld document is rebuilt from the request stream and edited for this attempt
+    // only, so the client's stays whole for the next one.
+    let (own, kept) = if withheld {
         let Some(exchange) = arm.exchange.as_mut() else {
             return Ran::Stop(fault(defect()));
         };
-        own = match withhold(&store, exchange, producer) {
-            Ok(own) => own,
-            Err(error) => return stopped(Some(exchange), error).await,
-        };
-        RequestView {
-            document: &own.0,
-            media: &own.1,
-            operation: arm.view.operation,
+        match withhold(&store, exchange, arm.operation, producer) {
+            Ok(own) => (own, Some(client)),
+            Err(error) => {
+                arm.request = Some(client);
+                return stopped(arm.exchange.as_mut(), error).await;
+            }
         }
     } else {
-        arm.view
+        (client, None)
     };
-    let validated = match arm.arms.refence(&attempt, view) {
-        Ok(validated) => validated,
-        Err(codec::Error::Destination) => return old_arm(&attempt, trace, withheld),
-        Err(error @ (codec::Error::Unsupported | codec::Error::Schema | codec::Error::MaxTokensRequired)) => {
-            return Ran::Skip(skip(&attempt, trace, destination, Refusal::Fence(error)));
+    let fenced = match own.fence(|view| arm.arms.refence(&attempt, view)) {
+        Ok(fenced) => fenced,
+        Err(refused) => {
+            let (error, own) = *refused;
+            arm.request = kept.or(Some(own));
+            return match error {
+                codec::Error::Destination => old_arm(&attempt, trace, withheld),
+                error @ (codec::Error::Unsupported | codec::Error::Schema | codec::Error::MaxTokensRequired) => {
+                    Ran::Skip(skip(&attempt, trace, destination, Refusal::Fence(error)))
+                }
+                error => stopped(arm.exchange.as_mut(), error).await,
+            };
         }
-        Err(error) => return stopped(arm.exchange.as_mut(), error).await,
     };
+    if old_only {
+        // The candidate passed admission and its fence; only the old arm serves it.
+        arm.request = kept.or_else(|| Some(fenced.into_request()));
+        return old_arm(&attempt, trace, withheld);
+    }
     if withheld {
         log_withheld(&attempt, trace);
     }
@@ -243,9 +271,9 @@ pub(super) async fn run<X: Arms>(
         Some(sink) => sink.clone().with_capture(req.capture().clone()),
         None => req.usage.clone(),
     };
-    let request = Request {
-        validated,
-        client: Client {
+    let mut request = Request::owned(
+        fenced,
+        Client {
             caller: &call.caller,
             headers: &call.headers,
             route: &call.request_path,
@@ -260,12 +288,19 @@ pub(super) async fn run<X: Arms>(
             // envelope to unwrap (D2-6k cut, owner 2026-11-15).
             original: &call.body,
         },
-    };
+    );
+    // The client's document: the one this attempt edited is the withheld copy.
+    let shown = kept
+        .as_ref()
+        .map_or_else(|| request.validated().view(), OwnedRequest::view);
+    let egress = egress::prepare(&exchange, &response, identity, shown);
     lease.redispatch();
     let started = arm
         .arms
-        .start(&attempt, &request, &mut exchange.request, response)
+        .start(&attempt, &mut request, &mut exchange.request, response)
         .await;
+    // A document the executor kept serves the next attempt, unless this one's was withheld.
+    arm.request = kept.or_else(|| request.into_request());
     let Started {
         headers,
         stream,
@@ -290,8 +325,10 @@ pub(super) async fn run<X: Arms>(
     }
     if respond::passthrough_headers(cfg) {
         sent.extend(respond::filter_upstream_headers(&headers));
+    } else if ck_exec::kimi::PROVIDERS.contains(&lease.credential.provider.as_str()) {
+        sent.extend(super::kimi_proof(&respond::filter_upstream_headers(&headers)));
     }
-    match egress::deliver(rt.streams(), exchange, &stream, identity, arm.view, sent).await {
+    match egress::deliver(rt.streams(), exchange, &stream, egress, sent).await {
         Ok(response) => Ran::Committed(Box::new(Committed {
             response,
             done: settlement.done,
@@ -458,17 +495,31 @@ async fn stopped(exchange: Option<&mut Exchange>, error: codec::Error) -> Ran {
     }
 }
 
-/// The request view without the reasoning another account produced, rebuilt from the
-/// exchange's request stream: the view every attempt shares is that stream's document.
+/// The request document rebuilt from the exchange's request stream (contract §2).
+fn rebuild(
+    store: &ck_stream::Store,
+    exchange: &mut Exchange,
+    operation: codec::Operation,
+) -> codec::Result<OwnedRequest> {
+    let mut records = store.reader(exchange.request.id(), 0)?;
+    let (document, media) = codec::chat::request::read_request(&mut exchange.request, &mut records)?;
+    Ok(OwnedRequest {
+        document,
+        media,
+        operation,
+    })
+}
+
+/// The request document without the reasoning another account produced, rebuilt for one attempt.
 fn withhold(
     store: &ck_stream::Store,
     exchange: &mut Exchange,
+    operation: codec::Operation,
     producer: provenance::Producer<'_>,
-) -> codec::Result<(Document, Registry)> {
-    let mut records = store.reader(exchange.request.id(), 0)?;
-    let (mut document, media) = codec::chat::request::read_request(&mut exchange.request, &mut records)?;
-    provenance::drop_foreign(&mut exchange.request, &mut document, producer)?;
-    Ok((document, media))
+) -> codec::Result<OwnedRequest> {
+    let mut own = rebuild(store, exchange, operation)?;
+    provenance::drop_foreign(&mut exchange.request, &mut own.document, producer)?;
+    Ok(own)
 }
 
 /// Why a candidate is skipped before anything is sent.

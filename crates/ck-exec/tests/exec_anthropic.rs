@@ -137,10 +137,10 @@ impl Fixture {
         }
         let attempt = self.exchange.attempt(&self.streams.store);
         let validated = self.executors.fence(&attempt, ingress, request).unwrap();
-        let handle = self.exchange.request_with(validated, body);
+        let mut handle = self.exchange.request_with(validated, body);
         let response = self.streams.response(request);
         let id = response.id();
-        (self.executors.start(&attempt, &handle, request, response).await, id)
+        (self.executors.start(&attempt, &mut handle, request, response).await, id)
     }
 
     /// An Anthropic client request run to its upstream answer.
@@ -531,7 +531,8 @@ async fn a_request_without_max_tokens_needs_a_configured_default() {
         // An explicit client limit never needs a default, and other refusals keep their kind.
         (CATALOG, "claude-opus-4-7", json!({"max_tokens": 64}), "accepted"),
         ("", SONNET, json!({"max_completion_tokens": 64}), "accepted"),
-        ("", SONNET, json!({"max_tokens": 0}), "schema"),
+        // An explicit zero pre-warms Anthropic's prompt cache.
+        ("", SONNET, json!({"max_tokens": 0}), "accepted"),
         ("", SONNET, json!({"max_tokens": 64, "n": 2}), "unsupported"),
         ("", SONNET, json!({"max_completion_tokens": 64, "n": 2}), "unsupported"),
     ];

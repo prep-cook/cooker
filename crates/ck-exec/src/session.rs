@@ -87,7 +87,7 @@ pub trait Turns: Execute {
     fn turn(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> impl Future<Output = Result<Turn<Self::Ingress, Self::Cancel>, ExecError>> + Send;
 }

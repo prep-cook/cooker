@@ -166,10 +166,10 @@ impl Execute for OpenAICompatExecutor {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<RelayIngress>, ExecError> {
-        if let Operation::Media(media) = request.validated.view().operation {
+        if let Operation::Media(media) = request.validated().view().operation {
             return crate::openai_compat_media::images(attempt, request, streams, self.route(attempt)?, media).await;
         }
         let upstream = chat(attempt, request, streams, self.route(attempt)?).await?;
@@ -184,7 +184,7 @@ impl Execute for OpenAICompatExecutor {
     async fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<RelayIngress>, ExecError> {
         Ok(Counted::Local {
@@ -195,7 +195,7 @@ impl Execute for OpenAICompatExecutor {
     async fn compact(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<RelayIngress>, ExecError> {
         let route = self.route(attempt)?;
@@ -203,7 +203,7 @@ impl Execute for OpenAICompatExecutor {
             destination: DESTINATION,
             upstream_stream: false,
         };
-        let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
+        let upload = copy(&egress.encode(&request.validated(), streams.request).map_err(encoding)?)?;
         let relay = Relay::new(attempt, request)?;
         let body = relay.compact(upload, route.compat.as_ref())?;
         let ingress = ResponsesIngress::new(
@@ -268,13 +268,13 @@ pub(crate) async fn chat(
     streams: Streams<'_>,
     route: Route,
 ) -> Result<Upstream<ChatIngress>, ExecError> {
-    let document = request.validated.view().document;
+    let document = request.validated().view().document;
     let stream = streaming(document).map_err(encoding)?;
     let egress = ChatEgress {
-        destination: request.validated.destination(),
+        destination: request.validated().destination(),
         upstream_stream: stream,
     };
-    let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
+    let upload = copy(&egress.encode(&request.validated(), streams.request).map_err(encoding)?)?;
     let relay = Relay::new(attempt, request)?;
     let body = relay.chat(upload, stream, route.compat.as_ref())?;
     let mode = if stream {
@@ -315,7 +315,7 @@ pub(crate) async fn chat(
 pub(crate) fn count(attempt: &Attempt<'_>, request: &Request<'_>, streams: Streams<'_>) -> Result<u64, ExecError> {
     let view = RequestView {
         operation: Operation::Generate,
-        ..request.validated.view()
+        ..request.validated().view()
     };
     let generate = RequestFence::default()
         .end(view, &ModelCapability::new(attempt))
@@ -425,7 +425,7 @@ impl<'r> Relay<'r> {
             attempt,
             request,
             base_model: parse_suffix(attempt.model).model_name.trim().to_owned(),
-            source: source(request.validated.view().document).map_err(encoding)?,
+            source: source(request.validated().view().document).map_err(encoding)?,
         })
     }
 

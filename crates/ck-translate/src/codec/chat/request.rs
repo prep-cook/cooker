@@ -99,6 +99,19 @@ struct PendingTree {
 }
 
 impl Ingress {
+    /// Hands over the document and media a successful [`RequestIngress::finish`] closed, and
+    /// drops the parser state, so only the request the attempts read stays in memory.
+    pub fn into_request(self) -> Result<crate::codec::OwnedRequest> {
+        if self.failed {
+            return Err(Error::Closed);
+        }
+        Ok(crate::codec::OwnedRequest {
+            document: self.document,
+            media: self.media,
+            operation: self.operation,
+        })
+    }
+
     pub fn new(
         owner: &mut Writer,
         store: &ck_stream::Store,

@@ -94,17 +94,17 @@ impl Execute for CodexExecutor {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<CodexIngress>, ExecError> {
-        match request.validated.view().operation {
+        match request.validated().view().operation {
             Operation::AlphaSearch => return self.alpha(attempt, request, streams).await,
             Operation::Media(media) => return self.serve_images(attempt, request, streams, media).await,
             _ => {}
         }
         crate::codex_siwc::require_token(attempt.credential)?;
-        let stream = streaming(request.validated.view().document).map_err(encoding)?;
-        let upload = encode(&request.validated, streams.request, true)?;
+        let stream = streaming(request.validated().view().document).map_err(encoding)?;
+        let upload = encode(&request.validated(), streams.request, true)?;
         let shaped = Shape::new(attempt, request, &upload)?;
         let call = if stream { Call::Stream } else { Call::NonStream };
         let scratch = streams.response.allocator();
@@ -134,12 +134,12 @@ impl Execute for CodexExecutor {
     async fn count_tokens(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Counted<CodexIngress>, ExecError> {
         let view = RequestView {
             operation: Operation::Generate,
-            ..request.validated.view()
+            ..request.validated().view()
         };
         let generate = RequestFence::default()
             .end(view, &CodexCapability::default())
@@ -163,11 +163,11 @@ impl Execute for CodexExecutor {
     async fn compact(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<CodexIngress>, ExecError> {
         crate::codex_siwc::require_token(attempt.credential)?;
-        let upload = encode(&request.validated, streams.request, false)?;
+        let upload = encode(&request.validated(), streams.request, false)?;
         let shaped = Shape::new(attempt, request, &upload)?;
         let ingress = Ingress::new(
             streams.response,
@@ -342,7 +342,7 @@ impl<'r> Shape<'r> {
             attempt,
             request,
             upload,
-            source: source(request.validated.view().document).map_err(encoding)?,
+            source: source(request.validated().view().document).map_err(encoding)?,
             requested,
         })
     }

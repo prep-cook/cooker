@@ -531,7 +531,7 @@ impl Turns for XaiExecutor {
     async fn turn(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Turn<XaiIngress, Cancel>, ExecError> {
         let session_id = request
@@ -547,7 +547,7 @@ impl Turns for XaiExecutor {
                 )
             })?;
         let credential = attempt.credential;
-        let upload = encode(&request.validated, true, streams.request)?;
+        let upload = encode(&request.validated(), true, streams.request)?;
         let call = Call::new(attempt, request)?;
         let mut prepared = call.shape(&upload, &self.replay, true, Format::Codex)?;
         call.report(&prepared.body);

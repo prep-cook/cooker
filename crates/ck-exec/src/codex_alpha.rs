@@ -46,7 +46,7 @@ impl CodexExecutor {
         let egress = search::Egress {
             destination: crate::codex_exec::DESTINATION,
         };
-        let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
+        let upload = copy(&egress.encode(&request.validated(), streams.request).map_err(encoding)?)?;
         let session = ck_wire::session::cpa_session_id(request.client.session);
         let view = View::for_request(attempt.credential, attempt.cfg).with_session(session);
         let settings = Settings::scoped(attempt.cfg, &view);

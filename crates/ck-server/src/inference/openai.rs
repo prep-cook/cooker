@@ -1,4 +1,4 @@
-//! OpenAI routes: Chat Completions, legacy Completions, Responses and compact
+//! OpenAI routes: Chat Completions, legacy Completions (refused), Responses and compact
 //! (sdk/api/handlers/openai/openai_handlers.go, openai_responses_handlers.go).
 
 use ck_core::gostr::GoStr;
@@ -12,8 +12,10 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use ck_core::exec::{Caller, ExecError, Operation};
 use ck_core::format::Format;
+use ck_translate::codec;
 use serde_json::Value;
 
+use crate::http::egress::{Framing, Output, Protocol};
 use crate::http::gojson::{self, Obj};
 use crate::http::respond::{self, Writer};
 use crate::inference::claude::{alt, peek, read_failed};
@@ -124,7 +126,7 @@ pub async fn chat_completions(
     limit: crate::http::body_limit::Limit,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let mut body = match body {
+    let body = match body {
         Ok(body) => match read_body(&headers, body, limit.0) {
             Ok(body) => body,
             Err(response) => return *response,
@@ -135,20 +137,8 @@ pub async fn chat_completions(
     if ck_wire::json::get(&body, "deferred").kind == ck_wire::json::Kind::True {
         return super::xai_deferred::create(&rt, caller, peer, matched, &uri, headers, body).await;
     }
-    let mut stream = fields.get("stream") == Some(&Value::Bool(true));
-    // Go converts Responses-shaped payloads sent to this route into Chat Completions.
-    // Like Go, the handler ignores the conversion's refusal of an emptied user turn and
-    // sends the converted body.
-    if responses_shaped(&body) {
-        let model = gojson::gjson_string(fields.get("model"));
-        if let Ok(converted) = ck_translate::responses_to_chat_completions_body(&model, &body, stream) {
-            body = Bytes::from(converted);
-            stream = peek(&body)
-                .get("stream")
-                .is_some_and(|v| v.as_bool() == Some(true) || truthy(v));
-        }
-    }
-    let model = gojson::gjson_string(peek(&body).get("model"));
+    let stream = fields.get("stream") == Some(&Value::Bool(true));
+    let model = gojson::gjson_string(fields.get("model"));
     let query = uri.query().unwrap_or_default().to_owned();
     let path = dispatch::route_path(matched.as_ref(), &uri);
     let req = Request {
@@ -159,16 +149,21 @@ pub async fn chat_completions(
         path,
     };
     let alt = alt(&req.query);
-    let keepalive = respond::keepalive(&rt.config());
-    dispatch::serve(
+    let output = Output {
+        protocol: Protocol::Chat,
+        operation: codec::Operation::Generate,
+        framing: if stream { Framing::Sse } else { Framing::Json },
+    };
+    dispatch::exchange::serve(
         &rt,
         call(req, Format::OpenAI, model, body, stream, alt),
-        move |result| async move {
+        output,
+        |result| async move {
             match result {
                 Err(failure) => errors::openai(&failure),
                 Ok(Done::Buffered { body, .. }) => respond::json(200, "application/json", body),
                 Ok(Done::Stream { first, rest, .. }) => {
-                    respond::sse(respond::stream(first, rest, ChatSse::new(false), keepalive))
+                    respond::sse(respond::stream(first, rest, ChatSse::default(), None))
                 }
             }
         },
@@ -176,243 +171,19 @@ pub async fn chat_completions(
     .await
 }
 
-/// gjson `Bool()` on a non-boolean value.
-fn truthy(v: &Value) -> bool {
-    match v {
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
-        Value::String(s) => matches!(s.as_str(), "1" | "t" | "T" | "TRUE" | "true" | "True"),
-        _ => false,
-    }
-}
-
-/// Go `shouldTreatAsResponsesFormat`.
-fn responses_shaped(body: &[u8]) -> bool {
-    #[derive(serde::Deserialize, Default)]
-    struct Keys {
-        messages: Option<serde::de::IgnoredAny>,
-        input: Option<serde::de::IgnoredAny>,
-        instructions: Option<serde::de::IgnoredAny>,
-    }
-    let keys: Keys = serde_json::from_slice(body).unwrap_or_default();
-    keys.messages.is_none() && (keys.input.is_some() || keys.instructions.is_some())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn completions(
-    State(rt): State<Arc<Runtime>>,
-    Extension(caller): Extension<Caller>,
-    peer: dispatch::Peer,
-    matched: Option<MatchedPath>,
-    original: OriginalUri,
-    headers: HeaderMap,
-    limit: crate::http::body_limit::Limit,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let body = match body {
-        Ok(body) => match read_body(&headers, body, limit.0) {
-            Ok(body) => body,
-            Err(response) => return *response,
-        },
-        Err(rejection) => return read_failed(&rejection),
-    };
-    let root: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let stream = root.get("stream") == Some(&Value::Bool(true));
-    let chat = completions_to_chat(&root);
-    let model = gojson::gjson_string(root.get("model"));
-    let req = Request {
-        caller,
-        peer: dispatch::peer(peer),
-        query: String::new(),
-        headers,
-        path: dispatch::route_path(matched.as_ref(), &original.0),
-    };
-    let keepalive = respond::keepalive(&rt.config());
-    dispatch::serve(
-        &rt,
-        call(req, Format::OpenAI, model, Bytes::from(chat), stream, None),
-        move |result| async move {
-            match result {
-                Err(failure) => errors::openai(&failure),
-                Ok(Done::Buffered { body, .. }) => {
-                    let chat: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                    respond::json(200, "application/json", chat_to_completions(&chat))
-                }
-                Ok(Done::Stream { first, rest, .. }) => {
-                    respond::sse(respond::stream(first, rest, ChatSse::new(true), keepalive))
-                }
-            }
-        },
-    )
-    .await
-}
-
-/// strconv.FormatFloat(f, 'f', -1, 64).
-fn go_float(v: &Value) -> String {
-    let f = match v {
-        Value::Number(n) => n.as_f64().unwrap_or(0.0),
-        Value::String(s) => s.trim().parse().unwrap_or(0.0),
-        Value::Bool(b) => f64::from(u8::from(*b)),
-        _ => 0.0,
-    };
-    let s = format!("{f}");
-    s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
-}
-
-/// gjson `Int()`.
-fn go_int(v: &Value) -> i64 {
-    match v {
-        Value::Number(n) => n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64),
-        Value::String(s) => s.trim().parse::<f64>().map(|f| f as i64).unwrap_or(0),
-        Value::Bool(b) => i64::from(*b),
-        _ => 0,
-    }
-}
-
-/// Go `convertCompletionsRequestToChatCompletions`.
-fn completions_to_chat(root: &Value) -> String {
-    let mut prompt = gojson::gjson_string(root.get("prompt"));
-    if prompt.is_empty() {
-        prompt = "Complete this:".into();
-    }
-    let model = gojson::gjson_string(root.get("model"));
-    let message = Obj::new()
-        .str("role", "user")
-        .raw("content", &gojson::sjson_string(&prompt))
-        .finish();
-    let mut out = Obj::new()
-        .raw("model", &gojson::sjson_string(&model))
-        .raw("messages", &format!("[{message}]"));
-    let get = |k: &str| root.get(k);
-    if let Some(v) = get("max_tokens") {
-        out = out.raw("max_tokens", &go_int(v).to_string());
-    }
-    for key in ["temperature", "top_p", "frequency_penalty", "presence_penalty"] {
-        if let Some(v) = get(key) {
-            out = out.raw(key, &go_float(v));
-        }
-    }
-    if let Some(v) = get("stop") {
-        out = out.raw("stop", &v.to_string());
-    }
-    for key in ["stream", "logprobs"] {
-        if let Some(v) = get(key) {
-            out = out.raw(key, &truthy(v).to_string());
-        }
-    }
-    if let Some(v) = get("top_logprobs") {
-        out = out.raw("top_logprobs", &go_int(v).to_string());
-    }
-    if let Some(v) = get("echo") {
-        out = out.raw("echo", &truthy(v).to_string());
-    }
-    out.finish()
-}
-
-fn completion_head(root: &Value) -> Obj {
-    Obj::new()
-        .raw("id", &gojson::sjson_string(&gojson::gjson_string(root.get("id"))))
-        .str("object", "text_completion")
-        .raw("created", &root.get("created").map_or(0, go_int).to_string())
-        .raw("model", &gojson::sjson_string(&gojson::gjson_string(root.get("model"))))
-}
-
-/// Go `convertChatCompletionsResponseToCompletions`.
-fn chat_to_completions(root: &Value) -> String {
-    let mut choices = Vec::new();
-    for choice in root.get("choices").and_then(Value::as_array).into_iter().flatten() {
-        let mut c = serde_json::Map::new();
-        c.insert("index".into(), choice.get("index").map_or(0, go_int).into());
-        let source = choice.get("message").or_else(|| choice.get("delta"));
-        if let Some(content) = source.and_then(|m| m.get("content")) {
-            c.insert("text".into(), gojson::gjson_string(Some(content)).into());
-        }
-        if let Some(reason) = choice.get("finish_reason") {
-            c.insert("finish_reason".into(), gojson::gjson_string(Some(reason)).into());
-        }
-        if let Some(logprobs) = choice.get("logprobs") {
-            c.insert("logprobs".into(), logprobs.clone());
-        }
-        choices.push(Value::Object(c));
-    }
-    let choices = if choices.is_empty() {
-        "[]".into()
-    } else {
-        gojson::sorted(&Value::Array(choices))
-    };
-    let mut out = completion_head(root).raw("choices", &choices);
-    if let Some(usage) = root.get("usage") {
-        out = out.raw("usage", &usage.to_string());
-    }
-    out.finish()
-}
-
-/// Go `convertChatCompletionsStreamChunkToCompletions`; `None` drops the chunk.
-fn chat_chunk_to_completions(root: &Value) -> Option<String> {
-    let chat_choices = root.get("choices").and_then(Value::as_array);
-    let has_content = chat_choices.into_iter().flatten().any(|choice| {
-        let text = choice
-            .get("delta")
-            .and_then(|d| d.get("content"))
-            .map(|c| gojson::gjson_string(Some(c)));
-        let reason = choice.get("finish_reason").map(|r| gojson::gjson_string(Some(r)));
-        text.is_some_and(|t| !t.is_empty()) || reason.is_some_and(|r| !r.is_empty() && r != "null")
-    });
-    if !has_content && root.get("usage").is_none() {
-        return None;
-    }
-    let mut choices = Vec::new();
-    for choice in chat_choices.into_iter().flatten() {
-        let mut c = serde_json::Map::new();
-        c.insert("index".into(), choice.get("index").map_or(0, go_int).into());
-        let text = choice
-            .get("delta")
-            .and_then(|d| d.get("content"))
-            .map(|c| gojson::gjson_string(Some(c)))
-            .unwrap_or_default();
-        c.insert("text".into(), text.into());
-        if let Some(reason) = choice
-            .get("finish_reason")
-            .map(|r| gojson::gjson_string(Some(r)))
-            .filter(|r| r != "null")
-        {
-            c.insert("finish_reason".into(), reason.into());
-        }
-        if let Some(logprobs) = choice.get("logprobs") {
-            c.insert("logprobs".into(), logprobs.clone());
-        }
-        choices.push(Value::Object(c));
-    }
-    let choices = if choices.is_empty() {
-        "[]".into()
-    } else {
-        gojson::sorted(&Value::Array(choices))
-    };
-    let mut out = completion_head(root).raw("choices", &choices);
-    if let Some(usage) = root.get("usage") {
-        out = out.raw("usage", &usage.to_string());
-    }
-    Some(out.finish())
+/// Q8: S1 has no legacy Completions codec, so the route refuses every request visibly.
+pub async fn completions() -> Response {
+    errors::not_implemented("The legacy Completions API is not supported. Use /v1/chat/completions.")
 }
 
 /// Chat Completions SSE: `data:` frames, an error frame, then `data: [DONE]`.
+#[derive(Default)]
 struct ChatSse {
-    completions: bool,
     /// A chunk reached the writer (Go's peek loop received one). Go answers a stream
     /// that closes before any with `[DONE]`: `CloseError` lives in `handleStreamResult`.
     delivered: bool,
     /// A written chunk carried a `finish_reason` (Go 97dd9eec `sawFinishReason`).
     finished: bool,
-}
-
-impl ChatSse {
-    fn new(completions: bool) -> Self {
-        ChatSse {
-            completions,
-            delivered: false,
-            finished: false,
-        }
-    }
 }
 
 /// Go `chunkHasFinishReason`: any choice with a non-null, non-empty `finish_reason`.
@@ -427,24 +198,9 @@ fn chunk_has_finish_reason(chunk: &[u8]) -> bool {
 
 impl Writer for ChatSse {
     fn chunk(&mut self, event: Bytes) -> Vec<Bytes> {
-        // Set before the legacy conversion: a first chunk it drops still started the stream.
         self.delivered = true;
-        if !self.completions {
-            self.finished |= chunk_has_finish_reason(&event);
-            return vec![respond::ensure_frame(event)];
-        }
-        let frame = respond::ensure_frame(event);
-        let Some(payload) = respond::data_payload(&frame) else {
-            return Vec::new();
-        };
-        let Ok(root) = serde_json::from_slice::<Value>(&payload) else {
-            return Vec::new();
-        };
-        let Some(converted) = chat_chunk_to_completions(&root) else {
-            return Vec::new();
-        };
-        self.finished |= chunk_has_finish_reason(converted.as_bytes());
-        vec![Bytes::from(format!("data: {converted}\n\n"))]
+        self.finished |= chunk_has_finish_reason(&event);
+        vec![respond::ensure_frame(event)]
     }
 
     fn error(&mut self, error: &ExecError) -> Vec<Bytes> {
@@ -1110,42 +866,6 @@ pub async fn compact(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn completions_request_conversion_matches_go() {
-        let root: Value = serde_json::from_str(
-            r#"{"model":"m","prompt":"hi <b>","max_tokens":5.7,"temperature":1,"top_p":0.25,"stop":["\n"],"stream":true,"echo":0}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            completions_to_chat(&root),
-            r#"{"model":"m","messages":[{"role":"user","content":"hi <b>"}],"max_tokens":5,"temperature":1,"top_p":0.25,"stop":["\n"],"stream":true,"echo":false}"#
-        );
-        let empty: Value = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
-        assert!(completions_to_chat(&empty).contains(r#""content":"Complete this:""#));
-    }
-
-    #[test]
-    fn completions_response_conversion_matches_go() {
-        let chat: Value = serde_json::from_str(
-            r#"{"id":"c1","created":7,"model":"m","choices":[{"index":0,"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"total_tokens":3}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            chat_to_completions(&chat),
-            r#"{"id":"c1","object":"text_completion","created":7,"model":"m","choices":[{"finish_reason":"stop","index":0,"text":"ok"}],"usage":{"total_tokens":3}}"#
-        );
-        let role_only: Value = serde_json::from_str(
-            r#"{"id":"c","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
-        )
-        .unwrap();
-        assert_eq!(chat_chunk_to_completions(&role_only), None);
-        let delta: Value = serde_json::from_str(r#"{"id":"c","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}"#).unwrap();
-        assert_eq!(
-            chat_chunk_to_completions(&delta).unwrap(),
-            r#"{"id":"c","object":"text_completion","created":1,"model":"m","choices":[{"finish_reason":"","index":0,"text":"x"}]}"#
-        );
-    }
 
     #[test]
     fn responses_framer_repairs_errors_and_requires_terminal_events() {

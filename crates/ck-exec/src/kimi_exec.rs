@@ -67,10 +67,10 @@ impl Execute for KimiExecutor {
     async fn execute(
         &self,
         attempt: &Attempt<'_>,
-        request: &Request<'_>,
+        request: &mut Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<RelayIngress>, ExecError> {
-        let document = request.validated.view().document;
+        let document = request.validated().view().document;
         let stream = streaming(document).map_err(encoding)?;
         let shape = Shape::new(attempt, request)?;
         let mode = if stream {
@@ -83,7 +83,7 @@ impl Execute for KimiExecutor {
                 destination: DESTINATION,
                 upstream_stream: stream,
             };
-            let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
+            let upload = copy(&egress.encode(&request.validated(), streams.request).map_err(encoding)?)?;
             let body = shape.responses(upload)?;
             let limit = kimi::RESPONSES_LINE_LIMIT as u64;
             let ingress = ResponsesIngress::new(streams.response, attempt.identity, Operation::Generate, mode, limit)
@@ -95,7 +95,7 @@ impl Execute for KimiExecutor {
                 destination: DESTINATION,
                 upstream_stream: stream,
             };
-            let upload = copy(&egress.encode(&request.validated, streams.request).map_err(encoding)?)?;
+            let upload = copy(&egress.encode(&request.validated(), streams.request).map_err(encoding)?)?;
             let body = shape.chat(upload, stream)?;
             let (store, identity, limit) = (attempt.store, attempt.identity, kimi::CHAT_LINE_LIMIT as u64);
             let ingress = ChatIngress::new(streams.response, store, identity, Operation::Generate, mode, limit)
@@ -125,7 +125,7 @@ impl Execute for KimiExecutor {
     async fn count_tokens(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Counted<RelayIngress>, ExecError> {
         // [`KimiCapability`] sends every count back to the old route at the fence.
@@ -135,7 +135,7 @@ impl Execute for KimiExecutor {
     async fn compact(
         &self,
         _attempt: &Attempt<'_>,
-        _request: &Request<'_>,
+        _request: &mut Request<'_>,
         _streams: Streams<'_>,
     ) -> Result<Upstream<RelayIngress>, ExecError> {
         // Kimi has no native compact; [`KimiCapability`] refuses it at the fence.
@@ -157,7 +157,7 @@ struct Shape<'r> {
 
 impl<'r> Shape<'r> {
     fn new(attempt: &'r Attempt<'r>, request: &'r Request<'r>) -> Result<Self, ExecError> {
-        let document = request.validated.view().document;
+        let document = request.validated().view().document;
         Ok(Self {
             attempt,
             request,
@@ -192,7 +192,7 @@ impl<'r> Shape<'r> {
     /// The old path's native Responses body (`execute_responses`), which forwarded the
     /// client's own body.
     fn responses(&self, mut upload: Vec<u8>) -> Result<Vec<u8>, ExecError> {
-        client_input(&mut upload, self.request.validated.view().document).map_err(encoding)?;
+        client_input(&mut upload, self.request.validated().view().document).map_err(encoding)?;
         let (baseline, requested) = self.baseline(&upload);
         // The egress wrote `stream` as the old path set it.
         let mut body = self.model(upload);

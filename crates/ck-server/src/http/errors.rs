@@ -17,8 +17,10 @@ pub(crate) fn local(request: &Request, status: u16, message: &str) -> Response {
 pub(crate) fn renderer(path: &str, headers: &HeaderMap) -> fn(u16, &str) -> Response {
     if anthropic_body_path(path) || (path.starts_with("/v1/models") && headers.contains_key("anthropic-version")) {
         anthropic
-    } else if path.starts_with("/v1beta/models") || path.starts_with("/v1beta/interactions") {
+    } else if path.starts_with("/v1beta/models") {
         gemini
+    } else if path.starts_with("/v1beta/interactions") {
+        interactions
     } else {
         |status, message| super::respond::gin_json(status, errors::openai_body(status, message))
     }
@@ -61,7 +63,40 @@ pub(crate) fn gemini_body(status: u16, text: &str) -> String {
         .and_then(|v| v.get("message"))
         .and_then(Value::as_str)
         .unwrap_or(text);
-    let kind = match status {
+    json!({"error": {"code": status, "message": message, "status": gemini_status(status)}}).to_string()
+}
+
+/// The Interactions API error: a `snake_case` string `code` from its own table, and no numeric
+/// code or `status` member. A status the table does not list falls back to its HTTP reason.
+pub(crate) fn interactions(status: u16, text: &str) -> Response {
+    let code = match status {
+        400 => "invalid_request".to_owned(),
+        401 => "authentication".to_owned(),
+        402 => "payment_required".to_owned(),
+        403 => "permission_denied".to_owned(),
+        404 => "not_found".to_owned(),
+        409 => "aborted".to_owned(),
+        416 => "out_of_range".to_owned(),
+        429 => "too_many_requests".to_owned(),
+        499 => "cancelled".to_owned(),
+        500 => "api_error".to_owned(),
+        501 => "unimplemented".to_owned(),
+        503 => "service_unavailable".to_owned(),
+        504 => "deadline_exceeded".to_owned(),
+        _ => axum::http::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|s| s.canonical_reason())
+            .unwrap_or("api_error")
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_"),
+    };
+    let body = json!({"error": {"code": code, "message": text}}).to_string();
+    super::respond::json(status, "application/json", body)
+}
+
+/// The Google API status name for an HTTP status.
+fn gemini_status(status: u16) -> &'static str {
+    match status {
         400 | 422 => "INVALID_ARGUMENT",
         401 => "UNAUTHENTICATED",
         402 | 413 | 429 => "RESOURCE_EXHAUSTED",
@@ -73,6 +108,5 @@ pub(crate) fn gemini_body(status: u16, text: &str) -> String {
         501 => "UNIMPLEMENTED",
         502 | 503 | 529 => "UNAVAILABLE",
         _ => "INTERNAL",
-    };
-    json!({"error": {"code": status, "message": message, "status": kind}}).to_string()
+    }
 }

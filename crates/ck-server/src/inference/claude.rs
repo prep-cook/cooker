@@ -10,8 +10,10 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use ck_core::exec::{Caller, ExecError, Operation};
 use ck_core::format::Format;
+use ck_translate::codec;
 use serde_json::Value;
 
+use crate::http::egress::{Framing, Output, Protocol};
 use crate::http::respond::{self, Writer};
 use crate::inference::dispatch::{self, Call, Done};
 use crate::{Runtime, http::gojson, inference::errors};
@@ -187,13 +189,20 @@ async fn handle(
         turn: None,
         media: None,
     };
-    let keepalive = respond::keepalive(&rt.config());
-    dispatch::serve(&rt, call, move |result| async move {
+    let output = Output {
+        protocol: Protocol::Anthropic,
+        operation: match operation {
+            Operation::CountTokens => codec::Operation::CountTokens,
+            _ => codec::Operation::Generate,
+        },
+        framing: if stream { Framing::Sse } else { Framing::Json },
+    };
+    dispatch::exchange::serve(&rt, call, output, |result| async move {
         match result {
             Err(failure) => errors::claude(&failure),
             Ok(Done::Buffered { body, .. }) => respond::json(200, "application/json", body),
             Ok(Done::Stream { first, rest, .. }) => {
-                respond::sse(respond::stream(first, rest, ClaudeSse::default(), keepalive))
+                respond::sse(respond::stream(first, rest, ClaudeSse::default(), None))
             }
         }
     })

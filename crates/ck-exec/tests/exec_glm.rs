@@ -95,7 +95,7 @@ async fn rejected_candidate(model: &str, body: Value, capable_next: bool) {
         let attempt = next.attempt(&streams.store);
         let validated = pipeline::refence(&executor, &attempt, initial.view()).unwrap();
         let response = streams.response(&upload);
-        let started = pipeline::start(&executor, &attempt, &next.request(validated), &mut upload, response)
+        let started = pipeline::start(&executor, &attempt, &mut next.request(validated), &mut upload, response)
             .await
             .unwrap();
         started.producer.await.unwrap().unwrap();
@@ -179,9 +179,15 @@ async fn glm_terminals_preserve_native_reason_and_known_usage() {
             let validated = fence(&mut ingress, &mut upload, &bytes, 1, &executor.capability(&attempt)).unwrap();
             let response = streams.response(&upload);
             let id = response.id();
-            let started = pipeline::start(&executor, &attempt, &exchange.request(validated), &mut upload, response)
-                .await
-                .unwrap();
+            let started = pipeline::start(
+                &executor,
+                &attempt,
+                &mut exchange.request(validated),
+                &mut upload,
+                response,
+            )
+            .await
+            .unwrap();
             assert_eq!(started.producer.await.unwrap().is_err(), failed);
             let published = streams.read_to_end(id).await;
             let terminal = if failed {

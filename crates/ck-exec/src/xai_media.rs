@@ -776,7 +776,7 @@ impl XaiExecutor {
                 };
                 // A deferred create reserves its place in the job table before anything is sent,
                 // as a video create does, so a full table sends nothing (E-Q5).
-                let deferred = media_exec::images_flag(request.validated.view().document, "deferred")
+                let deferred = media_exec::images_flag(request.validated().view().document, "deferred")
                     .map_err(xai_exec::encoding)?;
                 let slot = if deferred {
                     let slot = self.jobs.reserve(request.client.caller, JobKind::Image, call.binding());
@@ -838,7 +838,7 @@ impl XaiExecutor {
                     )
                     .await?;
                 let (content_type, length) = media_exec::entity(&upstream.headers);
-                let format = speech_format(request.validated.view().document).map_err(xai_exec::encoding)?;
+                let format = speech_format(request.validated().view().document).map_err(xai_exec::encoding)?;
                 let content_type = speech_type(content_type, &format);
                 let ingress = audio::Ingress::new(
                     streams.response,
@@ -1055,7 +1055,7 @@ impl MediaCall<'_> {
     fn binding(&self) -> JobBinding {
         JobBinding {
             credential: self.attempt.credential.id.clone(),
-            model: media_exec::requested_model(self.request.validated.view().document)
+            model: media_exec::requested_model(self.request.validated().view().document)
                 .ok()
                 .filter(|model| !model.is_empty())
                 .unwrap_or_else(|| self.attempt.model.trim().to_owned()),
@@ -1077,7 +1077,7 @@ impl MediaCall<'_> {
     fn rules(&self, from: &str, upload: Vec<u8>) -> Vec<u8> {
         let model = parse_suffix(self.attempt.model).model_name;
         let original = upload.clone();
-        let requested = media_exec::requested_model(self.request.validated.view().document).unwrap_or_default();
+        let requested = media_exec::requested_model(self.request.validated().view().document).unwrap_or_default();
         let requested = if requested.is_empty() {
             model.as_str()
         } else {

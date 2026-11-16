@@ -102,7 +102,7 @@ async fn attempt<I: RequestIngress>(
     let mut handle = exchange.request(validated);
     handle.client.execution_session = session;
     (
-        pipeline::start(executor, &attempt, &handle, request, response).await,
+        pipeline::start(executor, &attempt, &mut handle, request, response).await,
         id,
     )
 }
