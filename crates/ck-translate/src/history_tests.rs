@@ -54,7 +54,8 @@ impl Rig {
             | Source::Compaction
             | Source::SignedCompaction
             | Source::AntigravityClaude
-            | Source::AntigravityTwoCalls => {
+            | Source::AntigravityTwoCalls
+            | Source::AntigravitySharedCallId => {
                 let mut i = crate::responses::response::Ingress::new(&mut w, id, op, mode, limit).unwrap();
                 feed(&mut i, &mut w);
             }
@@ -189,6 +190,8 @@ enum Source {
     AntigravityClaude,
     /// Two Antigravity Claude calls whose signatures differ only in surrounding whitespace.
     AntigravityTwoCalls,
+    /// [`Source::AntigravityTwoCalls`] with both calls under one call ID.
+    AntigravitySharedCallId,
 }
 
 impl Source {
@@ -256,12 +259,8 @@ impl Source {
                 "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
             }),
             Self::AntigravityClaude => antigravity_answer(antigravity_items()),
-            Self::AntigravityTwoCalls => antigravity_answer(json!([
-                {"id": "rs_a", "type": "reasoning", "summary": [], "encrypted_content": CALL_SIG},
-                {"id": "fc_a", "type": "function_call", "call_id": "call_a", "name": "f", "arguments": "{}", "status": "completed"},
-                {"id": "rs_b", "type": "reasoning", "summary": [], "encrypted_content": CALL_SIG_TAB},
-                {"id": "fc_b", "type": "function_call", "call_id": "call_b", "name": "g", "arguments": "{}", "status": "completed"}
-            ])),
+            Self::AntigravityTwoCalls => antigravity_two_calls("call_b"),
+            Self::AntigravitySharedCallId => antigravity_two_calls("call_a"),
             Self::SignedCompaction => json!({
                 "id": "resp_c", "object": "response.compaction",
                 "output": [{"id": "cmp_1", "type": "compaction", "content": "sum", "signature": "SIG=="}],
@@ -319,13 +318,21 @@ const ANTIGRAVITY_B: Producer<'static> = Producer {
 /// an upstream may send it.
 const THINKING_SIG: &str = "RWhrS0Z3Z01FQUl5RVdOc1lYVmtaUzF6YjI1dVpYUXROQzAyR0FFPQ==";
 const CALL_SIG: &str = " EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=\n";
+/// The calls of [`Source::AntigravityTwoCalls`] upstream, in order, each with its own bytes.
+const TWO_CALLS: &str = r#"{"functionCall":{"args":{},"id":"call_a","name":"f"},"thoughtSignature":" EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=\n"},{"functionCall":{"args":{},"id":"call_b","name":"g"},"thoughtSignature":"\tEhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE= "}"#;
+/// The calls of [`Source::AntigravitySharedCallId`] upstream, in order, each with its own bytes.
+const SHARED_CALL_ID: &str = r#"{"functionCall":{"args":{},"id":"call_a","name":"f"},"thoughtSignature":" EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=\n"},{"functionCall":{"args":{},"id":"call_a","name":"g"},"thoughtSignature":"\tEhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE= "}"#;
 /// [`CALL_SIG`] with other padding: a second item holding the same signature differently.
 const CALL_SIG_TAB: &str = "\tEhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE= ";
 
 /// The client's first message, then the items of [`Source::AntigravityClaude`] replayed by the
 /// client itself, the call's result and an opaque item, each claiming proof.
 fn client_replay() -> Value {
-    let mut items = vec![json!({"role": "user", "content": "q"})];
+    let mut items = vec![json!({"role": "user", "content": [
+        {"type": "input_text", "text": "q"},
+        // A part kind kept whole.
+        {"type": "input_video", "video_url": "https://invalid.example/video", "_ck_proven": 7}
+    ]})];
     items.extend(antigravity_items().as_array().unwrap().iter().cloned());
     items.push(json!({"type": "function_call_output", "call_id": "call_1", "output": "done"}));
     // An item kind kept whole.
@@ -347,6 +354,16 @@ fn antigravity_items() -> Value {
         {"id": "rs_2", "type": "reasoning", "summary": [], "encrypted_content": CALL_SIG},
         {"id": "fc_1", "type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{\"a\":1}", "status": "completed"}
     ])
+}
+
+/// Two signed calls, the second under call ID `second`.
+fn antigravity_two_calls(second: &str) -> Value {
+    antigravity_answer(json!([
+        {"id": "rs_a", "type": "reasoning", "summary": [], "encrypted_content": CALL_SIG},
+        {"id": "fc_a", "type": "function_call", "call_id": "call_a", "name": "f", "arguments": "{}", "status": "completed"},
+        {"id": "rs_b", "type": "reasoning", "summary": [], "encrypted_content": CALL_SIG_TAB},
+        {"id": "fc_b", "type": "function_call", "call_id": second, "name": "g", "arguments": "{}", "status": "completed"}
+    ]))
 }
 
 fn antigravity_answer(output: Value) -> Value {
@@ -699,10 +716,17 @@ fn provider_members_reach_only_their_producer() {
             attempt: ANTIGRAVITY_A,
             to: To::Antigravity,
             admission: Admission::Keep,
-            present: &[
-                "\"thoughtSignature\":\" EhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE=\\n\"",
-                "\"thoughtSignature\":\"\\tEhkKFwgMEAIyEWNsYXVkZS1zb25uZXQtNC02GAE= \"",
-            ],
+            present: &[TWO_CALLS],
+            absent: &["_ck_"],
+        },
+        Row {
+            case: "Antigravity history at its own account: calls sharing a call ID keep their own bytes",
+            input: json!("q"),
+            turns: &[(Source::AntigravitySharedCallId, ANTIGRAVITY_A)],
+            attempt: ANTIGRAVITY_A,
+            to: To::Antigravity,
+            admission: Admission::Keep,
+            present: &[SHARED_CALL_ID],
             absent: &["_ck_"],
         },
         Row {

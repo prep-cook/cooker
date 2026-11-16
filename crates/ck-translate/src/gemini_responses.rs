@@ -587,19 +587,6 @@ fn with_field(item: &Res<'_>, path: &str, value: &[u8]) -> Res<'static> {
     owned(&raw)
 }
 
-/// By call ID, the `_ck_proven` identity of the reasoning item whose signature
-/// [`pair_reasoning_with_function_calls`] binds to each tool call.
-pub(crate) fn paired_call_items(items: &[Res<'_>]) -> HashMap<Vec<u8>, Vec<u8>> {
-    pair_reasoning_with_function_calls(items)
-        .iter()
-        .filter(|item| is_tool_call(item) && !trimmed(item, SIGNATURE_FIELD).is_empty())
-        .filter_map(|item| {
-            let proven = item.get(PROVEN);
-            proven.exists().then(|| (extract_call_id(item), proven.raw.to_vec()))
-        })
-        .collect()
-}
-
 /// `call` with the `_ck_proven` identity of `reasoning`, the item its signature comes from.
 fn with_source(mut call: Vec<u8>, reasoning: &Res<'_>) -> Vec<u8> {
     let proven = reasoning.get(PROVEN);
@@ -1837,6 +1824,18 @@ fn effective_role(role: &[u8]) -> Vec<u8> {
 
 /// ConvertOpenAIResponsesRequestToGemini.
 pub(crate) fn convert(model: &str, raw: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    convert_with_sources(model, raw).map(|(out, _)| out)
+}
+
+/// Per function call part, in output order, the `_ck_proven` identity of its signature's item.
+pub(crate) type CallSources = Vec<Option<Vec<u8>>>;
+
+/// [`convert`], with the `_ck_proven` identity of the reasoning item each function call part
+/// takes its signature from, one entry per part in output order (`None`: no proven item). The
+/// identity follows the call occurrence through the pairing, so calls sharing a call ID keep
+/// their own items.
+pub(crate) fn convert_with_sources(model: &str, raw: &[u8]) -> Result<(Vec<u8>, CallSources), crate::Error> {
+    let mut sources = vec![];
     let mut drops = UserTurnDrops::default();
     let mut native = sig::provider_from_model_name(model) == Provider::Gemini;
     let mut out = br#"{"contents":[]}"#.to_vec();
@@ -1886,7 +1885,7 @@ pub(crate) fn convert(model: &str, raw: &[u8]) -> Result<Vec<u8>, crate::Error> 
         native |= has_carrier;
         let items = normalize_tool_call_outputs(items);
         let items = pair_reasoning_with_function_calls(&items);
-        let mut contents = convert_items(&items, native, &forward, &mut system_parts, &mut drops);
+        let mut contents = convert_items(&items, native, &forward, &mut system_parts, &mut drops, &mut sources);
         contents = coalesce_model_contents(contents);
         contents = merge_adjacent_user_contents(contents);
         gj::set_items(&mut out, "contents", &contents);
@@ -1944,7 +1943,7 @@ pub(crate) fn convert(model: &str, raw: &[u8]) -> Result<Vec<u8>, crate::Error> 
         result = sig::sanitize_gemini_request_thought_signatures(&result, "contents");
     }
     let result = strip_trailing_model_prefill(result);
-    drops.result().map(|()| result)
+    drops.result().map(|()| (result, sources))
 }
 
 /// The `input` loop of ConvertOpenAIResponsesRequestToGemini.
@@ -1954,6 +1953,7 @@ fn convert_items(
     forward: &HashMap<Vec<u8>, Vec<u8>>,
     system_parts: &mut Vec<Vec<u8>>,
     drops: &mut UserTurnDrops,
+    sources: &mut CallSources,
 ) -> Vec<Vec<u8>> {
     let mut contents: Vec<Vec<u8>> = vec![];
     let mut names_by_call: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
@@ -2138,6 +2138,8 @@ fn convert_items(
                 } else {
                     sig::gemini_replay_signature_or_bypass(&raw_signature, BlockKind::GeminiFunctionCall).into_bytes()
                 };
+                let proven = item.get(PROVEN);
+                sources.push(proven.exists().then(|| proven.raw.to_vec()));
                 let thought_text = field(item, SUMMARY_FIELD);
                 if !thought_text.is_empty() {
                     contents.push(reasoning_function_call_content(
@@ -2280,15 +2282,16 @@ fn convert_items(
 
 #[cfg(test)]
 mod tests {
-    /// A call paired with a reasoning item names that item's `_ck_proven` identity, whether the
-    /// item comes before the call or rides after it as a carrier; an unproven item names none.
+    /// Each function call part names the reasoning item its signature comes from, by call
+    /// occurrence: whether the item comes before the call or rides after it as a carrier, and
+    /// when two calls share a call ID. An unproven item names none.
     #[test]
-    fn a_paired_call_names_the_item_its_signature_comes_from() {
+    fn each_function_call_part_names_the_item_its_signature_comes_from() {
         let call = |id: &str| format!(r#"{{"type":"function_call","call_id":"{id}","name":"f","arguments":"{{}}"}}"#);
         let output = |id: &str| format!(r#"{{"type":"function_call_output","call_id":"{id}","output":"ok"}}"#);
         let reasoning =
             |proof: &str| format!(r#"{{"type":"reasoning","summary":[],"encrypted_content":" S\n"{proof}}}"#);
-        // (case, items, call ID to identity)
+        // (case, items, identity per function call part)
         let rows = [
             (
                 "reasoning before each call",
@@ -2298,23 +2301,29 @@ mod tests {
                     reasoning(r#","_ck_proven":5"#),
                     call("b"),
                 ],
-                vec![("a", "3"), ("b", "5")],
+                vec![Some("3"), Some("5")],
+            ),
+            (
+                "two calls sharing a call ID",
+                vec![
+                    reasoning(r#","_ck_proven":3"#),
+                    call("a"),
+                    reasoning(r#","_ck_proven":5"#),
+                    call("a"),
+                ],
+                vec![Some("3"), Some("5")],
             ),
             (
                 "a carrier after the call",
                 vec![call("a"), reasoning(r#","_ck_proven":7"#), output("a")],
-                vec![("a", "7")],
+                vec![Some("7")],
             ),
-            ("an unproven item", vec![reasoning(""), call("a")], vec![]),
+            ("an unproven item", vec![reasoning(""), call("a")], vec![None]),
         ];
         for (case, items, want) in rows {
-            let raw = format!("[{}]", items.join(","));
-            let parsed = ck_wire::json::get(raw.as_bytes(), "@this");
-            let got = super::paired_call_items(&parsed.array());
-            let want: std::collections::HashMap<Vec<u8>, Vec<u8>> = want
-                .iter()
-                .map(|(id, proof)| (id.as_bytes().to_vec(), proof.as_bytes().to_vec()))
-                .collect();
+            let raw = format!(r#"{{"input":[{}]}}"#, items.join(","));
+            let (_, got) = super::convert_with_sources("claude-sonnet-4-6", raw.as_bytes()).unwrap();
+            let want: Vec<Option<Vec<u8>>> = want.iter().map(|w| w.map(|p| p.as_bytes().to_vec())).collect();
             assert_eq!(got, want, "{case}");
         }
     }

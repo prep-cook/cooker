@@ -48,12 +48,12 @@ fn convert(model: &str, raw: &[u8], model_info: Option<&ModelInfo>) -> Result<Ve
     {
         return web_search_request(model, raw);
     }
-    let mut out = crate::gemini_responses::convert(model, raw)?;
+    let (mut out, sources) = crate::gemini_responses::convert_with_sources(model, raw)?;
     strip_google_search(&mut out);
     let out = rewrite_claude_reasoning(model, raw, out);
     let mut out = crate::antigravity_gemini::convert(model, &out);
     strip_google_search(&mut out);
-    let out = restore_proven_call_signatures(model, raw, out);
+    let out = restore_proven_call_signatures(model, raw, &sources, out);
     Ok(enable_thinking_summary(raw, out))
 }
 
@@ -93,10 +93,10 @@ fn supports_native_web_search(model: &str, model_info: Option<&ModelInfo>) -> bo
 /// buildAntigravityResponsesWebSearchRequest.
 fn web_search_request(model: &str, raw: &[u8]) -> Result<Vec<u8>, Error> {
     let domains = ws::allowed_domains(&gj::parse(raw));
-    let out = crate::gemini_responses::convert(model, raw)?;
+    let (out, sources) = crate::gemini_responses::convert_with_sources(model, raw)?;
     let out = rewrite_claude_reasoning(model, raw, out);
     let out = crate::antigravity_gemini::convert(model, &out);
-    let mut out = restore_proven_call_signatures(model, raw, out);
+    let mut out = restore_proven_call_signatures(model, raw, &sources, out);
     gj::set_str(&mut out, "requestType", "web_search");
     ensure_web_search_tool(&mut out, &domains);
     ensure_web_search_instruction(&mut out);
@@ -313,17 +313,17 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
 
 /// Owner ruling P7b-1 where provenance allows it: a Claude model's function call takes the
 /// signature of the proven reasoning item the Gemini Responses pairing binds to it, with the
-/// bytes that item holds. The item is found by the `_ck_proven` identity the egress gave it,
-/// so two items holding the same signature differently each keep their own bytes. The
-/// envelope removed every function-call signature before, as CLIProxyAPI does; an unproven
-/// one stays removed, since Anthropic mints the same form.
-fn restore_proven_call_signatures(model: &str, raw: &[u8], mut out: Vec<u8>) -> Vec<u8> {
-    if provider_from_model_name(model) != Provider::Claude {
+/// bytes that item holds. `sources` names that item for each function call part, in order, by
+/// the `_ck_proven` identity the egress gave it; calls sharing a call ID and items holding one
+/// signature differently each keep their own. The envelope steps keep every function call part
+/// in place, so the parts match `sources` one for one. The envelope removed every function-call signature before, as
+/// CLIProxyAPI does; an unproven one stays removed, since Anthropic mints the same form.
+fn restore_proven_call_signatures(model: &str, raw: &[u8], sources: &[Option<Vec<u8>>], mut out: Vec<u8>) -> Vec<u8> {
+    if provider_from_model_name(model) != Provider::Claude || sources.iter().all(Option::is_none) {
         return out;
     }
-    let input = gj::get(raw, "input");
-    let items = input.array();
-    let held: HashMap<Vec<u8>, Vec<u8>> = items
+    let held: HashMap<Vec<u8>, Vec<u8>> = gj::get(raw, "input")
+        .array()
         .iter()
         .filter(|item| item.get("type").bytes().as_ref() == b"reasoning")
         .filter_map(|item| {
@@ -333,27 +333,23 @@ fn restore_proven_call_signatures(model: &str, raw: &[u8], mut out: Vec<u8>) -> 
                 .then(|| (proven.raw.to_vec(), item.get("encrypted_content").bytes().into_owned()))
         })
         .collect();
-    if held.is_empty() {
-        return out;
-    }
-    let calls = crate::gemini_responses::paired_call_items(&items);
     let contents = gj::get(&out, "request.contents").into_owned();
+    let mut calls = vec![];
     for (ci, content) in contents.array().iter().enumerate() {
         for (pi, part) in content.get("parts").array().iter().enumerate() {
-            let Some(bytes) = calls
-                .get(part.get("functionCall.id").bytes().as_ref())
-                .and_then(|id| held.get(id))
-            else {
-                continue;
-            };
-            let signature = provider_compatible(Provider::Claude, bytes, BlockKind::Unknown);
-            if !signature.is_empty() {
-                gj::set_str(
-                    &mut out,
-                    &format!("request.contents.{ci}.parts.{pi}.thoughtSignature"),
-                    &signature,
-                );
+            if part.get("functionCall").exists() {
+                calls.push(format!("request.contents.{ci}.parts.{pi}.thoughtSignature"));
             }
+        }
+    }
+    debug_assert_eq!(calls.len(), sources.len(), "a function call part was added or removed");
+    for (path, source) in calls.iter().zip(sources) {
+        let Some(bytes) = source.as_ref().and_then(|id| held.get(id)) else {
+            continue;
+        };
+        let signature = provider_compatible(Provider::Claude, bytes, BlockKind::Unknown);
+        if !signature.is_empty() {
+            gj::set_str(&mut out, path, &signature);
         }
     }
     out
