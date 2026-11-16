@@ -268,6 +268,10 @@ pub struct Registry {
     /// Finalizer steps a test holds.
     #[cfg(any(test, feature = "testing"))]
     pub holds: crate::testing::Holds,
+    /// A test runtime's private pool directory, which the store opens in instead of
+    /// `$XDG_RUNTIME_DIR/cooker` (`testing::runtime`).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) directory: std::sync::OnceLock<std::path::PathBuf>,
     tasks: tokio_util::task::TaskTracker,
     /// Live-session tasks (`super::sessions`): shutdown cancels `sessions` and waits for them
     /// before the store closes, so each publishes its final counters.
@@ -312,7 +316,14 @@ impl Registry {
             return Err(ck_stream::Error::Closed);
         }
         if slot.is_none() {
-            let config = ck_stream::Config::from_environment().map_err(ck_stream::Error::Io)?;
+            #[cfg(any(test, feature = "testing"))]
+            let config = match self.directory.get() {
+                Some(directory) => Ok(ck_stream::Config::new(directory.clone())),
+                None => ck_stream::Config::from_environment(),
+            };
+            #[cfg(not(any(test, feature = "testing")))]
+            let config = ck_stream::Config::from_environment();
+            let config = config.map_err(ck_stream::Error::Io)?;
             *slot = Some(Arc::new(Store::open(config).map_err(ck_stream::Error::Io)?));
         }
         Ok(slot.as_ref().expect("opened above").clone())
