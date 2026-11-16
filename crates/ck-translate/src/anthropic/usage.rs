@@ -212,6 +212,7 @@ fn name_hash(doc: &Document, name: Name) -> Result<u64> {
     }
     Ok(hasher.finish())
 }
+/// Whether the update reports `name` with a value other than `null`.
 fn supplied(previous: &Document, name: Name, (doc, index): (&Document, &Index)) -> Result<bool> {
     let hash = name_hash(previous, name)?;
     let start = index.partition_point(|&(h, _)| h < hash);
@@ -224,13 +225,31 @@ fn supplied(previous: &Document, name: Name, (doc, index): (&Document, &Index)) 
                 break;
             }
             if c.is_none() {
+                return Ok(!matches!(doc.node(next)?.value, Value::Null));
+            }
+        }
+    }
+    Ok(false)
+}
+/// Whether `object` in `previous` has a member named like `name` in `doc`.
+fn has_member(previous: &Document, object: usize, doc: &Document, name: Name) -> Result<bool> {
+    for field in previous.children(object)? {
+        let mut a = previous.name_chars(previous.node(field)?.name.ok_or(Error::Schema)?)?;
+        let mut b = doc.name_chars(name)?;
+        loop {
+            let c = a.next_scalar()?;
+            if c != b.next_scalar()? {
+                break;
+            }
+            if c.is_none() {
                 return Ok(true);
             }
         }
     }
     Ok(false)
 }
-/// Retains old members the update omits; `cache_creation` merges one level deep.
+/// Retains old members the update omits or reports as `null`, as the Anthropic SDK's message
+/// accumulator does; `cache_creation` merges one level deep.
 fn merge(
     old: Option<(&Document, usize)>,
     (doc, node): (&Document, usize),
@@ -258,11 +277,17 @@ fn merge(
         }
     }
     for field in doc.children(node)? {
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        if matches!(doc.node(field)?.value, Value::Null)
+            && let Some((previous, root)) = old
+            && has_member(previous, root, doc, name)?
+        {
+            continue;
+        }
         if !first {
             e.bytes(b",")?;
         }
         first = false;
-        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
         doc.write_name(name, e)?;
         e.bytes(b":")?;
         if let Some(nested) = nested

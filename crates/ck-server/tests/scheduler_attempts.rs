@@ -16,6 +16,16 @@ use ck_server::scheduling::scheduler::Policy;
 use ck_server::{Runtime, router};
 use serde_json::Value;
 
+/// A complete Anthropic message, and the same answer streamed: [`START`] holds the first
+/// deliverable text, [`REST`] ends the message.
+const MESSAGE: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+const START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n\
+    event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+    event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"committed\"}}\n\n";
+const REST: &str = "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+    event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+    event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
 #[derive(Clone, Copy)]
 enum Mode {
     FirstFails,
@@ -64,19 +74,19 @@ async fn upstream(State(mock): State<Arc<Mock>>, req: Request) -> Response {
         }
         Mode::AfterCommit if token == "Bearer fake-a" => {
             use futures_util::StreamExt;
-            let broken = futures_util::stream::once(async {
-                Ok::<_, std::io::Error>(Bytes::from_static(b"data: committed\n\n"))
-            })
-            .chain(futures_util::stream::once(async move {
-                mock.break_stream.notified().await;
-                Err(std::io::Error::other("mock postcommit reset"))
-            }));
+            let broken =
+                futures_util::stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(START.as_bytes())) })
+                    .chain(futures_util::stream::once(async move {
+                        mock.break_stream.notified().await;
+                        Err(std::io::Error::other("mock postcommit reset"))
+                    }));
             ([("content-type", "text/event-stream")], Body::from_stream(broken)).into_response()
         }
         Mode::BeforeCommit | Mode::AfterCommit => {
-            ([("content-type", "text/event-stream")], "data: recovered\n\n").into_response()
+            let recovered = format!("{}{REST}", START.replace("committed", "recovered"));
+            ([("content-type", "text/event-stream")], recovered).into_response()
         }
-        _ => ([("content-type", "application/json")], "{\"ok\":true}").into_response(),
+        _ => ([("content-type", "application/json")], MESSAGE).into_response(),
     }
 }
 
@@ -153,7 +163,9 @@ impl Fixture {
         let client = wreq::Client::new();
         let request = client
             .post(format!("{}/v1/messages", self.url))
-            .body(format!("{{\"model\":\"claude-sonnet-5\",\"stream\":{stream}}}"))
+            .body(format!(
+                r#"{{"model":"claude-sonnet-5","max_tokens":5,"stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+            ))
             .send();
         if matches!(self.mock.mode, Mode::BeforeCommit) {
             let release = async {
@@ -186,7 +198,8 @@ async fn same_round_failover_preserves_lease_counts_and_last_error() {
     .await;
     let response = fixture.request(false).await;
     assert_eq!(response.status().as_u16(), 200);
-    assert_eq!(response.text().await.unwrap(), "{\"ok\":true}");
+    let reply: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(reply["content"][0]["text"], "ok");
     assert_eq!(fixture.seen(), ["Bearer fake-a", "Bearer fake-b"]);
     assert_eq!(
         fixture.rt.store().stats(),
@@ -367,7 +380,8 @@ async fn postcommit_stream_fault_is_terminal_and_never_replayed() {
     // Headers prove the first event committed; only then cut the upstream stream.
     fixture.mock.break_stream.notify_one();
     let text = response.text().await.unwrap();
-    assert!(text.starts_with("data: committed\n\n"));
+    assert!(text.starts_with("event: message_start\n"), "{text}");
+    assert!(text.contains(r#""text":"committed""#), "{text}");
     assert!(text.contains("event: error\n"));
     assert!(!text.contains("recovered"));
     assert_eq!(fixture.seen(), ["Bearer fake-a"]);

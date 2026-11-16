@@ -2163,32 +2163,36 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// `ensureModelMaxTokens`: only a model some Claude credential registered gets a
-    /// default `max_tokens`, its registered completion limit or 1024.
+    /// `ensureModelMaxTokens` without its 1024 fallback (owner Q-H): only a model some
+    /// Claude credential registered gets its completion limit as the default `max_tokens`.
     fn ensure_max_tokens(&self, body: String) -> String {
         let model = self.base_model.trim();
-        if !rawjson::valid(&body)
-            || rawjson::get(&body, "max_tokens").exists()
-            || !ck_core::registry::model_providers(model)
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case("claude"))
+        if !ck_core::registry::model_providers(model)
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("claude"))
         {
             return body;
         }
-        let max = ck_core::registry::registered_model(model, Some("claude"))
-            .and_then(|info| {
-                info.raw
-                    .get("max_completion_tokens")
-                    .and_then(serde_json::Value::as_i64)
-            })
-            .filter(|n| *n > 0)
-            .unwrap_or(DEFAULT_MAX_TOKENS);
-        rawjson::set_raw(&body, "max_tokens", &max.to_string())
+        let limit = ck_core::registry::registered_model(model, Some("claude")).and_then(|info| {
+            info.raw
+                .get("max_completion_tokens")
+                .and_then(serde_json::Value::as_i64)
+        });
+        default_max_tokens(body, limit)
     }
 }
 
-/// `defaultModelMaxTokens`.
-const DEFAULT_MAX_TOKENS: i64 = 1024;
+/// Sets `limit` as `max_tokens` on a body without one. Without a positive limit the body goes
+/// as the client sent it, and Anthropic answers a missing limit itself.
+fn default_max_tokens(body: String, limit: Option<i64>) -> String {
+    if !rawjson::valid(&body) || rawjson::get(&body, "max_tokens").exists() {
+        return body;
+    }
+    match limit.filter(|n| *n > 0) {
+        Some(max) => rawjson::set_raw(&body, "max_tokens", &max.to_string()),
+        None => body,
+    }
+}
 
 /// Fill `thinking.display: updates` for progress-display models with active thinking.
 fn cloak_thinking_display(body: String) -> String {

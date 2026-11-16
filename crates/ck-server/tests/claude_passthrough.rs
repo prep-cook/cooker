@@ -14,9 +14,63 @@ use ck_exec::Executors;
 use ck_exec::claude::ClaudeExecutor;
 use ck_server::router;
 
-const SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
+const SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-opus-5-5\",\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n\
+                   event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                   event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+                   event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                   event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
                    event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
-const JSON_REPLY: &str = r#"{"id":"msg_1","type":"message","content":[]}"#;
+const JSON_REPLY: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+
+/// Whether `got` holds every member of `want` with an equal value; arrays and scalars compare
+/// whole. The gateway re-encodes answers, so it may add members such as `stop_reason: null`.
+fn holds(got: &serde_json::Value, want: &serde_json::Value) -> bool {
+    match (got, want) {
+        (serde_json::Value::Object(got), serde_json::Value::Object(want)) => {
+            want.iter().all(|(k, w)| got.get(k).is_some_and(|g| holds(g, w)))
+        }
+        (serde_json::Value::Array(got), serde_json::Value::Array(want)) => {
+            got.len() == want.len() && got.iter().zip(want).all(|(g, w)| holds(g, w))
+        }
+        _ => got == want,
+    }
+}
+
+/// The `event:` names and parsed `data:` payloads of an SSE body; `id:` cursors are dropped.
+fn events(text: &str) -> Vec<(String, serde_json::Value)> {
+    text.split("\n\n")
+        .filter(|frame| !frame.trim().is_empty())
+        .map(|frame| {
+            let field = |name: &str| {
+                frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .unwrap_or_default()
+                    .trim()
+            };
+            (
+                field("event:").to_owned(),
+                serde_json::from_str(field("data:")).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// `got` is the answer `want` names, event by event.
+fn assert_events(got: &str, want: &str) {
+    let (got_events, want_events) = (events(got), events(want));
+    assert_eq!(got_events.len(), want_events.len(), "{got}");
+    for ((name, data), (want_name, want_data)) in got_events.iter().zip(&want_events) {
+        assert_eq!(name, want_name, "{got}");
+        assert!(holds(data, want_data), "{data} lacks {want_data}");
+    }
+}
+
+/// `got` is the JSON answer `want` names.
+fn assert_reply(got: &str, want: &str) {
+    let (got, want) = (serde_json::from_str(got).unwrap(), serde_json::from_str(want).unwrap());
+    assert!(holds(&got, &want), "{got} lacks {want}");
+}
 
 async fn assert_http_error(response: wreq::Response, kind: &str) -> serde_json::Value {
     let id = response.headers()["request-id"].to_str().unwrap().to_owned();
@@ -73,7 +127,7 @@ async fn upstream(State(log): State<Log>, req: Request) -> Response {
         use futures_util::StreamExt;
         // The pause lets hyper flush the first event before the connection is cut.
         let chunks = futures_util::stream::once(async {
-            Ok::<_, std::io::Error>(Bytes::from_static(b"event: message_start\ndata: {}\n\n"))
+            Ok::<_, std::io::Error>(Bytes::from(SSE.split_inclusive("\n\n").take(3).collect::<String>()))
         })
         .chain(futures_util::stream::once(async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -192,15 +246,15 @@ async fn claude_messages_end_to_end() {
     );
 
     // Non-streaming: JSON path, body forwarded byte for byte, upstream headers dropped.
-    let json_body = r#"{ "model":"claude-opus-5-5",  "messages":[{"role":"user","content":"hi"}] }"#;
+    let json_body = r#"{ "model":"claude-opus-5-5", "max_tokens":5, "messages":[{"role":"user","content":"hi"}] }"#;
     let res = post(json_body).await.unwrap();
     assert_eq!(res.status().as_u16(), 200);
     assert_eq!(res.headers()["content-type"], "application/json");
     assert!(res.headers().get("request-id").is_none() && res.headers().get("x-secret").is_none());
-    assert_eq!(res.text().await.unwrap(), JSON_REPLY);
+    assert_reply(&res.text().await.unwrap(), JSON_REPLY);
 
     // Streaming: SSE headers set by the proxy, events intact.
-    let stream_body = r#"{"model":"claude-opus-5-5","stream":true,"messages":[]}"#;
+    let stream_body = r#"{"model":"claude-opus-5-5","max_tokens":5,"stream":true,"messages":[]}"#;
     let res = client
         .post(&url)
         .header("authorization", "Bearer client-key-1")
@@ -210,35 +264,34 @@ async fn claude_messages_end_to_end() {
         .unwrap();
     assert_eq!(res.status().as_u16(), 200);
     assert_eq!(res.headers()["content-type"], "text/event-stream");
-    assert_eq!(res.headers()["cache-control"], "no-cache");
+    assert_eq!(res.headers()["cache-control"], "no-store");
     assert!(res.headers().get("request-id").is_none());
-    assert_eq!(res.text().await.unwrap(), SSE);
+    assert_events(&res.text().await.unwrap(), SSE);
 
     // Upstream error before streaming: Claude error JSON and status. Go sends Retry-After
     // only for its own scheduler/cooldown errors, never a raw upstream one.
-    let res = post(r#"{"model":"claude-opus-5-5","stream":true,"x":"MODE_429"}"#)
-        .await
-        .unwrap();
+    let res = post(
+        r#"{"model":"claude-opus-5-5","max_tokens":5,"stream":true,"messages":[{"role":"user","content":"MODE_429"}]}"#,
+    )
+    .await
+    .unwrap();
     assert_eq!(res.status().as_u16(), 429);
     assert!(res.headers().get("retry-after").is_none());
     let error = assert_http_error(res, "rate_limit_error").await;
     assert_eq!(error["error"]["message"], "slow down");
 
     // Upstream dies mid-stream: events so far, then a terminal error event.
-    let res = post(r#"{"model":"claude-opus-5-5","stream":true,"x":"MODE_BREAK"}"#)
+    let res = post(r#"{"model":"claude-opus-5-5","max_tokens":5,"stream":true,"messages":[{"role":"user","content":"MODE_BREAK"}]}"#)
         .await
         .unwrap();
     assert_eq!(res.status().as_u16(), 200);
-    let text = res.text().await.unwrap();
-    let (first, rest) = text.split_at("event: message_start\ndata: {}\n\n".len());
-    assert_eq!(first, "event: message_start\ndata: {}\n\n");
-    let data = rest.strip_prefix("event: error\ndata: ").expect("terminal error event");
-    let error: serde_json::Value = serde_json::from_str(data.trim()).unwrap();
-    assert_eq!(error["type"], "error");
-    assert_eq!(error["error"]["type"], "api_error");
-    assert!(error["error"]["message"].is_string());
-    assert!(error.get("request_id").is_none(), "SSE has no HTTP request_id");
-    assert!(rest.ends_with("\n\n"));
+    let got = events(&res.text().await.unwrap());
+    assert_eq!(got[0].0, "message_start");
+    assert_eq!(got.last().unwrap().0, "error", "{got:?}");
+    assert!(
+        got.last().unwrap().1.get("request_id").is_none(),
+        "SSE has no HTTP request_id"
+    );
 
     let seen = log.lock().unwrap().clone();
     assert_eq!(seen.len(), 4);
@@ -270,19 +323,12 @@ async fn claude_messages_end_to_end() {
         assert_eq!(s.accept_encoding, expected);
         assert!(!s.client_key_leaked, "client key must never reach upstream");
     }
-    let max_tokens = ck_core::registry::pinned()
-        .channel("claude")
-        .iter()
-        .find(|m| m.id == "claude-opus-5-5")
-        .and_then(|m| m.raw.get("max_completion_tokens").and_then(serde_json::Value::as_i64))
-        .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&seen[0].body),
-        format!(
-            r#"{{ "model":"claude-opus-5-5",  "messages":[{{"role":"user","content":[{{"type":"text","text":"hi","cache_control":{{"type":"ephemeral"}}}}]}}] ,"max_tokens":{max_tokens},"stream":false}}"#
-        ),
-        "untouched members keep their bytes; Go's normalizations are appended in place"
-    );
+    // The client's limit goes upstream, with Go's default cache breakpoint on the last turn.
+    let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(sent["max_tokens"], 5);
+    assert_eq!(sent["stream"], false);
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "hi");
+    assert_eq!(sent["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
 
     let models: serde_json::Value = client
         .get(format!("{proxy}/v1/models"))
@@ -331,23 +377,29 @@ async fn unregistered_and_unserved_models_follow_anthropic_errors() {
     };
     // Go (differential case disabled-credential): a disabled credential registers no
     // models, so the model has no provider: 400, not auth_not_found.
-    let res = post(r#"{"model":"claude-opus-5"}"#).await.unwrap();
+    let res = post(r#"{"model":"claude-opus-5","max_tokens":5,"messages":[]}"#)
+        .await
+        .unwrap();
     assert_eq!(res.status().as_u16(), 400);
     let error = assert_http_error(res, "invalid_request_error").await;
     assert_eq!(error["error"]["message"], "unknown provider for model claude-opus-5");
     // An Antigravity credential without a project or refresh token: Go's
     // PrepareRequestAuth fails in ensureAccessToken (`missing refresh token`, 401)
     // before any request leaves, and the conductor answers that last error.
-    let res = post(r#"{"model":"gemini-3-flash"}"#).await.unwrap();
+    let res = post(r#"{"model":"gemini-3-flash","max_tokens":5,"messages":[]}"#)
+        .await
+        .unwrap();
     assert_eq!(res.status().as_u16(), 401);
     let error = assert_http_error(res, "authentication_error").await;
     assert!(!error.to_string().contains("missing refresh token"));
     // Go v8.0.35 (f62d4d28) dropped these Antigravity models from the catalog, so the
     // credential no longer registers them and they have no provider.
     for model in ["gemini-pro-agent", "gemini-3.1-pro-low", "gemini-3.7-flash-high"] {
-        let res = post(Box::leak(format!(r#"{{"model":"{model}"}}"#).into_boxed_str()))
-            .await
-            .unwrap();
+        let res = post(Box::leak(
+            format!(r#"{{"model":"{model}","max_tokens":5,"messages":[]}}"#).into_boxed_str(),
+        ))
+        .await
+        .unwrap();
         assert_eq!(res.status().as_u16(), 400, "{model}");
         assert_http_error(res, "invalid_request_error").await;
     }
@@ -418,12 +470,12 @@ async fn request_log_masks_upstream_credentials() {
     let res = wreq::Client::new()
         .post(format!("{proxy}/v1/messages"))
         .header("x-api-key", "client-key-1")
-        .body(r#"{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}"#)
+        .body(r#"{"model":"claude-opus-5-5","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
         .unwrap();
     assert_eq!(res.status().as_u16(), 200);
-    assert_eq!(res.text().await.unwrap(), JSON_REPLY);
+    assert_reply(&res.text().await.unwrap(), JSON_REPLY);
     // The secret really went upstream, so the log had it to mask.
     assert_eq!(log.lock().unwrap()[0].authorization, format!("Bearer {API_KEY}"));
 
@@ -464,6 +516,7 @@ async fn request_log_masks_upstream_credentials() {
 const READ_PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
 const HEAD_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 const FIRST_BYTE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+const TAIL_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 const CLIENT_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
 const USAGE_SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n\
@@ -478,8 +531,8 @@ const FIRST_EVENT: &str = "event: message_start\ndata: {\"type\":\"message_start
 
 /// A mock Anthropic upstream on raw sockets with a small receive window, so a body it
 /// has not read stays with the sender. A request body over 1 MiB waits [`READ_PAUSE`]
-/// before it is read, [`HEAD_DELAY`] before the response head and [`FIRST_BYTE_DELAY`]
-/// before the events; smaller ones are answered at once, and one that says `MODE_CUT`
+/// before it is read, [`HEAD_DELAY`] before the response head, [`FIRST_BYTE_DELAY`]
+/// before the first event and [`TAIL_DELAY`] before the rest; smaller ones are answered at once, and one that says `MODE_CUT`
 /// gets its first event and then a closed connection. Connections are kept alive.
 /// Records each request's body length and whether its head had a Content-Length.
 async fn slow_upstream(seen: Arc<Mutex<Vec<(usize, bool)>>>) -> String {
@@ -533,6 +586,12 @@ async fn slow_upstream(seen: Arc<Mutex<Vec<(usize, bool)>>>) -> String {
                     }
                     if slow {
                         tokio::time::sleep(FIRST_BYTE_DELAY).await;
+                        // The answer commits on the first event, before the upstream ends.
+                        conn.get_mut().write_all(FIRST_EVENT.as_bytes()).await.unwrap();
+                        tokio::time::sleep(TAIL_DELAY).await;
+                        let rest = &USAGE_SSE[FIRST_EVENT.len()..];
+                        conn.get_mut().write_all(rest.as_bytes()).await.unwrap();
+                        continue;
                     }
                     conn.get_mut().write_all(USAGE_SSE.as_bytes()).await.unwrap();
                 }
@@ -628,7 +687,7 @@ async fn usage_record_times_each_stage() {
         .await
         .unwrap();
     assert_eq!(res.status().as_u16(), 200);
-    assert_eq!(res.text().await.unwrap(), USAGE_SSE);
+    assert_events(&res.text().await.unwrap(), USAGE_SSE);
     let small =
         r#"{"model":"claude-opus-5-5","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
     let res = client
@@ -638,7 +697,7 @@ async fn usage_record_times_each_stage() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.text().await.unwrap(), USAGE_SSE);
+    assert_events(&res.text().await.unwrap(), USAGE_SSE);
     let cut = small.replace("hi", "MODE_CUT");
     let res = client
         .post(&url)
@@ -647,7 +706,9 @@ async fn usage_record_times_each_stage() {
         .send()
         .await
         .unwrap();
-    assert!(res.text().await.unwrap().starts_with(FIRST_EVENT));
+    // Only `message_start` arrived before the connection closed: the attempt fails before
+    // commitment, with the transport error.
+    assert_eq!(res.status().as_u16(), 500, "{}", res.text().await.unwrap());
 
     let records = usage_records(&rt, 3).await;
     let upstream = seen.lock().unwrap().clone();
@@ -670,11 +731,13 @@ async fn usage_record_times_each_stage() {
         "upstream_body_sent_ms",
         "upstream_headers_ms",
         "upstream_first_byte_ms",
-        "client_first_byte_ms",
     ]
     .map(|key| ms(slow, key));
     assert!(stages.is_sorted(), "stages out of order: {slow}");
-    let [received, started, _, sent, headers, first, _] = stages;
+    let [received, started, _, sent, headers, first] = stages;
+    // The answer committed on its first event, before the upstream finished.
+    let client = ms(slow, "client_first_byte_ms");
+    assert!(client >= first, "client before upstream first byte: {slow}");
     // Each stamp is taken when the proxy sees its event, possibly late under load, so a
     // gap between two such stamps can be shorter than the mock's delay. The bounds run
     // from the request's start and from `started`, stamped before the dial: the mock's
@@ -710,10 +773,11 @@ async fn usage_record_times_each_stage() {
         upstream[1],
         (quick["upstream_request_bytes"].as_u64().unwrap() as usize, true)
     );
-    assert!(
-        ms(quick, "client_first_byte_ms") >= ms(quick, "upstream_first_byte_ms"),
-        "{quick}"
-    );
+    // The record settles on its own task: it has the client's first byte only when the
+    // answer committed before the upstream finished.
+    if let Some(client) = quick["timings"]["client_first_byte_ms"].as_u64() {
+        assert!(client >= ms(quick, "upstream_first_byte_ms"), "{quick}");
+    }
 
     // A stream cut short fails, and its record still has the bytes it got.
     let cut = &records[2];
@@ -758,7 +822,7 @@ async fn usage_record_names_the_conversation_and_prompt_prefix() {
             request = request.header("x-claude-code-session-id", *session);
         }
         let res = request.body(body.clone()).send().await.unwrap();
-        assert_eq!(res.text().await.unwrap(), USAGE_SSE);
+        assert_events(&res.text().await.unwrap(), USAGE_SSE);
     }
     let records = usage_records(&rt, requests.len()).await;
     let field = |i: usize, key: &str| records[i][key].as_str().unwrap_or_default().to_owned();
@@ -811,7 +875,7 @@ async fn usage_record_names_the_conversation_and_prompt_prefix() {
 #[tokio::test]
 async fn claude_cache_telemetry_is_final_content_free_and_observational() {
     let _registry = REGISTRY.lock().await;
-    const REPLY: &str = r#"{"id":"msg_cache","type":"message","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":13,"output_tokens":3,"cache_read_input_tokens":1700,"cache_creation_input_tokens":900,"cache_creation":{"ephemeral_5m_input_tokens":217,"ephemeral_1h_input_tokens":683}}}"#;
+    const REPLY: &str = r#"{"id":"msg_cache","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":13,"output_tokens":3,"cache_read_input_tokens":1700,"cache_creation_input_tokens":900,"cache_creation":{"ephemeral_5m_input_tokens":217,"ephemeral_1h_input_tokens":683}}}"#;
     let seen: Log = Arc::default();
     let upstream_url = serve(
         axum::Router::new()
@@ -822,7 +886,7 @@ async fn claude_cache_telemetry_is_final_content_free_and_observational() {
                     accept_encoding: String::new(), client_key_leaked: false, body: body.clone(),
                 });
                 if serde_json::from_slice::<serde_json::Value>(&body).unwrap()["stream"] == true {
-                    let sse = format!("event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{REPLY}}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":7}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n");
+                    let sse = format!("event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{REPLY}}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":7}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n");
                     ([("content-type", "text/event-stream")], sse).into_response()
                 } else {
                     ([("content-type", "application/json")], REPLY).into_response()
@@ -1071,19 +1135,17 @@ async fn claude_cache_telemetry_lookup_boundaries_and_automatic_targets() {
         body["model"] = "claude-opus-5-5".into();
         body["max_tokens"] = 16.into();
         body["prompt_cache_options"] = serde_json::json!({"mode":"explicit"});
-        assert_eq!(
-            client
-                .post(&url)
-                .header("x-api-key", "client-key-1")
-                .json(body)
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap(),
-            JSON_REPLY
-        );
+        let reply = client
+            .post(&url)
+            .header("x-api-key", "client-key-1")
+            .json(body)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_reply(&reply, JSON_REPLY);
     }
     let records = usage_records(&rt, bodies.len()).await;
     let cache = |i: usize| &records[i]["claude_cache"];

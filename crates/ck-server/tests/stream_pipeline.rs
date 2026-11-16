@@ -724,7 +724,7 @@ async fn an_attempt_carries_the_route_facts() {
         let trace = Trace::with_request_id(Some("trace".into()));
         let served = tokio::time::timeout(
             Duration::from_secs(5),
-            dispatch::run_exchange(&fixture.rt, &fake, call, &trace, codec),
+            dispatch::run_exchange(&fixture.rt, &fake, call, &trace, codec, None),
         )
         .await
         .expect("the call finishes");
@@ -1230,7 +1230,7 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             .with_writer(move || writer.clone())
             .finish();
         let mut run =
-            Box::pin(dispatch::run_exchange(&fixture.rt, &fake, call, &trace, codec).with_subscriber(subscriber));
+            Box::pin(dispatch::run_exchange(&fixture.rt, &fake, call, &trace, codec, None).with_subscriber(subscriber));
         if let Ends::Gone = row.ends {
             let started = async {
                 while fake.begun.lock().unwrap().is_empty() {
@@ -1482,7 +1482,7 @@ async fn every_exit_keeps_the_committed_streams_and_discards_the_rest() {
         call.model = row.model.into();
         let trace = Trace::with_request_id(Some("trace".into()));
         let mut run = Box::pin(
-            std::panic::AssertUnwindSafe(dispatch::run_exchange(&fixture.rt, &fake, call, &trace, codec))
+            std::panic::AssertUnwindSafe(dispatch::run_exchange(&fixture.rt, &fake, call, &trace, codec, None))
                 .catch_unwind(),
         );
         let waiting = async {

@@ -233,7 +233,7 @@ api-keys:
           alias: "kimi-k2"
 ```
 
-A `vertex` key with `interactions: true` sends Interactions clients (`/v1beta/interactions`) to Vertex's native Interactions API (`/v1beta1/interactions`) instead of translating them to `generateContent`. A Vertex service-account file opts in the same way with `"interactions": true` or `"native_interactions": true` at the top level. When the credential names a project (a service account's `project_id`, or a file's `project_id` next to its `access_token`), the path is `/v1beta1/projects/<project>/locations/global/interactions`; the credential's `location` is ignored, and the host is the configured `base-url` or `https://aiplatform.googleapis.com`.
+`/v1beta/interactions` currently answers 501, so the following Interactions settings have no effect. A `vertex` key with `interactions: true` sends Interactions clients (`/v1beta/interactions`) to Vertex's native Interactions API (`/v1beta1/interactions`) instead of translating them to `generateContent`. A Vertex service-account file opts in the same way with `"interactions": true` or `"native_interactions": true` at the top level. When the credential names a project (a service account's `project_id`, or a file's `project_id` next to its `access_token`), the path is `/v1beta1/projects/<project>/locations/global/interactions`; the credential's `location` is ignored, and the host is the configured `base-url` or `https://aiplatform.googleapis.com`.
 
 Vertex partner and open models (MaaS), named `<publisher>/<model>` such as `deepseek-ai/deepseek-v4.1-flash-maas` or `publishers/<publisher>/models/<model>`, go to Vertex's OpenAI-compatible `endpoints/openapi` route as Chat Completions requests, for every client format and before the Interactions opt-in; the upstream model is `<publisher>/<model>`. Two setups reach the route:
 
@@ -280,6 +280,10 @@ routing:
 - **Failover** to the next credential follows the entry's `request-scoped-errors` actions, else the usual handling.
 
 `X-Ck-Routed-Provider` names the serving credential's selector. It is sent only when `routing.providers` sets `exclude` or `order`, or a model router served the request.
+
+### Settings that do not apply to Chat, Anthropic and Gemini routes
+
+`/v1/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens` and the Gemini `/v1beta/models/...` routes send nothing before the first byte of the answer, so `requests.nonstream-keepalive-interval`, `requests.streaming.keepalive-seconds` and `requests.streaming.bootstrap-retries` have no effect on them. A failure before that byte fails over to the next candidate instead. The settings still apply to the Responses, image, video and speech routes.
 
 ### Optional preset: fail over only on 429
 

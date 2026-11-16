@@ -236,6 +236,17 @@ fn write(failure: &Failure, render: impl FnOnce(u16, &str) -> Response) -> Respo
     response
 }
 
+/// Q8: an OpenAI route S1 has no codec for refuses every request with 501.
+pub fn not_implemented(message: &str) -> Response {
+    let detail = Obj::new()
+        .str("message", message)
+        .str("type", "invalid_request_error")
+        .raw("param", "null")
+        .str("code", "unsupported_endpoint")
+        .finish();
+    crate::http::respond::json(501, "application/json", Obj::new().raw("error", &detail).finish())
+}
+
 pub fn openai(failure: &Failure) -> Response {
     write(failure, |status, text| {
         crate::http::respond::json(status, "application/json", openai_body(status, text))

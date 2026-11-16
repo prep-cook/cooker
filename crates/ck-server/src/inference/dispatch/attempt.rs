@@ -290,6 +290,8 @@ pub(super) async fn run<X: Arms>(
     }
     if respond::passthrough_headers(cfg) {
         sent.extend(respond::filter_upstream_headers(&headers));
+    } else if ck_exec::kimi::PROVIDERS.contains(&lease.credential.provider.as_str()) {
+        sent.extend(super::kimi_proof(&respond::filter_upstream_headers(&headers)));
     }
     match egress::deliver(rt.streams(), exchange, &stream, identity, arm.view, sent).await {
         Ok(response) => Ran::Committed(Box::new(Committed {

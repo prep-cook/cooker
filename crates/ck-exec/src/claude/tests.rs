@@ -2719,3 +2719,22 @@ pub(super) fn api_key_identity(ctx: &Ctx<'_>, req: &ExecRequest, count: bool) ->
     let detection = detect::detect(&req.headers, &utf8(&req.original_body), count, &ctx.settings);
     !ctx.bearer && !ctx.cli_profile && !detection.confirmed && !ctx.wire_policy(detection.confirmed).0
 }
+
+/// The old route invents no `max_tokens` (owner Q-H): only a registered completion limit
+/// fills a missing one.
+#[test]
+fn a_missing_max_tokens_takes_only_a_registered_limit() {
+    let without = r#"{"model":"m","messages":[]}"#;
+    let with = r#"{"model":"m","max_tokens":8,"messages":[]}"#;
+    // (body, registered limit, sent max_tokens)
+    let rows = [
+        (without, Some(4096), Some(4096)),
+        (without, None, None),
+        (without, Some(0), None),
+        (with, Some(4096), Some(8)),
+    ];
+    for (body, limit, want) in rows {
+        let got: Value = serde_json::from_str(&default_max_tokens(body.to_owned(), limit)).unwrap();
+        assert_eq!(got["max_tokens"].as_i64(), want, "{body} {limit:?}");
+    }
+}

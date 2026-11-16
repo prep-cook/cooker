@@ -57,8 +57,8 @@ pub struct Client<'a> {
     /// Derived session (`ctx:v1:<sha256>`), set only when no explicit session exists.
     pub derived_session: Option<&'a str>,
     /// Request-side usage facts and upstream capture (contract §3, G4). An executor calls only
-    /// `request`, `upstream_model`, `claude_cache`, `round_trip_started`, `first_byte` and the
-    /// capture calls; response usage comes from the canonical stream, never `response_*`.
+    /// `request`, `upstream_model`, `claude_cache`, `delegated_executor`, `round_trip_started`,
+    /// `first_byte` and the capture calls; response usage comes from the canonical stream, never `response_*`.
     pub usage: &'a UsageSink,
     /// The client's request body as the server received it (contract G5). Only the Claude
     /// executor reads it, and only for an Anthropic request the OAuth cloak or the Claude

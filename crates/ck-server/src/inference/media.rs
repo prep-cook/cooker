@@ -10,7 +10,7 @@ use ck_stream::{Store, Writer};
 use ck_translate::codec::document::Document;
 use ck_translate::codec::event::LocalId;
 use ck_translate::codec::media::Registry;
-use ck_translate::codec::{ClientCapability, RequestFence, RequestView};
+use ck_translate::codec::{ClientCapability, OwnedRequest, RequestFence, RequestView};
 
 use crate::Runtime;
 use crate::http::egress::Output;
@@ -74,9 +74,9 @@ impl Decoded {
         let operation = exchange.output.operation;
         let codec = dispatch::Codec {
             exchange,
-            view: RequestView {
-                document: &document,
-                media: &registry,
+            request: OwnedRequest {
+                document,
+                media: registry,
                 operation,
             },
             request_id,

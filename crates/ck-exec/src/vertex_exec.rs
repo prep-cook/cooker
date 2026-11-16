@@ -288,24 +288,40 @@ impl VertexExecutor {
         request: &Request<'_>,
         streams: Streams<'_>,
     ) -> Result<Upstream<VertexIngress>, ExecError> {
-        let (base_url, key) = vertex::openapi_route(attempt.credential)?;
-        // Refused before the token exchange, as the relay refuses it before its send.
-        let url = crate::openai_compat::endpoint(&base_url, CHAT_PATH);
-        crate::xai_url::new_request(&url)?;
-        if let Some(error) = crate::xai_url::transport_refusal(&url) {
-            return Err(error);
-        }
-        let client = self.client(attempt.credential, attempt.cfg);
-        let api_auth = matches!(key, vertex::OpenApiKey::Key(_));
-        let key = self.openapi_key(&client, key).await?;
-        let route = Route {
-            client,
-            base_url,
-            key,
-            api_auth,
-            compat: None,
-        };
         let model = openapi_model(attempt.model);
+        let route = async {
+            let (base_url, key) = vertex::openapi_route(attempt.credential)?;
+            // Refused before the token exchange, as the relay refuses it before its send.
+            let url = crate::openai_compat::endpoint(&base_url, CHAT_PATH);
+            crate::xai_url::new_request(&url)?;
+            if let Some(error) = crate::xai_url::transport_refusal(&url) {
+                return Err(error);
+            }
+            let client = self.client(attempt.credential, attempt.cfg);
+            let api_auth = matches!(key, vertex::OpenApiKey::Key(_));
+            let key = self.openapi_key(&client, key).await?;
+            Ok(Route {
+                client,
+                base_url,
+                key,
+                api_auth,
+                compat: None,
+            })
+        }
+        .await;
+        // The usage record names the executor whose token rule applies, with the normalized
+        // model: Vertex when the route or its credential fails, the relay for everything after
+        // (as `VertexExecutor::openapi`).
+        let executor = if route.is_ok() {
+            "OpenAICompatExecutor"
+        } else {
+            "GeminiVertexExecutor"
+        };
+        request
+            .client
+            .usage
+            .delegated_executor(executor, &parse_suffix(&model).model_name);
+        let route = route?;
         let upstream = relay::chat(&with_model(attempt, &model), request, streams, route).await?;
         Ok(Upstream {
             status: upstream.status,

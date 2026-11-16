@@ -223,7 +223,7 @@ async fn post(url: &str, path: &str, body: &str) -> (u16, wreq::header::HeaderMa
 #[tokio::test]
 async fn chat_completions_translate_and_stream_upstream_for_non_stream_clients() {
     let p = proxy("", vec![oauth("a.json", "fake-ok", serde_json::json!({}))]).await;
-    let body = format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hello"}}]}}"#);
+    let body = format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"hello"}}]}}"#);
     let (status, headers, text) = post(&p.url, "/v1/chat/completions", &body).await;
     assert_eq!(status, 200, "{text}");
     assert_eq!(headers["content-type"], "application/json");
@@ -242,106 +242,58 @@ async fn chat_completions_translate_and_stream_upstream_for_non_stream_clients()
     assert_eq!(parts[1].len(), 16);
     assert_eq!(parts[2].as_bytes()[14], b'7', "UUIDv7: {trace}");
 
-    // Streaming: OpenAI frames and a closing [DONE] (openai_handlers.go WriteDone).
-    let stream_body =
-        format!(r#"{{"model":"{MODEL}","stream":true,"messages":[{{"role":"user","content":"hello"}}]}}"#);
+    // Streaming: OpenAI frames, each with its resume cursor, and a closing [DONE].
+    let stream_body = format!(
+        r#"{{"model":"{MODEL}","stream":true,"max_tokens":5,"messages":[{{"role":"user","content":"hello"}}]}}"#
+    );
     let (status, headers, text) = post(&p.url, "/v1/chat/completions", &stream_body).await;
     assert_eq!(status, 200);
     assert_eq!(headers["content-type"], "text/event-stream");
-    assert_eq!(headers["connection"], "keep-alive");
     assert!(text.starts_with("data: {"), "{text}");
-    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert!(
+        text.trim_end()
+            .rsplit("\n\n")
+            .next()
+            .unwrap()
+            .starts_with("data: [DONE]\nid: v1.e."),
+        "{text}"
+    );
     assert!(text.contains(r#""content":"hi""#));
 }
 
-/// Go `StartNonStreamingKeepAlive` (M2-0036), expectations from the Go golden
-/// `nonstream_keepalive` (tests/reference/server/main.go): a result within one interval
-/// is untouched; a slower one commits 200 `application/json` with a `\n` per interval,
-/// then the rendered body, even when it is an error.
-///
-/// Synchronisation decides every outcome, never a wall-clock margin: the fast cases use
-/// an interval that cannot elapse during the test, and a held mock answers only after
-/// the test has read the first keep-alive newline. Which calls run the keep-alive at all
-/// is `dispatch::tests::nonstream_keepalive_only_for_nonstream_generate`.
+/// `requests.nonstream-keepalive-interval` does not apply to the codec routes (D2-PLAN
+/// §5.1, Q-F): nothing reaches the client before commitment, so a slow answer sends no
+/// keep-alive newline and keeps its own status and headers. Which calls still run the
+/// keep-alive is `dispatch::tests::nonstream_keepalive_only_for_nonstream_generate`.
 #[tokio::test]
-async fn nonstream_keepalive_commits_like_go() {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/server_go.json")).unwrap();
-    let golden = |name: &str| {
-        fixture["nonstream_keepalive"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == name)
-            .unwrap()
-            .clone()
-    };
-    // Splits the keep-alive newlines from the rendered body.
-    let split = |text: &str| {
-        let rest = text.trim_start_matches('\n');
-        (text.len() - rest.len(), rest.to_owned())
-    };
+async fn codec_routes_send_no_keepalive_before_commitment() {
     let body = format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"hi"}}]}}"#);
-
-    // A result before the first tick is answered as without a keep-alive.
-    let never = "requests:\n  nonstream-keepalive-interval: 86400\n";
-    for (token, case) in [("fake-ok", "fast_ok"), ("fake-bad", "fast_error")] {
-        let want = golden(case);
-        let p = proxy(never, vec![oauth("a.json", token, serde_json::json!({}))]).await;
-        let (status, headers, text) = post(&p.url, "/v1/messages", &body).await;
-        assert_eq!(u64::from(status), want["status"].as_u64().unwrap(), "{text}");
-        assert_eq!(headers["content-type"], want["content_type"].as_str().unwrap());
-        assert!(headers.get("content-length").is_some(), "{headers:?}");
-        assert_eq!(split(&text).0, 0, "{text:?}");
-        if case == "fast_error" {
-            let error = assert_claude_error(&text, &headers, "invalid_request_error");
-            assert_eq!(error["error"]["message"], "bad input");
-        }
-    }
-
-    // A result after the first tick: the mock holds its reply until the client has read
-    // a keep-alive newline, so the commit always precedes the result.
     let every_second = "requests:\n  nonstream-keepalive-interval: 1\n";
-    for (token, path, case) in [
-        ("fake-held-ok", "/v1/chat/completions", "slow_ok"),
-        ("fake-held-bad", "/v1/messages", "slow_error"),
+    for (token, path, status) in [
+        ("fake-held-ok", "/v1/chat/completions", 200),
+        ("fake-held-ok", "/v1/messages", 200),
+        ("fake-held-bad", "/v1/messages", 400),
     ] {
-        let want = golden(case);
         let p = proxy(every_second, vec![oauth("a.json", token, serde_json::json!({}))]).await;
-        let res = wreq::Client::new()
+        let request = wreq::Client::new()
             .post(format!("{}{path}", p.url))
             .header("authorization", "Bearer client-key")
             .body(body.clone())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(u64::from(res.status().as_u16()), want["status"].as_u64().unwrap());
-        let headers = res.headers().clone();
-        assert_eq!(headers["content-type"], want["content_type"].as_str().unwrap());
-        assert!(headers.get("content-length").is_none(), "{headers:?}");
-        let mut chunks = res.bytes_stream();
-        let mut text = Vec::new();
-        while text.is_empty() {
-            text.extend_from_slice(&chunks.next().await.unwrap().unwrap());
-        }
-        assert!(text.iter().all(|&b| b == b'\n'), "{:?}", String::from_utf8_lossy(&text));
+            .send();
+        let request = tokio::spawn(request);
+        p.seen.arrived.notified().await;
+        // Two keep-alive intervals pass while the upstream holds its answer.
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        assert!(
+            !request.is_finished(),
+            "{path}: the response committed before the answer"
+        );
         p.seen.release.notify_one();
-        while let Some(chunk) = chunks.next().await {
-            text.extend_from_slice(&chunk.unwrap());
-        }
-        let text = String::from_utf8(text).unwrap();
-        let (newlines, rest) = split(&text);
-        assert!(newlines >= 1, "{text:?}");
-        let (want_newlines, _) = split(want["body"].as_str().unwrap());
-        assert_eq!(want_newlines, 1);
-        if case == "slow_error" {
-            // Legacy keepalive has already committed the headers; D2 owns its removal.
-            let error = assert_claude_error_body(&rest, "invalid_request_error");
-            assert!(!headers.contains_key("request-id"));
-            assert_eq!(error["error"]["message"], "bad input");
-        } else {
-            let reply: Value = serde_json::from_str(&rest).unwrap();
-            assert_eq!(reply["choices"][0]["message"]["content"], "hi");
-        }
+        let res = request.await.unwrap().unwrap();
+        assert_eq!(res.status().as_u16(), status, "{path}");
+        assert_eq!(res.headers()["content-type"], "application/json", "{path}");
+        let text = res.text().await.unwrap();
+        assert!(text.starts_with('{'), "{path}: {text:?}");
     }
 }
 
@@ -440,28 +392,121 @@ async fn passthrough_headers_follow_go() {
     }
 }
 
+/// Chat, Anthropic and Gemini requests decode with their client codec before selection
+/// (D2-PLAN §3.1): a request the codec refuses answers in the route's error shape and sends
+/// nothing, and a valid one commits on the contract arm, which names its stream in
+/// `X-Ck-Stream-Id`. Routes without a codec refuse every request (Q8).
 #[tokio::test]
-async fn legacy_completions_convert_both_ways() {
-    let p = proxy("", vec![oauth("a.json", "fake-ok", serde_json::json!({}))]).await;
-    let body = format!(r#"{{"model":"{MODEL}","prompt":"say hi","max_tokens":9}}"#);
-    let (status, _, text) = post(&p.url, "/v1/completions", &body).await;
-    assert_eq!(status, 200, "{text}");
-    let reply: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(reply["object"], "text_completion");
-    assert_eq!(reply["choices"][0]["text"], "hi");
-    let seen = p.seen.requests.lock().unwrap().clone();
-    assert_eq!(seen[0].1["messages"][0]["content"][0]["text"], "say hi");
-    assert_eq!(seen[0].1["max_tokens"], 9);
-    let (_, _, text) = post(
-        &p.url,
-        "/v1/completions",
-        &body.replace("\"max_tokens\"", "\"stream\":true,\"max_tokens\""),
-    )
-    .await;
-    assert!(
-        text.contains(r#""object":"text_completion""#) && text.ends_with("data: [DONE]\n\n"),
-        "{text}"
+async fn codec_routes_decode_before_selection_and_commit_on_the_contract_arm() {
+    struct Row {
+        path: String,
+        body: String,
+        status: u16,
+        /// Upstream requests the row sends.
+        sends: usize,
+        /// The answer came from the contract arm.
+        stream_id: bool,
+        /// Text the client's body contains.
+        reply: &'static str,
+        /// Text the upstream body contains.
+        upstream: &'static str,
+    }
+    let user = r#"{"role":"user","content":"hello"}"#;
+    let chat = |extra: &str| format!(r#"{{"model":"{MODEL}","max_tokens":5{extra},"messages":[{user}]}}"#);
+    let messages = |extra: &str| format!(r#"{{"model":"{MODEL}","max_tokens":5{extra},"messages":[{user}]}}"#);
+    let gemini = |method: &str| format!("/v1beta/models/{MODEL}:{method}");
+    let contents =
+        r#"{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"generationConfig":{"maxOutputTokens":5}}"#
+            .to_owned();
+    // Signed thinking from an earlier Claude turn reaches a Claude upstream unchanged.
+    let signed = format!(
+        r#"{{"model":"{MODEL}","max_tokens":5,"stream":true,"messages":[{{"role":"user","content":"q"}},{{"role":"assistant","content":[{{"type":"thinking","thinking":"t","signature":"sig-1"}},{{"type":"text","text":"a"}}]}},{user}]}}"#
     );
+    let ok = |path: String, body: String, reply| Row {
+        path,
+        body,
+        status: 200,
+        sends: 1,
+        stream_id: true,
+        reply,
+        upstream: "",
+    };
+    let refused = |path: String, body: String, status, reply| Row {
+        path,
+        body,
+        status,
+        sends: 0,
+        stream_id: false,
+        reply,
+        upstream: "",
+    };
+    let chat_path = || "/v1/chat/completions".to_owned();
+    let messages_path = || "/v1/messages".to_owned();
+    let rows = [
+        ok(chat_path(), chat(""), r#""content":"hi""#),
+        ok(chat_path(), chat(r#","stream":true"#), "data: [DONE]"),
+        ok(messages_path(), messages(""), r#""text":"hi""#),
+        ok(messages_path(), messages(r#","stream":true"#), "event: message_stop"),
+        ok(gemini("generateContent"), contents.clone(), r#""text":"hi""#),
+        ok(gemini("streamGenerateContent"), contents.clone(), "data: {"),
+        Row {
+            upstream: r#""signature":"sig-1""#,
+            ..ok(messages_path(), signed, "event: message_stop")
+        },
+        refused(chat_path(), "{".into(), 400, "invalid_request_error"),
+        refused(messages_path(), "{".into(), 400, r#""type":"error""#),
+        refused(gemini("generateContent"), "{".into(), 400, "INVALID_ARGUMENT"),
+        // A Responses-shaped body is not converted to Chat.
+        refused(
+            chat_path(),
+            format!(r#"{{"model":"{MODEL}","input":"hello"}}"#),
+            400,
+            "invalid_request_error",
+        ),
+        // Nothing invents a `max_tokens` (Q-H): an Anthropic client sends one, and a Chat client
+        // bound for Anthropic without one or a configured default is refused before sending.
+        refused(
+            messages_path(),
+            format!(r#"{{"model":"{MODEL}","messages":[{user}]}}"#),
+            400,
+            "invalid_request_error",
+        ),
+        refused(
+            chat_path(),
+            format!(r#"{{"model":"{MODEL}","messages":[{user}]}}"#),
+            400,
+            "invalid_request_error",
+        ),
+        refused(
+            "/v1/completions".into(),
+            format!(r#"{{"model":"{MODEL}","prompt":"hi"}}"#),
+            501,
+            "unsupported_endpoint",
+        ),
+        refused(
+            "/v1beta/interactions".into(),
+            format!(r#"{{"model":"{MODEL}","input":"hi"}}"#),
+            501,
+            "UNIMPLEMENTED",
+        ),
+    ];
+    for row in rows {
+        let p = proxy("", vec![oauth("a.json", "fake-ok", serde_json::json!({}))]).await;
+        let (status, headers, text) = post(&p.url, &row.path, &row.body).await;
+        let case = format!("{} {}", row.path, row.body);
+        assert_eq!(status, row.status, "{case}: {text}");
+        assert_eq!(
+            headers.get("x-ck-stream-id").is_some(),
+            row.stream_id,
+            "{case}: {headers:?}"
+        );
+        assert!(text.contains(row.reply), "{case}: {text}");
+        let seen = p.seen.requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), row.sends, "{case}");
+        if !row.upstream.is_empty() {
+            assert!(seen[0].1.to_string().contains(row.upstream), "{case}: {}", seen[0].1);
+        }
+    }
 }
 
 #[tokio::test]
@@ -493,7 +538,7 @@ async fn failover_stop_rules_and_cooldown_contracts() {
     let (status, _, text) = post(
         &p.url,
         "/v1/chat/completions",
-        &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#),
     )
     .await;
     assert_eq!(status, 400);
@@ -507,7 +552,7 @@ async fn failover_stop_rules_and_cooldown_contracts() {
     let (status, headers, text) = post(
         &p.url,
         "/v1/chat/completions",
-        &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#),
     )
     .await;
     assert_eq!(status, 429);
@@ -519,7 +564,7 @@ async fn failover_stop_rules_and_cooldown_contracts() {
     let (status, headers, text) = post(
         &p.url,
         "/v1/chat/completions",
-        &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#),
     )
     .await;
     assert_eq!(status, 429);
@@ -535,7 +580,7 @@ async fn failover_stop_rules_and_cooldown_contracts() {
     let (status, headers, text) = post(
         &p.url,
         "/v1/messages",
-        &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#),
     )
     .await;
     assert_eq!(status, 429);
@@ -551,7 +596,8 @@ async fn failover_stop_rules_and_cooldown_contracts() {
 #[tokio::test]
 async fn mid_stream_failure_ends_with_route_error_frame() {
     let p = proxy("", vec![oauth("a.json", "fake-break", serde_json::json!({}))]).await;
-    let body = format!(r#"{{"model":"{MODEL}","stream":true,"messages":[{{"role":"user","content":"x"}}]}}"#);
+    let body =
+        format!(r#"{{"model":"{MODEL}","stream":true,"max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#);
     let (status, _, text) = post(&p.url, "/v1/chat/completions", &body).await;
     assert_eq!(status, 200, "{text}");
     let last = text.trim_end().rsplit("\n\n").next().unwrap();
@@ -637,7 +683,7 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
     let (status, _, text) = post(
         &p.url,
         "/v1/chat/completions",
-        r#"{"model":"team/friendly","messages":[{"role":"user","content":"x"}]}"#,
+        r#"{"model":"team/friendly","max_tokens":5,"messages":[{"role":"user","content":"x"}]}"#,
     )
     .await;
     assert_eq!(status, 200, "{text}");
@@ -666,7 +712,7 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
     let (status, _, _) = post(
         &p.url,
         "/v1/messages",
-        &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#),
     )
     .await;
     assert_eq!(status, 400);
@@ -749,16 +795,6 @@ async fn misc_routes_match_go() {
     let other = callback("/anthropic/callback?state=siwc&code=c").await.unwrap();
     assert_eq!(other.status().as_u16(), 200);
     assert_eq!(other.headers()["content-type"], "text/html; charset=utf-8");
-    // Interactions validation (interactions_handlers.go).
-    let (status, _, text) = post(&p.url, "/v1beta/interactions", r#"{"model":"a","agent":"b"}"#).await;
-    assert_eq!(status, 400);
-    let error: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(error["error"]["code"], 400);
-    assert_eq!(error["error"]["status"], "INVALID_ARGUMENT");
-    assert_eq!(
-        error["error"]["message"],
-        "request requires exactly one of model or agent"
-    );
     // Gemini action parsing (gemini_handlers.go).
     let (status, _, text) = post(&p.url, "/v1beta/models/x", "{}").await;
     assert_eq!(status, 404);
@@ -1145,13 +1181,15 @@ async fn empty_stream_fails_over_and_reports_empty_stream() {
     let empty: Reply = Box::new(|| ([("content-type", "text/event-stream")], "").into_response());
     let (url, _, _) = scripted_proxy("", &["fake-a"], vec![empty]).await;
     let (status, headers, text) = post(&url, "/v1/messages", &body).await;
-    assert_eq!(status, 500);
+    // The contract arm's empty upstream stream is a local 502, so its detail is redacted.
+    assert_eq!(status, 502, "{text}");
     let error = assert_claude_error(&text, &headers, "api_error");
-    assert!(!error.to_string().contains("upstream stream closed"));
+    assert_eq!(error["error"]["message"], "Bad Gateway");
 }
 
 /// Go handlers_stream.go: `requests.streaming.bootstrap-retries` re-runs a stream that
-/// failed before its first payload, independently of request-retry.
+/// failed before its first payload, independently of request-retry. Only routes without a
+/// client codec still run it; the Responses route is one until it switches (D2-3b).
 #[tokio::test]
 async fn bootstrap_retries_rerun_a_stream_that_broke_before_its_first_payload() {
     let broken: Reply = Box::new(|| {
@@ -1172,10 +1210,10 @@ async fn bootstrap_retries_rerun_a_stream_that_broke_before_its_first_payload() 
         )
             .into_response()
     });
-    let body = format!(r#"{{"model":"{MODEL}","stream":true,"max_tokens":5,"messages":[]}}"#);
+    let body = format!(r#"{{"model":"{MODEL}","stream":true,"max_output_tokens":5,"input":"x"}}"#);
     let config = "requests:\n  streaming:\n    bootstrap-retries: 1\n";
     let (url, script, _) = scripted_proxy(config, &["fake-a"], vec![broken, sse_reply()]).await;
-    let (status, _, text) = post(&url, "/v1/messages", &body).await;
+    let (status, _, text) = post(&url, "/v1/responses", &body).await;
     assert_eq!(status, 200, "{text}");
     assert_eq!(script.calls.lock().unwrap().len(), 2);
 
@@ -1198,7 +1236,7 @@ async fn bootstrap_retries_rerun_a_stream_that_broke_before_its_first_payload() 
             .into_response()
     });
     let (url, script, _) = scripted_proxy("", &["fake-a"], vec![broken, sse_reply()]).await;
-    let (status, _, _) = post(&url, "/v1/messages", &body).await;
+    let (status, _, _) = post(&url, "/v1/responses", &body).await;
     assert_eq!(status, 500, "without bootstrap retries the transport fault is final");
     assert_eq!(script.calls.lock().unwrap().len(), 1);
 }
@@ -1347,7 +1385,7 @@ async fn usage_queue_records_every_attempt() {
     assert_eq!(ok["access_token_sha256"].as_str().unwrap().len(), 64);
 
     // A streamed attempt publishes once the stream ends, with the merged usage.
-    let body = format!(r#"{{"model":"{MODEL}","stream":true,"messages":[]}}"#);
+    let body = format!(r#"{{"model":"{MODEL}","stream":true,"max_tokens":5,"messages":[]}}"#);
     let (status, _, _) = post(&p.url, "/v1/messages", &body).await;
     assert_eq!(status, 200);
     let records = pop();
