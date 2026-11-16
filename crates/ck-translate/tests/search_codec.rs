@@ -1,10 +1,14 @@
 #[allow(dead_code, reason = "these tests use only the mapped store and writer")]
 mod semantic;
 
+use ck_stream::Read;
 use ck_translate::{
     codec::{
+        Error, ResponseEgress, ResponseIngress,
         document::{Document, Value},
-        encode, provenance,
+        encode,
+        event::{Direction, Identity, LocalId},
+        provenance,
         source::Source,
     },
     search::{self, Decoder, Phase},
@@ -26,6 +30,39 @@ fn decode(mapped: &mut Mapped, input: &[u8], phase: Phase, chunk: usize) -> Docu
         decoder.advance(&mut mapped.writer, bytes).unwrap();
     }
     decoder.finish(&mut mapped.writer).unwrap()
+}
+
+fn identity() -> Identity {
+    Identity {
+        request_id: LocalId::new("search-request").unwrap(),
+        stream_id: LocalId::new("search-stream").unwrap(),
+        attempt: 1,
+        direction: Direction::Response,
+    }
+}
+
+/// `body` as the upstream's answer through the search ingress and the client's egress: what the
+/// client got and how the egress ended.
+fn through_stream(body: &[u8], chunk: usize) -> (Vec<u8>, Result<(), Error>) {
+    let mut mapped = Mapped::new();
+    let mut ingress = search::Ingress::new(&mut mapped.writer, identity(), body.len().max(1) as u64).unwrap();
+    let _ = body
+        .chunks(chunk)
+        .try_for_each(|bytes| ingress.advance(&mut mapped.writer, bytes))
+        .and_then(|()| ingress.finish(&mut mapped.writer));
+    let mut egress = search::ResultEgress::new(&mapped.writer, Some(identity()));
+    let mut reader = mapped.store.reader(mapped.writer.id(), 0).unwrap();
+    let mut client = Vec::new();
+    let mut result = Ok(());
+    while result.is_ok()
+        && let std::task::Poll::Ready(Some(Read::Record(lease))) = reader.try_next()
+    {
+        result = egress.advance(&mut mapped.writer, lease, |out| {
+            client.extend(bytes(&out));
+            Ok(())
+        });
+    }
+    (client, result.and_then(|()| egress.finish()))
 }
 
 #[test]
@@ -58,6 +95,15 @@ fn search_round_trip_preserves_native_fields_through_canonical_storage() {
                 serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
                 fixture["wire"]
             );
+            // An upstream result reaches the client as the body the upstream sent.
+            if phase == Phase::Result {
+                let (client, result) = through_stream(&wire, chunk);
+                result.unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&client).unwrap(),
+                    fixture["wire"]
+                );
+            }
         }
     }
 }
@@ -93,6 +139,13 @@ fn search_rejects_invalid_or_incomplete_documents() {
                 assert!(decoder.advance(&mut mapped.writer, b" ").is_err());
             } else {
                 assert!(decoder.finish(&mut mapped.writer).is_err(), "accepted {input:?}");
+            }
+            // An upstream answer that is not a whole result gives the client nothing: the egress
+            // reads the upstream failure.
+            if phase == Phase::Result {
+                let (client, result) = through_stream(input, chunk);
+                assert!(client.is_empty(), "{input:?}");
+                assert!(matches!(result, Err(Error::Truncated)), "{input:?}: {result:?}");
             }
         }
     }

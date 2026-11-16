@@ -8,7 +8,7 @@
 use ck_stream::{ScratchLease, Writer};
 
 mod response;
-pub use response::Ingress;
+pub use response::{Ingress, ResultEgress};
 
 use crate::{
     boundary,

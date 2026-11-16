@@ -609,49 +609,6 @@ async fn truncated_error_body_is_a_transport_failure_not_an_auth_failure() {
     assert_ne!(error.status, 401);
 }
 
-#[tokio::test]
-async fn alpha_search_reads_at_most_32_mib_whatever_the_status() {
-    use crate::codex_testkit::Reply;
-    let mock = Mock::start().await;
-    let big = "x".repeat(ALPHA_SEARCH_MAX_RESPONSE + 4096);
-    let error_body = "e".repeat(100 * 1024);
-    mock.script(
-        "/alpha/search",
-        vec![
-            Reply {
-                status: 200,
-                headers: vec![("content-type".into(), "application/json".into())],
-                body: big,
-            },
-            Reply {
-                status: 500,
-                headers: vec![("content-type".into(), "application/json".into())],
-                body: error_body.clone(),
-            },
-        ],
-    );
-    let executor = executor().with_alpha_base_url(&mock.url);
-    let cred = oauth_credential(&mock.url);
-    for (status, expected) in [(200, ALPHA_SEARCH_MAX_RESPONSE), (500, error_body.len())] {
-        let response = executor
-            .alpha_search(
-                &cred,
-                b"{}",
-                &HeaderMap::new(),
-                "",
-                &Config::default(),
-                &Default::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status, status);
-        let ResponseBody::Buffered(body) = response.body else {
-            unreachable!()
-        };
-        assert_eq!(body.len(), expected, "status {status}");
-    }
-}
-
 /// Records what the executor reports to the attempt's usage record.
 #[derive(Default)]
 struct Recorded(std::sync::Mutex<Vec<(&'static str, Format, String)>>);
@@ -1275,9 +1232,8 @@ async fn capture_stops_at_the_terminal_line() {
 }
 
 /// Body read failures follow each Go call site: Execute (`data, errRead := io.ReadAll`)
-/// records every byte that arrived, the unfinished tail included, then the error; Alpha
-/// Search records the partial body, then the error; the stream path's error response
-/// records only the read error and returns it.
+/// records every byte that arrived, the unfinished tail included, then the error; the stream
+/// path's error response records only the read error and returns it.
 #[tokio::test]
 async fn capture_keeps_each_sites_read_error_policy() {
     // Execute: the whole partial body, then the error.
@@ -1303,25 +1259,6 @@ async fn capture_keeps_each_sites_read_error_policy() {
     );
     assert!(matches!(&taps[3], Tap::Error(_)), "{taps:?}");
     assert_eq!(taps.len(), 4, "{taps:?}");
-
-    // Alpha Search: the prefix, then the error.
-    let url = broken_upstream(200, "application/json", vec!["{\"results\":["], true).await;
-    let tap = Arc::new(Wiretap::default());
-    let mut cred = oauth_credential(&url);
-    cred.attributes.insert("api_key".into(), "sk-FAKE".into());
-    let _ = executor()
-        .alpha_search(
-            &cred,
-            b"{}",
-            &HeaderMap::new(),
-            "",
-            &Config::default(),
-            &ck_core::exec::CaptureSink::new(tap.clone()),
-        )
-        .await;
-    let taps = tap.taps();
-    assert_eq!(taps[2], Tap::Chunk("{\"results\":[".into()), "{taps:?}");
-    assert!(matches!(&taps[3], Tap::Error(_)), "{taps:?}");
 
     // Stream: an error body that breaks is the read error, not a status error.
     let url = broken_upstream(401, "application/json", vec!["{\"error\":"], true).await;

@@ -1112,8 +1112,12 @@ async fn run_loop<X: Arms>(
         call.execution_session.as_deref(),
         &call.caller.principal,
     );
-    // Go's usage reporter: one record per Generate attempt while the queue accepts.
-    let usage = (call.operation == Operation::Generate && rt.usage_queue().accepts()).then(|| {
+    let alpha = arm
+        .as_ref()
+        .is_some_and(|arm| arm.operation() == ck_translate::codec::Operation::AlphaSearch);
+    // Go's usage reporter: one record per Generate attempt while the queue accepts. Alpha
+    // Search reports none (`Server.codexAlphaSearch`).
+    let usage = (call.operation == Operation::Generate && !alpha && rt.usage_queue().accepts()).then(|| {
         Arc::new(crate::observability::usage_record::Facts::new(
             usage_client(&cfg, &call, trace, &session),
             call.entry,
@@ -1144,6 +1148,15 @@ async fn run_loop<X: Arms>(
                     .get("plan_type")
                     .is_some_and(|plan| plan.trim().eq_ignore_ascii_case("free"));
             if free && !pinned_exclusion.contains(&credential.id) {
+                pinned_exclusion.push(credential.id.clone());
+            }
+        }
+    }
+    // `codex_alpha_search_v1`: a credential the policy refuses is no candidate for Alpha
+    // Search, so it neither answers the request nor spends a retry slot.
+    if alpha {
+        for credential in rt.store().snapshot() {
+            if !rt.executors.codex.alpha_allowed(&credential, &cfg) && !pinned_exclusion.contains(&credential.id) {
                 pinned_exclusion.push(credential.id.clone());
             }
         }

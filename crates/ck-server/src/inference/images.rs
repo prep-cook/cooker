@@ -258,7 +258,7 @@ async fn run(
 
 /// What the images codec refused of a client request, in client wording: malformed input is
 /// 400, an oversized body or part 413, and storage follows contract §9.
-fn refused(error: codec::Error) -> Failure {
+pub(crate) fn refused(error: codec::Error) -> Failure {
     let error = match error {
         codec::Error::Storage(error) => dispatch::stored(&error),
         codec::Error::Limit | codec::Error::EventTooLarge => {

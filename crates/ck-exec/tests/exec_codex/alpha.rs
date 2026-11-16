@@ -104,6 +104,11 @@ async fn a_search_result_is_one_operation_record() {
             .credential
             .attributes
             .insert("header:X-Sess".into(), "$CPA-SESSION-ID".into());
+        // An API key identifies as cooker over a configured User-Agent.
+        exchange
+            .credential
+            .attributes
+            .insert("header:User-Agent".into(), "configured/1".into());
         let mut held = decoded(&streams, 5);
         let (outcome, records, terminal) = attempt(&streams, &exchange, &mut held).await.unwrap();
         outcome.unwrap();
