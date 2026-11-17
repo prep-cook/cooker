@@ -33,7 +33,7 @@ cp /tmp/rsfix/realtime_http_go.json /tmp/rsfix/codex_live_ws_go.json /tmp/rsfix/
 `codex_live_tunnel_go.json` comes from `zz_rsfix_live_tunnel_test.go` (copy it next to
 the others in `internal/client/codex/live/`, run `-run TestRSFixLiveTunnelVectors`, copy
 `/tmp/rsfix/live_tunnel_vectors.json` to `../../fixtures/codex_live_tunnel_go.json`). It
-is replayed by `src/realtime/tunnel_tests.rs`, built with `--features media-relay`:
+is replayed by `src/realtime/api/tunnel_tests.rs`, built with `--features media-relay`:
 
 - `prepare`: `prepareProxiedUpstreamAnswer` on answers built from `testProxySDP`, with
   the error or the rewritten SDP (each tunnel listener masked as `LISTENn`), targets,

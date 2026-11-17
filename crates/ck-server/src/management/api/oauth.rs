@@ -769,38 +769,64 @@ async fn save_if_pending<T: Clone + Send + Sync + 'static>(
     };
     // Transfer ownership before locks, hydration or provider merge/write effects.
     state.config_store().hold_login(held);
-    let worker = state.clone();
-    match state
-        .work
-        .clone()
-        .spawn_blocking(move || {
+    let saved = async {
+        let (worker, admitted) = (state.clone(), backend.clone());
+        let admission = save_blocking(state, move || {
             let admission = {
                 let _disk = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
-                backend.admit_work()
+                admitted.admit_work()
             };
             anyhow::ensure!(!rejected.load(std::sync::atomic::Ordering::SeqCst), LoginRejected);
-            let paths = backend
-                .documents()?
-                .into_iter()
-                .map(|(path, _)| path)
-                .collect::<Vec<_>>();
-            let _locks = paths
-                .iter()
-                .map(|path| ck_exec::codex_siwc_bind::lock_file(path).map_err(anyhow::Error::msg))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let _disk = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
-            backend.repair_cache()?;
-            admission?;
-            worker.credential_changes.notify_one();
-            Ok::<_, anyhow::Error>(())
+            Ok(admission)
         })
-        .await
-    {
-        Ok(Ok(())) => Outcome::Saved,
-        Ok(Err(_)) => Outcome::Failed(save_error.to_owned()),
+        .await?;
+        // The result committed at admission, so the cache repair never gives up on a busy
+        // document: it waits for that lock alone, off `disk` and the store, so the refresh
+        // holding it can commit, then repairs again. Shutdown stops the wait; the stored
+        // credential stays, and `CredentialDb::initialize` restores every cache file at
+        // the next start.
+        loop {
+            let (worker, repairing) = (state.clone(), backend.clone());
+            let busy = save_blocking(state, move || {
+                let _disk = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
+                repairing.repair_cache()
+            })
+            .await?;
+            let Some(busy) = busy else { break };
+            #[cfg(test)]
+            crate::testing::installation_effects::run(
+                &busy,
+                crate::testing::installation_effects::Stage::LoginRepairBusy,
+            )?;
+            tokio::select! {
+                biased;
+                _ = state.stopping.cancelled() => break,
+                lock = state.rt.lock_codex_file(&busy) => {
+                    let lock = lock.map_err(anyhow::Error::msg)?;
+                    ck_exec::codex_siwc_bind::unlock(&lock).map_err(anyhow::Error::msg)?;
+                }
+            }
+        }
+        admission?;
+        state.credential_changes.notify_one();
+        Ok::<_, anyhow::Error>(())
+    };
+    match saved.await {
+        Ok(()) => Outcome::Saved,
+        Err(_) => Outcome::Failed(save_error.to_owned()),
+    }
+}
+
+/// Runs one step of a login save on the blocking pool, where `disk` may be taken.
+async fn save_blocking<T: Send + 'static>(
+    state: &Management,
+    step: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    match state.work.clone().spawn_blocking(step).await {
+        Ok(result) => result,
         Err(e) => {
             resume_panic(e);
-            Outcome::Failed(save_error.to_owned())
+            Err(anyhow::anyhow!("login save task cancelled"))
         }
     }
 }
@@ -2506,6 +2532,250 @@ mod tests {
         }
         drop((state, db, database));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Saves a Vertex login result for `sid` through the login save worker.
+    async fn save_vertex(state: &Arc<Management>, sid: &str) -> Outcome {
+        save_if_pending(
+            state,
+            sid,
+            "vertex",
+            (),
+            |dir, (), save| {
+                let path = dir.join("vertex.json");
+                save_login(Some(&save), std::slice::from_ref(&path), || {
+                    std::fs::write(&path, VERTEX_SAVED).map_err(|error| error.to_string())?;
+                    Ok(path.clone())
+                })
+            },
+            "save failed",
+        )
+        .await
+    }
+
+    const VERTEX_SAVED: &[u8] = br#"{"type":"vertex","prefix":"saved"}"#;
+
+    /// Fires once when the login save finds `path`'s lock held and is about to wait for it.
+    fn busy_signal(
+        path: &std::path::Path,
+    ) -> (
+        crate::testing::installation_effects::Guard,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use crate::testing::installation_effects::{self, Stage};
+        let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+        let guard = installation_effects::once(path, Stage::LoginRepairBusy, move || {
+            let _ = busy_tx.send(());
+            Ok(())
+        });
+        (guard, busy_rx)
+    }
+
+    /// Bounds only a regression's failure; a correct wait ends well before it.
+    const BOUNDED: Duration = Duration::from_secs(10);
+
+    /// Cache repair rewrites every document, so a login save waits while a refresh holds
+    /// any document's lock, not only its destination's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn login_save_waits_for_a_lock_on_an_unrelated_document() {
+        let (root, state, db) = sqlite_state("unrelated-lock");
+        let other = db.auth_dir().join("other.json");
+        let before = br#"{"type":"claude","access_token":"unrelated-fixture"}"#;
+        db.save(&other, before).unwrap();
+        let document = ck_exec::codex_siwc_bind::lock_file(&other).unwrap();
+        let (first, busy) = busy_signal(&other);
+        state.oauth.register("unrelated-lock", "vertex");
+        let saving = tokio::spawn({
+            let state = state.clone();
+            async move { save_vertex(&state, "unrelated-lock").await }
+        });
+        tokio::time::timeout(BOUNDED, busy)
+            .await
+            .expect("the login save found the unrelated lock held")
+            .unwrap();
+        assert!(
+            !saving.is_finished(),
+            "the login save repaired the cache under a held lock"
+        );
+        drop(first);
+        let (_again, mut again) = busy_signal(&other);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            again.try_recv().is_err(),
+            "the login save probed again without waiting for the held lock"
+        );
+        drop(document);
+        let outcome = tokio::time::timeout(BOUNDED, saving)
+            .await
+            .expect("the login save waits for the released lock")
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Saved));
+        let path = db.auth_dir().join("vertex.json");
+        assert_eq!(db.read(&path).unwrap().unwrap(), VERTEX_SAVED);
+        assert_eq!(std::fs::read(&path).unwrap(), VERTEX_SAVED, "the cache was repaired");
+        assert_eq!(std::fs::read(&other).unwrap(), before);
+        drop(state);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The login result commits at admission, before the cache repair. Locks that keep
+    /// changing hands therefore delay the repair but never fail a login whose credential
+    /// is already stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn login_save_repairs_after_any_number_of_busy_documents() {
+        let (root, state, db) = sqlite_state("busy-handoff");
+        let documents: Vec<_> = (0..17)
+            .map(|i| {
+                let data = format!(r#"{{"type":"claude","access_token":"busy-fixture-{i:02}"}}"#);
+                (db.auth_dir().join(format!("busy-{i:02}.json")), data.into_bytes())
+            })
+            .collect();
+        db.command().unwrap().save_documents(&documents).unwrap();
+        // The repair probes documents in name order, so each wait meets the next lock.
+        let held: Vec<_> = documents
+            .iter()
+            .map(|(path, _)| (ck_exec::codex_siwc_bind::lock_file(path).unwrap(), busy_signal(path)))
+            .collect();
+        state.oauth.register("busy-handoff", "vertex");
+        let saving = tokio::spawn({
+            let state = state.clone();
+            async move { save_vertex(&state, "busy-handoff").await }
+        });
+        for (document, (guard, busy)) in held {
+            tokio::time::timeout(BOUNDED, busy)
+                .await
+                .expect("the login save waits for each held lock in turn")
+                .unwrap();
+            drop(document);
+            drop(guard);
+        }
+        let outcome = tokio::time::timeout(BOUNDED, saving).await.unwrap().unwrap();
+        assert!(matches!(outcome, Outcome::Saved));
+        assert_eq!(
+            db.read(&db.auth_dir().join("vertex.json")).unwrap().unwrap(),
+            VERTEX_SAVED
+        );
+        drop(state);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Shutdown joins login workers, so a save waiting for a refresh's lock must stop
+    /// waiting. The credential committed at admission stays; the next start's
+    /// `CredentialDb::initialize` restores every cache file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_stops_a_login_save_waiting_for_a_document_lock() {
+        let (root, state, db) = sqlite_state("shutdown-busy");
+        let other = db.auth_dir().join("other.json");
+        db.save(&other, br#"{"type":"claude","access_token":"shutdown-fixture"}"#)
+            .unwrap();
+        let document = ck_exec::codex_siwc_bind::lock_file(&other).unwrap();
+        let (_busy, busy) = busy_signal(&other);
+        state.oauth.register("shutdown-busy", "vertex");
+        let worker = state.clone();
+        spawn_login(&state, "shutdown-busy", "vertex", None, async move {
+            let outcome = save_vertex(&worker, "shutdown-busy").await;
+            settle(&worker, "shutdown-busy", outcome).await;
+        });
+        tokio::time::timeout(BOUNDED, busy)
+            .await
+            .expect("the login save found the lock held")
+            .unwrap();
+        tokio::time::timeout(BOUNDED, state.shutdown())
+            .await
+            .expect("shutdown waited for a login save blocked on a document lock");
+        assert_eq!(
+            db.read(&db.auth_dir().join("vertex.json")).unwrap().unwrap(),
+            VERTEX_SAVED
+        );
+        assert!(
+            state.oauth.get("shutdown-busy").unwrap().2,
+            "the stored login reported success"
+        );
+        drop(document);
+        state.rt.shutdown_codex_refreshes().await;
+        drop(state);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Marks the re-executed test process that runs under a lowered descriptor limit.
+    #[cfg(unix)]
+    const LOW_NOFILE_CHILD: &str = "CK_OAUTH_LOW_NOFILE_CHILD";
+
+    /// A login save must not hold a descriptor per stored document: the child lowers only
+    /// its own soft `RLIMIT_NOFILE` before any runtime exists, so the parent and other
+    /// tests keep theirs.
+    #[cfg(unix)]
+    #[test]
+    fn login_save_beside_2000_documents_fits_a_1024_descriptor_limit() {
+        const NAME: &str =
+            "management::api::oauth::tests::login_save_beside_2000_documents_fits_a_1024_descriptor_limit";
+        if std::env::var_os(LOW_NOFILE_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(LOW_NOFILE_CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "low-descriptor child failed ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+                output.status
+            );
+            return;
+        }
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit and setrlimit only read and write the given struct.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        assert!(limit.rlim_max >= 1024, "hard descriptor limit below 1024");
+        limit.rlim_cur = 1024;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (root, state, db) = sqlite_state("low-nofile");
+                let documents: Vec<_> = (0..2000)
+                    .map(|i| {
+                        let data = format!(r#"{{"type":"claude","access_token":"low-nofile-fixture-{i:04}"}}"#);
+                        (db.auth_dir().join(format!("low-nofile-{i:04}.json")), data.into_bytes())
+                    })
+                    .collect();
+                db.command().unwrap().save_documents(&documents).unwrap();
+                state.oauth.register("low-nofile", "vertex");
+                let outcome = save_if_pending(
+                    &state,
+                    "low-nofile",
+                    "vertex",
+                    (),
+                    |dir, (), save| {
+                        let path = dir.join("vertex.json");
+                        save_login(Some(&save), std::slice::from_ref(&path), || {
+                            std::fs::write(&path, br#"{"type":"vertex","prefix":"saved"}"#)
+                                .map_err(|error| error.to_string())?;
+                            Ok(path.clone())
+                        })
+                    },
+                    "save failed",
+                )
+                .await;
+                assert!(matches!(outcome, Outcome::Saved));
+                let path = db.auth_dir().join("vertex.json");
+                let saved = br#"{"type":"vertex","prefix":"saved"}"#;
+                assert_eq!(db.read(&path).unwrap().unwrap(), saved);
+                assert_eq!(std::fs::read(&path).unwrap(), saved);
+                assert_eq!(db.documents().unwrap().len(), 2001);
+                drop(state);
+                drop(db);
+                std::fs::remove_dir_all(root).unwrap();
+            });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

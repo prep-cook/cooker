@@ -18,8 +18,8 @@ parent, the base branch tip: exactly what merging would change.
 
 Lanes and the jobs they run, each building the Dockerfile stage of the same name:
   dashboard  the dashboard's checks and build
-  check      fmt, clippy, actionlint, THIRD-PARTY-NOTICES, the harness build, script tests,
-             the requirements check
+  check      fmt, clippy, the Rust size gate, actionlint, THIRD-PARTY-NOTICES, the harness
+             build, script tests, the requirements check
   test       the two test shards and the test counts
   perf       the size and idle gates on the release binary, the image smoke test and size
 """
@@ -90,10 +90,9 @@ _COMPILED = tuple((re.compile(pattern, re.DOTALL), lanes) for pattern, lanes in 
 
 
 def lanes_for(path):
-    for pattern, lanes in _COMPILED:
-        if pattern.fullmatch(path):
-            return lanes
-    return ALL
+    lanes = next((lanes for pattern, lanes in _COMPILED if pattern.fullmatch(path)), ALL)
+    # The check stage measures every Rust file, wherever it lives (tools/check-rust-size.py).
+    return lanes | {"check"} if path.endswith(".rs") else lanes
 
 
 def classify(paths):

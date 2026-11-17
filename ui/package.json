@@ -7,7 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node --experimental-strip-types --test \"src/**/*.test.ts\" scripts/private-credential-store.test.mjs",
+    "test": "node --experimental-strip-types --test \"src/**/*.test.ts\" scripts/private-credential-store.test.mjs tools/mock/server.test.mjs",
     "lint": "node tools/lint.mjs",
     "format": "prettier --write .",
     "check:api": "node tools/check-api.mjs",

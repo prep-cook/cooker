@@ -115,6 +115,12 @@ class Paths(unittest.TestCase):
         self.assertEqual(lanes("bench/budgets.txt"), {"test", "perf"})
         self.assertEqual(lanes("bench/gate.sh"), {"test", "perf"})
 
+    def test_rust_anywhere_runs_the_size_gate(self):
+        # tools/check-rust-size.py in the check stage measures every Rust file.
+        self.assertEqual(lanes("ui/scripts/login-harness/src/main.rs"), {"dashboard", "check"})
+        self.assertEqual(lanes("ui/scripts/login-harness/Cargo.toml"), {"dashboard"})
+        self.assertEqual(lanes("bench/load/src/main.rs"), {"test", "perf", "check"})
+
     def test_unknown_paths_run_everything(self):
         for path in ("tools/x.py", "newdir/file", ".github/scripts/new.sh",
                      ".github/other.yml", "crates"):

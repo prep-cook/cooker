@@ -598,7 +598,7 @@ These are source-verified transformations at the cited baseline, not claims that
 | L18 | Realtime declares live usage logging unported; the S0 usage path must not inherit that omission. | `crates/ck-server/src/realtime/api.rs:21-23` | New |
 
 Existing direct Claude→Responses carriage of redacted thinking must survive even though the Chat projection loses it (`crates/ck-translate/src/claude_responses_response.rs:167-175`).
-Current compact rejects stream=true (`crates/ck-server/src/inference/openai.rs:1064-1079`); S0 retains that operation contract, not a raw-body shortcut.
+Current compact rejects stream=true (`crates/ck-server/src/inference/openai.rs:1065-1080`); S0 retains that operation contract, not a raw-body shortcut.
 
 ## 6. Storage
 

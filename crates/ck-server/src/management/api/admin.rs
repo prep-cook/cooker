@@ -539,71 +539,99 @@ pub(crate) async fn credential_batch(
         let path = db.auth_dir().join(name);
         deletions.push((deletion, path));
     }
-    // Stable order prevents multi-document writers from inverting protocol locks.
-    // Wait off the async worker and without holding either management or owner gate.
-    let mut paths: Vec<_> = documents
-        .iter()
-        .map(|(_, path, _)| path.clone())
-        .chain(deletions.iter().map(|(_, path)| path.clone()))
-        .collect();
-    paths.sort();
-    let mut locks = Vec::with_capacity(paths.len());
-    for path in paths {
-        locks.push(
-            state
-                .rt
-                .lock_codex_file(&path)
-                .await
-                .map_err(|_| AdminError::store(&state))?,
-        );
+    let batch = Arc::new((documents, deletions));
+    for _ in 0..16 {
+        let attempt = batch.clone();
+        let busy = match blocking(state.clone(), move |state| credential_batch_attempt(state, &attempt)).await? {
+            BatchAttempt::Done(response) => return Ok(response),
+            BatchAttempt::Busy(path) => path,
+        };
+        // Wait off the store for this document alone, then repeat every check: whatever
+        // its holder committed meanwhile is the source the conditions now apply to.
+        let lock = state
+            .rt
+            .lock_codex_file(&busy)
+            .await
+            .map_err(|_| AdminError::store(&state))?;
+        ck_exec::codex_siwc_bind::unlock(&lock).map_err(|_| AdminError::store(&state))?;
     }
-    blocking(state, move |state| {
-        let _locks = locks;
-        let _disk = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut command = db.command().map_err(|_| AdminError::store(state))?;
-        let mut prepared = Vec::with_capacity(documents.len());
-        for (document, path, bytes) in &documents {
-            let (target, _, synthesized, _) =
-                super::auth_files::prepare_upload(state, &document.name, bytes).map_err(|(invalid, _)| {
-                    if invalid {
-                        AdminError::new(state, 400, "invalid_credential", "invalid credential document")
-                    } else {
-                        AdminError::store(state)
-                    }
-                })?;
-            if target != *path {
-                return Err(AdminError::new(
-                    state,
-                    400,
-                    "invalid_credential_target",
-                    "invalid managed target",
-                ));
-            }
-            if document.if_none_match || document.if_match.is_some() {
-                let current = command.read(path).map_err(|_| AdminError::store(state))?;
-                let conflict = document.if_none_match && current.is_some()
-                    || document.if_match.as_ref().is_some_and(|expected| {
-                        current
-                            .as_ref()
-                            .is_none_or(|bytes| !format!("{:x}", Sha256::digest(bytes)).eq_ignore_ascii_case(expected))
-                    });
-                if conflict {
-                    return Err(AdminError::new(
-                        state,
-                        412,
-                        "precondition_failed",
-                        "a credential precondition failed",
-                    ));
-                }
-            }
-            prepared.push((path.clone(), synthesized.is_some()));
+    Err(AdminError::new(
+        &state,
+        500,
+        "store_failed",
+        "the credential lock kept changing hands",
+    ))
+}
+
+type CredentialBatchParts = (
+    Vec<(CredentialDocument, std::path::PathBuf, Vec<u8>)>,
+    Vec<(CredentialDeletion, std::path::PathBuf)>,
+);
+
+enum BatchAttempt {
+    Done(Response),
+    /// A refresh holds this document's lock; nothing was written.
+    Busy(std::path::PathBuf),
+}
+
+/// One all-or-nothing batch attempt under `disk` and the store command.
+fn credential_batch_attempt(
+    state: &Management,
+    (documents, deletions): &CredentialBatchParts,
+) -> Result<BatchAttempt, AdminError> {
+    let db = state.rt.store().credential_backend();
+    let _disk = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut command = db.command().map_err(|_| AdminError::store(state))?;
+    // Every refresh of an existing document takes its lock and only then restores the
+    // document through the store command, keeping the lock until its result commits. A
+    // free lock probed under this command therefore means no refresh of that document
+    // has started or can start before this commit, so the probe releases each lock at
+    // once instead of keeping one descriptor per document. A held lock means a refresh
+    // is in flight: give up the attempt and the store so that refresh can commit.
+    for path in documents
+        .iter()
+        .map(|(_, path, _)| path)
+        .chain(deletions.iter().map(|(_, path)| path))
+    {
+        let lock = ck_exec::codex_siwc_bind::open_lock_file(path).map_err(|_| AdminError::store(state))?;
+        if !ck_exec::codex_siwc_bind::try_lock(&lock).map_err(|_| AdminError::store(state))? {
+            return Ok(BatchAttempt::Busy(path.clone()));
         }
-        for (deletion, path) in &deletions {
+        ck_exec::codex_siwc_bind::unlock(&lock).map_err(|_| AdminError::store(state))?;
+    }
+    #[cfg(test)]
+    crate::testing::installation_effects::run(
+        &db.auth_dir(),
+        crate::testing::installation_effects::Stage::CredentialBatchProbed,
+    )
+    .map_err(|_| AdminError::store(state))?;
+    let mut prepared = Vec::with_capacity(documents.len());
+    for (document, path, bytes) in documents {
+        let (target, _, synthesized, _) =
+            super::auth_files::prepare_upload(state, &document.name, bytes).map_err(|(invalid, _)| {
+                if invalid {
+                    AdminError::new(state, 400, "invalid_credential", "invalid credential document")
+                } else {
+                    AdminError::store(state)
+                }
+            })?;
+        if target != *path {
+            return Err(AdminError::new(
+                state,
+                400,
+                "invalid_credential_target",
+                "invalid managed target",
+            ));
+        }
+        if document.if_none_match || document.if_match.is_some() {
             let current = command.read(path).map_err(|_| AdminError::store(state))?;
-            if current
-                .as_ref()
-                .is_none_or(|bytes| !format!("{:x}", Sha256::digest(bytes)).eq_ignore_ascii_case(&deletion.if_match))
-            {
+            let conflict = document.if_none_match && current.is_some()
+                || document.if_match.as_ref().is_some_and(|expected| {
+                    current
+                        .as_ref()
+                        .is_none_or(|bytes| !format!("{:x}", Sha256::digest(bytes)).eq_ignore_ascii_case(expected))
+                });
+            if conflict {
                 return Err(AdminError::new(
                     state,
                     412,
@@ -612,46 +640,59 @@ pub(crate) async fn credential_batch(
                 ));
             }
         }
-        let documents: Vec<_> = documents.into_iter().map(|(_, path, bytes)| (path, bytes)).collect();
-        let mut changes: Vec<_> = documents
-            .iter()
-            .map(|(path, bytes)| (path.clone(), Some(bytes.as_slice())))
-            .collect();
-        changes.extend(deletions.iter().map(|(_, path)| (path.clone(), None)));
-        // Validation is shared with upload, but this port preserves original bytes.
-        command
-            .apply_documents(&changes)
-            .map_err(|_| AdminError::store(state))?;
-        drop(command);
-        for path in prepared
-            .iter()
-            .map(|(path, _)| path)
-            .chain(deletions.iter().map(|(_, path)| path))
+        prepared.push((path.clone(), synthesized.is_some()));
+    }
+    for (deletion, path) in deletions {
+        let current = command.read(path).map_err(|_| AdminError::store(state))?;
+        if current
+            .as_ref()
+            .is_none_or(|bytes| !format!("{:x}", Sha256::digest(bytes)).eq_ignore_ascii_case(&deletion.if_match))
         {
-            state.oauth.invalidate_siwc(path);
+            return Err(AdminError::new(
+                state,
+                412,
+                "precondition_failed",
+                "a credential precondition failed",
+            ));
         }
-        {
-            let mut fallbacks = state.fallbacks.lock().unwrap_or_else(PoisonError::into_inner);
-            for (_, path) in &deletions {
-                fallbacks.remove(path);
+    }
+    let mut changes: Vec<_> = documents
+        .iter()
+        .map(|(_, path, bytes)| (path.clone(), Some(bytes.as_slice())))
+        .collect();
+    changes.extend(deletions.iter().map(|(_, path)| (path.clone(), None)));
+    // Validation is shared with upload, but this port preserves original bytes.
+    command
+        .apply_documents(&changes)
+        .map_err(|_| AdminError::store(state))?;
+    drop(command);
+    for path in prepared
+        .iter()
+        .map(|(path, _)| path)
+        .chain(deletions.iter().map(|(_, path)| path))
+    {
+        state.oauth.invalidate_siwc(path);
+    }
+    {
+        let mut fallbacks = state.fallbacks.lock().unwrap_or_else(PoisonError::into_inner);
+        for (_, path) in deletions {
+            fallbacks.remove(path);
+        }
+        for (path, claimed) in prepared {
+            if claimed {
+                fallbacks.remove(&path);
+            } else {
+                fallbacks.insert(path);
             }
-            for (path, claimed) in prepared {
-                if claimed {
-                    fallbacks.remove(&path);
-                } else {
-                    fallbacks.insert(path);
-                }
-            }
         }
-        state.publish((*state.rt.config()).clone(), None);
-        state.credential_changes.notify_one();
-        let mut receipt = json!({"status": "ok", "saved": documents.len()});
-        if !deletions.is_empty() {
-            receipt["deleted"] = deletions.len().into();
-        }
-        Ok(send(state, StatusCode::OK, &receipt, None))
-    })
-    .await
+    }
+    state.publish((*state.rt.config()).clone(), None);
+    state.credential_changes.notify_one();
+    let mut receipt = json!({"status": "ok", "saved": documents.len()});
+    if !deletions.is_empty() {
+        receipt["deleted"] = deletions.len().into();
+    }
+    Ok(BatchAttempt::Done(send(state, StatusCode::OK, &receipt, None)))
 }
 
 fn checked(kind: Kind, id: &str, condition: Option<Precondition>, op: Op) -> Vec<Op> {
@@ -694,10 +735,10 @@ fn answer(state: &Management, done: &Committed, restart: bool, resource: Option<
 }
 
 /// Runs synchronous store work off the async runtime.
-async fn blocking(
+async fn blocking<T: Send + 'static>(
     state: Arc<Management>,
-    f: impl FnOnce(&Management) -> Result<Response, AdminError> + Send + 'static,
-) -> Result<Response, AdminError> {
+    f: impl FnOnce(&Management) -> Result<T, AdminError> + Send + 'static,
+) -> Result<T, AdminError> {
     let fallback = state.clone();
     state
         .work
@@ -983,4 +1024,91 @@ pub(crate) async fn import(
         Ok(answer(state, &done, restart, None, query.dry_run))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::installation_effects::{self, Stage};
+    use std::time::Duration;
+
+    /// The probe releases each document lock before the batch commits. A refresh that
+    /// takes the lock in that window must read the batch's bytes, never the source they
+    /// replace: its restore waits for the store command the batch still holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_locking_after_the_batch_probe_reads_the_batch() {
+        let root = std::env::temp_dir().join(format!("cooker-batch-probe-{}", uuid::Uuid::new_v4()));
+        let config = Arc::new(crate::testing::config_store(&root.join("cooker.db")).unwrap());
+        let db = crate::store::credential_store::CredentialDb::initialize(config.clone()).unwrap();
+        let path = db.auth_dir().join("probed.json");
+        let seed = br#"{"type":"claude","access_token":"probe-seed-fixture"}"#;
+        let batch = br#"{"type":"claude","access_token":"probe-batch-fixture"}"#;
+        db.save(&path, seed).unwrap();
+        let mut cfg = config.load().unwrap().config;
+        cfg.auth_dir = db.auth_dir();
+        let rt = Arc::new(crate::testing::runtime_with_db(
+            cfg,
+            Vec::new(),
+            ck_exec::Executors {
+                claude: ck_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+                codex: Default::default(),
+                devices: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+            },
+            db.clone(),
+        ));
+        let state = Management::new(rt, config);
+
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _parked = installation_effects::once(&db.auth_dir(), Stage::CredentialBatchProbed, move || {
+            parked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        let document = CredentialDocument {
+            name: "probed.json".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(batch),
+            if_match: None,
+            if_none_match: false,
+        };
+        let parts: CredentialBatchParts = (vec![(document, path.clone(), batch.to_vec())], Vec::new());
+        let committing = std::thread::spawn({
+            let state = state.clone();
+            move || matches!(credential_batch_attempt(&state, &parts), Ok(BatchAttempt::Done(_)))
+        });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        // The timeouts only bound a deadlock's failure.
+        let bounded = Duration::from_secs(10);
+        tokio::time::timeout(bounded, parked_rx).await.unwrap().unwrap();
+        let reading = tokio::spawn({
+            let (path, db, shutdown) = (path.clone(), db.clone(), shutdown.clone());
+            async move { crate::runtime::state::test_read_locked_codex_file(&path, &shutdown, db).await }
+        });
+        // Let the refresh take the free lock and reach its read before the batch commits.
+        let held = ck_exec::codex_siwc_bind::open_lock_file(&path).unwrap();
+        tokio::time::timeout(bounded, async {
+            while ck_exec::codex_siwc_bind::try_lock(&held).unwrap() {
+                ck_exec::codex_siwc_bind::unlock(&held).unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the refresh takes the probed lock");
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release_tx.send(()).unwrap();
+        let (lock, read) = tokio::time::timeout(bounded, reading).await.unwrap().unwrap().unwrap();
+        assert!(committing.join().unwrap(), "the batch commits");
+        assert_eq!(
+            Json::Object(read),
+            serde_json::from_slice::<Json>(batch).unwrap(),
+            "a refresh locking after the probe read the replaced source"
+        );
+        assert_eq!(db.read(&path).unwrap().unwrap(), batch);
+        drop(lock);
+        drop((state, db));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

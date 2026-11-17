@@ -5,63 +5,27 @@ description: A quiet operator console. Grey carries hierarchy; hue carries state
 
 # Design language: Rosé Pine (Moon/Dawn)
 
-The dashboard is where one person keeps many provider accounts healthy behind one local endpoint.
-They come to answer three questions, in this order: can the proxy serve right now, which account
-needs me, and what did my tools just send. Every screen is built for scanning a long list and
-acting on one row, not for reading.
+The dashboard lets one operator keep many provider accounts healthy behind one local endpoint. The operator opens it to answer three questions, in this order: whether the proxy can serve now, which account needs attention, and what the tools just sent. Every screen supports scanning a long list and acting on one row; no screen is designed for reading.
 
-Product rules in `PRODUCT.md` still apply; where it and this file disagree on visual or size
-clauses, this file wins.
+The product rules in `PRODUCT.md` apply. Where that file and this one disagree on visual or size clauses, this file takes precedence.
 
 ## Principles
 
-1. **Grey carries hierarchy, hue carries state.** Surfaces, text and controls are the palette's
-   neutral roles. A coloured pixel means a state (ready, cooling, failing, info) or, in iris
-   only, the focus ring. Links are body text (as the card-v2 admin draws them): a chevron, the
-   hover and the button shape show what is clickable.
-2. **One way to draw each thing.** One row, one list, one detail panel, one dialog, one form field,
-   one notice. Astryx components first; a local component exists only when two screens need it.
-3. **Dense, not cramped.** Row height and type follow Astryx's console scale. Numbers use tabular
-   figures; identifiers (model IDs, keys, paths, file names) use the mono family.
-4. **State is never colour alone.** Every lamp has a word or an accessible label; active navigation
-   changes weight and background, not only hue.
-5. **Motion reports, it does not decorate.** One motion module, Astryx durations, all off under
-   `prefers-reduced-motion`.
+1. **Grey carries hierarchy, hue carries state.** Surfaces, text and controls use the palette's neutral roles. A coloured pixel marks a state (ready, cooling, failing, info) or, in iris only, the focus ring. Links use body text colour, as the card-v2 admin draws them: a chevron, the hover state and the button shape show what is clickable.
+2. **One way to draw each thing.** Use one row, one list, one detail panel, one dialog, one form field and one notice. Use Astryx components first; a local component exists only when two screens need it.
+3. **Dense, not cramped.** Row height and type follow Astryx's console scale. Numbers use tabular figures; identifiers (model IDs, keys, paths, file names) use the mono family.
+4. **State is never colour alone.** Every lamp has a word or an accessible label; active navigation changes weight and background, not only hue.
+5. **Motion reports; it does not decorate.** Use one motion module and Astryx durations, and disable all motion under `prefers-reduced-motion`.
 
 ## Colour
 
-The default palette is **Neutral**, described below.
-The other two are [Rosé Pine](https://rosepinetheme.com): **Moon** in dark mode and **Dawn** in
-light mode, and **Rosé Pine** (Main) for dark with Dawn for light. The Rosé Pine values come
-unmodified from [rose-pine/palette](https://github.com/rose-pine/palette) (MIT): the named roles
-from `palette.json`, the highlight roles from `dist/css/rose-pine.css`; they live in
-`src/themes/site/rosePine.ts`. Every colour is an official value; pairs that miss a contrast limit are listed in
-`REQUIREMENTS.md` Exceptions instead of being adjusted.
+The default palette is **Neutral**, described below. The other two palettes are [Rosé Pine](https://rosepinetheme.com): **Moon** (Moon in dark mode, Dawn in light mode) and **Rosé Pine** (Main) (Main in dark mode, Dawn in light mode). The Rosé Pine values come unmodified from [rose-pine/palette](https://github.com/rose-pine/palette) (MIT): the named roles from `palette.json`, the highlight roles from `dist/css/rose-pine.css`; they live in `src/themes/site/rosePine.ts`. Every colour is an official value; pairs that miss a contrast limit are listed in `REQUIREMENTS.md` Exceptions instead of being adjusted.
 
-**Neutral** is Astryx's neutral theme with its own colours in both modes, added for anyone who
-finds Rosé Pine too colourful.
-`siteNeutralTheme.ts` builds `site-neutral` (in the entry) with the site's sizes, type scale
-and motion rule, and a few colours so it reads monochrome: bar fills take neutral's greys (#919191 light, #777777 dark) instead of core's
-blue-grey, chart volume takes Astryx's categorical blue #0171E3 in both modes, as BoothDex's trend
-charts draw it (a grey volume series reads as dead), and warning takes neutral's orange family (soft #ffc7a1 / #503424
-fill, #622700 / #ffb37e ink; light icons and dots core's #d66100) instead of its bright yellow
-#ffce2f. Accent, focus ring, error, success and info stay neutral's. Each override and its source
-value is commented in the file. The role table below is the Rosé Pine palettes'.
+**Neutral** is Astryx's neutral theme with its own colours in both modes, added for anyone who finds Rosé Pine too colourful. `siteNeutralTheme.ts` builds `site-neutral` (in the entry) with the site's sizes, type scale and motion rule, and a few colours so it reads monochrome: bar fills take neutral's greys (#919191 light, #777777 dark) instead of core's blue-grey; chart volume takes Astryx's categorical blue #0171E3 in both modes, as BoothDex's trend charts draw it (a grey volume series reads as dead); and warning takes neutral's orange family (soft #ffc7a1 / #503424 fill, #622700 / #ffb37e ink; light icons and dots core's #d66100) instead of its bright yellow #ffce2f. Accent, focus ring, error, success and info stay neutral's. Each override and its source value is commented in the file. The role table below describes the Rosé Pine palettes.
 
-- Theme: the three site themes extend Astryx's official neutral theme
-  (`defineTheme({extends: neutralTheme})`, as Astryx's setup guide does) and set only tokens:
-  fonts, component styles, icons (lucide), radius and motion come from neutral.
-  `src/themes/site/siteNeutralTheme.ts` builds `site-neutral` (Neutral, the default, in the
-  entry); `siteTheme.ts` builds `site` (Moon) and `siteMainTheme.ts` builds `site-main`, both
-  loaded on demand when chosen. `astryx theme build` names its outputs after the theme, and they keep
-  those names, so the import example in each generated header stays true; the Rosé Pine colour
-  and type tokens are shared (`roseTokens`). Both modes are
-  first-class, following the system by default with a manual switch.
-- Palette and mode are separate choices. Mode is one click: a ghost icon button flips light and
-  dark relative to what is shown (BoothDex's ColorModeToggle), and until the first press the page
-  follows the system. Palette, mode (with "follow the system") and language are set in the
-  settings dialog (see Preferences). The choice is stored and applied before the first render.
-- Roles, the same for both palettes, following Rosé Pine's own usage table:
+- Theme: the three site themes extend Astryx's official neutral theme (`defineTheme({extends: neutralTheme})`, as Astryx's setup guide does) and set only tokens. Fonts, component styles, icons (lucide), radius and motion come from neutral. `src/themes/site/siteNeutralTheme.ts` builds `site-neutral` (Neutral, the default, in the entry); `siteTheme.ts` builds `site` (Moon) and `siteMainTheme.ts` builds `site-main`, and both load on demand when chosen. `astryx theme build` names its outputs after the theme, and they keep those names, so the import example in each generated header stays true; the Rosé Pine colour and type tokens are shared (`roseTokens`). Both modes are first-class; the theme follows the system by default and provides a manual switch.
+- Palette and mode are separate choices. Mode takes one click: a ghost icon button flips light and dark relative to what is shown (BoothDex's ColorModeToggle), and until the first press the page follows the system. Palette, mode (with "follow the system") and language are set in the settings dialog (see Preferences). The choice is stored and applied before the first render.
+- Roles are the same for both palettes and follow Rosé Pine's own usage table:
 
   | Dashboard role | Rosé Pine role |
   | --- | --- |
@@ -84,51 +48,23 @@ value is commented in the file. The role table below is the Rosé Pine palettes'
   | Error (failing), red Token (error log level) | love |
   | rose | unused |
 
-- Status vocabulary, closed set: `ready`, `cooling`, `failing`, `info`, `disabled` (muted). A lamp
-  is Astryx's `StatusDot` (`success`, `warning`, `error`, `neutral`; `info` is for banners and
-  badges only) with its word in secondary text beside it, as the BoothDex console draws
-  it. Icons, lamps and status borders take the hue; banner and badge
-  fills are overlay with the hue as their text, so no fill is mixed from a hue. Contrast limits stay: body text ≥ 10:1,
-  secondary and status text ≥ 5:1, measured on the composited colour; the official colours miss
-  some of them, see `REQUIREMENTS.md`.
-- The dialog scrim, the shadow and the hover and pressed overlays drawn over a fill keep Astryx's
-  translucent defaults: they are not palette colours, and Rosé Pine defines none.
-- Text tokens are not fill tokens. Traffic strips use the neutral roles for volume; gold for a
-  bucket where 5 % to 50 % of the requests failed, love from 50 % (fewer failures stay neutral).
+- Status vocabulary is a closed set: `ready`, `cooling`, `failing`, `info`, `disabled` (muted). A lamp is Astryx's `StatusDot` (`success`, `warning`, `error`, `neutral`; `info` is for banners and badges only) with its word in secondary text beside it, as the BoothDex console draws it. Icons, lamps and status borders take the hue; banner and badge fills are overlay with the hue as their text, so no fill is mixed from a hue. Contrast limits stay: body text ≥ 10:1, secondary and status text ≥ 5:1, measured on the composited colour; the official colours miss some of them; see `REQUIREMENTS.md`.
+- The dialog scrim, the shadow, and the hover and pressed overlays drawn over a fill keep Astryx's translucent defaults; they are not palette colours, and Rosé Pine defines none.
+- Text tokens are not fill tokens. Traffic strips use the neutral roles for volume, gold for a bucket where 5% to 50% of the requests failed, and love from 50% (fewer failures stay neutral).
 
 ## Type
 
-- Fonts are the neutral theme's own, unchanged (fonts and icons use the component library's
-  defaults): Figtree, then the system sans stack, for body and headings;
-  the system monospace stack for code. Neutral's `fonts.css` loads Figtree from Google Fonts at
-  run time; the app imports the same four weights from `@fontsource/figtree` instead (in
-  `src/themes/site/index.ts`), so it makes no third-party request, as BoothDex does. There is no
-  `typography` block and no per-locale font rule, so CJK text falls to the system fonts the
-  browser picks for the page language.
-- Scale: the card-v2 admin's (card-v2 `panelScale`, MIT): `typography.scale`
-  base 15, ratio 1.2, in `siteTypography` (`src/themes/site/siteTheme.ts`). Body 15, card title in
-  a list 18 (h3), section 22 (h2), page title 26 (h1), metric value 31 (`display-3`); supporting
-  text 13 on a 20 px line (`--text-supporting-size`, as card-v2 `panelShared` sets it). Weights are
-  400, 500 and 600 only: headings and the metric value are semibold in every locale.
-- Controls follow `panelShared`: `--size-element-sm` 32 (row actions, icon buttons with a 16 px
-  glyph), `md` 36 (buttons, inputs, nav rows), `lg` 40. Radii 8 / 12 / 16 (inner, element, card).
+- Fonts are the neutral theme's own and unchanged: fonts and icons use the component library's defaults. Figtree, then the system sans stack, for body and headings; the system monospace stack for code. Neutral's `fonts.css` loads Figtree from Google Fonts at run time; the app imports the same four weights from `@fontsource/figtree` instead (in `src/themes/site/index.ts`), so it makes no third-party request, as BoothDex does. There is no `typography` block and no per-locale font rule, so CJK text falls to the system fonts the browser picks for the page language.
+- Scale: the card-v2 admin's (card-v2 `panelScale`, MIT): `typography.scale` base 15, ratio 1.2, in `siteTypography` (`src/themes/site/siteTheme.ts`). Body 15, card title in a list 18 (h3), section 22 (h2), page title 26 (h1), metric value 31 (`display-3`); supporting text 13 on a 20 px line (`--text-supporting-size`, as card-v2 `panelShared` sets it). Weights are 400, 500 and 600 only: headings and the metric value are semibold in every locale.
+- Controls follow `panelShared`: `--size-element-sm` 32 (row actions, icon buttons with a 16 px glyph), `md` 36 (buttons, inputs, nav rows), `lg` 40. Radii 8, 12 and 16 (inner, element, card).
 
 ## Layout
 
-Every screen starts from an Astryx template and keeps its frame: build from the templates and the
-components as they come, and take page content from the component library too. Each page file names its template in its header comment and lists every
-deviation with its reason.
+Every screen starts from an Astryx template and keeps its frame: build from the templates and their components, and take page content from the component library. Each page file names its template in its header comment and lists every deviation with its reason.
 
 ### Routes
 
-Six hash routes: not everything needs a page of its own, so the rest are views of one of them
-(`?view=`) or dialogs (`?open=`). The side nav groups the pages in titled sections, never
-collapsed, as the card-v2 console does: Monitor (Overview, Usage), Accounts (Accounts, Provider
-keys), Models (Models, Payload rules), Server (Settings, Client keys, Logs). The table is
-`navSections` in `src/app/routes.ts`; a view's URL stays on its route whatever section lists it.
-Pages carry no tab strip: switching through header tabs reads as too much. Sign-in is not a route.
-Each tab and dialog hosts a feature page from `src/features/` through a thin host in
-`src/app/pages/`.
+Six hash routes are defined. Not every screen needs its own page, so the remaining screens are views of one route (`?view=`) or dialogs (`?open=`). The side nav groups the pages in titled sections that are never collapsed, as the card-v2 console does: Monitor (Overview, Usage), Accounts (Accounts, Provider keys), Models (Models, Payload rules), Server (Settings, Client keys, Logs). The table is `navSections` in `src/app/routes.ts`; a view's URL stays on its route whatever section lists it. Pages carry no tab strip; switching through header tabs reads as excessive. Sign-in is not a route. Each tab and dialog hosts a feature page from `src/features/` through a thin host in `src/app/pages/`.
 
 | Route (`#id`) | Answers first | Template | Views (side nav) and dialogs |
 | --- | --- | --- | --- |
@@ -142,125 +78,55 @@ Each tab and dialog hosts a feature page from `src/features/` through a thin hos
 | Connect an account (dialog over any page, `?open=connect`) | Which kind of account, and how far is the authorization? | `form-wizard-dialog` | After the type is chosen only that flow shows |
 | About (preferences dialog, `?open=about`) | Which build is this, and is it current? | `settings-dialog` | The dialog's About panel (below) |
 
-- One hash form: `#<route>[/<arg>][?<query>]`. A tab is `?view=<tab>` (the first tab has none); a
-  dialog is `?open=<dialog>`; a filter is its own key (`#accounts?show=<reason>`, which Accounts
-  reads). Logs keeps its own `?tab=`, which is why the route tab is `view`. A hash that names no
-  route opens the first page; there are no redirects from older hashes.
-- A hosted dialog is `PageDialog` on the `form-wizard-dialog` frame, 800 wide, not the template's
-  620: the hosted pages were laid out for a reading width (`roles.content.formWidth`). Closing it
-  drops its own query keys, so the next opening starts clean.
+- One hash form: `#<route>[/<arg>][?<query>]`. A tab is `?view=<tab>` (the first tab has none); a dialog is `?open=<dialog>`; a filter is its own key (`#accounts?show=<reason>`, which Accounts reads). Logs keeps its own `?tab=`, which is why the route tab is `view`. A hash that names no route opens the first page; there are no redirects from older hashes.
+- A hosted dialog is `PageDialog` on the `form-wizard-dialog` frame, 800 wide, not the template's 620: the hosted pages were laid out for a reading width (`roles.content.formWidth`). Closing it drops its own query keys, so the next opening starts clean.
 - Filters, tabs, paging and the open item live in the hash query, so Back restores them.
-- The sign-in page renders none of the signed-in app: the shell and its pages are their own chunks
-  (`src/app/chunks.ts`). Every load starts the shell and the current page's chunk while the
-  session cookie is checked. recharts loads once a chart has its data and the page has painted,
-  so it is never on a page's critical path.
-- After sign-in, every route's chunk is fetched when the browser is idle, so the first visit to a
-  page does not wait for its chunks. Queries are fresh for 30 s (`src/app/queryClient.ts`); a
-  page entered again shows its cached data while it refetches, and polling queries keep their own
-  interval.
+- The sign-in page renders none of the signed-in app: the shell and its pages are their own chunks (`src/app/chunks.ts`). Every load starts the shell and the current page's chunk while the session cookie is checked. recharts loads once a chart has its data and the page has painted, so it is never on a page's critical path.
+- After sign-in, the browser fetches every route's chunk when it is idle, so the first visit to a page does not wait for its chunks. Queries are fresh for 30 s (`src/app/queryClient.ts`); a page entered again shows its cached data while it refetches, and polling queries keep their own interval.
 
 ### Shell (`shell-side-nav`, as BoothDex's admin shell)
 
 The precedent is the BoothDex admin console, itself built from the same template.
 
-- Astryx `AppShell` with the side nav only; there is no top bar. `SideNav` is `collapsible` and
-  `resizable` (260 px default, 220 to 360).
+- Astryx `AppShell` with the side nav only; there is no top bar. `SideNav` is `collapsible` and `resizable` (260 px default, 220 to 360).
 - Header: `SideNavHeading` with the brand mark and "cooker", linking to the first page.
-- Body: one `SideNavSection` per entry of `navSections`, its title a small heading over its
-  `SideNavItem`s, each with its lucide icon; no collapsible groups. The current page is Astryx's own
-  selected item. `Network` is the brand mark and never a nav icon.
-- Collapsed rail: section headings hide and every page is one icon that navigates on click, its name as `SideNavItem`'s own
-  tooltip on hover and keyboard focus; no flyout or submenu exists. Tab reaches each icon in order
-  and Enter navigates. The width and the collapsed state persist through `resizable.autoSaveId`
-  (Astryx reads and writes localStorage in try/catch), a per-viewer convenience.
-- Footer (`SideNavSection isHeaderHidden`): the connection row (host with its `StatusDot`; a
-  popover gives the lamp, version and commit), "Go to page" (`CommandPalette`, also Ctrl/Cmd+K,
-  lists the pages and, under them, their tabs and dialogs; SideNav has no search slot), GitHub (new tab) and Sign
-  out.
-- Footer icon row (`SideNav footerIcons`, beside the collapse button, the slot SideNav keeps in
-  the collapsed rail): the colour-mode toggle and the settings button, each a ghost icon button
-  with a tooltip.
-- Phones (below Astryx `md`): AppShell's own phone bar and drawer, nothing hand-built; the bar
-  carries the heading and the footer icon row.
+- Body: one `SideNavSection` per entry of `navSections`, with its title as a small heading over its `SideNavItem`s, each with its lucide icon; there are no collapsible groups. The current page uses Astryx's own selected item. `Network` is the brand mark and never a nav icon.
+- Collapsed rail: section headings hide and every page becomes one icon that navigates on click, with its name as `SideNavItem`'s own tooltip on hover and keyboard focus; no flyout or submenu exists. Tab reaches each icon in order, and Enter navigates. The width and the collapsed state persist through `resizable.autoSaveId` (Astryx reads and writes localStorage in try/catch), a per-viewer convenience.
+- Footer (`SideNavSection isHeaderHidden`): the connection row (host with its `StatusDot`; a popover gives the lamp, version and commit), "Go to page" (`CommandPalette`, also Ctrl/Cmd+K, lists the pages and, under them, their tabs and dialogs; SideNav has no search slot), GitHub (new tab) and Sign out.
+- Footer icon row (`SideNav footerIcons`, beside the collapse button, the slot SideNav keeps in the collapsed rail): the colour-mode toggle and the settings button, each a ghost icon button with a tooltip.
+- Phones (below Astryx `md`): AppShell's own phone bar and drawer, with nothing hand-built; the bar carries the heading and the footer icon row.
 - After sign-in and after every page change, focus moves to the page's h1 without a ring.
 
 ### Preferences
 
-- The settings button opens the `settings-dialog` template. Appearance: palette (with a preview),
-  mode (light, dark, follow the system) and language. Keyboard shortcuts: the template's own panel
-  (`settings-dialog/page.tsx:413`). Options that affect only this browser sit in the dialog too.
-- The About panel (below) is the dialog's last panel, opened directly by
-  `?open=about`.
+- The settings button opens the `settings-dialog` template. Appearance: palette (with a preview), mode (light, dark, follow the system) and language. Keyboard shortcuts: the template's own panel (`settings-dialog/page.tsx:413`). Options that affect only this browser sit in the dialog too.
+- The About panel (below) is the dialog's last panel, opened directly by `?open=about`.
 - Server settings, which affect everyone, stay on the Settings page and never enter the dialog.
-- Sign-in keeps its own mode, palette and language controls at the page's top end, on the page
-  gutter, because the side nav is not there yet.
+- Sign-in keeps its own mode, palette and language controls at the page's top end, on the page gutter, because the side nav is not there yet.
 
 ### Sign-in (`login-card`)
 
-- One flat card, centred (the template's: no `elevation`); the preference controls above. Under
-  the card, one link to the repository. The template's third-party sign-in, forgotten password,
-  sign-up and terms do not exist for cooker and are left out.
-- Inside the card, top to bottom: brand mark and name; h1 "Connect to this server"; a status line
-  (lamp, host, and whether `GET /healthz` answers, rechecked every 10 s while the tab is shown);
-  the key field with a show/hide button (`InputGroup`); the primary Connect button; the help as a
-  closed `Collapsible`.
-- Connect is never greyed out. With an empty field it focuses the field and shows the field's
-  error; while signing in it shows Astryx's busy state and one press sends one request. Enter in
-  the field submits through `onEnter`, which ignores Enter that commits an IME conversion.
+- One flat card, centred (the template's: no `elevation`), with the preference controls above. Under the card, one link to the repository. The template's third-party sign-in, forgotten password, sign-up and terms do not exist for cooker and are left out.
+- Inside the card, top to bottom: the brand mark and name; the h1 "Connect to this server"; a status line (lamp, host, and whether `GET /healthz` answers, rechecked every 10 s while the tab is shown); the key field with a show/hide button (`InputGroup`); the primary Connect button; the help as a closed `Collapsible`.
+- Connect is never greyed out. With an empty field it focuses the field and shows the field's error; while signing in it shows Astryx's busy state, and one press sends one request. Enter in the field submits through `onEnter`, which ignores Enter that commits an IME conversion.
 - Sign-in errors are the field's error status, so the field describes them (`aria-describedby`).
 
 ### Pages
 
-- Every page renders in one frame component, `src/app/PageFrame.tsx`, after the card-v2 admin's
-  (card-v2 `PageFrame.tsx`, MIT): `Layout height="fill"` with the page padding set once
-  on the `Layout`, `LayoutHeader`, `LayoutContent` and, for a detail or a rail, `LayoutPanel` at
-  the end. A page puts its template's body inside it and never draws its own header, so the h1
-  does not jump between pages. The header and the
-  content share one line, so the h1 sits at the same place on every page; the content line stops at
-  the content width, and a reading-width page caps only its content, aligned to the header's
-  start, never centred.
-- The header holds the h1, one supporting line (held empty while the page's line waits for its
-  data, so nothing moves), the page's controls and at most one primary action. Controls that do
-  not fit beside the title (a phone with two labelled buttons) take their own row under the
-  supporting line, decided by the title and the controls alone, so a count arriving never moves
-  them. A list's search and filters sit in the `LayoutHeader` (as `table-filter` does), so they
-  stay while the content scrolls; on phones they fold as the template's narrow layout folds them
-  (`table-filter:2034-2088`). A rarely used action (Clear) goes into a menu. A route's views are
-  side-nav items, never a tab strip in the header.
-- A page hosted by a route renders through `PageHostContext` (`src/app/pageHost.ts`): as a tab,
-  its frame takes the route's title, tabs and controls; in a dialog, it draws only its controls
-  and body under the dialog's title.
-- The body is header plus one or two sections. More goes into header tabs, a 340 px side column
-  (`layout.sideColumn`) or paging at 20 rows.
-- Headings: h1 the page; h2 `SectionHeading` (`src/components/`) for a section outside cards; h3
-  `CardHeading` inside a card; h4 a sub-block. Never two headings stacked. A key number is a
-  `MetricCard` (label row, value at the metric size, optional badge, one supporting line; with
-  `href` the whole card is the link, marked by a chevron). All three follow card-v2's components.
-- Cards have one style (radius 16, hairline border, the card padding) and hold only a few related
-  facts or a chart. Lists, tables, settings and logs are flat with hairline dividers, never boxed.
+- Every page renders in one frame component, `src/app/PageFrame.tsx`, after the card-v2 admin's (card-v2 `PageFrame.tsx`, MIT): `Layout height="fill"` with the page padding set once on the `Layout`, `LayoutHeader`, `LayoutContent` and, for a detail or a rail, `LayoutPanel` at the end. A page puts its template's body inside it and never draws its own header, so the h1 does not jump between pages. The header and the content share one line, so the h1 sits at the same place on every page; the content line stops at the content width, and a reading-width page caps only its content, aligned to the header's start, never centred.
+- The header holds the h1; one supporting line, held empty while the page's line waits for its data so nothing moves; the page's controls; and at most one primary action. Controls that do not fit beside the title (a phone with two labelled buttons) take their own row under the supporting line, decided by the title and the controls alone, so a count arriving never moves them. A list's search and filters sit in the `LayoutHeader` (as `table-filter` does), so they stay while the content scrolls; on phones they fold as the template's narrow layout folds them (`table-filter:2034-2088`). A rarely used action (Clear) goes into a menu. A route's views are side-nav items, never a tab strip in the header.
+- A page hosted by a route renders through `PageHostContext` (`src/app/pageHost.ts`): as a tab, its frame takes the route's title, tabs and controls; in a dialog, it draws only its controls and body under the dialog's title.
+- The body is a header plus one or two sections. More content goes into header tabs, a 340 px side column (`layout.sideColumn`) or paging at 20 rows.
+- Headings: h1 is the page; h2 is `SectionHeading` (`src/components/`) for a section outside cards; h3 is `CardHeading` inside a card; h4 is a sub-block. Never stack two headings. A key number is a `MetricCard` (label row, value at the metric size, optional badge, one supporting line; with `href` the whole card is the link, marked by a chevron). All three follow card-v2's components.
+- Cards have one style (radius 16, hairline border, the card padding) and hold only a few related facts or a chart. Lists, tables, settings and logs are flat with hairline dividers and are never boxed.
 - The outcome of a page action is a toast, or a banner directly under the header for a read.
-- Collections are rows, not cards. Accounts and Logs are virtualized with
-  `@tanstack/react-virtual` (as `LogRows.tsx` does; the templates do not virtualize).
-- Low-frequency detail (raw JSON, empty groups, import forms) starts collapsed or lives in the
-  detail panel.
-- The preferences dialog's About panel lists the build and the server in one `MetadataList`: version,
-  commit, build time, config layout, routing strategy, auth directory, remote management (a lamp
-  with its word) and dashboard source; a value the server does not send reads "Not reported". It
-  ends with the release check, whose outcomes are: up to date (`success`), update available with a
-  link to the releases (`info`), cannot compare (`info`), no release published yet (`info`; the
-  server's 502 `invalid_response`), checks disabled (`info`), anything else an error banner with
-  Retry.
+- Collections are rows, not cards. Accounts and Logs are virtualized with `@tanstack/react-virtual` (as `LogRows.tsx` does; the templates do not virtualize).
+- Low-frequency detail (raw JSON, empty groups, import forms) starts collapsed or lives in the detail panel.
+- The preferences dialog's About panel lists the build and the server in one `MetadataList`: version, commit, build time, config layout, routing strategy, auth directory, remote management (a lamp with its word) and dashboard source. A value the server does not send reads "Not reported". The panel ends with the release check, whose outcomes are: up to date (`success`); update available with a link to the releases (`info`); cannot compare (`info`); no release published yet (`info`; the server's 502 `invalid_response`); checks disabled (`info`); anything else an error banner with Retry.
 
 ### Roles
 
-A role that repeats across pages has one value. Sizes, spacing, type, radii, control heights,
-heading levels, card use and link colour come from the card-v2 admin (MIT): one
-size for each role keeps a dense page from looking cluttered. Colours stay Rosé Pine. The Astryx templates settle the rest.
-Spacing and sizes inside one template's own composition (its gaps, a toolbar's `size="sm"`) stay
-as that template writes them. Values are in `src/themes/site/roles.ts` and `layout.ts`; `check:ui`
-enforces the type rows and `npm run measure` the rendered values.
-A template's typography value (`Text size="sm"`, for example) enters a page only after it is
-added to `roles.ts` with a named use and its source, so text stays one scale across pages.
+A role that repeats across pages has one value. Sizes, spacing, type, radii, control heights, heading levels, card use and link colour come from the card-v2 admin (MIT): one size for each role keeps a dense page from looking cluttered. Colours stay Rosé Pine. The Astryx templates settle the rest. Spacing and sizes inside one template's own composition (its gaps, a toolbar's `size="sm"`) stay as that template writes them. Values are in `src/themes/site/roles.ts` and `layout.ts`; `check:ui` enforces the type rows, and `npm run measure` enforces the rendered values. A template's typography value (`Text size="sm"`, for example) enters a page only after it is added to `roles.ts` with a named use and its source, so text stays one scale across pages.
 
 | Role | Value | Source |
 | --- | --- | --- |
@@ -285,32 +151,24 @@ added to `roles.ts` with a named use and its source, so text stays one scale acr
 | Detail panel | `LayoutPanel` behind a `ResizeHandle`, 380 px (320 to 560), padding 0. Below the compact query (`(max-width: 768px), (max-width: 1024px) and (pointer: coarse) and (hover: none)`) a `BottomSheet height="tall" padding={0}` | `table-filter:2229`, `:4300`, `:4313`, `:1129` |
 | Skeleton | Each region renders `Skeleton`s in the shape and size of its content, as `table-filter`'s loading rows do; a refetch keeps the previous data on screen | `table-filter:1882-1945` |
 
-Measured limits (`npm run measure`): CLS during load ≤ 0.02; the first region
-moves ≤ 2 px from its skeleton to its content; each route's answer element (Overview's first
-attention card or its all-clear line, for example) is inside 1440×900 and 390×844. Every measured route declares
-its answer selector and the measurements its page draws (table rows, header buttons, row actions,
-skeleton); a missing declaration or a declared measurement with no sample fails, and so do
-buttons of one role whose heights differ within a route.
+Measured limits (`npm run measure`): CLS during load ≤ 0.02; the first region moves ≤ 2 px from its skeleton to its content; each route's answer element (Overview's first attention card or its all-clear line, for example) is inside 1440×900 and 390×844. Every measured route declares its answer selector and the measurements its page draws (table rows, header buttons, row actions, skeleton); a missing declaration or a declared measurement with no sample fails, and so do buttons of one role whose heights differ within a route.
 
 ### Keyboard
 
-As the templates do it: each row is one tab stop and Enter or Space opens its detail
-(`table-inbox:1109-1125`, `table-filter:2754-2762`). Astryx Table has no arrow-key movement
-between rows, and none is added. Ctrl/Cmd+K opens "Go to page"; the shortcuts are listed in the
-settings dialog.
+Follow the templates: each row is one tab stop, and Enter or Space opens its detail (`table-inbox:1109-1125`, `table-filter:2754-2762`). Astryx Table has no arrow-key movement between rows, and none is added. Ctrl/Cmd+K opens "Go to page"; the settings dialog lists the shortcuts.
 
 ## Components
 
 | Need | Use |
 |---|---|
-| Account, key, model, log rows | One `Row` pattern on Astryx `List`/`Table`: status lamp + label, name + secondary line, metrics, row menu |
-| Detail | Astryx `LayoutPanel` + `MetadataList`; `BottomSheet` on phones (Roles) |
+| Account, key, model, log rows | One `Row` pattern on Astryx `List`/`Table`: status lamp and label, name and secondary line, metrics, row menu |
+| Detail | Astryx `LayoutPanel` with `MetadataList`; `BottomSheet` on phones (Roles) |
 | Edits | Astryx `Dialog purpose="form"`; config edits show a diff and reread before write |
 | Quota windows | Astryx `ProgressBar` with label and reset time |
 | Traffic per source (20 × 10 min) | The `dashboard-alert-rail` template's own `UptimeStrip`: one cell per bucket, neutral volume, gold or love by failure share, accessible summary |
 | Charts | See Charts |
 | Writes | Busy button, one write at a time, success toast, failure toast that stays with the server's text; deletes confirm in `AlertDialog` |
-| Notices | See below |
+| Notices | See Notifications |
 
 ## Notifications
 
@@ -325,49 +183,25 @@ settings dialog.
 
 ## Motion
 
-Press feedback, toast enter/exit, panel open/close, lamp pulse on live things (log tail, OAuth
-waiting, live usage). No page transitions, no row entrance stagger: a list that refreshes every
-10 s must not move.
+Motion covers press feedback, toast entry and exit, panel open and close, and a lamp pulse on live elements (log tail, OAuth waiting, live usage). There are no page transitions and no row entrance stagger: a list that refreshes every 10 s must not move.
 
 ## Charts
 
-- Charts use recharts, as nine Astryx templates do (`dashboard/page.tsx:20`,
-  `dashboard-alert-rail/page.tsx:60-68`); Astryx has no chart component. All charts live in one
-  module (`src/components/charts/`), structured after card-v2's chart set (`charts.tsx`,
-  `TrendChart.tsx`, `LegendDot.tsx`, `MetricCard.tsx`, `focusRing.ts`).
-- Colours are theme tokens passed as CSS variables (`dashboard-alert-rail:697-730`): series take
-  `--color-data-categorical-*`, defined in the theme as Rosé Pine colours; failure stays gold and
-  love. No hex or px fallbacks in chart code.
+- Charts use recharts, as nine Astryx templates do (`dashboard/page.tsx:20`, `dashboard-alert-rail/page.tsx:60-68`); Astryx has no chart component. All charts live in one module (`src/components/charts/`), structured after card-v2's chart set (`charts.tsx`, `TrendChart.tsx`, `LegendDot.tsx`, `MetricCard.tsx`, `focusRing.ts`).
+- Colours are theme tokens passed as CSS variables (`dashboard-alert-rail:697-730`): series take `--color-data-categorical-*`, defined in the theme as Rosé Pine colours; failure stays gold and love. Chart code has no hex or px fallbacks.
 - `isAnimationActive` is off on every series: the 10 s poll must not replay an animation.
-- Hover or focus shows a point's tooltip and the arrow keys step through points; a mouse click
-  draws no browser outline, keyboard focus draws Astryx's focus ring.
-- Geometry after the card-v2 admin (card-v2 `TrendChart.tsx`): two series at most, 2 px lines or
-  bars, grid lines across the value axis only (horizontal in a time chart), no dots. The plot is
-  14rem high, 12rem on a phone (`chartPlot` in `src/themes/site/charts.ts`); a bar list grows with
-  its rows instead. The legend is one text row. Two chart cards side by side align at the top and keep their own heights.
-- Charts draw only what the API has: total and failed requests over 200 minutes (Overview), source
-  comparison and failure rate (Activity, Usage tab). The templates' 1h / 1d / 7d windows are dropped.
-  Each chart has a one-line written conclusion as its screen-reader description, not shown: the
-  tiles carry the same numbers, and a visible sentence would only repeat them.
+- Hover or focus shows a point's tooltip, and the arrow keys step through points; a mouse click draws no browser outline, and keyboard focus draws Astryx's focus ring.
+- Geometry follows the card-v2 admin (card-v2 `TrendChart.tsx`): two series at most, 2 px lines or bars, grid lines across the value axis only (horizontal in a time chart), no dots. The plot is 14rem high, 12rem on a phone (`chartPlot` in `src/themes/site/charts.ts`); a bar list grows with its rows instead. The legend is one text row. Two chart cards side by side align at the top and keep their own heights.
+- Charts draw only what the API has: total and failed requests over 200 minutes (Overview), and source comparison and failure rate (Activity, Usage tab). The templates' 1h, 1d and 7d windows are dropped. Each chart has a one-line written conclusion as its screen-reader description, not shown: the tiles carry the same numbers, and a visible sentence would only repeat them.
 - KPI tiles (`MetricCard`) appear where the page's template has them: Overview and Activity's Usage tab.
 
 ## Not doing
 
 - No gradients, glass or glow.
-- No top bar: the brand is the side nav's heading and the page title is the page's h1.
-- No custom selected-item decoration and no style overrides on Astryx navigation components, or
-  on any component: the theme sets tokens only (gate: `check:ui`, a `components` block in a
-  theme source fails).
-- No disabled-grey primary buttons: a primary action stays pressable and explains itself (focus
-  and a field error, or a banner) instead of greying out.
-- No long explanatory paragraphs above data: one supporting line under the title; anything more
-  is a collapsed section or one muted note after the data.
+- No top bar: the brand is the side nav's heading, and the page title is the page's h1.
+- No custom selected-item decoration and no style overrides on Astryx navigation components, or on any component: the theme sets tokens only (gate: `check:ui`; a `components` block in a theme source fails).
+- No disabled-grey primary buttons: a primary action stays pressable and explains itself (with focus and a field error, or a banner) instead of greying out.
+- No long explanatory paragraphs above data: one supporting line under the title; anything more is a collapsed section or one muted note after the data.
 - No accent hue beyond iris in its two places (links, focus ring); the primary button stays ink.
-- Icons are the component library's defaults and no app registry: a semantic name from the theme
-  where one fits the meaning (`calendar`, `wrench`, `search`, `copy`, `check`, `eyeSlash` ...; the
-  list is `npx astryx docs icons available-names`), otherwise a lucide component passed straight to
-  `Icon` or an `icon` prop and typed with Astryx's `IconProps["icon"]`. No `registerIcons`, no second
-  icon set, and template icons (heroicons) become lucide. The brand mark is lucide `Network` in the
-  text colour with no tile behind it, in the side nav, on the sign-in card and in
-  `public/favicon.svg` (gate: `check:ui`, any `<svg>`, `<path>` or `registerIcons` fails).
+- Icons are the component library's defaults and there is no app registry: use a semantic name from the theme where one fits the meaning (`calendar`, `wrench`, `search`, `copy`, `check`, `eyeSlash` and similar; the list is `npx astryx docs icons available-names`), otherwise a lucide component passed straight to `Icon` or an `icon` prop and typed with Astryx's `IconProps["icon"]`. There is no `registerIcons` and no second icon set, and template icons (heroicons) become lucide. The brand mark is lucide `Network` in the text colour with no tile behind it, in the side nav, on the sign-in card and in `public/favicon.svg` (gate: `check:ui`; any `<svg>`, `<path>` or `registerIcons` fails).
 - No per-page colours, spacings or font sizes: the Roles table holds the one value per role.

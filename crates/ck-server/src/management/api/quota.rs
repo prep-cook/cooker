@@ -1,5 +1,5 @@
 //! `POST /v0/management/quota/fetch` (Go `FetchCredentialQuota`): runs the
-//! credential's declarative `quota_probe` (management/quota_probe.rs).
+//! credential's declarative `quota_probe` (management/api/quota_probe.rs).
 
 use std::sync::Arc;
 

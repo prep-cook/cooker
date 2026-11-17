@@ -1,13 +1,13 @@
 version: 2
 updates:
-  # One pull request a week per ecosystem, titled `deps: …` as CONTRIBUTING.md asks. Major versions need code changes and are done
+  # One pull request a week per ecosystem, titled `deps(deps): …` so the title check passes. Major versions need code changes and are done
   # by hand, so Dependabot does not open them.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     commit-message:
-      prefix: deps
+      prefix: deps(deps)
     groups:
       actions:
         patterns: ["*"]
@@ -27,7 +27,7 @@ updates:
       interval: weekly
     labels: [dependencies, rust, no-changelog]
     commit-message:
-      prefix: deps
+      prefix: deps(deps)
     groups:
       cargo:
         patterns: ["*"]

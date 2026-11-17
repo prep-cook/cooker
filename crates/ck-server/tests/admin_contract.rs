@@ -233,6 +233,155 @@ async fn credential_batch_preserves_bytes_and_is_in_the_portable_snapshot() {
     assert_eq!(f.head(), head);
 }
 
+/// Marks the re-executed test process that runs under a lowered descriptor limit.
+#[cfg(unix)]
+const LOW_NOFILE_CHILD: &str = "CK_ADMIN_CONTRACT_LOW_NOFILE_CHILD";
+
+/// One batch must not hold a descriptor per document: the child lowers only its own soft
+/// `RLIMIT_NOFILE` before any runtime exists, so the parent and other tests keep theirs.
+#[cfg(unix)]
+#[test]
+fn credential_batch_of_2000_documents_fits_a_1024_descriptor_limit() {
+    const NAME: &str = "credential_batch_of_2000_documents_fits_a_1024_descriptor_limit";
+    if std::env::var_os(LOW_NOFILE_CHILD).is_some() {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit and setrlimit only read and write the given struct.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        assert!(limit.rlim_max >= 1024, "hard descriptor limit below 1024");
+        limit.rlim_cur = 1024;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(large_credential_batch(2000));
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(LOW_NOFILE_CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "low-descriptor child failed ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+        output.status
+    );
+}
+
+#[cfg(unix)]
+async fn large_credential_batch(count: usize) {
+    use base64::Engine as _;
+    let f = Fixture::new("credential-batch-low-nofile", false).await;
+    let expected: std::collections::BTreeMap<String, Vec<u8>> = (0..count)
+        .map(|i| {
+            let name = format!("low-nofile-{i:04}.json");
+            let data = format!(r#"{{"type":"claude","access_token":"low-nofile-fixture-{i:04}"}}"#);
+            (name, data.into_bytes())
+        })
+        .collect();
+    let documents: Vec<_> = expected.iter().map(|(name, data)| batch_document(name, data)).collect();
+    let response = f
+        .request(wreq::Method::POST, "/admin/v1/credentials/batch")
+        .json(&json!({ "documents": documents }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["saved"], count);
+
+    let response = f
+        .request(wreq::Method::GET, "/admin/v1/credentials")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let canonical: std::collections::BTreeMap<String, Vec<u8>> = body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|document| {
+            let data = document["data"].as_str().unwrap();
+            (
+                document["name"].as_str().unwrap().to_owned(),
+                base64::engine::general_purpose::STANDARD.decode(data).unwrap(),
+            )
+        })
+        .collect();
+    assert!(canonical == expected, "canonical documents differ from the batch");
+
+    let copy = f.dir.join("portable.db");
+    std::fs::copy(f.state.config_store().path().unwrap(), &copy).unwrap();
+    let store = Arc::new(ck_server::testing::config_store(&copy).unwrap());
+    let db = ck_server::store::credential_store::CredentialDb::initialize(store.clone()).unwrap();
+    let portable: std::collections::BTreeMap<String, Vec<u8>> = db
+        .documents()
+        .unwrap()
+        .into_iter()
+        .map(|(path, bytes)| (path.file_name().unwrap().to_str().unwrap().to_owned(), bytes))
+        .collect();
+    assert!(portable == expected, "portable snapshot differs from the batch");
+}
+
+/// A batch touching a document whose lock a refresh holds waits for it without holding
+/// the store, then checks its source conditions again against what the refresh wrote.
+#[tokio::test]
+async fn credential_batch_waits_for_a_held_document_lock_and_rechecks_its_source() {
+    use sha2::Digest as _;
+    let f = Fixture::new("credential-batch-busy", false).await;
+    let seed = br#"{"type":"claude","access_token":"busy-seed-fixture"}"#;
+    let refreshed = br#"{"type":"claude","access_token":"busy-refreshed-fixture"}"#;
+    let replacement = br#"{"type":"claude","access_token":"busy-replacement-fixture"}"#;
+    let response = f
+        .request(wreq::Method::POST, "/admin/v1/credentials/batch")
+        .json(&json!({"documents": [batch_document("busy.json", seed)]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let db = f.rt.store().credential_backend();
+    let busy = db.auth_dir().join("busy.json");
+    let post = |documents: Value| {
+        f.request(wreq::Method::POST, "/admin/v1/credentials/batch")
+            .json(&json!({ "documents": documents }))
+            .send()
+    };
+    let mut stale = batch_document("busy.json", replacement);
+    stale["if_match"] = format!("{:x}", sha2::Sha256::digest(seed)).into();
+    let mut current = batch_document("busy.json", replacement);
+    current["if_match"] = format!("{:x}", sha2::Sha256::digest(refreshed)).into();
+
+    for (document, status, kept) in [(stale, 412, &refreshed[..]), (current, 200, &replacement[..])] {
+        let refresh = ck_exec::codex_siwc_bind::lock_file(&busy).unwrap();
+        let waiting = post(json!([document, batch_document("waiting-peer.json", seed)]));
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "the batch waits for the refresh"
+        );
+        // The waiting batch holds neither the management nor the store gate.
+        let other = post(json!([batch_document("unrelated.json", seed)])).await.unwrap();
+        assert_eq!(other.status(), 200);
+        db.save(&busy, refreshed).unwrap();
+        drop(refresh);
+        let response = waiting.await.unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(db.read(&busy).unwrap().unwrap(), kept);
+        let peer = db.auth_dir().join("waiting-peer.json");
+        assert_eq!(db.read(&peer).unwrap().is_some(), status == 200, "all or nothing");
+    }
+}
+
 #[tokio::test]
 async fn credential_batch_saves_and_deletes_atomically_with_raw_source_conditions() {
     use sha2::Digest as _;

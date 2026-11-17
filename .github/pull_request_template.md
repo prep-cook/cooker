@@ -1,9 +1,9 @@
-<!-- AI may help write this; unverified content may not be submitted.
+<!-- AI may help write this description; unverified content may not be submitted.
 
 State each fact once; do not restate the title, diff or template.
-No filler, praise, summaries of your own work or emoji.
+Do not use filler, praise, summaries of your own work or emoji.
 Paste only relevant log lines; link or collapse long output.
-Say what you could not verify.
+State what you could not verify.
 -->
 
 <sub>中文模板：[提交中文说明](?template=pull_request_template_zh.md)。</sub>
@@ -34,7 +34,7 @@ Check only claims that are true. A false claim closes the pull request.
 - [ ] `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test --workspace --locked` pass, and the Verified section records any check I could not complete.
 - [ ] I ran `npm run check`, `npm test` and `npm run build` in `ui/` when I changed the dashboard, and added every new string to the English, `zh-CN` and `zh-TW` catalogs.
 - [ ] No real keys, tokens or account data appear in code, tests, logs or screenshots.
-- [ ] I updated the docs when users see the change.
+- [ ] I updated the documentation where users see the change.
 - [ ] I added a `changes/<branch-slug>.md` fragment when I changed a shipped path (see `changes/README.md`).
 - [ ] AI helped write this change.
 - [ ] No AI was used for this change.

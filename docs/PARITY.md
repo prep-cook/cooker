@@ -8,7 +8,7 @@ Most existing fixtures were recorded from the previous reference, `6fecc6e` (v8.
 
 ## What works today
 
-- Client APIs: `POST /v1/messages` and `/v1/messages/count_tokens` (Anthropic), `POST /v1/chat/completions`, `/v1/responses`, `/v1/responses/compact` and `/v1/responses/input_tokens` (OpenAI), with `GET`, `DELETE` and `POST .../cancel` on `/v1/responses/{id}` over the caller's local turns and local `background` runs, `/v1beta/models/...` (Gemini), `GET /v1/models`, and the Codex paths under `/backend-api/codex/`. Streaming (SSE) and non-streaming, with format translation between the three protocols.
+- Client APIs: `POST /v1/messages` and `/v1/messages/count_tokens` (Anthropic), `POST /v1/chat/completions`, `/v1/responses`, `/v1/responses/compact` and `/v1/responses/input_tokens` (OpenAI), with `GET`, `DELETE` and `POST .../cancel` on `/v1/responses/{id}` over the caller's local turns and local `background` runs, `/v1beta/models/...` (Gemini), `GET /v1/models`, and the Codex paths under `/backend-api/codex/`. Both streaming (SSE) and non-streaming requests are supported, with format translation between the three protocols.
 - Refused: `POST /v1/completions` (legacy Completions) answers 501 with code `unsupported_endpoint`, and `POST /v1beta/interactions` (Gemini Interactions) answers 501 in the Interactions error shape with code `unimplemented`, because cooker has no codec for them.
 - Images, video and speech: `POST /v1/images/generations` and `/v1/images/edits` through Codex accounts, xAI and OpenAI-compatible upstreams, the `/v1/videos` and `/openai/v1/videos` routes for xAI video, and `POST /v1/audio/speech` and `/v1/tts` for xAI text-to-speech (Grok TTS).
 - WebSocket: the Responses WebSocket on `GET /v1/responses` and `GET /backend-api/codex/responses`, used by Codex clients. Each `response.create` is one Responses turn with cooker's response id; `previous_response_id` continues a stored turn or the socket's last `store: false` turn, and every attempt resends the history, so a continuation can move to another account. `response.interrupt` reaches a turn on a Codex upstream socket; response steering is not served. An open Codex or xAI upstream socket survives a reload that changes only `requests.proxy-url`, and removing a credential ends only the sessions dialed for it.
@@ -17,12 +17,12 @@ Most existing fixtures were recorded from the previous reference, `6fecc6e` (v8.
 - Account sign-in from the command line or the dashboard: Claude, Codex (browser or device code), Google Antigravity, Kimi, Meta, xAI and Devin.
 - Routing: round-robin, weighted and fill-first selection, retries, cooldowns, session affinity, model aliases and exclusions, payload rules, per-credential and global proxies.
 - The v8 Management API for configuration, credentials, OAuth sign-in, quota checks (`/requests/api-call`), usage counters, logs and model catalogs, plus the dashboard at `/management.html`.
-- HTTPS on the main port (`server.tls`), logging in Go's format to stdout or a rotating `main.log` with Go's per-request access log lines, request log files with client and upstream sections, LAN discovery (`-discover` and the `server.discovery` advertisement), `.env` loading, and remote model catalog updates as in Go (`--local-model` turns them off).
+- HTTPS on the main port (`server.tls`), logging in Go's format (except that the caller tag shows the source path under `src/`, not the bare file name) to stdout or a rotating `main.log` with Go's per-request access log lines, request log files with client and upstream sections, LAN discovery (`-discover` and the `server.discovery` advertisement), `.env` loading, and remote model catalog updates as in Go (`--local-model` turns them off).
 - The `PGSTORE_*`, `OBJECTSTORE_*` and `GITSTORE_*` storage backends, and the Redis-protocol usage subscriber on the main port.
 - Config and credential files are watched and reloaded without a restart. A plaintext management key is hashed on first start, as Go does.
-- The separate, optional `observability.pprof` listener follows Go v8.0.35 for startup, reload and shutdown, including active requests continuing after a drain timeout without starting a replacement until another config publication. Temporary accept errors retain the listener and back off. Its index, command line and symbol routes are always available when enabled. CPU profiles require the non-default `ck-server/pprof` build feature on Unix; published release binaries exclude it and return no resolved symbol names. Go runtime profiles return plain-text `501` answers, as approved in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md).
+- The separate, optional `observability.pprof` listener follows Go v8.0.35 for startup, reload and shutdown, including active requests continuing after a drain timeout without starting a replacement listener until another config publication. Temporary accept errors retain the listener and back off. Its index, command line and symbol routes are always available when enabled. CPU profiles require the non-default `ck-server/pprof` build feature on Unix; published release binaries exclude it and return no resolved symbol names. Go runtime profiles return plain-text `501` answers, as approved in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md).
 
-The dashboard says when the server lacks an endpoint instead of failing: actions it cannot do are disabled and named, and pages it cannot load say which route is missing. What is still missing is listed under [Upcoming features](../README.md#upcoming-features), and the deliberate differences from Go are in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md).
+The dashboard reports a missing server endpoint instead of failing. Actions the server cannot perform are disabled and named, and pages it cannot load state which route is missing. [Where it stands](#where-it-stands) counts what is still missing, and [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md) records the deliberate differences from Go.
 
 ## Where it stands
 
@@ -40,7 +40,7 @@ Audit of 2026-10-20 (v0.2.6, d1261f2) against CLIProxyAPI v8.0.35 (`ae3ee3be`).
 | All | 1679 | 897 | 766 | 16 |
 <!-- parity-summary:end -->
 
-An item is covered when it is implemented and a Rust test or a fixture recorded from the Go server checks it. Partial means it works but not every case is pinned by a test, or only part of it is implemented; most partial items are Go test files whose behaviour other tests cover without porting each case. Missing means it is not implemented. A deliberate difference from Go, listed in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md), counts as covered.
+An item is covered when it is implemented and a Rust test or a fixture recorded from the Go server checks it. Partial means the item works but not every case is pinned by a test, or only part of it is implemented; most partial items are Go test files whose behaviour other tests cover without porting each case. Missing means the item is not implemented. A deliberate difference from Go, listed in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md), counts as covered.
 
 ## What each milestone covers
 
@@ -53,11 +53,24 @@ An item is covered when it is implemented and a Rust test or a fixture recorded 
 | M5 | The Management API, WebSockets, realtime and live voice, and access control |
 | M6 | Plugins (removed on 2026-11-13), the terminal UI and LAN discovery |
 
-Missing items now also include model catalog sources (their `models.*` settings are read and validated but do not yet choose a source) and new configuration contracts. Most v8.0.35 Management API changes are in: ETag and If-Match on v8 config, auth indexes in v8 api-keys, model definitions by channel, credential patches applied to the current record and the stale-reload guard. So are `GET /v1/models/{model}` and the watcher's handling of half-written credential files. The static model catalog, which model definitions by channel serve, is v8.0.35's. So is binding SIWC tokens to a Codex credential from the v8 Management API, including Go's post-binding 401 recovery but without its registration-epoch check. So is the `--siwc-bind` command, which binds them from the command line. So are requests through the bound tokens (`use_siwc`) and their refresh on a five-minute lead, beside the outer tokens, and the refresh of a Codex credential file under its lock, which adopts tokens another process rotated on disk. So are the historical v8 config aliases and Go v8.0.35's direct v8 config save, which keeps an explicit `null` and the values as written. So are Go's background refresh after a Codex 401 (which replaces a rejected token that is not yet due), the clearing of unauthorized cooldowns after a refresh that keeps live quota blocks, and the 96-hour Codex refresh lead. Not yet: the background refresh after other providers' 401s, and keeping requests off a rejected or expired token while its refresh is pending. The terminal UI exists, though some Go cases remain unported.
+Missing items now also include model catalog sources (their `models.*` settings are read and validated but do not yet choose a source) and new configuration contracts.
+
+Most v8.0.35 Management API changes are present:
+
+- ETag and If-Match on v8 config, auth indexes in v8 api-keys, model definitions by channel, credential patches applied to the current record, and the stale-reload guard.
+- `GET /v1/models/{model}` and the watcher's handling of half-written credential files.
+- The static model catalog, which model definitions by channel serve; it is v8.0.35's.
+- Binding SIWC tokens to a Codex credential from the v8 Management API, including Go's post-binding 401 recovery but without its registration-epoch check. The `--siwc-bind` command binds the same tokens from the command line.
+- Requests through the bound tokens (`use_siwc`) and their refresh on a five-minute lead, beside the outer tokens.
+- The refresh of a Codex credential file under its lock, which adopts tokens another process rotated on disk.
+- The historical v8 config aliases and Go v8.0.35's direct v8 config save; the save keeps an explicit `null` and the values as written.
+- Go's background refresh after a Codex 401, which replaces a rejected token that is not yet due; the clearing of unauthorized cooldowns after a refresh that keeps live quota blocks; and the 96-hour Codex refresh lead.
+
+Not yet implemented: the background refresh after other providers' 401s, and keeping requests off a rejected or expired token while its refresh is pending. The terminal UI exists, though some Go cases remain unported.
 
 Antigravity (M3) is implemented: sign-in from the command line, the dashboard and the Management API, the executor, AI credits, connection pool settings, reasoning replay and the web-search capability probe. The executor features have Go-recorded tests with local mock upstreams; sign-in is tested against local mock endpoints. Selected v8.0.27 changes add Claude 5.5 models, CAQS thinking signatures and backend errors inside streams. This is not full v8.0.35 parity: model entitlements, session continuation, newer schema and usage fixes, and several suites remain unported. [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md#antigravity) and the upstream inventory list them. No live Antigravity account has been used in these tests.
 
-The audit combines a source scan with saved route probes and manual judgments. Rerunning it reuses those saved probes and judgments. Live-provider compatibility needs separate testing. Counts can lag runtime wiring; a method implemented in a host library may still be unused by the server. The feature descriptions above follow the server's actual call paths.
+The audit combines a source scan with saved route probes and manual judgments; rerunning it reuses those saved probes and judgments. Live-provider compatibility requires separate testing. Counts can lag runtime wiring: a method implemented in a host library may still be unused by the server. The feature descriptions above follow the server's actual call paths.
 
 ## The audit files
 

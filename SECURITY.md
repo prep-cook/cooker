@@ -2,16 +2,16 @@
 
 ## Reporting a vulnerability
 
-Please report security problems privately through GitHub's [private vulnerability reporting](https://github.com/prep-cook/cooker/security/advisories/new), not in a public issue. Include the version (`cooker --version`), what an attacker can do, and the steps to reproduce. Leave real keys, tokens and account files out of the report.
+Report security vulnerabilities privately through GitHub's [private vulnerability reporting](https://github.com/prep-cook/cooker/security/advisories/new), not in a public issue. Include the version (`cooker --version`), what an attacker can do, and the steps to reproduce. Keep real keys, tokens and account files out of the report.
 
-You should get an answer within a week. Fixes go into a new release, and the advisory is published once users can update.
+You can expect a response within one week. Fixes are included in a new release, and the advisory is published once users can update.
 
 ## Supported versions
 
-Only the latest release gets security fixes.
+Only the latest release receives security fixes.
 
 ## Scope
 
-In scope: the cooker server, its Management API and the built-in dashboard, for example a way around client-key or management-key checks, a credential or key leaking into logs or responses, or a request that reaches a provider with the wrong account.
+In scope: the cooker server, its Management API and the built-in dashboard. Examples include bypassing client-key or management-key checks, a credential or key leaking into logs or responses, and a request that reaches a provider with the wrong account.
 
 Out of scope: a proxy deliberately exposed to the internet without `access.api-keys`, behaviour of the upstream providers, and problems in CLIProxyAPI itself (report those to [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)). [Running it safely](docs/GETTING-STARTED.md#running-it-safely) lists the settings a safe deployment needs.

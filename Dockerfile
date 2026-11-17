@@ -119,6 +119,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy -p ck-server --all-targets --features media-relay,pprof --locked -- -D warnings
 python3 -I tools/check-crate-deps.py
+python3 -I tools/check-rust-size.py
 cargo check --locked --manifest-path harness/rust/Cargo.toml --target-dir target
 actionlint -version
 # Every workflow by name: without .git in the context, actionlint finds no project.
@@ -170,6 +171,7 @@ COPY --from=test /home/builder/out/ /
 # WebRTC media relay: without it every WebRTC call answers 501 (owner ruling E-Q3).
 FROM source AS build
 ARG BUILD_JOBS
+ARG CK_COMMIT CK_BUILD_DATE
 RUN --mount=type=cache,id=cooker-cargo-src-release,target=/usr/local/cargo/registry/src,uid=1000,gid=1000 \
     --mount=type=cache,id=cooker-target-release,target=/src/target,uid=1000,gid=1000 <<'EOF'
 features=ck-server/media-relay

@@ -2,9 +2,9 @@
 
 ## Ask a question or report a problem
 
-Start with [Getting started](../docs/GETTING-STARTED.md), [Configuration](../docs/CONFIGURATION.md) and [Clients](../docs/CLIENTS.md). Search existing issues before opening a report, then use the [GitHub issue templates](https://github.com/prep-cook/cooker/issues/new/choose) for problems and feature requests.
+Read [Getting started](../docs/GETTING-STARTED.md), [Configuration](../docs/CONFIGURATION.md) and [Clients](../docs/CLIENTS.md) first. Search existing issues before opening a report, then use the [GitHub issue templates](https://github.com/prep-cook/cooker/issues/new/choose) for problems and feature requests.
 
-For behaviour of the original Go server, ask in [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). State whether the problem also occurs there; [docs/DIFFERENCES-FROM-GO.md](../docs/DIFFERENCES-FROM-GO.md) lists the differences cooker keeps on purpose.
+For behaviour of the original Go server, ask in [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). State whether the problem also occurs there; [docs/DIFFERENCES-FROM-GO.md](../docs/DIFFERENCES-FROM-GO.md) lists the differences cooker keeps intentionally.
 
 ## Include diagnostic information
 
