@@ -122,6 +122,7 @@ schema["fields"]["worker-threads"] = "int"
 schema["fields"]["artificial-analysis"] = {"fields": {"api-key": "string", "url": "string", "cache-file": "string"}}
 schema["fields"]["model-catalog"] = {"list": {"fields": {"match": "string", "overrides": {"fields": {"default-max-tokens": {"optional": "int"}}}}}}
 schema["fields"]["model-routers"] = {"list": {"fields": {"name": "string", "tier": "string", "judge": "opaque", "models": {"list": "opaque"}, "fallback-models": "int", "providers": providers}}}
+put("requests.upstream-timeouts", {"fields": {key: "int" for key in ["header-seconds", "idle-seconds", "total-seconds"]}})
 realtime = ["ping-interval-seconds", "read-timeout-seconds", "write-timeout-seconds", "max-sockets-per-key"]
 schema["fields"]["realtime"] = {"fields": {key: "int" for key in realtime}}
 schema["fields"].pop("home", None)

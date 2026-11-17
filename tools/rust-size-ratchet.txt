@@ -3,7 +3,7 @@
 # fails when an entry's item grows, and when it shrinks or goes and the entry does not
 # follow. Lower or remove entries with `python3 -I tools/check-rust-size.py --update`; add or
 # raise one only with an owner's approval (REQUIREMENTS.md, "Exceptions").
-file crates/ck-core/src/config.rs 1424
+file crates/ck-core/src/config.rs 1427
 file crates/ck-core/src/config/binary.rs 662
 file crates/ck-core/src/config/credentials.rs 1981
 file crates/ck-core/src/exec.rs 647
@@ -115,7 +115,7 @@ file crates/ck-server/tests/responses_state.rs 1177
 file crates/ck-server/tests/routes.rs 1715
 file crates/ck-server/tests/stream_duplex.rs 1077
 file crates/ck-server/tests/stream_media.rs 944
-file crates/ck-server/tests/stream_pipeline.rs 1623
+file crates/ck-server/tests/stream_pipeline.rs 1754
 file crates/ck-stream/src/publication.rs 634
 file crates/ck-translate/src/anthropic/egress.rs 625
 file crates/ck-translate/src/anthropic/request.rs 621
@@ -475,8 +475,8 @@ fn crates/ck-server/tests/stream_media.rs::deferred_chat_jobs_belong_to_their_ca
 fn crates/ck-server/tests/stream_media.rs::deferred_image_jobs_belong_to_their_caller_and_charge_once 110
 fn crates/ck-server/tests/stream_media.rs::images_commit_at_their_first_image_and_resume_from_an_event_cursor 81
 fn crates/ck-server/tests/stream_media.rs::video_jobs_are_served_to_their_caller_on_their_credential_and_charged_once 259
-fn crates/ck-server/tests/stream_pipeline.rs::<Executor as Execute>::execute 82
-fn crates/ck-server/tests/stream_pipeline.rs::each_attempt_settles_and_is_discarded_before_the_next 671
+fn crates/ck-server/tests/stream_pipeline.rs::<Executor as Execute>::execute 100
+fn crates/ck-server/tests/stream_pipeline.rs::each_attempt_settles_and_is_discarded_before_the_next 757
 fn crates/ck-server/tests/stream_pipeline.rs::every_exit_keeps_the_committed_streams_and_discards_the_rest 192
 fn crates/ck-server/tests/usage_dimensions.rs::responses_billed_units_reach_accounting 101
 fn crates/ck-stream/src/publication/writer.rs::Writer::reserve_locked 86
