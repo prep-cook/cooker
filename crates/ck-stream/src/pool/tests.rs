@@ -206,6 +206,20 @@ fn decay_drops_the_states_of_punched_frames() {
     }
 }
 
+#[test]
+fn frame_states_stay_in_base_pages() {
+    let directory = Directory::new();
+    // A states mapping of two huge pages, of which only the initial extent is written.
+    let frames = (4 << 20) / std::mem::size_of::<states::FrameState>();
+    let pool = Pool::open(&directory.0, frames as u32, 1, 1, 0).unwrap();
+    let written = EXTENT as usize / pool_states_per_page();
+    let resident = resident_state_pages(&pool);
+    assert!(
+        resident <= written,
+        "{resident} resident state pages for {written} written"
+    );
+}
+
 fn pool_states_per_page() -> usize {
     // SAFETY: sysconf has no pointer arguments.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;

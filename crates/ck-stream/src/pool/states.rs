@@ -41,6 +41,15 @@ impl FrameStates {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
+        // Decay drops the states of punched frames page by page. A transparent huge page
+        // would keep a whole 2 MiB of them resident, so the mapping uses base pages only.
+        // SAFETY: the range is the fresh mapping above; the advice only selects page size.
+        if unsafe { libc::madvise(base, bytes, libc::MADV_NOHUGEPAGE) } != 0 {
+            let error = io::Error::last_os_error();
+            // SAFETY: the mapping above is this function's alone and nothing refers to it.
+            unsafe { libc::munmap(base, bytes) };
+            return Err(error);
+        }
         let states = Self {
             mapping: Mapping {
                 base: NonNull::new(base.cast()).ok_or_else(invalid)?,
