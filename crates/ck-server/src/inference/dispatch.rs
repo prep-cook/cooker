@@ -2,7 +2,8 @@
 //! `BaseAPIHandler.Execute*WithAuthManager` plus `Manager.Execute*`).
 //!
 //! Model to providers through the registry, credential selection across all of them,
-//! per-credential alias pools, request-scoped rules, retry rounds and stream bootstrap.
+//! per-credential alias pools, request-scoped rules, retry rounds and stream bootstrap
+//! (the first event before committing).
 //! Routes only parse their request and render the [`Done`] or [`Failure`].
 
 use std::sync::Arc;
@@ -19,9 +20,17 @@ use futures_util::StreamExt;
 use crate::http::gojson;
 use crate::http::respond;
 use crate::runtime::state::{AcquireError, Completing, Lease, Outcome, Runtime, Selection};
+use crate::scheduling::classify::CompactClass;
 use crate::scheduling::registry::{self, AliasResult, Registry};
 use crate::scheduling::scheduler::{Policy, canonical_model};
 use crate::scheduling::{classify, lcp};
+
+mod attempt;
+pub mod exchange;
+
+pub(crate) use attempt::stored;
+use attempt::{Arm, Ran};
+pub use attempt::{Arms, Codec};
 
 /// One client request, already parsed by its route.
 #[derive(Clone)]
@@ -48,87 +57,121 @@ pub struct Call {
     pub request_path: String,
     /// The downstream peer (Go `Request.RemoteAddr`), when the listener provides it.
     pub peer: Option<std::net::SocketAddr>,
-    /// A turn of a long-lived downstream session (the Responses WebSocket), `None` for
-    /// ordinary HTTP requests.
-    pub turn: Option<Arc<SessionTurn>>,
+    /// The Responses WebSocket connection a turn runs on, `None` for HTTP requests.
+    pub socket: Option<Arc<Socket>>,
     /// A media route (Go's `openai-image` / `openai-video` / `openai-speech` handler
     /// types), `None` for inference routes.
     pub media: Option<Arc<Media>>,
 }
 
-/// How a media route runs through [`run`]: which executor operation serves it, and the
-/// same credential binding a [`SessionTurn`] has (`WithPinnedAuthID`,
-/// `WithSelectedAuthIDCallback`), which the video routes use to keep a job on the
-/// credential that created it.
+/// How a media route runs through [`run`]: which media operation it is, and the
+/// credential binding (`WithPinnedAuthID`) the image and video polls use to keep a job on
+/// the credential that created it.
 pub struct Media {
     pub kind: MediaKind,
     /// Only this credential may serve the call.
     pub pinned: Option<String>,
-    /// Called with each credential right before it is attempted.
-    pub on_selected: Option<OnSelected>,
-    /// The client gets an event stream (Go's image streams, also when emulated from a
-    /// buffered call): until the result renders, [`serve`] holds the connection with
-    /// `: keep-alive` frames every `requests.streaming.keepalive-seconds`
-    /// (`waitImagesStreamExecution`) instead of the non-stream keep-alive. A failure that
-    /// renders after that commit is replaced by the response's [`SseError`] event.
-    pub sse: bool,
     /// `WithDisallowFreeAuth` (routed images): Codex credentials on the free plan are
     /// never selected (Go `isFreeCodexAuth`), in any round.
     pub disallow_free: bool,
 }
 
-/// The `event: error` frame a route attaches to an error response (as a response
-/// extension), for [`serve`] to write instead when the event stream already committed
-/// (`writeImagesStreamErrorEvent`).
-#[derive(Clone)]
-pub struct SseError(pub Bytes);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaKind {
-    /// [`ck_exec::Executors::images`]; image-only models are allowed
-    /// (`ExecuteImageWithAuthManager`).
+    /// Image-only models are allowed (`ExecuteImageWithAuthManager`).
     Images,
-    /// [`ck_exec::Executors::videos`].
     Videos,
-    /// [`ck_exec::Executors::speech`]; speech-only models are allowed, and no
-    /// non-stream keep-alive runs: its newlines would prefix the audio.
+    /// Speech-only models are allowed.
     Speech,
+    /// A deferred xAI Chat create or poll (X11); an empty success body denotes pending
+    /// (202), and no non-stream keep-alive runs: its newlines would prefix an empty body.
+    DeferredChat,
 }
 
 impl Call {
-    /// `WithPinnedAuthID` of a session turn or media call.
+    /// `WithPinnedAuthID` of a media call.
     pub(crate) fn pinned(&self) -> Option<String> {
-        self.turn
-            .as_ref()
-            .and_then(|t| t.pinned.clone())
-            .or_else(|| self.media.as_ref().and_then(|m| m.pinned.clone()))
+        self.media.as_ref().and_then(|m| m.pinned.clone())
     }
 
-    /// `WithSelectedAuthIDCallback` of a session turn or media call.
-    fn on_selected(&self) -> Option<&OnSelected> {
-        self.turn
-            .as_ref()
-            .and_then(|t| t.on_selected.as_ref())
-            .or_else(|| self.media.as_ref().and_then(|m| m.on_selected.as_ref()))
+    /// The key of the WebSocket connection the call is a turn of.
+    pub(crate) fn socket_key(&self) -> Option<crate::inference::responses_state::SocketKey> {
+        self.socket.as_ref().map(|socket| socket.key)
     }
 }
 
-/// How a session transport runs one turn through [`run`] (Go
-/// `ExecuteStreamWithAuthManager` with `WithPinnedAuthID`,
-/// `WithSelectedAuthIDCallback` and the execution session).
-pub struct SessionTurn {
-    /// Passed to [`ck_exec::Executors::execute_in_session`] for every attempt.
-    pub session: ck_core::exec::ExecSession,
-    /// Only this credential may serve the turn (`WithPinnedAuthID`); every retry round
-    /// excludes all others.
-    pub pinned: Option<String>,
-    /// Called with each credential right before it is attempted
-    /// (`WithSelectedAuthIDCallback`); the last call before success is the serving one.
-    pub on_selected: Option<OnSelected>,
+/// A Responses WebSocket connection, shared by its turns (E-PLAN §2.4.1). Every turn is an
+/// ordinary Responses exchange; the connection adds the scope of the turn its socket pins, the
+/// execution session of its upstream sockets, and the cancel of the attempt in flight.
+pub struct Socket {
+    pub key: crate::inference::responses_state::SocketKey,
+    /// The attempt in flight: an allocation handle on its response stream and, for a turn on
+    /// an upstream socket, that transport's cancel.
+    inflight: std::sync::Mutex<Option<(ck_stream::Writer, Option<ck_exec::TurnCancel>)>>,
 }
 
-/// The [`SessionTurn::on_selected`] callback.
-pub type OnSelected = Box<dyn Fn(&ck_core::credential::Credential) + Send + Sync>;
+impl Socket {
+    pub fn new() -> Self {
+        Self {
+            key: uuid::Uuid::new_v4().as_u128(),
+            inflight: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The execution session its turns' upstream sockets are pooled under.
+    pub fn session(&self) -> String {
+        format!("{:032x}", self.key)
+    }
+
+    pub(super) fn started(&self, response: ck_stream::Writer, cancel: Option<ck_exec::TurnCancel>) {
+        *self.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((response, cancel));
+    }
+
+    /// The turn ended: nothing is in flight.
+    pub fn ended(&self) {
+        self.inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    /// The client went away with a turn in flight (Settled 56): an upstream socket first gets
+    /// its transport's cancel command, then the attempt's response stream ends `Cancelled`,
+    /// which stops its producer. `false` when no attempt was in flight.
+    pub async fn cancel(&self) -> bool {
+        let inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some((mut response, cancel)) = inflight else {
+            return false;
+        };
+        if let Some(cancel) = cancel {
+            cancel.cancel().await;
+        }
+        response.finish(ck_stream::Terminal::Cancelled);
+        true
+    }
+
+    /// Writes a client's `response.interrupt` to the in-flight turn's upstream socket; `None`
+    /// when no turn runs on a socket that takes one.
+    pub async fn interrupt(&self, frame: &[u8]) -> Option<Result<(), ExecError>> {
+        let control = {
+            let inflight = self.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            inflight
+                .as_ref()
+                .and_then(|(_, cancel)| cancel.as_ref().and_then(ck_exec::TurnCancel::control))
+        }?;
+        Some(control.interrupt(frame).await)
+    }
+}
+
+impl Default for Socket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// The downstream peer address, as the listener records it (`ConnectInfo`).
 pub type Peer = Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>;
@@ -214,7 +257,7 @@ impl Failure {
             Failure::UnknownModel(model) => {
                 let message = gojson::sjson_string(&format!("unknown provider for model {model}"));
                 format!(
-                    r#"{{"error":{{"message":{message},"type":"invalid_request_error","code":"model_not_found","param":"model"}}}}"#
+                    r#"{{"error":{{"message":{message},"type":"invalid_request_error","code":"model_not_found","param":null}}}}"#
                 )
             }
             Failure::ImageOnly(model) => format!(
@@ -278,7 +321,8 @@ impl Failure {
         }
     }
 
-    /// An error the route returns untouched (claude_executor_fast_error.go).
+    /// A fast-mode error (claude_executor_fast_error.go): the route keeps its status and
+    /// filtered headers, and renders the body in the client's error shape.
     pub fn direct(&self) -> Option<&ExecError> {
         match self {
             Failure::Exec(e) if e.direct => Some(e),
@@ -402,8 +446,35 @@ const IMAGE_ONLY: [&str; 8] = [
     "grok-imagine-image-2.0",
 ];
 
+/// Stored prompts own their model; only the native OpenAI/Codex provider resolves them.
+fn prompt_model(call: &Call) -> bool {
+    matches!(call.entry, Format::OpenAIResponse | Format::Codex)
+        && call.model.is_empty()
+        && !ck_wire::json::get(&call.body, "model").exists()
+        && ck_wire::json::get(&call.body, "prompt").exists()
+}
+
+fn model_required() -> Failure {
+    Failure::Exec(ExecError::local(
+        400,
+        ck_core::exec::FailureScope::Request,
+        "model is required when no native prompt resolver is available",
+    ))
+}
+
 /// Go `getRequestDetails`: resolve `auto`, find the providers, keep the suffix.
 fn route(rt: &Runtime, registry: &Registry, call: &Call) -> Result<(Vec<String>, String), RunError> {
+    if prompt_model(call) {
+        if ck_wire::json::get(&call.body, "prompt.id").kind != ck_wire::json::Kind::String {
+            return Err(Failure::Exec(ExecError::local(
+                400,
+                ck_core::exec::FailureScope::Request,
+                "prompt.id must be a string",
+            ))
+            .into());
+        }
+        return Ok((vec!["codex".into()], String::new()));
+    }
     if let Some(provider) = &call.forced_provider {
         let model = gojson::trim(&call.model);
         check_route_only(gojson::trim(canonical_model_raw(model)), call)?;
@@ -459,137 +530,65 @@ fn canonical_model_raw(model: &str) -> &str {
 
 /// Runs `call` and renders the result, adding Go's `X-Ck-Trace-Id` (selection time,
 /// the selected credential's auth index and a request ID) once a credential was picked.
-///
-/// Non-stream generate calls run under Go's `StartNonStreamingKeepAlive`: when
-/// `requests.nonstream-keepalive-interval` is set and no result arrived within one
-/// interval, the response commits as 200 `application/json` and a `\n` goes out every
-/// interval until the call finishes; the rendered body follows. The rendered status and
-/// headers are lost then, as in Go, where they are written after the first keep-alive
-/// flush. Media calls marked [`Media::sse`] hold with event-stream keep-alives instead.
 pub async fn serve<F, Fut>(rt: &Arc<Runtime>, call: Call, render: F) -> axum::response::Response
 where
-    F: FnOnce(Result<Done, Failure>) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
+    F: FnOnce(Result<Done, Failure>) -> Fut,
+    Fut: std::future::Future<Output = axum::response::Response>,
 {
-    let sse = call.media.as_ref().is_some_and(|m| m.sse);
-    let speech = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Speech);
-    let interval = if sse {
-        crate::http::respond::keepalive(&rt.config())
-    } else {
-        nonstream_keepalive(&call, &rt.config())
+    let trace = Trace::with_request_id(crate::observability::api::current_request_id());
+    let result = run_routed_models(rt, call, &trace).await;
+    let upstream = upstream_headers(&rt.config(), &result, trace.served_by_kimi(rt));
+    traced(rt, &trace, render(result).await, upstream)
+}
+
+/// Serves a media request its route decoded into `codec` (E-PLAN §2.3). Nothing reaches the
+/// client before commitment: no keep-alive and no bootstrap retry rounds. A contract-arm answer
+/// is the client's response as it committed; `render` answers an old-arm result or a failure.
+pub async fn serve_exchange<F, Fut>(rt: &Arc<Runtime>, call: Call, codec: Codec, render: F) -> axum::response::Response
+where
+    F: FnOnce(Result<Done, Failure>) -> Fut,
+    Fut: std::future::Future<Output = axum::response::Response>,
+{
+    let trace = Trace::with_request_id(crate::observability::api::current_request_id());
+    let result = match run_exchange(rt, &rt.executors, call, &trace, codec, None).await {
+        Ok(Served::Committed(response)) => return traced(rt, &trace, response, None),
+        Ok(Served::Old(done)) => Ok(done),
+        Err(error) => Err(error.failure),
     };
-    let trace = Arc::new(Trace::with_request_id(crate::observability::api::current_request_id()));
-    let mut run = Box::pin({
-        let (rt, trace) = (rt.clone(), trace.clone());
-        async move {
-            let result = run_with_bootstrap_retries(&rt, call, &trace).await;
-            let cfg = rt.config();
-            let upstream = upstream_headers(&cfg, &result);
-            let result = match result {
-                // Go's speech handler reads the downstream headers the execution hands
-                // back (`downstreamHeadersAfterInterceptors`): the final filtered headers
-                // under passthrough, else none.
-                Ok(Done::Buffered { headers, body }) if speech => {
-                    let headers = if respond::passthrough_headers(&cfg) {
-                        respond::filter_upstream_headers(&headers)
-                    } else {
-                        HeaderMap::new()
-                    };
-                    Ok(Done::Buffered { headers, body })
-                }
-                result => result,
-            };
-            (result, upstream)
-        }
-    });
-    // Upstream headers and the trace ID go on a rendered response; once a keep-alive
-    // committed the headers they are lost, as in Go.
-    let traced = {
-        let (trace, rt) = (trace.clone(), rt.clone());
-        move |mut response: axum::response::Response, upstream: Option<Upstream>| {
-            // The same config snapshot decides passthrough for both header sources.
-            match upstream {
-                Some(Upstream::Success(headers)) => respond::write_upstream_headers(response.headers_mut(), &headers),
-                Some(Upstream::Error(headers)) => respond::write_error_headers(response.headers_mut(), &headers),
-                None => {}
-            }
-            if let Some(value) = trace.header() {
-                response.headers_mut().insert("x-ck-trace-id", value);
-            }
-            // The model a model router chose, and the provider that served (cooker only).
-            // Both are sent only when a router or `routing.providers` is in play, so a config
-            // without them answers exactly as Go does.
-            let routed_model = trace.routed_model();
-            let routed = routed_model.is_some() || rt.policy().providers.is_set();
-            if let Some(value) = routed_model.and_then(|m| axum::http::HeaderValue::from_str(&m).ok()) {
-                response.headers_mut().insert("x-ck-routed-model", value);
-            }
-            if let Some(value) = trace
-                .routed_provider(&rt)
-                .filter(|_| routed)
-                .and_then(|p| axum::http::HeaderValue::from_str(&p).ok())
-            {
-                response.headers_mut().insert("x-ck-routed-provider", value);
-            }
-            response
-        }
-    };
-    let Some(interval) = interval else {
-        let (result, upstream) = run.await;
-        return traced(render(result).await, upstream);
-    };
-    tokio::select! {
-        biased;
-        (result, upstream) = &mut run => return traced(render(result).await, upstream),
-        () = tokio::time::sleep(interval) => {}
+    let upstream = upstream_headers(&rt.config(), &result, trace.served_by_kimi(rt));
+    traced(rt, &trace, render(result).await, upstream)
+}
+
+/// Adds the upstream headers, the trace ID and the routing headers to a response.
+fn traced(
+    rt: &Runtime,
+    trace: &Trace,
+    mut response: axum::response::Response,
+    upstream: Option<Upstream>,
+) -> axum::response::Response {
+    // The same config snapshot decides passthrough for both header sources.
+    match upstream {
+        Some(Upstream::Success(headers)) => respond::write_upstream_headers(response.headers_mut(), &headers),
+        Some(Upstream::Error(headers)) => respond::write_error_headers(response.headers_mut(), &headers),
+        None => {}
     }
-    // Go's handlers stop the keep-alive as soon as Execute returns: no beats while the
-    // result renders (the video download, for one).
-    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    enum Event {
-        Tick,
-        Done(Result<Done, Failure>),
-    }
-    let events = futures_util::stream::unfold(Some((run, ticks)), |state| async move {
-        let (mut run, mut ticks) = state?;
-        tokio::select! {
-            biased;
-            (result, _) = &mut run => Some((Event::Done(result), None)),
-            _ = ticks.tick() => Some((Event::Tick, Some((run, ticks)))),
-        }
-    });
-    let beat = Bytes::from_static(if sse { b": keep-alive\n\n" } else { b"\n" });
-    let once = |bytes: Bytes| futures_util::stream::iter([Ok::<_, axum::Error>(bytes)]);
-    let first = once(beat.clone());
-    let mut render = Some(render);
-    let body = first.chain(events.flat_map(move |event| match event {
-        Event::Tick => once(beat.clone()).left_stream(),
-        Event::Done(result) => {
-            let render = render.take().expect("the run finishes once");
-            let rendered = futures_util::stream::once(render(result));
-            let body = rendered.flat_map(move |response| match response.extensions().get::<SseError>() {
-                Some(SseError(event)) if sse => once(event.clone()).left_stream(),
-                _ => response.into_body().into_data_stream().right_stream(),
-            });
-            body.right_stream()
-        }
-    }));
-    let body = axum::body::Body::from_stream(body);
-    let mut response = if sse {
-        crate::http::respond::sse(body)
-    } else {
-        let mut response = axum::response::Response::new(body);
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
-        );
-        response
-    };
-    let headers = response.headers_mut();
-    // Go cpa_trace.go applies the trace ID when the first keep-alive commits headers.
     if let Some(value) = trace.header() {
-        headers.insert("x-ck-trace-id", value);
+        response.headers_mut().insert("x-ck-trace-id", value);
+    }
+    // The model a model router chose, and the provider that served (cooker only).
+    // Both are sent only when a router or `routing.providers` is in play, so a config
+    // without them answers exactly as Go does.
+    let routed_model = trace.routed_model();
+    let routed = routed_model.is_some() || rt.policy().providers.is_set();
+    if let Some(value) = routed_model.and_then(|m| axum::http::HeaderValue::from_str(&m).ok()) {
+        response.headers_mut().insert("x-ck-routed-model", value);
+    }
+    if let Some(value) = trace
+        .routed_provider(rt)
+        .filter(|_| routed)
+        .and_then(|p| axum::http::HeaderValue::from_str(&p).ok())
+    {
+        response.headers_mut().insert("x-ck-routed-provider", value);
     }
     response
 }
@@ -602,53 +601,45 @@ enum Upstream {
     Error(HeaderMap),
 }
 
+/// The Kimi request proof among filtered upstream headers, which reaches the client even
+/// without header passthrough.
+fn kimi_proof(filtered: &HeaderMap) -> HeaderMap {
+    let mut proof = HeaderMap::new();
+    for name in ["msh-request-timestamp", "msh-request-signature"] {
+        for value in filtered.get_all(name) {
+            proof.append(name, value.clone());
+        }
+    }
+    proof
+}
+
 /// An error contributes only its [`ExecError::addon`] (Go `executionErrorMessage` reads
 /// `Headers()`); speech errors, like most, carry none.
-fn upstream_headers(cfg: &Config, result: &Result<Done, Failure>) -> Option<Upstream> {
-    if !respond::passthrough_headers(cfg) {
+///
+/// A Kimi credential's proof headers reach the client even without passthrough.
+fn upstream_headers(cfg: &Config, result: &Result<Done, Failure>, kimi: bool) -> Option<Upstream> {
+    let passthrough = respond::passthrough_headers(cfg);
+    if !passthrough && !kimi {
         return None;
     }
     match result {
         Ok(Done::Buffered { headers, .. } | Done::Stream { headers, .. }) => {
-            Some(Upstream::Success(respond::filter_upstream_headers(headers)))
+            let filtered = respond::filter_upstream_headers(headers);
+            if passthrough {
+                return Some(Upstream::Success(filtered));
+            }
+            Some(Upstream::Success(kimi_proof(&filtered)))
         }
-        Err(Failure::Exec(error)) if !error.direct => error.addon.as_deref().cloned().map(Upstream::Error),
+        Err(Failure::Exec(error)) if passthrough && !error.direct => {
+            error.addon.as_deref().cloned().map(Upstream::Error)
+        }
         Err(_) => None,
     }
 }
 
-/// `requests.nonstream-keepalive-interval` seconds (Go `NonStreamingKeepAliveInterval`;
-/// 0 or below disables it), for the calls whose Go handler starts the keep-alive: only
-/// non-stream generate handlers do; the count-tokens handlers (code_handlers.go,
-/// gemini_handlers.go) and the speech handler never call `StartNonStreamingKeepAlive`.
-fn nonstream_keepalive(call: &Call, cfg: &Config) -> Option<Duration> {
-    let speech = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Speech);
-    if call.stream || call.operation != Operation::Generate || speech {
-        return None;
-    }
-    let seconds = cfg
-        .document
-        .get("requests")
-        .and_then(|r| r.get("nonstream-keepalive-interval"))
-        .and_then(serde_yaml_ng::Value::as_i64)
-        .unwrap_or(0);
-    (seconds > 0).then(|| Duration::from_secs(seconds as u64))
-}
-
-/// `requests.streaming.bootstrap-retries` (Go `StreamingBootstrapRetries`).
-fn bootstrap_retries(cfg: &Config) -> usize {
-    cfg.document
-        .get("requests")
-        .and_then(|r| r.get("streaming"))
-        .and_then(|s| s.get("bootstrap-retries"))
-        .and_then(serde_yaml_ng::Value::as_i64)
-        .unwrap_or(0)
-        .max(0) as usize
-}
-
-/// Go handlers_stream.go: a stream that failed before its first payload is retried as a
-/// whole request when the status is statusless, auth, quota, timeout or 5xx.
-pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &Trace) -> Result<Done, Failure> {
+/// Runs `call` with the model a model router picks, moving to the router's fallback models
+/// while an attempt fails before any byte reached the client.
+async fn run_routed_models(rt: &Arc<Runtime>, call: Call, trace: &Trace) -> Result<Done, Failure> {
     let mut call = call;
     // A model router (`model-routers`) names the model, for the registry to route.
     let mut picked = None;
@@ -669,7 +660,9 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
             trace.prompt_prefix(call.entry, &call.body);
         }
         let scope = picked.as_ref().map(|p| p.scope.clone());
-        let result = retry_bootstrap(rt, call, trace, &resolved, scope).await;
+        let result = run_routed(rt, call, trace, resolved, scope)
+            .await
+            .map_err(|e| e.failure);
         // A conversation moves to a routed model only once it served.
         if let (Ok(_), Some(picked)) = (&result, &picked) {
             picked.commit(rt);
@@ -691,54 +684,6 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
         call = original;
         call.model = model;
     }
-}
-
-/// The bootstrap retry rounds of one resolved request.
-async fn retry_bootstrap(
-    rt: &Arc<Runtime>,
-    call: Call,
-    trace: &Trace,
-    resolved: &(Vec<String>, String),
-    scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
-) -> Result<Done, Failure> {
-    let max = if call.stream {
-        bootstrap_retries(&rt.config())
-    } else {
-        0
-    };
-    let mut result = run_routed(rt, call.clone(), trace, resolved.clone(), scope.clone()).await;
-    for _ in 0..max {
-        let original = match &result {
-            Err(RunError {
-                failure: Failure::Exec(e),
-                bootstrap: true,
-            }) if bootstrap_eligible(classify::go_status(e)) => e.clone(),
-            _ => break,
-        };
-        result = match run_routed(rt, call.clone(), trace, resolved.clone(), scope.clone()).await {
-            Err(RunError {
-                failure,
-                bootstrap: false,
-            }) if matches!(failure, Failure::Unavailable { .. }) && classify::response_status(&original) >= 500 => {
-                Err(RunError {
-                    failure: Failure::Exec(original),
-                    bootstrap: false,
-                })
-            }
-            Err(RunError {
-                failure,
-                bootstrap: false,
-            }) => {
-                return Err(failure);
-            }
-            other => other,
-        };
-    }
-    result.map_err(|e| e.failure)
-}
-
-fn bootstrap_eligible(status: u16) -> bool {
-    matches!(status, 0 | 401 | 402 | 403 | 408 | 429) || status >= 500
 }
 
 /// The trace ID of the last credential selected for a request.
@@ -836,6 +781,13 @@ impl Trace {
         self.7.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether the last selected credential is a Kimi one.
+    fn served_by_kimi(&self, rt: &Runtime) -> bool {
+        let id = self.6.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        id.and_then(|id| rt.store().get(&id))
+            .is_some_and(|c| ck_exec::kimi::PROVIDERS.contains(&c.provider.as_str()))
+    }
+
     /// The provider selector (`routing.providers`) of the last selected credential.
     fn routed_provider(&self, rt: &Runtime) -> Option<String> {
         let id = self
@@ -852,7 +804,7 @@ impl Trace {
     }
 
     /// The prompt prefix hash of the request's body, from the first body it is asked
-    /// for: the client's body when [`run_with_bootstrap_retries`] asks.
+    /// for: the client's body when [`serve`] asks.
     pub(crate) fn prompt_prefix(&self, format: Format, body: &[u8]) -> String {
         self.4
             .get_or_init(|| crate::observability::usage_record::prompt_prefix(format, body))
@@ -890,19 +842,14 @@ pub fn request_id() -> String {
     )
 }
 
-/// A terminal failure of [`run`]. `bootstrap` marks a stream that failed before its
-/// first payload (Go `streamBootstrapError`).
+/// A terminal failure of [`run`].
 pub struct RunError {
     pub failure: Failure,
-    pub bootstrap: bool,
 }
 
 impl From<Failure> for RunError {
     fn from(failure: Failure) -> Self {
-        Self {
-            failure,
-            bootstrap: false,
-        }
+        Self { failure }
     }
 }
 
@@ -919,7 +866,6 @@ impl Fault {
     fn into_run_error(self) -> RunError {
         RunError {
             failure: Failure::Exec(self.error),
-            bootstrap: self.bootstrap.is_some(),
         }
     }
 }
@@ -931,14 +877,55 @@ pub async fn run(rt: &Arc<Runtime>, call: Call, trace: &Trace) -> Result<Done, R
     run_routed(rt, call, trace, resolved, None).await
 }
 
+/// What a request with a decoded exchange ([`run_exchange`]) came to.
+pub enum Served {
+    /// An old-arm attempt answered; the route renders it as for [`run`].
+    Old(Done),
+    /// A contract-arm attempt committed: the response carries its first deliverable bytes.
+    Committed(axum::response::Response),
+}
+
+/// [`run`] for a request its route decoded into `codec`. Each candidate takes the contract
+/// arm through `arms` or the old arm (D2-PLAN §3.2, §4); both share selection, retry rounds,
+/// the credits fallback and one usage `Facts`.
+/// `scope` is a model router's provider scope.
+pub async fn run_exchange<X: Arms>(
+    rt: &Arc<Runtime>,
+    arms: &X,
+    call: Call,
+    trace: &Trace,
+    codec: Codec,
+    scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
+) -> Result<Served, RunError> {
+    let resolved = route(rt, &rt.registry(), &call)?;
+    let mut arm = Arm::new(arms, codec);
+    run_loop(rt, call, trace, resolved, scope, Some(&mut arm)).await
+}
+
 /// [`run`] for resolved providers and model.
 async fn run_routed(
     rt: &Arc<Runtime>,
     call: Call,
     trace: &Trace,
-    (providers, model): (Vec<String>, String),
+    resolved: (Vec<String>, String),
     scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
 ) -> Result<Done, RunError> {
+    let old = run_loop::<ck_exec::Executors>(rt, call, trace, resolved, scope, None).await?;
+    match old {
+        Served::Old(done) => Ok(done),
+        Served::Committed(_) => unreachable!("only an exchange commits"),
+    }
+}
+
+/// The selection loop; `arm` is the exchange of a request that may take the contract arm.
+async fn run_loop<X: Arms>(
+    rt: &Arc<Runtime>,
+    call: Call,
+    trace: &Trace,
+    (providers, model): (Vec<String>, String),
+    scope: Option<Arc<crate::scheduling::provider_policy::Providers>>,
+    mut arm: Option<&mut Arm<'_, X>>,
+) -> Result<Served, RunError> {
     let (cfg, policy) = rt.request_snapshot();
     let registry = rt.registry();
     let aliases = registry::global_aliases(&cfg);
@@ -949,8 +936,12 @@ async fn run_routed(
         call.execution_session.as_deref(),
         &call.caller.principal,
     );
-    // Go's usage reporter: one record per Generate attempt while the queue accepts.
-    let usage = (call.operation == Operation::Generate && rt.usage_queue().accepts()).then(|| {
+    let alpha = arm
+        .as_ref()
+        .is_some_and(|arm| arm.operation() == ck_translate::codec::Operation::AlphaSearch);
+    // Go's usage reporter: one record per Generate attempt while the queue accepts. Alpha
+    // Search reports none (`Server.codexAlphaSearch`).
+    let usage = (call.operation == Operation::Generate && !alpha && rt.usage_queue().accepts()).then(|| {
         Arc::new(crate::observability::usage_record::Facts::new(
             usage_client(&cfg, &call, trace, &session),
             call.entry,
@@ -981,6 +972,15 @@ async fn run_routed(
                     .get("plan_type")
                     .is_some_and(|plan| plan.trim().eq_ignore_ascii_case("free"));
             if free && !pinned_exclusion.contains(&credential.id) {
+                pinned_exclusion.push(credential.id.clone());
+            }
+        }
+    }
+    // `codex_alpha_search_v1`: a credential the policy refuses is no candidate for Alpha
+    // Search, so it neither answers the request nor spends a retry slot.
+    if alpha {
+        for credential in rt.store().snapshot() {
+            if !rt.executors.codex.alpha_allowed(&credential, &cfg) && !pinned_exclusion.contains(&credential.id) {
                 pinned_exclusion.push(credential.id.clone());
             }
         }
@@ -1025,6 +1025,8 @@ async fn run_routed(
     let mut upstream: Option<Fault> = None;
     loop {
         let mut last: Option<Fault> = None;
+        // A destination refusal answers only when no candidate failed after sending.
+        let mut skipped: Option<Fault> = None;
         let mut attempted: Vec<String> = Vec::new();
         let pick_failure = loop {
             if policy.max_retry_credentials > 0 && attempted.len() >= policy.max_retry_credentials {
@@ -1032,6 +1034,9 @@ async fn run_routed(
             }
             let lease = match rt.acquire(selection.clone(), &cfg, policy.clone(), &registry).await {
                 Ok(lease) => lease,
+                Err(AcquireError::Unavailable { retry_after: None, .. }) if last.is_none() && prompt_model(&call) => {
+                    return Err(model_required().into());
+                }
                 Err(AcquireError::Prepare { id, error }) => {
                     attempted.push(id.clone());
                     selection.exclude.push(id);
@@ -1100,8 +1105,23 @@ async fn run_routed(
                 compact,
                 keep_model: call.selection_model.is_some(),
             };
-            match attempt(rt, &cfg, &policy, &call, &request, usage.as_ref(), lease, target).await {
-                Attempt::Done(done) => return Ok(done),
+            let ran = attempt(
+                rt,
+                &cfg,
+                &policy,
+                &call,
+                trace,
+                &request,
+                usage.as_ref(),
+                arm.as_deref_mut(),
+                lease,
+                target,
+            )
+            .await;
+            match ran {
+                Attempt::Done(done) => return Ok(Served::Old(done)),
+                Attempt::Committed(response) => return Ok(Served::Committed(response)),
+                Attempt::Skip(fault) => skipped = Some(fault),
                 Attempt::Stop(fault) => {
                     trace.stop();
                     return Err(fault.into_run_error());
@@ -1117,7 +1137,7 @@ async fn run_routed(
         // The round's error decides retries: an attempt error when there was one, else
         // the selection failure. The response reports the latest upstream attempt when
         // there was one (Go executeMixedOnce, preferredExecutionAttemptError).
-        let round_error: RunError = match (last, pick_failure) {
+        let round_error: RunError = match (last.or(skipped), pick_failure) {
             (Some(fault), _) => fault.into_run_error(),
             (None, Some(failure)) => failure.into(),
             (None, None) => Failure::Unavailable {
@@ -1158,8 +1178,10 @@ async fn run_routed(
                     &cfg,
                     &policy,
                     &call,
+                    trace,
                     &request,
                     usage.as_ref(),
+                    arm.as_deref_mut(),
                     terminal(round_error),
                 )
                 .await;
@@ -1175,8 +1197,10 @@ async fn run_routed(
                     &cfg,
                     &policy,
                     &call,
+                    trace,
                     &request,
                     usage.as_ref(),
+                    arm.as_deref_mut(),
                     terminal(round_error),
                 )
                 .await;
@@ -1241,16 +1265,18 @@ impl Credits<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn fallback(
+    async fn fallback<X: Arms>(
         &self,
         rt: &Arc<Runtime>,
         cfg: &Config,
         policy: &Policy,
         call: &Call,
+        trace: &Trace,
         request: &ExecRequest,
         usage: Option<&Arc<crate::observability::usage_record::Facts>>,
+        mut arm: Option<&mut Arm<'_, X>>,
         error: RunError,
-    ) -> Result<Done, RunError> {
+    ) -> Result<Served, RunError> {
         // Go's ExecuteCount has no credits fallback; Execute and ExecuteStream do.
         if request.operation == Operation::CountTokens
             || !self.wanted(cfg, &error)
@@ -1295,8 +1321,23 @@ impl Credits<'_> {
             };
             // ponytail: a 401 inside a credits attempt retries with the refreshed
             // credential, which no longer carries the credits flag.
-            if let Attempt::Done(done) = attempt(rt, cfg, policy, call, request, usage, lease, target).await {
-                return Ok(done);
+            let ran = attempt(
+                rt,
+                cfg,
+                policy,
+                call,
+                trace,
+                request,
+                usage,
+                arm.as_deref_mut(),
+                lease,
+                target,
+            )
+            .await;
+            match ran {
+                Attempt::Done(done) => return Ok(Served::Old(done)),
+                Attempt::Committed(response) => return Ok(Served::Committed(response)),
+                Attempt::Stop(_) | Attempt::Skip(_) | Attempt::Next(_) => {}
             }
         }
         Err(error)
@@ -1305,10 +1346,14 @@ impl Credits<'_> {
 
 enum Attempt {
     Done(Done),
+    /// A contract-arm attempt committed.
+    Committed(axum::response::Response),
     /// Terminal for the whole request.
     Stop(Fault),
     /// Failed over; try the next credential.
     Next(Fault),
+    /// Every model of this credential refused the request before sending; try the next.
+    Skip(Fault),
 }
 
 /// What one selected credential executes.
@@ -1325,21 +1370,22 @@ struct Target<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn attempt(
+async fn attempt<X: Arms>(
     rt: &Arc<Runtime>,
     cfg: &Config,
     policy: &Policy,
     call: &Call,
+    trace: &Trace,
     request: &ExecRequest,
     usage: Option<&Arc<crate::observability::usage_record::Facts>>,
+    mut arm: Option<&mut Arm<'_, X>>,
     mut lease: Lease,
     target: Target<'_>,
 ) -> Attempt {
     let route_model = lease.selection.model.clone();
     let mut last = None;
     let mut refreshed = false;
-    let session = call.turn.as_ref().map(|turn| &turn.session);
-    for (i, upstream) in target.models.iter().enumerate() {
+    'models: for (i, upstream) in target.models.iter().enumerate() {
         // Go `stateModelForExecution`.
         let state = registry::state_model(target.selection_model, &route_model, upstream, target.pooled);
         lease.execution_model = state.clone();
@@ -1357,103 +1403,148 @@ async fn attempt(
         if let Some(m) = &lcp {
             req.session = Some(ck_wire::session::bound_session_identity(&m.session));
         }
-        if let Some(on_selected) = call.on_selected() {
-            on_selected(&lease.credential);
-        }
-        let start = |credential: &ck_core::credential::Credential, req: &mut ExecRequest| {
-            usage.map(|facts| {
-                let mut tracker = crate::observability::usage_record::Tracker::start(rt, facts, credential, upstream);
-                if let Some(m) = &lcp {
-                    tracker.lcp_session(m);
-                }
-                req.usage = tracker.sink().with_capture(req.capture().clone());
-                tracker
-            })
-        };
-        let mut tracker = start(&lease.credential, &mut req);
-        let execute = |credential: Arc<ck_core::credential::Credential>, req: ExecRequest| async move {
-            let credential = rt.for_executor(&credential);
-            match (session, call.media.as_ref().map(|m| m.kind)) {
-                (Some(session), _) => rt.executors.execute_in_session(&credential, req, cfg, session).await,
-                // The call names the path (Go's request_path metadata).
-                (None, Some(MediaKind::Images)) => {
-                    let path = req.request_path.clone();
-                    rt.executors.images(&credential, req, &path, cfg).await
-                }
-                (None, Some(MediaKind::Videos)) => {
-                    let path = req.request_path.clone();
-                    rt.executors.videos(&credential, req, &path, cfg).await
-                }
-                (None, Some(MediaKind::Speech)) => rt.executors.speech(&credential, req, cfg).await,
-                (None, None) => rt.executors.execute(&credential, req, cfg).await,
-            }
-        };
-        tracing::trace!(target: "cpa_latency", stage = "selected");
-        // Each pooled model is its own upstream dispatch, stamped right before it runs:
-        // after preparation and the after-auth interceptor (Go `nextExecutionSeq`).
-        lease.redispatch();
-        let mut executed = execute(lease.credential.clone(), req.clone()).await;
-        // Go `tryRefreshAfterUnauthorized`: one refresh-and-retry per credential.
-        if let Err(error) = &executed
-            && !refreshed
-            && classify::is_unauthorized(error)
-            && let Some(current) = rt.refresh_after_unauthorized(&lease.credential, cfg).await
-        {
-            refreshed = true;
-            if let Some(t) = tracker.take() {
-                t.fail(error);
-            }
-            lease.credential = current;
-            lease.redispatch();
-            tracker = start(&lease.credential, &mut req);
-            executed = execute(lease.credential.clone(), req).await;
-        }
-        if let (Ok(response), Some(t)) = (&executed, tracker.as_mut()) {
-            t.arrived(&response.headers);
-        }
-        let fault = match executed {
-            Ok(response) => match finish(call, response).await {
-                Ok(done) => {
-                    let done = track_usage(done, tracker.take());
-                    let done = if target.alias.force_mapping && !target.alias.original_alias.is_empty() {
-                        rewrite_model(done, &target.alias.original_alias)
-                    } else {
-                        done
-                    };
-                    return Attempt::Done(match done {
-                        Done::Stream { headers, first, rest } => {
-                            // A good first chunk answers a bounded window's probe now,
-                            // not when the stream ends.
-                            lease.accepted();
-                            Done::Stream {
-                                headers,
-                                first,
-                                rest: Completing::new(rest, lease).boxed(),
-                            }
-                        }
-                        buffered => {
-                            lease.complete(Outcome::Success);
-                            buffered
-                        }
-                    });
-                }
-                Err(fault) => {
-                    if let Some(t) = tracker.take() {
-                        t.fail(&fault.error);
+        let forced_alias = target.alias.force_mapping && !target.alias.original_alias.is_empty();
+        let fault = 'arm: {
+            let ran = match arm.as_deref_mut() {
+                Some(arm) => loop {
+                    let ran = attempt::run(
+                        arm,
+                        rt,
+                        cfg,
+                        call,
+                        trace,
+                        &req,
+                        usage,
+                        &mut lease,
+                        upstream,
+                        forced_alias.then_some(target.alias.original_alias.as_str()),
+                    )
+                    .await;
+                    // Go `tryRefreshAfterUnauthorized`, once per credential, after the failed
+                    // attempt was settled and discarded.
+                    if let Ran::Failed(fault) = &ran
+                        && !refreshed
+                        && classify::is_unauthorized(&fault.error)
+                        && let Some(current) = rt.refresh_after_unauthorized(&lease.credential, cfg).await
+                    {
+                        refreshed = true;
+                        lease.credential = current;
+                        continue;
                     }
-                    fault
+                    break ran;
+                },
+                None => Ran::Old,
+            };
+            match ran {
+                Ran::Old => {}
+                Ran::Failed(fault) => break 'arm fault,
+                Ran::Committed(committed) => return Attempt::Committed(committed.spawn(rt, lease)),
+                Ran::Stop(fault) => {
+                    lease.complete(Outcome::Neutral(fault.error.clone()));
+                    return Attempt::Stop(fault);
                 }
-            },
-            Err(error) => {
+                Ran::Skip(fault) => {
+                    let outcome = Outcome::Neutral(fault.error.clone());
+                    if i + 1 < target.models.len() {
+                        lease.note(&state, &outcome);
+                        continue 'models;
+                    }
+                    lease.complete(outcome);
+                    return last.map_or(Attempt::Skip(fault), Attempt::Next);
+                }
+            }
+            let start = |credential: &ck_core::credential::Credential, req: &mut ExecRequest| {
+                usage.map(|facts| {
+                    let mut tracker =
+                        crate::observability::usage_record::Tracker::start(rt, facts, credential, upstream);
+                    if let Some(m) = &lcp {
+                        tracker.lcp_session(m);
+                    }
+                    req.usage = tracker.sink().with_capture(req.capture().clone());
+                    tracker
+                })
+            };
+            let mut tracker = start(&lease.credential, &mut req);
+            let execute = |credential: Arc<ck_core::credential::Credential>, req: ExecRequest| async move {
+                let credential = rt.for_executor(&credential);
+                match call.media.as_ref().map(|m| m.kind) {
+                    Some(MediaKind::DeferredChat) => rt.executors.deferred_chat(&credential, req, cfg).await,
+                    // Other media runs only on the contract arm: a provider it does not take has
+                    // no executor for the call.
+                    Some(_) => Err(ck_exec::no_executor(&credential.provider)),
+                    None => rt.executors.execute(&credential, req, cfg).await,
+                }
+            };
+            tracing::trace!(target: "cpa_latency", stage = "selected");
+            // Each pooled model is its own upstream dispatch, stamped right before it runs:
+            // after preparation and the after-auth interceptor (Go `nextExecutionSeq`).
+            lease.redispatch();
+            let mut executed = execute(lease.credential.clone(), req.clone()).await;
+            // Go `tryRefreshAfterUnauthorized`: one refresh-and-retry per credential.
+            if let Err(error) = &executed
+                && !refreshed
+                && classify::is_unauthorized(error)
+                && let Some(current) = rt.refresh_after_unauthorized(&lease.credential, cfg).await
+            {
+                refreshed = true;
                 if let Some(t) = tracker.take() {
-                    t.fail(&error);
+                    t.fail(error);
                 }
-                Fault { error, bootstrap: None }
+                lease.credential = current;
+                lease.redispatch();
+                tracker = start(&lease.credential, &mut req);
+                executed = execute(lease.credential.clone(), req).await;
+            }
+            if let (Ok(response), Some(t)) = (&executed, tracker.as_mut()) {
+                t.arrived(&response.headers);
+            }
+            match executed {
+                Ok(response) => match finish(call, response).await {
+                    Ok(done) => {
+                        let done = track_usage(done, tracker.take());
+                        let done = if forced_alias {
+                            rewrite_model(done, &target.alias.original_alias)
+                        } else {
+                            done
+                        };
+                        return Attempt::Done(match done {
+                            Done::Stream { headers, first, rest } => {
+                                // A good first chunk answers a bounded window's probe now,
+                                // not when the stream ends.
+                                lease.accepted();
+                                Done::Stream {
+                                    headers,
+                                    first,
+                                    rest: Completing::new(rest, lease).boxed(),
+                                }
+                            }
+                            buffered => {
+                                lease.complete(Outcome::Success);
+                                buffered
+                            }
+                        });
+                    }
+                    Err(fault) => {
+                        if let Some(t) = tracker.take() {
+                            t.fail(&fault.error);
+                        }
+                        fault
+                    }
+                },
+                Err(error) => {
+                    if let Some(t) = tracker.take() {
+                        t.fail(&error);
+                    }
+                    Fault { error, bootstrap: None }
+                }
             }
         };
         let error = &fault.error;
         let action = policy.error_action(&lease.credential, error);
-        let neutral = (target.compact && classify::is_compact_neutral(error) && !action.force_cooldown)
+        // D2-PLAN §3.3: a compact failure is routed by its class; a missing endpoint leaves
+        // the credential's availability alone, since the next compact is its own probe.
+        let compact = target.compact.then(|| classify::compact_class(error));
+        let neutral = (compact == Some(CompactClass::Unsupported) && !action.force_cooldown)
             || (call.operation == Operation::CountTokens
                 && classify::is_count_endpoint_missing(error, upstream)
                 && !action.force_cooldown);
@@ -1464,18 +1555,17 @@ async fn attempt(
         };
         let stop = if action.matched {
             action.stop
+        } else if let Some(class) = compact {
+            class == CompactClass::ClientFault
         } else {
-            (target.compact && classify::is_compact_fault(error)) || classify::is_request_invalid(error)
+            classify::is_request_invalid(error)
         };
         // A credential-wide quota ends this credential's model pool.
         let last_here = stop || i + 1 == target.models.len() || classify::credential_scoped(error);
-        // Go returns a stopping bootstrap failure as is: an error, not a stream, so the
-        // handler's bootstrap retries never see it. Any other one goes on as a
+        // Go returns a stopping bootstrap failure as is. Any other one goes on as a
         // `streamBootstrapError`, whose `Headers()` are the stream's.
         let mut fault = fault;
-        if stop {
-            fault.bootstrap = None;
-        } else if let Some(headers) = &fault.bootstrap {
+        if !stop && let Some(headers) = &fault.bootstrap {
             fault.error.addon = Some(headers.clone());
         }
         if last_here {
@@ -1509,10 +1599,10 @@ fn usage_client(
         is_compaction: false,
         session_source: session.source,
         request_id: trace.request_id(),
-        // Session turns arrive on the WebSocket upgrade (a GET).
+        // WebSocket turns arrive on the upgrade (a GET).
         endpoint: format!(
             "{} {}",
-            if call.turn.is_some() { "GET" } else { "POST" },
+            if call.socket.is_some() { "GET" } else { "POST" },
             call.request_path
         ),
         api_key,
@@ -1852,58 +1942,6 @@ mod tests {
         }
     }
 
-    /// Go starts the non-stream keep-alive in the non-stream generate handlers only, and
-    /// `NonStreamingKeepAliveInterval` treats 0 and below as off.
-    #[test]
-    fn nonstream_keepalive_only_for_nonstream_generate() {
-        let call = |operation, stream| Call {
-            entry: Format::Claude,
-            response: Format::Claude,
-            operation,
-            model: "m".into(),
-            body: Bytes::new(),
-            stream,
-            alt: None,
-            headers: HeaderMap::new(),
-            caller: Caller {
-                principal: String::new(),
-                source: "",
-                provider: String::new(),
-            },
-            forced_provider: None,
-            selection_model: None,
-            execution_session: None,
-            request_path: String::new(),
-            peer: None,
-            turn: None,
-            media: None,
-        };
-        let cfg = |yaml: &str| Config::parse(yaml).unwrap();
-        let on = cfg("requests:\n  nonstream-keepalive-interval: 3\n");
-        assert_eq!(
-            nonstream_keepalive(&call(Operation::Generate, false), &on),
-            Some(Duration::from_secs(3))
-        );
-        assert_eq!(nonstream_keepalive(&call(Operation::Generate, true), &on), None);
-        assert_eq!(nonstream_keepalive(&call(Operation::CountTokens, false), &on), None);
-        for off in [
-            "{}\n",
-            "requests:\n  nonstream-keepalive-interval: 0\n",
-            "requests:\n  nonstream-keepalive-interval: -5\n",
-        ] {
-            assert_eq!(
-                nonstream_keepalive(&call(Operation::Generate, false), &cfg(off)),
-                None,
-                "{off}"
-            );
-        }
-        let configured = cfg("requests:\n  nonstream-keepalive-interval: 2\n");
-        assert_eq!(
-            nonstream_keepalive(&call(Operation::Generate, false), &configured),
-            Some(Duration::from_secs(2))
-        );
-    }
-
     /// Each attempt carries Go's binding for its credential and upstream model; a kept
     /// request model (Go `restoreExecutionModel`) routes Codex by that model. Expected
     /// values are the Go goldens' "codex configured" and "codex restore" cases.
@@ -1951,10 +1989,10 @@ mod tests {
     }
 
     #[test]
-    fn failure_texts_match_go_shapes() {
+    fn failure_texts_preserve_error_details() {
         assert_eq!(
             Failure::UnknownModel("claude-sonnet-4-6".into()).text(),
-            r#"{"error":{"message":"unknown provider for model claude-sonnet-4-6","type":"invalid_request_error","code":"model_not_found","param":"model"}}"#
+            r#"{"error":{"message":"unknown provider for model claude-sonnet-4-6","type":"invalid_request_error","code":"model_not_found","param":null}}"#
         );
         let cooldown = Failure::Cooldown {
             model: "m".into(),

@@ -19,15 +19,13 @@
           "body": "{\"created\":1700000001,\"data\":[{\"b64_json\":\"QUJD\",\"revised_prompt\":\" a cat, refined \"},{\"url\":\"http://UPSTREAM/img/2.png\",\"mime_type\":\"image/webp\"}],\"usage\":{\"total_tokens\":5,\"input_tokens\":2}}"
         }
       ],
-      "status": 200,
+      "status": 400,
       "response_headers": {
-        "Content-Length": "172",
+        "Content-Length": "124",
         "Content-Type": "application/json"
       },
-      "response": "{\"created\":1700000001,\"data\":[{\"b64_json\":\"QUJD\",\"revised_prompt\":\"a cat, refined\"},{\"url\":\"http://UPSTREAM/img/2.png\"}],\"usage\":{\"total_tokens\":5,\"input_tokens\":2}}",
-      "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 139\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"a cat\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"16:9\",\"resolution\":\"1k\",\"quality\":\"high\",\"n\":2}"
-      ]
+      "response": "{\"error\":{\"message\":\"the destination does not support the request\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+      "requests": []
     },
     {
       "name": "gen_xai_url_format",
@@ -49,12 +47,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "112",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"created\":\"\u003cnow\u003e\",\"data\":[{\"url\":\"data:image/jpeg;base64,QUJD\"},{\"url\":\"http://UPSTREAM/img/3.png\"}]}",
+      "response": "{\"created\":0,\"output_format\":\"jpeg\",\"data\":[{\"url\":\"data:image/jpeg;base64,QUJD\"},{\"url\":\"http://UPSTREAM/img/3.png\"}]}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 119\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image-quality\",\"prompt\":\"a dog\",\"response_format\":\"url\",\"aspect_ratio\":\"9:16\",\"resolution\":\"2k\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 119\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image-quality\",\"prompt\":\"a dog\",\"response_format\":\"url\",\"aspect_ratio\":\"9:16\",\"resolution\":\"2k\"}"
       ]
     },
     {
@@ -77,12 +75,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-store",
         "Content-Type": "text/event-stream"
       },
-      "response": "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD\",\"usage\":{\"total_tokens\":5,\"input_tokens\":2}}\n\nevent: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"url\":\"http://UPSTREAM/img/2.png\",\"usage\":{\"total_tokens\":5,\"input_tokens\":2}}\n\n",
+      "response": "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"created_at\":1700000001,\"revised_prompt\":\" a cat, refined \",\"b64_json\":\"QUJD\",\"usage\":{\"total_tokens\":5,\"input_tokens\":2}}\nid: v1.e.1\n\nevent: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"created_at\":1700000001,\"url\":\"http://UPSTREAM/img/2.png\",\"usage\":{\"total_tokens\":5,\"input_tokens\":2},\"mime_type\":\"image/webp\"}\nid: v1.e.2\n\n",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 120\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image-2.0\",\"prompt\":\"a bird\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"2k\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 120\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image-2.0\",\"prompt\":\"a bird\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"2k\"}"
       ]
     },
     {
@@ -105,12 +103,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-store",
         "Content-Type": "text/event-stream"
       },
-      "response": "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"url\":\"data:image/png;base64,QUJD\"}\n\n",
+      "response": "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"created_at\":1700000003,\"url\":\"data:png;base64,QUJD\",\"mime_type\":\"png\"}\nid: v1.e.1\n\n",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 111\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"a bird\",\"response_format\":\"url\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 111\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"a bird\",\"response_format\":\"url\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
       ]
     },
     {
@@ -129,16 +127,27 @@
             ]
           ],
           "body": "{\"created\":1700000004,\"data\":[{\"revised_prompt\":\"x\"}]}"
+        },
+        {
+          "status": 200,
+          "headers": [
+            [
+              "Content-Type",
+              "application/json"
+            ]
+          ],
+          "body": "{\"created\":1700000004,\"data\":[{\"revised_prompt\":\"x\"}]}"
         }
       ],
       "status": 502,
       "response_headers": {
-        "Content-Length": "113",
+        "Content-Length": "93",
         "Content-Type": "application/json"
       },
-      "response": "{\"error\":{\"message\":\"upstream did not return image output\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}",
+      "response": "{\"error\":{\"message\":\"Invalid boundary input\",\"type\":\"server_error\",\"param\":null,\"code\":null}}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 115\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"empty\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 115\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"empty\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}",
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 115\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"empty\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
       ]
     },
     {
@@ -157,16 +166,27 @@
             ]
           ],
           "body": "{\"data\":["
+        },
+        {
+          "status": 200,
+          "headers": [
+            [
+              "Content-Type",
+              "application/json"
+            ]
+          ],
+          "body": "{\"data\":["
         }
       ],
       "status": 502,
       "response_headers": {
-        "Content-Length": "122",
+        "Content-Length": "93",
         "Content-Type": "application/json"
       },
-      "response": "{\"error\":{\"message\":\"upstream returned invalid image response JSON\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}",
+      "response": "{\"error\":{\"message\":\"Invalid boundary input\",\"type\":\"server_error\",\"param\":null,\"code\":null}}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 116\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"broken\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 116\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"broken\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}",
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 116\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"broken\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
       ]
     },
     {
@@ -189,12 +209,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "102",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"created\":1700000005,\"data\":[{\"b64_json\":\"WFla\",\"revised_prompt\":\"lake\"}],\"usage\":{\"total_tokens\":3}}",
+      "response": "{\"created\":1700000005,\"usage\":{\"total_tokens\":3},\"data\":[{\"revised_prompt\":\"lake\",\"b64_json\":\"WFla\"}]}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cli-proxy-openai-compat\r\nContent-Length: 62\r\nAuthorization: Bearer sk-fake-acme\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"a lake\",\"n\":1,\"style\":\"vivid\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 62\r\nAuthorization: Bearer sk-fake-acme\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"a lake\",\"n\":1,\"style\":\"vivid\"}"
       ]
     },
     {
@@ -217,12 +237,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "77",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"created\":1700000006,\"data\":[{\"url\":\"http://UPSTREAM/img/lake.png\"}]}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cli-proxy-openai-compat\r\nContent-Length: 64\r\nAuthorization: Bearer sk-fake-acme\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"a lake\",\"response_format\":\"url\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 64\r\nAuthorization: Bearer sk-fake-acme\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"a lake\",\"response_format\":\"url\"}"
       ]
     },
     {
@@ -240,17 +260,17 @@
               "text/event-stream"
             ]
           ],
-          "body": "event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"AA\"}\n\nevent: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD\"}\n\n"
+          "body": "event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"AA==\"}\n\nevent: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD\"}\n\n"
         }
       ],
       "status": 200,
       "response_headers": {
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-store",
         "Content-Type": "text/event-stream"
       },
-      "response": "event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"AA\"}\n\nevent: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD\"}\n\n",
+      "response": "event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"partial_image_index\":0,\"created_at\":0,\"b64_json\":\"AA==\"}\nid: v1.e.1\n\nevent: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"created_at\":0,\"b64_json\":\"QUJD\"}\nid: v1.e.2\n\n",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cli-proxy-openai-compat\r\nContent-Length: 54\r\nAccept: text/event-stream\r\nAuthorization: Bearer sk-fake-acme\r\nCache-Control: no-cache\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"a lake\",\"stream\":true}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 54\r\nAccept: text/event-stream\r\nAuthorization: Bearer sk-fake-acme\r\nCache-Control: no-cache\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"a lake\",\"stream\":true}"
       ]
     },
     {
@@ -369,15 +389,13 @@
           "body": "{\"created\":1700000001,\"data\":[{\"b64_json\":\"QUJD\",\"revised_prompt\":\" a cat, refined \"},{\"url\":\"http://UPSTREAM/img/2.png\",\"mime_type\":\"image/webp\"}],\"usage\":{\"total_tokens\":5,\"input_tokens\":2}}"
         }
       ],
-      "status": 200,
+      "status": 400,
       "response_headers": {
-        "Content-Length": "172",
+        "Content-Length": "120",
         "Content-Type": "application/json"
       },
-      "response": "{\"created\":1700000001,\"data\":[{\"b64_json\":\"QUJD\",\"revised_prompt\":\"a cat, refined\"},{\"url\":\"http://UPSTREAM/img/2.png\"}],\"usage\":{\"total_tokens\":5,\"input_tokens\":2}}",
-      "requests": [
-        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 298\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"make it blue\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"2k\",\"images\":[{\"type\":\"image_url\",\"url\":\"https://example.com/a.png\"},{\"type\":\"image_url\",\"url\":\"https://example.com/b.png\"},{\"type\":\"image_url\",\"url\":\"https://example.com/c.png\"}]}"
-      ]
+      "response": "{\"error\":{\"message\":\"Invalid request: invalid protocol schema\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+      "requests": []
     },
     {
       "name": "edit_json_xai_one_image",
@@ -399,12 +417,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "74",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"created\":1700000007,\"data\":[{\"url\":\"http://UPSTREAM/img/e.png\"}]}",
       "requests": [
-        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 155\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"crop\",\"response_format\":\"url\",\"aspect_ratio\":\"20:9\",\"image\":{\"type\":\"image_url\",\"url\":\"https://example.com/a.png\"}}"
+        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 155\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"crop\",\"response_format\":\"url\",\"aspect_ratio\":\"20:9\",\"image\":{\"type\":\"image_url\",\"url\":\"https://example.com/a.png\"}}"
       ]
     },
     {
@@ -427,12 +445,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-store",
         "Content-Type": "text/event-stream"
       },
-      "response": "event: image_edit.completed\ndata: {\"type\":\"image_edit.completed\",\"b64_json\":\"RUZH\"}\n\n",
+      "response": "event: image_edit.completed\ndata: {\"type\":\"image_edit.completed\",\"created_at\":1700000008,\"b64_json\":\"RUZH\"}\nid: v1.e.1\n\n",
       "requests": [
-        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 138\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"crop\",\"response_format\":\"b64_json\",\"image\":{\"type\":\"image_url\",\"url\":\"https://example.com/a.png\"}}"
+        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 138\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"crop\",\"response_format\":\"b64_json\",\"image\":{\"type\":\"image_url\",\"url\":\"https://example.com/a.png\"}}"
       ]
     },
     {
@@ -443,10 +461,10 @@
       "body": "{\"model\":\"grok-imagine-image\",\"prompt\":\"crop\",\"images\":[{\"image_url\":\"\"}]}",
       "status": 400,
       "response_headers": {
-        "Content-Length": "89",
-        "Content-Type": "application/json; charset=utf-8"
+        "Content-Length": "120",
+        "Content-Type": "application/json"
       },
-      "response": "{\"error\":{\"message\":\"Invalid request: image is required\",\"type\":\"invalid_request_error\"}}",
+      "response": "{\"error\":{\"message\":\"Invalid request: invalid protocol schema\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
       "requests": []
     },
     {
@@ -469,12 +487,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "51",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"created\":1700000009,\"data\":[{\"b64_json\":\"Q09N\"}]}",
       "requests": [
-        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cli-proxy-openai-compat\r\nContent-Length: 77\r\nAuthorization: Bearer sk-fake-acme\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"recolor\",\"image\":\"https://example.com/a.png\"}"
+        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 94\r\nAuthorization: Bearer sk-fake-acme\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"recolor\",\"images\":[{\"image_url\":\"https://example.com/a.png\"}]}"
       ]
     },
     {
@@ -495,15 +513,13 @@
           "body": "{\"created\":1700000001,\"data\":[{\"b64_json\":\"QUJD\",\"revised_prompt\":\" a cat, refined \"},{\"url\":\"http://UPSTREAM/img/2.png\",\"mime_type\":\"image/webp\"}],\"usage\":{\"total_tokens\":5,\"input_tokens\":2}}"
         }
       ],
-      "status": 200,
+      "status": 400,
       "response_headers": {
-        "Content-Length": "172",
+        "Content-Length": "120",
         "Content-Type": "application/json"
       },
-      "response": "{\"created\":1700000001,\"data\":[{\"b64_json\":\"QUJD\",\"revised_prompt\":\"a cat, refined\"},{\"url\":\"http://UPSTREAM/img/2.png\"}],\"usage\":{\"total_tokens\":5,\"input_tokens\":2}}",
-      "requests": [
-        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 266\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"add a hat\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"2:3\",\"quality\":\"low\",\"n\":2,\"images\":[{\"type\":\"image_url\",\"url\":\"data:image/png;base64,UE5HREFUQQ==\"},{\"type\":\"image_url\",\"url\":\"data:image/gif;base64,R0lGODlhAQABAA==\"}]}"
-      ]
+      "response": "{\"error\":{\"message\":\"Invalid request: invalid protocol schema\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+      "requests": []
     },
     {
       "name": "edit_multipart_xai_stream",
@@ -523,15 +539,13 @@
           "body": "{\"created\":1700000010,\"data\":[{\"b64_json\":\"SEFU\"}]}"
         }
       ],
-      "status": 200,
+      "status": 400,
       "response_headers": {
-        "Cache-Control": "no-cache",
-        "Content-Type": "text/event-stream"
+        "Content-Length": "120",
+        "Content-Type": "application/json"
       },
-      "response": "event: image_edit.completed\ndata: {\"type\":\"image_edit.completed\",\"b64_json\":\"SEFU\"}\n\n",
-      "requests": [
-        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 158\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"hat\",\"response_format\":\"b64_json\",\"image\":{\"type\":\"image_url\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==\"}}"
-      ]
+      "response": "{\"error\":{\"message\":\"Invalid request: invalid protocol schema\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+      "requests": []
     },
     {
       "name": "edit_multipart_compat",
@@ -553,12 +567,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "51",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"created\":1700000011,\"data\":[{\"b64_json\":\"TVBD\"}]}",
       "requests": [
-        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cli-proxy-openai-compat\r\nContent-Length: 594\r\nAuthorization: Bearer sk-fake-acme\r\nContent-Type: multipart/form-data; boundary=BOUNDARY\r\nAccept-Encoding: gzip\r\n\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nacme-image\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhat\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"size\"\r\n\r\n1024x1024\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n--BOUNDARY--\r\n"
+        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 594\r\nAuthorization: Bearer sk-fake-acme\r\nContent-Type: multipart/form-data; boundary=BOUNDARY\r\nAccept-Encoding: gzip\r\n\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nacme-image\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhat\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"size\"\r\n\r\n1024x1024\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n--BOUNDARY--\r\n"
       ]
     },
     {
@@ -579,15 +593,13 @@
           "body": "event: image_edit.completed\ndata: {\"type\":\"image_edit.completed\",\"b64_json\":\"TVBD\"}\n\n"
         }
       ],
-      "status": 200,
+      "status": 400,
       "response_headers": {
-        "Cache-Control": "no-cache",
-        "Content-Type": "text/event-stream"
+        "Content-Length": "120",
+        "Content-Type": "application/json"
       },
-      "response": "event: image_edit.completed\ndata: {\"type\":\"image_edit.completed\",\"b64_json\":\"TVBD\"}\n\n",
-      "requests": [
-        "POST /v1/images/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cli-proxy-openai-compat\r\nContent-Length: 591\r\nAccept: text/event-stream\r\nAuthorization: Bearer sk-fake-acme\r\nCache-Control: no-cache\r\nContent-Type: multipart/form-data; boundary=BOUNDARY\r\nAccept-Encoding: gzip\r\n\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nacme-image\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhat\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n--BOUNDARY--\r\n"
-      ]
+      "response": "{\"error\":{\"message\":\"Invalid request: invalid protocol schema\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+      "requests": []
     },
     {
       "name": "edit_multipart_missing_image",
@@ -678,12 +690,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "169",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"progress\":0,\"status\":\"queued\",\"id\":\"req-vid-1\",\"model\":\"grok-imagine-video\",\"prompt\":\"waves\",\"seconds\":\"15\",\"size\":\"1280x720\",\"created_at\":\"\u003cnow\u003e\"}",
+      "response": "{\"id\":\"req-vid-1\",\"object\":\"video\",\"status\":\"queued\",\"model\":\"grok-imagine-video\",\"prompt\":\"waves\",\"seconds\":\"15\",\"size\":\"1280x720\",\"created_at\":\"\u003cnow\u003e\",\"progress\":0}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 147\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"waves\",\"duration\":15,\"aspect_ratio\":\"16:9\",\"resolution\":\"720p\",\"image\":{\"url\":\"https://example.com/i.png\"}}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 147\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"waves\",\"duration\":15,\"resolution\":\"720p\",\"aspect_ratio\":\"16:9\",\"image\":{\"url\":\"https://example.com/i.png\"}}"
       ]
     },
     {
@@ -704,10 +716,10 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "187",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-vid-1\",\"model\":\"grok-imagine-video\",\"created_at\":1700000100,\"status\":\"completed\",\"progress\":100,\"seconds\":\"8\",\"video_url\":\"http://UPSTREAM/files/v.mp4\"}",
+      "response": "{\"id\":\"req-vid-1\",\"object\":\"video\",\"status\":\"completed\",\"progress\":100,\"created_at\":1700000100,\"model\":\"grok-imagine-video\",\"video_url\":\"http://UPSTREAM/files/v.mp4\",\"seconds\":\"8\"}",
       "requests": [
         "GET /v1/videos/req-vid-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
@@ -730,10 +742,10 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "101",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-vid-1\",\"model\":\"grok-imagine-video\",\"status\":\"in_progress\",\"progress\":40}",
+      "response": "{\"id\":\"req-vid-1\",\"object\":\"video\",\"status\":\"in_progress\",\"progress\":40,\"model\":\"grok-imagine-video\"}",
       "requests": [
         "GET /v1/videos/req-vid-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
@@ -778,10 +790,8 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Disposition": "attachment; filename=\"v.mp4\"",
-        "Content-Length": "7",
-        "Content-Type": "video/mp4",
-        "Etag": "\"abc\""
+        "Cache-Control": "no-store",
+        "Content-Type": "video/mp4"
       },
       "response": "MP4DATA",
       "requests": [
@@ -961,12 +971,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "175",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"progress\":5,\"status\":\"queued\",\"id\":\"req-vid-2\",\"model\":\"grok-imagine-video-1.5\",\"prompt\":\"hi there\",\"seconds\":\"4\",\"size\":\"720x1280\",\"created_at\":\"\u003cnow\u003e\"}",
+      "response": "{\"id\":\"req-vid-2\",\"object\":\"video\",\"status\":\"queued\",\"progress\":5,\"model\":\"grok-imagine-video-1.5\",\"prompt\":\"hi there\",\"seconds\":\"4\",\"size\":\"720x1280\",\"created_at\":\"\u003cnow\u003e\"}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 182\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video-1.5\",\"prompt\":\"hi there\",\"duration\":4,\"aspect_ratio\":\"16:9\",\"resolution\":\"480p\",\"reference_images\":[{\"url\":\"https://a/1.png\"},{\"url\":\"https://a/2.png\"}]}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 182\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video-1.5\",\"prompt\":\"hi there\",\"duration\":4,\"resolution\":\"480p\",\"aspect_ratio\":\"16:9\",\"reference_images\":[{\"url\":\"https://a/1.png\"},{\"url\":\"https://a/2.png\"}]}"
       ]
     },
     {
@@ -987,10 +997,10 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "142",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-vid-2\",\"model\":\"grok-imagine-video\",\"status\":\"failed\",\"progress\":0,\"error\":{\"code\":\"outer\",\"message\":\"moderated\"}}",
+      "response": "{\"id\":\"req-vid-2\",\"object\":\"video\",\"status\":\"failed\",\"error\":{\"message\":\"moderated\",\"code\":\"content_policy\"},\"model\":\"grok-imagine-video\"}",
       "requests": [
         "GET /v1/videos/req-vid-2 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
@@ -1015,12 +1025,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "173",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"progress\":0,\"status\":\"in_progress\",\"id\":\"req-vid-3\",\"model\":\"grok-imagine-video\",\"prompt\":\"rain\",\"seconds\":\"1\",\"size\":\"1024x1792\",\"created_at\":\"\u003cnow\u003e\"}",
+      "response": "{\"id\":\"req-vid-3\",\"object\":\"video\",\"status\":\"in_progress\",\"model\":\"grok-imagine-video\",\"prompt\":\"rain\",\"seconds\":\"1\",\"size\":\"1024x1792\",\"created_at\":\"\u003cnow\u003e\",\"progress\":0}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 145\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"rain\",\"duration\":1,\"aspect_ratio\":\"9:16\",\"resolution\":\"720p\",\"image\":{\"url\":\"https://example.com/r.png\"}}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 145\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"rain\",\"duration\":1,\"resolution\":\"720p\",\"aspect_ratio\":\"9:16\",\"image\":{\"url\":\"https://example.com/r.png\"}}"
       ]
     },
     {
@@ -1041,10 +1051,10 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "82",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-vid-3\",\"model\":\"grok-imagine-video\",\"status\":\"queued\"}",
+      "response": "{\"id\":\"req-vid-3\",\"object\":\"video\",\"status\":\"queued\",\"model\":\"grok-imagine-video\"}",
       "requests": [
         "GET /v1/videos/req-vid-3 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
@@ -1067,10 +1077,10 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "82",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-vid-3\",\"model\":\"grok-imagine-video\",\"status\":\"queued\"}",
+      "response": "{\"id\":\"req-vid-3\",\"object\":\"video\",\"status\":\"queued\",\"model\":\"grok-imagine-video\"}",
       "requests": [
         "GET /v1/videos/req-vid-3 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
@@ -1161,23 +1171,7 @@
             ]
           ],
           "body": "{\"status\":\"queued\"}"
-        }
-      ],
-      "status": 502,
-      "response_headers": {
-        "Content-Length": "122",
-        "Content-Type": "application/json"
-      },
-      "response": "{\"error\":{\"message\":\"xAI video response did not include request_id\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}",
-      "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 98\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"x\",\"duration\":4,\"aspect_ratio\":\"9:16\",\"resolution\":\"720p\"}"
-      ]
-    },
-    {
-      "name": "video_retrieve_unbound",
-      "method": "GET",
-      "path": "/openai/v1/videos/req-unknown",
-      "upstreams": [
+        },
         {
           "status": 200,
           "headers": [
@@ -1189,15 +1183,29 @@
           "body": "{\"status\":\"queued\"}"
         }
       ],
-      "status": 200,
+      "status": 502,
       "response_headers": {
-        "Content-Length": "84",
+        "Content-Length": "122",
         "Content-Type": "application/json"
       },
-      "response": "{\"object\":\"video\",\"id\":\"req-unknown\",\"model\":\"grok-imagine-video\",\"status\":\"queued\"}",
+      "response": "{\"error\":{\"message\":\"xAI video response did not include request_id\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}",
       "requests": [
-        "GET /v1/videos/req-unknown HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 98\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"x\",\"duration\":4,\"resolution\":\"720p\",\"aspect_ratio\":\"9:16\"}",
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 98\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"x\",\"duration\":4,\"resolution\":\"720p\",\"aspect_ratio\":\"9:16\"}"
       ]
+    },
+    {
+      "name": "video_retrieve_unbound",
+      "method": "GET",
+      "path": "/openai/v1/videos/req-unknown",
+      "upstreams": [],
+      "status": 404,
+      "response_headers": {
+        "Content-Length": "202",
+        "Content-Type": "application/json"
+      },
+      "response": "{\"error\":{\"message\":\"Video job 'req-unknown' was not created through this server since it last started, or has expired. Create the video again.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+      "requests": []
     },
     {
       "name": "native_generations",
@@ -1219,7 +1227,7 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "29",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"request_id\":\"req-native-1\"}",
@@ -1245,7 +1253,7 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "70",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"status\":\"done\",\"video\":{\"url\":\"http://UPSTREAM/files/n.mp4\"}}",
@@ -1273,12 +1281,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "29",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"request_id\":\"req-native-2\"}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 43\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"prompt\":\"p\",\"model\":\"grok-imagine-video\"}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 43\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"p\"}"
       ]
     },
     {
@@ -1301,12 +1309,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "29",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"request_id\":\"req-native-3\"}",
       "requests": [
-        "POST /v1/videos/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 87\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"p\",\"video\":{\"url\":\"https://example.com/v.mp4\"}}"
+        "POST /v1/videos/edits HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 87\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"p\",\"video\":{\"url\":\"https://example.com/v.mp4\"}}"
       ]
     },
     {
@@ -1329,12 +1337,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "29",
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
       "response": "{\"request_id\":\"req-native-4\"}",
       "requests": [
-        "POST /v1/videos/extensions HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 69\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"p\",\"video_id\":\"req-native-1\"}"
+        "POST /v1/videos/extensions HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 69\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"p\",\"video_id\":\"req-native-1\"}"
       ]
     },
     {
@@ -1388,7 +1396,7 @@
       },
       "response": "{\"error\":\"not found\"}",
       "requests": [
-        "GET /v1/videos/req-native-2 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
+        "GET /v1/videos/req-native-2 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
     },
     {
@@ -1440,11 +1448,12 @@
       ],
       "status": 200,
       "response_headers": {
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "\n{\"created\":1700000020,\"data\":[{\"b64_json\":\"U0xX\"}]}",
+      "response": "{\"created\":1700000020,\"data\":[{\"b64_json\":\"U0xX\"}]}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 114\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"slow\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 114\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"slow\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
       ]
     },
     {
@@ -1468,12 +1477,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-store",
         "Content-Type": "text/event-stream"
       },
-      "response": ": keep-alive\n\nevent: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"U0xX\"}\n\n",
+      "response": "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"created_at\":1700000021,\"b64_json\":\"U0xX\"}\nid: v1.e.1\n\n",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 114\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"slow\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 114\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"slow\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
       ]
     },
     {
@@ -1495,14 +1504,14 @@
           "body": "{\"error\":{\"message\":\"bad prompt\",\"type\":\"invalid_request_error\"}}"
         }
       ],
-      "status": 200,
+      "status": 400,
       "response_headers": {
-        "Cache-Control": "no-cache",
-        "Content-Type": "text/event-stream"
+        "Content-Length": "90",
+        "Content-Type": "application/json"
       },
-      "response": ": keep-alive\n\nevent: error\ndata: {\"error\":{\"message\":\"bad prompt\",\"type\":\"invalid_request_error\"}}\n\n",
+      "response": "{\"error\":{\"message\":\"bad prompt\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 114\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"slow\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 114\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"slow\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
       ]
     },
     {
@@ -1522,16 +1531,28 @@
             ]
           ],
           "body": "{\"data\":[]}"
+        },
+        {
+          "delay_ms": 1400,
+          "status": 200,
+          "headers": [
+            [
+              "Content-Type",
+              "application/json"
+            ]
+          ],
+          "body": "{\"data\":[]}"
         }
       ],
-      "status": 200,
+      "status": 502,
       "response_headers": {
-        "Cache-Control": "no-cache",
-        "Content-Type": "text/event-stream"
+        "Content-Length": "93",
+        "Content-Type": "application/json"
       },
-      "response": ": keep-alive\n\nevent: error\ndata: {\"error\":{\"message\":\"upstream did not return image output\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}\n\n",
+      "response": "{\"error\":{\"message\":\"Invalid boundary input\",\"type\":\"server_error\",\"param\":null,\"code\":null}}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 114\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"slow\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 114\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"slow\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}",
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 114\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-image\",\"prompt\":\"slow\",\"response_format\":\"b64_json\",\"aspect_ratio\":\"1:1\",\"resolution\":\"1k\"}"
       ]
     },
     {
@@ -1553,13 +1574,14 @@
           "body": "{\"error\":{\"message\":\"nope\",\"type\":\"invalid_request_error\"}}"
         }
       ],
-      "status": 200,
+      "status": 400,
       "response_headers": {
+        "Content-Length": "84",
         "Content-Type": "application/json"
       },
-      "response": "\n{\"error\":{\"message\":\"nope\",\"type\":\"invalid_request_error\"}}",
+      "response": "{\"error\":{\"message\":\"nope\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cli-proxy-openai-compat\r\nContent-Length: 38\r\nAuthorization: Bearer sk-fake-acme\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"slow\"}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 38\r\nAuthorization: Bearer sk-fake-acme\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"slow\"}"
       ]
     },
     {
@@ -1583,12 +1605,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-store",
         "Content-Type": "text/event-stream"
       },
-      "response": ": keep-alive\n\nevent: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"U0xX\"}\n\n",
+      "response": "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"created_at\":0,\"b64_json\":\"U0xX\"}\nid: v1.e.1\n\n",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cli-proxy-openai-compat\r\nContent-Length: 52\r\nAccept: text/event-stream\r\nAuthorization: Bearer sk-fake-acme\r\nCache-Control: no-cache\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"slow\",\"stream\":true}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 52\r\nAccept: text/event-stream\r\nAuthorization: Bearer sk-fake-acme\r\nCache-Control: no-cache\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"slow\",\"stream\":true}"
       ]
     },
     {
@@ -1610,14 +1632,14 @@
           "body": "{\"error\":{\"message\":\"nope\",\"type\":\"invalid_request_error\"}}"
         }
       ],
-      "status": 200,
+      "status": 400,
       "response_headers": {
-        "Cache-Control": "no-cache",
-        "Content-Type": "text/event-stream"
+        "Content-Length": "84",
+        "Content-Type": "application/json"
       },
-      "response": ": keep-alive\n\nevent: error\ndata: {\"error\":{\"message\":\"nope\",\"type\":\"invalid_request_error\"}}\n\n",
+      "response": "{\"error\":{\"message\":\"nope\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cli-proxy-openai-compat\r\nContent-Length: 52\r\nAccept: text/event-stream\r\nAuthorization: Bearer sk-fake-acme\r\nCache-Control: no-cache\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"slow\",\"stream\":true}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 52\r\nAccept: text/event-stream\r\nAuthorization: Bearer sk-fake-acme\r\nCache-Control: no-cache\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"slow\",\"stream\":true}"
       ]
     },
     {
@@ -1638,14 +1660,14 @@
           "body": ""
         }
       ],
-      "status": 500,
+      "status": 502,
       "response_headers": {
-        "Content-Length": "134",
+        "Content-Length": "93",
         "Content-Type": "application/json"
       },
-      "response": "{\"error\":{\"message\":\"empty_stream: upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}",
+      "response": "{\"error\":{\"message\":\"Invalid boundary input\",\"type\":\"server_error\",\"param\":null,\"code\":null}}",
       "requests": [
-        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cli-proxy-openai-compat\r\nContent-Length: 53\r\nAccept: text/event-stream\r\nAuthorization: Bearer sk-fake-acme\r\nCache-Control: no-cache\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"empty\",\"stream\":true}"
+        "POST /v1/images/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 53\r\nAccept: text/event-stream\r\nAuthorization: Bearer sk-fake-acme\r\nCache-Control: no-cache\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"acme-image\",\"prompt\":\"empty\",\"stream\":true}"
       ]
     },
     {
@@ -1669,11 +1691,12 @@
       ],
       "status": 200,
       "response_headers": {
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "\n{\"object\":\"video\",\"progress\":0,\"status\":\"queued\",\"id\":\"req-slow-1\",\"model\":\"grok-imagine-video\",\"prompt\":\"slow\",\"seconds\":\"4\",\"size\":\"720x1280\",\"created_at\":\"\u003cnow\u003e\"}",
+      "response": "{\"id\":\"req-slow-1\",\"object\":\"video\",\"status\":\"queued\",\"model\":\"grok-imagine-video\",\"prompt\":\"slow\",\"seconds\":\"4\",\"size\":\"720x1280\",\"created_at\":\"\u003cnow\u003e\",\"progress\":0}",
       "requests": [
-        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 101\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"slow\",\"duration\":4,\"aspect_ratio\":\"9:16\",\"resolution\":\"720p\"}"
+        "POST /v1/videos/generations HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nContent-Length: 101\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n{\"model\":\"grok-imagine-video\",\"prompt\":\"slow\",\"duration\":4,\"resolution\":\"720p\",\"aspect_ratio\":\"9:16\"}"
       ]
     },
     {
@@ -1705,12 +1728,12 @@
       ],
       "status": 200,
       "response_headers": {
-        "Content-Length": "7",
+        "Cache-Control": "no-store",
         "Content-Type": "video/mp4"
       },
       "response": "SLOWMP4",
       "requests": [
-        "GET /v1/videos/req-slow-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n",
+        "GET /v1/videos/req-slow-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n",
         "GET /files/slow.mp4 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
     },
@@ -1733,11 +1756,12 @@
       ],
       "status": 200,
       "response_headers": {
+        "Cache-Control": "no-store",
         "Content-Type": "application/json"
       },
-      "response": "\n{\"status\":\"queued\"}",
+      "response": "{\"status\":\"pending\"}",
       "requests": [
-        "GET /v1/videos/req-slow-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: Go-http-client/1.1\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-2\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
+        "GET /v1/videos/req-slow-1 HTTP/1.1\r\nHost: UPSTREAM\r\nUser-Agent: cooker\r\nAccept: application/json\r\nAuthorization: Bearer XAI-KEY-1\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n"
       ]
     },
     {

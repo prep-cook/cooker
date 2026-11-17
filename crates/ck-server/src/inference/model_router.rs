@@ -16,13 +16,15 @@ use std::time::{Duration, Instant};
 use ck_core::config::Config;
 use ck_core::exec::Operation;
 use ck_core::format::Format;
+use ck_translate::codec;
 use ck_wire::gostr::GoStr;
 use ck_wire::json;
 use serde_yaml_ng::Value;
 
 use crate::Runtime;
+use crate::http::egress::{Framing, Output, Protocol};
 use crate::inference::aa::Catalog;
-use crate::inference::dispatch::{Call, Done, Trace};
+use crate::inference::dispatch::{Call, Done, Served, Trace};
 use crate::scheduling::registry::{self, Spec};
 
 const STICKY_TTL: Duration = Duration::from_secs(3600);
@@ -658,6 +660,7 @@ async fn ask_system_one(
     });
     let mut headers = ck_exec::proxy::GoHeaders::new();
     headers.set("content-type", "application/json");
+    headers.set("user-agent", "cooker");
     let key = attribute("api_key");
     if !key.is_empty() {
         headers.set("authorization", format!("Bearer {key}"));
@@ -712,17 +715,28 @@ async fn ask_chat(rt: &Arc<Runtime>, call: &Call, model: &str, task: &str) -> Re
         execution_session: None,
         request_path: "/v1/chat/completions".into(),
         peer: None,
-        turn: None,
+        socket: None,
         media: None,
     };
     let trace = Trace::with_request_id(None);
-    let run = crate::inference::dispatch::run_with_bootstrap_retries(rt, judged, &trace);
-    let body = match tokio::time::timeout(JUDGE_TIMEOUT, run).await {
-        Ok(Ok(Done::Buffered { body, .. })) => body,
-        Ok(Ok(Done::Stream { .. })) => return Err("streamed answer".to_owned()),
-        Ok(Err(failure)) => return Err(format!("HTTP {}", failure.status())),
-        Err(_) => return Err("timed out".to_owned()),
+    let output = Output {
+        protocol: Protocol::Chat,
+        operation: codec::Operation::Generate,
+        framing: Framing::Json,
     };
+    let answer = async {
+        match crate::inference::dispatch::exchange::run(rt, judged, output, &trace).await {
+            Ok(Served::Old(Done::Buffered { body, .. })) => Ok(body),
+            Ok(Served::Old(Done::Stream { .. })) => Err("streamed answer".to_owned()),
+            Ok(Served::Committed(response)) => axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .map_err(|_| "body read failed".to_owned()),
+            Err(failure) => Err(format!("HTTP {}", failure.status())),
+        }
+    };
+    let body = tokio::time::timeout(JUDGE_TIMEOUT, answer)
+        .await
+        .map_err(|_| "timed out".to_owned())??;
     let answer = json::get(&body, "choices.0.message.content").str().into_owned();
     grade(&answer)
         .map(f64::from)
@@ -1281,6 +1295,7 @@ mod tests {
             body: String,
         ) -> axum::response::Response {
             use axum::response::IntoResponse;
+            assert_eq!(headers.get("user-agent").unwrap(), "cooker");
             let auth = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
@@ -1436,7 +1451,8 @@ mod tests {
         let hi = serde_json::json!({"role": "user", "content": "hi"});
         let ok = serde_json::json!({"role": "assistant", "content": "ok"});
         // Tool results inside the agent loop keep the model (and its cache) without a judgment.
-        let looped = turn(serde_json::json!([hi, ok, {"role": "tool", "tool_call_id": "c", "content": "r"}]));
+        let call = serde_json::json!({"role": "assistant", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]});
+        let looped = turn(serde_json::json!([hi, call, {"role": "tool", "tool_call_id": "c", "content": "r"}]));
         assert_eq!(chat(&url, looped).await.1, "cheap");
         assert_eq!(judged_by_jev.lock().unwrap().len(), 1);
         // A new user message Jev grades hard moves the conversation up ...
@@ -1494,7 +1510,7 @@ mod tests {
             execution_session: Some("router-regression".into()),
             request_path: "/v1/chat/completions".into(),
             peer: None,
-            turn: None,
+            socket: None,
             media: None,
         }
     }
@@ -1687,7 +1703,8 @@ mod tests {
         assert_eq!(chat(&url, first).await.1, "cheap");
         // `cheap` leaves the router's list: the next loop turn may no longer use it.
         rt.publish_config(config(&upstream_url, &jev_router(&jev_url, "    models: [top]\n")));
-        let looped = serde_json::json!({"model": "smart", "messages": [hi, {"role": "assistant", "content": "ok"}, {"role": "tool", "tool_call_id": "c", "content": "r"}]});
+        let call = serde_json::json!({"role": "assistant", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]});
+        let looped = serde_json::json!({"model": "smart", "messages": [hi, call, {"role": "tool", "tool_call_id": "c", "content": "r"}]});
         assert_eq!(chat(&url, looped).await.1, "top");
     }
 

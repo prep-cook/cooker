@@ -1,0 +1,621 @@
+use crate::codec::{
+    self, Capability, Error, Operation, RequestFence, RequestView, Result, ValidatedRequest,
+    document::{Document, Name, Value, pending::Pending},
+    encode,
+    event::{Emitter, Identity, Scope},
+    json,
+    media::{self, Registry},
+};
+use ck_stream::{ScratchLease, Writer};
+
+#[path = "request_stream.rs"]
+mod stream;
+
+pub struct Ingress {
+    owner: u64,
+    input: Option<Pending>,
+    active: Option<stream::StringState>,
+    started: bool,
+    last_field: Option<usize>,
+    published_media: usize,
+    document: Option<Document>,
+    media: Registry,
+    emitter: Emitter,
+    fence: RequestFence,
+    operation: Operation,
+    reader: ck_stream::Reader,
+    closed: bool,
+}
+impl Ingress {
+    /// Hands over the document and media [`RequestIngress::finish`] closed, and drops the
+    /// parser state, so only the request the attempts read stays in memory.
+    pub fn into_request(self) -> Result<crate::codec::OwnedRequest> {
+        Ok(crate::codec::OwnedRequest {
+            document: self.document.filter(|_| self.closed).ok_or(Error::Closed)?,
+            media: self.media,
+            operation: self.operation,
+        })
+    }
+
+    pub fn new(
+        owner: &mut Writer,
+        store: &ck_stream::Store,
+        identity: Identity,
+        operation: Operation,
+        max_bytes: u64,
+    ) -> Result<Self> {
+        if operation == Operation::Compact {
+            return Err(Error::Unsupported);
+        }
+        Ok(Self {
+            owner: owner.id(),
+            input: Some(Pending::new(owner, max_bytes)?),
+            active: None,
+            started: false,
+            last_field: None,
+            published_media: 0,
+            document: None,
+            media: Registry::new(owner)?,
+            emitter: Emitter::new(identity),
+            fence: RequestFence::default(),
+            operation,
+            reader: store.reader(owner.id(), 0)?,
+            closed: false,
+        })
+    }
+    fn prepare(&mut self, owner: &mut Writer) -> Result<()> {
+        self.input.as_mut().ok_or(Error::Closed)?.finish()?;
+        self.consume(owner)?;
+        let mut doc = self.input.take().ok_or(Error::Closed)?.document;
+        self.media.validate_registrations(&doc, 0)?;
+        normalize(owner, &mut doc, self.operation)?;
+        self.media.relocate_ingress(&doc, 0)?;
+        super::content::register_media(
+            &mut doc,
+            &mut self.media,
+            owner,
+            &mut self.emitter,
+            &mut self.reader,
+            &mut self.published_media,
+        )?;
+        // Anthropic clients send `max_tokens` themselves.
+        super::request_schema::validate(
+            RequestView {
+                document: &doc,
+                media: &self.media,
+                operation: self.operation,
+            },
+            None,
+        )?;
+        for media in self.media.entries().filter(|media| media.data.is_some()) {
+            media::bytes(&doc, media, |_| Ok(()))?;
+        }
+        let root = doc.root();
+        fields(
+            &mut doc,
+            &self.media,
+            root,
+            (&mut [None; 128], 0),
+            &mut self.emitter,
+            owner,
+            &mut self.reader,
+        )?;
+        for index in self.published_media..self.media.len() {
+            media::publish(&doc, self.media.at(index), &mut self.emitter, owner, Scope::default())?;
+            self.media.retain(&mut doc, index, owner, &mut self.reader)?;
+        }
+        doc.retire_scratch()?;
+        self.document = Some(doc);
+        Ok(())
+    }
+}
+impl codec::RequestIngress for Ingress {
+    fn flush_deadline(&self) -> Option<std::time::Instant> {
+        self.pending_deadline()
+    }
+
+    fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
+        crate::boundary::enter(self.owner, owner, self.closed)?;
+        let result = (|| {
+            if bytes.is_empty() {
+                self.flush_pending(owner)?;
+            }
+            for chunk in bytes.chunks(8192) {
+                self.input.as_mut().ok_or(Error::Closed)?.advance(owner, chunk)?;
+                self.consume(owner)?;
+            }
+            Ok(())
+        })();
+        self.closed = result.is_err();
+        crate::boundary::reported(result, &mut self.emitter, owner, true)
+    }
+    fn finish<'a>(&'a mut self, owner: &mut Writer, destination: &impl Capability) -> Result<ValidatedRequest<'a>> {
+        crate::boundary::enter(self.owner, owner, self.closed)?;
+        self.closed = true;
+        let prepared = self.prepare(owner);
+        crate::boundary::reported(prepared, &mut self.emitter, owner, true)?;
+        let view = RequestView {
+            document: self.document.as_ref().ok_or(Error::Schema)?,
+            media: &self.media,
+            operation: self.operation,
+        };
+        crate::boundary::end_request(&mut self.fence, view, destination, &mut self.emitter, owner)
+    }
+}
+#[derive(Clone, Copy, Default)]
+pub struct AnthropicCapability {
+    /// `max_tokens` for a generation request without one: the per-model setting, else the
+    /// model's output maximum (owner ruling 2026-11-15). `None` refuses such a request with
+    /// [`Error::MaxTokensRequired`].
+    pub default_max_tokens: Option<u64>,
+    /// What the model accepts as `thinking.budget_tokens`, from the registry `thinking` data.
+    pub budget: Budget,
+}
+/// A model's manual thinking budget (`thinking.type: enabled`).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum Budget {
+    /// No registry data: the official minimum of 1024 applies.
+    #[default]
+    Unknown,
+    /// Manual thinking with a budget of at least `min`.
+    Manual { min: u64 },
+    /// Adaptive thinking only: the API refuses `type: enabled` and any budget.
+    Adaptive,
+}
+impl Capability for AnthropicCapability {
+    fn destination(&self) -> &'static str {
+        "anthropic"
+    }
+    fn validate(&self, view: RequestView<'_>) -> Result<()> {
+        super::request_schema::validate(view, self.default_max_tokens)?;
+        self.budget(view)
+    }
+}
+impl AnthropicCapability {
+    /// Refuses a thinking budget below the minimum or sent to an adaptive-only model; nothing
+    /// is adjusted. A budget of at least `max_tokens` passes: interleaved thinking, a header
+    /// the fence does not see, allows it, so the official API judges.
+    fn budget(&self, view: RequestView<'_>) -> Result<()> {
+        let (doc, root) = (view.document, view.document.root());
+        let Some(thinking) = doc.member(doc.required(root, "x_ck")?, "thinking")? else {
+            return Ok(());
+        };
+        let enabled = doc.member(thinking, "enabled")?.map(|n| doc.node(n)).transpose()?;
+        let enabled = enabled.is_some_and(|n| matches!(n.value, Value::Bool(true)));
+        let Some(budget) = doc.member(thinking, "budget_tokens")?.filter(|_| enabled) else {
+            return Ok(());
+        };
+        let budget = doc.unsigned(budget)?;
+        let min = match self.budget {
+            Budget::Unknown => 1024,
+            Budget::Manual { min } => min.max(1024),
+            Budget::Adaptive => return Err(Error::Unsupported),
+        };
+        if budget < min {
+            return Err(Error::Schema);
+        }
+        Ok(())
+    }
+}
+pub struct Egress {
+    pub destination: &'static str,
+    pub upstream_stream: bool,
+    /// The limit for a request without one; `None` leaves `max_tokens` out for the executor's
+    /// payload rules to set (the fence admitted the request).
+    pub default_max_tokens: Option<u64>,
+}
+impl Egress {
+    /// Writes `,"max_tokens":` when a generation or compaction request has none: its
+    /// `max_completion_tokens`, else the default, else nothing.
+    pub(super) fn fill_max_tokens(&self, view: RequestView<'_>, e: &mut encode::Encoder<'_, '_>) -> Result<()> {
+        let (doc, root) = (view.document, view.document.root());
+        if view.operation == Operation::CountTokens || doc.member(root, "max_tokens")?.is_some() {
+            return Ok(());
+        }
+        match (doc.member(root, "max_completion_tokens")?, self.default_max_tokens) {
+            (Some(limit), _) => {
+                e.bytes(b",\"max_tokens\":")?;
+                doc.write(limit, e)
+            }
+            (None, Some(limit)) => {
+                e.bytes(b",\"max_tokens\":")?;
+                e.unsigned(limit)
+            }
+            (None, None) => Ok(()),
+        }
+    }
+}
+impl codec::RequestEgress for Egress {
+    fn encode(&self, request: &ValidatedRequest<'_>, owner: &mut Writer) -> Result<ScratchLease> {
+        let view = request.for_destination(self.destination)?;
+        view.document.check_owner(owner)?;
+        // Messages answers a compaction in one JSON body only.
+        if view.operation != Operation::Generate && self.upstream_stream {
+            return Err(Error::Unsupported);
+        }
+        encode::scratch(owner, |e| super::request_encode::write(view, self, e))
+    }
+}
+fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation) -> Result<()> {
+    let root = doc.root();
+    let (x, original) = envelope(owner, doc, operation)?;
+    capture(
+        owner,
+        doc,
+        root,
+        &[
+            "x_ck",
+            "model",
+            "messages",
+            "system",
+            "stream",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "stop_sequences",
+            "thinking",
+            "output_config",
+            "tools",
+            "tool_choice",
+            "metadata",
+            "service_tier",
+            "cache_control",
+            "container",
+            "context_management",
+            "mcp_servers",
+            "betas",
+        ],
+        original,
+    )?;
+    let (provider, native) = controls(doc, root, x)?;
+    super::content::cache(owner, doc, root)?;
+    messages(owner, doc, root)?;
+    tools(owner, doc, root, x, original)?;
+    tool_choice(owner, doc, root, original)?;
+    capture(
+        owner,
+        doc,
+        root,
+        &[
+            "x_ck",
+            "model",
+            "messages",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "stream",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "stop",
+            "metadata",
+            "service_tier",
+            "response_format",
+        ],
+        original,
+    )?;
+    if doc.node(native)?.first.is_none() {
+        doc.remove(provider, "anthropic")?;
+    }
+    if doc.node(provider)?.first.is_none() {
+        doc.remove(x, "provider_parameters")?;
+    }
+    Ok(())
+}
+/// Replaces `x_ck` with the canonical envelope, keeping a client `x_ck` as original data;
+/// returns the envelope and its `original` array.
+fn envelope(owner: &mut Writer, doc: &mut Document, operation: Operation) -> Result<(usize, usize)> {
+    let root = doc.root();
+    let collision = doc.remove(root, "x_ck")?;
+    let x = doc.set(root, "x_ck", Value::Object)?;
+    doc.set(x, "v", Value::Unsigned(1))?;
+    doc.set(x, "original_protocol", Value::Text("anthropic"))?;
+    doc.set(
+        x,
+        "operation",
+        Value::Text(if operation == Operation::Generate {
+            "generate"
+        } else {
+            "count_tokens"
+        }),
+    )?;
+    let original = doc.set(x, "original", Value::Array)?;
+    doc.set(x, "replay", Value::Array)?;
+    doc.set(x, "anthropic_order", Value::Array)?;
+    if let Some(node) = collision {
+        preserve(owner, doc, original, root, node, None)?;
+    }
+    Ok((x, original))
+}
+/// Renames `stop_sequences` and moves thinking, output and Anthropic-only controls into
+/// `x_ck`; returns the `provider_parameters` object and its `anthropic` member.
+fn controls(doc: &mut Document, root: usize, x: usize) -> Result<(usize, usize)> {
+    if let Some(stop) = doc.member(root, "stop_sequences")? {
+        doc.rename(stop, "stop")?;
+    }
+    let provider = doc.set(x, "provider_parameters", Value::Object)?;
+    let native = doc.set(provider, "anthropic", Value::Object)?;
+    for key in ["top_k", "container", "context_management", "mcp_servers", "betas"] {
+        if let Some(node) = doc.remove(root, key)? {
+            doc.append(native, node)?;
+        }
+    }
+    if let Some(thinking) = doc.remove(root, "thinking")? {
+        let kind = doc.member(thinking, "type")?;
+        if let Some(kind) = kind
+            && doc.string_is(kind, "between_tools")?
+        {
+            // No other protocol has this mode: as an Anthropic-only control it reaches
+            // Anthropic unchanged, and every other destination's fence refuses it.
+            doc.append(native, thinking)?;
+        } else {
+            let normalized = doc.set(x, "thinking", Value::Object)?;
+            if let Some(kind) = kind {
+                if doc.string_is(kind, "enabled")? || doc.string_is(kind, "adaptive")? {
+                    doc.set(normalized, "enabled", Value::Bool(true))?;
+                } else if doc.string_is(kind, "disabled")? {
+                    doc.set(normalized, "enabled", Value::Bool(false))?;
+                } else {
+                    return Err(Error::Unsupported);
+                }
+            }
+            if let Some(budget) = doc.member(thinking, "budget_tokens")? {
+                let value = doc.node(budget)?.value;
+                doc.set(normalized, "budget_tokens", value)?;
+            }
+            doc.rename(thinking, "native")?;
+            doc.append(normalized, thinking)?;
+        }
+    }
+    if let Some(output) = doc.remove(root, "output_config")? {
+        if let Some(effort) = doc.remove(output, "effort")? {
+            let thinking = match doc.member(x, "thinking")? {
+                Some(n) => n,
+                None => doc.set(x, "thinking", Value::Object)?,
+            };
+            doc.append(thinking, effort)?;
+        }
+        if let Some(format) = doc.remove(output, "format")? {
+            let response = doc.set(root, "response_format", Value::Object)?;
+            let kind = doc.remove(format, "type")?.ok_or(Error::Schema)?;
+            doc.append(response, kind)?;
+            doc.rename(format, "json_schema")?;
+            doc.append(response, format)?;
+        }
+        // An emptied object carries nothing, and a kept one would trip foreign fences.
+        if doc.node(output)?.first.is_some() {
+            doc.append(native, output)?;
+        }
+    }
+    Ok((provider, native))
+}
+/// Prepends `system` as a system message and normalizes every message.
+fn messages(owner: &mut Writer, doc: &mut Document, root: usize) -> Result<()> {
+    let messages = doc.required(root, "messages")?;
+    if !matches!(doc.node(messages)?.value, Value::Array) {
+        return Err(Error::Schema);
+    }
+    let system = doc.remove(root, "system")?;
+    let new_messages = doc.add(None, Value::Array)?;
+    if let Some(system) = system {
+        let message = doc.add(None, Value::Object)?;
+        doc.append(new_messages, message)?;
+        doc.set(message, "role", Value::Text("system"))?;
+        doc.rename(system, "content")?;
+        doc.append(message, system)?;
+    }
+    while let Some(message) = doc.node(messages)?.first {
+        doc.detach(messages, message)?;
+        doc.append(new_messages, message)?;
+    }
+    doc.transplant(messages, new_messages)?;
+    let mut current = doc.node(messages)?.first;
+    let mut message_index = 0;
+    while let Some(message) = current {
+        current = doc.node(message)?.next;
+        super::content::normalize(owner, doc, message, message_index)?;
+        message_index += 1;
+    }
+    // A redacted block records its replay entry's position, counted in one pass.
+    let replay = doc.required(doc.required(doc.root(), "x_ck")?, "replay")?;
+    let mut next = doc.node(replay)?.first;
+    let mut index = 0;
+    while let Some(entry) = next {
+        next = doc.node(entry)?.next;
+        if let Some((part, _)) = doc.origin(entry)?
+            && super::is(doc, part, "type", "redacted")?
+        {
+            doc.set(part, "replay_index", Value::Unsigned(index))?;
+        }
+        index += 1;
+    }
+    Ok(())
+}
+/// Keeps server tools as opaque declarations and maps custom tools to Chat functions.
+fn tools(owner: &mut Writer, doc: &mut Document, root: usize, x: usize, original: usize) -> Result<()> {
+    let Some(tools) = doc.member(root, "tools")? else {
+        return Ok(());
+    };
+    let mut next = doc.node(tools)?.first;
+    while let Some(tool) = next {
+        next = doc.node(tool)?.next;
+        super::content::cache(owner, doc, tool)?;
+        if let Some(kind) = doc.member(tool, "type")?
+            && !doc.string_is(kind, "custom")?
+        {
+            let declarations = match doc.member(x, "tools")? {
+                Some(n) => n,
+                None => doc.set(x, "tools", Value::Array)?,
+            };
+            let entry = doc.add(None, Value::Object)?;
+            doc.append(declarations, entry)?;
+            doc.set(entry, "pointer", Value::Text("/tools"))?;
+            let declaration = doc.add(Some(Name::Static("declaration")), Value::Object)?;
+            doc.transplant(declaration, tool)?;
+            doc.append(entry, declaration)?;
+            doc.replace(tool, Value::Object)?;
+            doc.set(tool, "type", Value::Text("server"))?;
+            doc.bind_origin(entry, tool, None)?;
+            continue;
+        }
+        if let Some(kind) = doc.remove(tool, "type")? {
+            preserve(owner, doc, original, tool, kind, None)?;
+        }
+        let function = doc.add(Some(Name::Static("function")), Value::Object)?;
+        while let Some(field) = doc.node(tool)?.first {
+            doc.detach(tool, field)?;
+            if doc.name_is(doc.node(field)?.name.ok_or(Error::Schema)?, "input_schema")? {
+                doc.rename(field, "parameters")?;
+            }
+            doc.append(function, field)?;
+        }
+        doc.set(tool, "type", Value::Text("function"))?;
+        doc.append(tool, function)?;
+    }
+    Ok(())
+}
+fn tool_choice(owner: &mut Writer, doc: &mut Document, root: usize, original: usize) -> Result<()> {
+    let Some(choice) = doc.member(root, "tool_choice")? else {
+        return Ok(());
+    };
+    if let Some(disable) = doc.remove(choice, "disable_parallel_tool_use")? {
+        let Value::Bool(value) = doc.node(disable)?.value else {
+            return Err(Error::Schema);
+        };
+        doc.set(root, "parallel_tool_calls", Value::Bool(!value))?;
+    }
+    let kind = doc.required(choice, "type")?;
+    if doc.string_is(kind, "tool")? {
+        let name = doc.remove(choice, "name")?.ok_or(Error::Schema)?;
+        doc.replace(kind, Value::Text("function"))?;
+        let f = doc.set(choice, "function", Value::Object)?;
+        doc.append(f, name)?;
+        capture(owner, doc, choice, &["type", "function"], original)?;
+    } else if doc.string_is(kind, "auto")? || doc.string_is(kind, "any")? || doc.string_is(kind, "none")? {
+        let value = if doc.string_is(kind, "any")? {
+            "required"
+        } else if doc.string_is(kind, "none")? {
+            "none"
+        } else {
+            "auto"
+        };
+        capture(owner, doc, choice, &["type"], original)?;
+        doc.replace(choice, Value::Text(value))?;
+    } else {
+        return Err(Error::Unsupported);
+    }
+    Ok(())
+}
+pub(super) fn capture(
+    owner: &mut Writer,
+    doc: &mut Document,
+    parent: usize,
+    known: &[&str],
+    original: usize,
+) -> Result<()> {
+    let mut next = doc.node(parent)?.first;
+    while let Some(field) = next {
+        next = doc.node(field)?.next;
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        if known
+            .iter()
+            .try_fold(false, |yes, key| Ok::<_, Error>(yes || doc.name_is(name, key)?))?
+        {
+            continue;
+        }
+        doc.detach(parent, field)?;
+        preserve(owner, doc, original, parent, field, None)?;
+    }
+    Ok(())
+}
+pub(super) fn preserve(
+    owner: &mut Writer,
+    doc: &mut Document,
+    original: usize,
+    parent: usize,
+    field: usize,
+    carrier: Option<&'static str>,
+) -> Result<()> {
+    let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+    let pointer = encode::scratch(owner, |e| {
+        e.bytes(b"\"/")?;
+        let mut chars = doc.name_chars(name)?;
+        while let Some(c) = chars.next_scalar()? {
+            match c {
+                '~' => e.bytes(b"~0")?,
+                '/' => e.bytes(b"~1")?,
+                c => e.escaped(c.encode_utf8(&mut [0; 4]))?,
+            }
+        }
+        e.bytes(b"\"")
+    })?;
+    let pointer = doc.import_json(owner, pointer)?;
+    doc.rename(pointer, "pointer")?;
+    let entry = doc.add(None, Value::Object)?;
+    doc.append(original, entry)?;
+    doc.set(entry, "protocol", Value::Text("anthropic"))?;
+    doc.append(entry, pointer)?;
+    doc.rename(field, "value")?;
+    doc.append(entry, field)?;
+    doc.bind_origin(entry, parent, carrier)
+}
+#[derive(Clone, Copy)]
+enum Component {
+    Name(Name),
+    Index(u64),
+}
+fn fields(
+    doc: &mut Document,
+    registry: &Registry,
+    node: usize,
+    (path, depth): (&mut [Option<Component>; 128], usize),
+    emitter: &mut Emitter,
+    owner: &mut Writer,
+    reader: &mut ck_stream::Reader,
+) -> Result<()> {
+    if depth == path.len() {
+        return Err(Error::Limit);
+    }
+    let registered = registry.get(doc, node)?;
+    if doc.published(node)? {
+        if registered.is_some() {
+            return Ok(());
+        }
+    } else {
+        let (record, spans) = emitter.emit_field(
+            owner,
+            |e| {
+                e.bytes(b"\"")?;
+                for component in path[..depth].iter().flatten() {
+                    e.bytes(b"/")?;
+                    match component {
+                        Component::Index(index) => e.unsigned(*index)?,
+                        Component::Name(name) => codec::provenance::write_pointer_segment(doc, *name, e)?,
+                    }
+                }
+                e.bytes(b"\"")
+            },
+            |e| codec::event::write_field_value(doc, node, registered, e),
+        )?;
+        let lease = codec::internal::committed(reader, record)?;
+        doc.bind_field(owner, node, lease, spans)?;
+        doc.mark_published(node);
+    }
+    if registered.is_some() {
+        return Ok(());
+    }
+    let mut child = doc.node(node)?.first;
+    let mut index = 0;
+    while let Some(n) = child {
+        child = doc.node(n)?.next;
+        path[depth] = Some(if matches!(doc.node(node)?.value, Value::Array) {
+            Component::Index(index)
+        } else {
+            Component::Name(doc.node(n)?.name.ok_or(Error::Schema)?)
+        });
+        fields(doc, registry, n, (path, depth + 1), emitter, owner, reader)?;
+        index += 1;
+    }
+    Ok(())
+}

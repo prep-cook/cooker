@@ -232,17 +232,14 @@ fn wreq_proxy_url(url: &str) -> String {
     }
 }
 
-/// `proxyutil.Redact`: a proxy URL safe for logs (no user info).
-pub fn redact(raw: &str) -> String {
-    match url::Url::parse(raw.trim()) {
-        Ok(mut u) => {
-            if !u.username().is_empty() || u.password().is_some() {
-                let _ = u.set_username("xxxxx");
-                let _ = u.set_password(None);
-            }
-            u.to_string()
-        }
-        Err(_) => "<invalid proxy url>".into(),
+pub use crate::upstream::transport_text;
+
+/// A proxy as a log names it: the URL redacted ([`ck_wire::redact::url`]), since it can
+/// carry a password, a query key or a fragment.
+fn logged(proxy: &Proxy) -> String {
+    match proxy {
+        Proxy::Url(u) => ck_wire::redact::url(u.trim()),
+        _ => String::new(),
     }
 }
 
@@ -315,7 +312,7 @@ impl GoClients {
             tracing::warn!("unusable proxy configuration; using the default transport");
         }
         self.try_get(proxy).unwrap_or_else(|| {
-            tracing::warn!(proxy = %match proxy { Proxy::Url(u) => redact(u), _ => String::new() }, "proxy client failed; using the default transport");
+            tracing::warn!(proxy = %logged(proxy), "proxy client failed; using the default transport");
             self.default.clone().unwrap_or_else(|| plain_client(self.timed))
         })
     }
@@ -965,11 +962,9 @@ async fn exchange(
             None => {
                 let next = current.join(&location).map_err(|_| {
                     local(
-                        ExecError::local(
-                            500,
-                            FailureScope::Transport,
-                            format!("failed to parse Location header {location:?}"),
-                        ),
+                        // The text names no part of the location, which may carry
+                        // credentials in its userinfo or query, as every capture would.
+                        ExecError::local(500, FailureScope::Transport, "failed to parse Location header"),
                         &hop_url,
                     )
                 })?;
@@ -1352,6 +1347,14 @@ pub async fn read_all(
     Ok(out.freeze())
 }
 
+/// Records a line [`lines`] yielded as a captured response chunk, with the `\n` the
+/// scanner removed: chunks join as they are recorded, so each line stays on its own.
+pub(crate) fn capture_line(capture: &ck_core::exec::CaptureSink, line: &[u8]) {
+    if capture.logs_responses() {
+        capture.record(ck_core::exec::CaptureEvent::ResponseChunk(&[line, b"\n"].concat()));
+    }
+}
+
 /// `bufio.Scanner` with `ScanLines` and `Buffer(nil, max)`: one item per line without
 /// its `\n`, a trailing `\r` dropped, the final unterminated line included, and
 /// `bufio.ErrTooLong` when no newline falls within `max` bytes of a line's start (the
@@ -1399,15 +1402,16 @@ pub fn lines(
                     return Some((Ok(drop_cr(&line[..at])), st));
                 }
                 st.scanned = window;
-                // A full buffer without a newline: more data is too long, while the end
-                // of the body makes it the final line.
+                // A full buffer without a newline: more data is too long, while a clean end
+                // of the body makes it the final line. A read error leaves it unterminated,
+                // so it is dropped and the error ends the lines.
                 if st.buf.len() > max {
                     st.finished = true;
                     let error = ExecError::local(500, FailureScope::Request, "bufio.Scanner: token too long");
                     return Some((Err(error), st));
                 }
                 if st.ended {
-                    if !st.buf.is_empty() {
+                    if st.error.is_none() && !st.buf.is_empty() {
                         let line = st.buf.split();
                         st.scanned = 0;
                         return Some((Ok(drop_cr(&line)), st));
@@ -1439,7 +1443,8 @@ mod tests {
     /// A body read line by line fails with Go's scanner text `unexpected EOF` only when
     /// the upstream ended it early; a reset keeps the generic transport text. Every
     /// reply sends five of the hundred bytes or a partial chunked body, then, once the
-    /// client holds the response, closes or resets the connection.
+    /// client holds the response, closes or resets the connection. The unterminated line
+    /// the cut left is dropped: the error is the only item.
     #[tokio::test]
     async fn scanned_bodies_name_only_an_early_end_unexpected_eof() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -1476,12 +1481,15 @@ mod tests {
                 .unwrap();
             holds_response.send(()).unwrap();
             let mut read = lines(upstream.body, 1 << 20);
-            let error = loop {
-                match read.next().await.expect("a read error") {
-                    Ok(_) => {}
-                    Err(error) => break error,
-                }
-            };
+            let error = read
+                .next()
+                .await
+                .expect("a read error")
+                .expect_err("the cut line `hello` is not a line");
+            assert!(
+                read.next().await.is_none(),
+                "{head:?} reset={reset}: the error ends the lines"
+            );
             assert_eq!(
                 (
                     String::from_utf8_lossy(&error.body).into_owned(),
@@ -1507,8 +1515,13 @@ mod tests {
         assert_eq!(wreq_proxy_url("SOCKS5://h:1"), "socks5h://h:1");
         assert_eq!(wreq_proxy_url("socks5h://h:1"), "socks5h://h:1");
         assert_eq!(wreq_proxy_url("http://h:1"), "http://h:1");
-        assert_eq!(redact("http://user:secret@p:1/"), "http://xxxxx@p:1/");
-        assert!(!redact("socks5://user:secret@p:1").contains("secret"));
+        // Review of #127, finding 4: the warning for an unbuildable proxy client.
+        let raw = format!(
+            "http://u:{}@127.0.0.1:9/?code=sk-review-secret#sk-review-secret",
+            "p".repeat(70000)
+        );
+        assert_eq!(logged(&Proxy::parse(&raw)), "http://127.0.0.1:9/?code=***#***");
+        assert_eq!(logged(&Proxy::parse("socks5://user:secret@p:1")), "socks5://p:1");
     }
 
     #[test]
@@ -1838,6 +1851,7 @@ mod tests {
     /// Every case runs the real `bufio.Scanner` in tests/reference/proxy/main.go.
     #[tokio::test]
     async fn lines_follow_go_bufio_scanner() {
+        const CUT_LINE_DROPPED: [&str; 2] = ["partial-then-io-error", "exact-max-then-io-error"];
         for case in go_fixture()["lines"].as_array().unwrap() {
             let name = case["name"].as_str().unwrap();
             let mut items: Vec<Result<Bytes, ExecError>> = case["chunks"]
@@ -1869,12 +1883,17 @@ mod tests {
                 .into_iter()
                 .map(|t| String::from_utf8(t.unwrap().to_vec()).unwrap())
                 .collect();
-            let want: Vec<&str> = case["tokens"]
+            let mut want: Vec<&str> = case["tokens"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|t| t.as_str().unwrap())
                 .collect();
+            // Go hands the line a read error cut to the split function; cooker drops it, so a
+            // truncated body never ends on a line its upstream did not finish.
+            if CUT_LINE_DROPPED.contains(&name) {
+                want.pop();
+            }
             assert_eq!(tokens, want, "{name}");
             let error = errors.into_iter().map(|e| e.unwrap_err()).collect::<Vec<_>>();
             match case["error"].as_str().unwrap() {

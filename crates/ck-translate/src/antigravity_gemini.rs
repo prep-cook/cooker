@@ -6,12 +6,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use ck_wire::json::{self as gj, GoValue, Kind, Res};
-use ck_wire::signature::{
-    compatible_antigravity_claude_thinking_signature, sanitize_gemini_request_thought_signatures,
-};
+use ck_wire::signature::{BlockKind, Provider, sanitize_gemini_request_thought_signatures};
 
+use crate::antigravity_claude::provider_compatible;
 use crate::common::{go_lower, restore_sanitized_tool_name, trim_space};
-use crate::gemini::{attach_default_safety_settings, has_function_response};
+use crate::gemini_gemini::{attach_default_safety_settings, has_function_response};
 use crate::responses_tools::{disambiguated_tool_name_map, map_sanitized_function_name, sanitized_function_name_map};
 use crate::stream::GoStream;
 use crate::{Error, Registered, ResponseCtx};
@@ -21,7 +20,7 @@ pub static PAIR: Registered = registered!(
     request: |ctx, body| Ok(convert(ctx.model, body)),
     non_stream: |ctx, body| Ok(non_stream(ctx.original_request, body)),
     go_stream: go_stream,
-    token_count: Some(crate::gemini::token_count),
+    token_count: Some(crate::gemini_gemini::token_count),
 );
 
 /// The part fields that can carry a function name.
@@ -577,12 +576,16 @@ fn has_signature_key(value: &Res<'_>) -> bool {
 enum PartFate {
     Keep,
     Drop,
-    /// The re-marshaled part, and whether it counts as a change. A thinking part whose
-    /// signature is already normalized does not: its content keeps its raw bytes unless
-    /// another part changes.
+    /// The re-marshaled part, and whether it differs from the part as sent. An unchanged part
+    /// keeps its raw bytes unless another part of its content changes.
     Rewrite(GoValue, bool),
 }
 
+/// SanitizeAntigravityClaudeGeminiRequestSignatures for one part, except that a thinking part's
+/// valid Claude signature goes upstream as the client holds it (Settled 68): only the legacy
+/// `<group>#` prefix comes off, and it moves to the part's own `thoughtSignature`. CLIProxyAPI
+/// re-wraps the single-layer form (`antigravity_gemini_request.go:419-441`). Other signatures,
+/// a function call's included, are removed: no producer proves who minted them.
 fn sanitize_part(part: &Res<'_>, model_turn: bool) -> PartFate {
     // A json.Decoder into map[string]any: anything but an object fails and is kept.
     let Some(Ok(mut map)) = GoValue::parse(&part.raw).map(GoValue::into_object) else {
@@ -590,39 +593,39 @@ fn sanitize_part(part: &Res<'_>, model_turn: bool) -> PartFate {
     };
     let signature = SIGNATURE_PATHS.iter().find_map(|p| string_at(&map, p));
     let has_key = signature.is_some() || has_signature_key(part);
-    let strip = |mut map: GoMap| {
-        for path in SIGNATURE_PATHS {
-            delete_at(&mut map, path);
-        }
-        map
-    };
-    let response = map.contains_key("functionResponse") || map.contains_key("function_response");
-    if response || !model_turn || map.get("thought") != Some(&GoValue::Bool(true)) {
-        return if has_key {
-            PartFate::Rewrite(GoValue::Object(strip(map)), true)
+    let sent = map.clone();
+    for path in SIGNATURE_PATHS {
+        delete_at(&mut map, path);
+    }
+    let stripped = |map: GoMap| {
+        if has_key {
+            PartFate::Rewrite(GoValue::Object(map), true)
         } else {
             PartFate::Keep
-        };
-    }
-    let Some(normalized) = compatible_antigravity_claude_thinking_signature(signature.as_deref().unwrap_or_default())
-    else {
-        return PartFate::Drop;
+        }
     };
+    let response = map.contains_key("functionResponse") || map.contains_key("function_response");
+    let thought = map.get("thought") == Some(&GoValue::Bool(true));
+    if !model_turn || response || !thought {
+        return stripped(map);
+    }
+    let raw = signature.as_deref().unwrap_or_default().as_bytes();
+    let kept = String::from_utf8(provider_compatible(Provider::Claude, raw, BlockKind::Unknown)).unwrap_or_default();
     let text = match map.get("text") {
         Some(GoValue::String(t)) => t.as_str(),
         _ => "",
     };
-    if trim_space(text.as_bytes()).is_empty() {
+    if kept.is_empty() || trim_space(text.as_bytes()).is_empty() {
         return PartFate::Drop;
     }
-    let changed = Some(&normalized) != signature.as_ref();
-    map = strip(map);
-    map.insert("thoughtSignature".into(), GoValue::String(normalized));
+    map.insert("thoughtSignature".into(), GoValue::String(kept));
+    // A moved signature changes the part even when its value does not.
+    let changed = map != sent;
     PartFate::Rewrite(GoValue::Object(map), changed)
 }
 
-/// SanitizeAntigravityClaudeGeminiRequestSignatures: only model thinking parts with a
-/// Claude-compatible signature and non-empty text keep (a normalized) signature; other
+/// SanitizeAntigravityClaudeGeminiRequestSignatures: model thinking parts keep a valid Claude
+/// signature ([`sanitize_part`]); thinking without one, or without text, is dropped; other
 /// signature fields are removed and contents left without parts are dropped.
 pub(crate) fn sanitize_claude_signatures(raw: Vec<u8>) -> Vec<u8> {
     let contents = gj::get(&raw, "request.contents");

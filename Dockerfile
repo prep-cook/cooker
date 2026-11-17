@@ -167,17 +167,19 @@ EOF
 FROM scratch AS test-report
 COPY --from=test /home/builder/out/ /
 
-# The release binary. The default build excludes the CPU profiler and its symbol resolver.
+# The release binary. It excludes the CPU profiler and its symbol resolver, and includes the
+# WebRTC media relay: without it every WebRTC call answers 501 (owner ruling E-Q3).
 FROM source AS build
 ARG BUILD_JOBS
 ARG CK_COMMIT CK_BUILD_DATE
 RUN --mount=type=cache,id=cooker-cargo-src-release,target=/usr/local/cargo/registry/src,uid=1000,gid=1000 \
     --mount=type=cache,id=cooker-target-release,target=/src/target,uid=1000,gid=1000 <<'EOF'
-if cargo tree --locked -p cooker --edges normal --prefix none | grep -E '^(pprof|backtrace) v'; then
+features=ck-server/media-relay
+if cargo tree --locked -p cooker --features "$features" --edges normal --prefix none | grep -E '^(pprof|backtrace) v'; then
   echo 'Release binaries must exclude CPU profiling and symbol resolution'
   exit 1
 fi
-cargo build --release --locked -p cooker ${BUILD_JOBS:+--jobs "$BUILD_JOBS"}
+cargo build --release --locked -p cooker --features "$features" ${BUILD_JOBS:+--jobs "$BUILD_JOBS"}
 install -D -m 0755 target/release/cooker /home/builder/out/cooker
 EOF
 
@@ -207,12 +209,16 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 cooker \
  && useradd --system --uid 10001 --gid 10001 --home-dir /data --shell /usr/sbin/nologin cooker \
- && mkdir -p /data \
- && chown cooker:cooker /data
+ && mkdir -p /data /run/cooker-runtime \
+ && chown cooker:cooker /data /run/cooker-runtime \
+ && chmod 0700 /run/cooker-runtime
 COPY --from=build /home/builder/out/cooker /usr/local/bin/cooker
 # The license, the MIT notices it carries forward, and the third-party licenses the binary needs.
 COPY LICENSE LICENSE-MIT NOTICE THIRD-PARTY-NOTICES /usr/share/doc/cooker/
 USER cooker
+# The stream pool opens under $XDG_RUNTIME_DIR/cooker. Mount a tmpfs there so pooled bodies
+# stay in memory: --tmpfs /run/cooker-runtime:rw,noexec,nosuid,mode=0700,uid=10001,gid=10001
+ENV XDG_RUNTIME_DIR=/run/cooker-runtime
 # The config database (/data/cooker.db) and credentials live in /data; mount a volume there.
 # A first start imports /data/config.yaml when it exists, and otherwise starts with defaults
 # on port 8317. No VOLUME instruction: some hosts, Railway among them, refuse to build a

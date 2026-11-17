@@ -2,10 +2,9 @@
 //!
 //! A browser running the AI Studio bridge connects to `/v1/ws`; while it stays
 //! connected the server holds a runtime-only `aistudio` credential named after the
-//! session. Requests take the Gemini pipeline (without `maxOutputTokens`, response MIME
-//! type and schema, and with upper-case thinking levels) and travel to the browser as
-//! relay messages. Every translated chunk and body is re-encoded the way Go's
-//! `ensureColonSpacedJSON` writes JSON.
+//! session. Generation requests retain Gemini safety defaults, output limits and
+//! schema dialects, with upper-case thinking levels, and travel as relay messages.
+//! Translated chunks and bodies use colon-spaced JSON.
 
 use ck_core::gostr::GoStr;
 use std::collections::VecDeque;
@@ -43,7 +42,7 @@ fn plain_error(message: impl Into<String>) -> ExecError {
 
 /// Go's `statusErr{code: status}`; a status outside HTTP's range is answered as 500.
 fn status_error(status: i64, body: Vec<u8>) -> ExecError {
-    g::status_err(u16::try_from(status).ok().filter(|s| *s >= 100).unwrap_or(500), body)
+    g::status_err(u16::try_from(status).ok().filter(|s| *s >= 100).unwrap_or(500), body).from_upstream()
 }
 
 fn header_map(headers: &std::collections::BTreeMap<String, Vec<String>>) -> http::HeaderMap {
@@ -131,14 +130,42 @@ fn endpoint(model: &str, action: &str, alt: &str) -> String {
     base
 }
 
+fn translate_body(
+    req: &ExecRequest,
+    cfg: &Config,
+    model: &str,
+    body: &[u8],
+    stream: bool,
+) -> Result<Vec<u8>, ExecError> {
+    if req.source_format == Format::Gemini {
+        return ck_translate::gemini_to_aistudio(
+            &ck_translate::RequestCtx {
+                model,
+                stream,
+                tool_search: false,
+            },
+            body,
+        )
+        .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()));
+    }
+    let mut translated = g::translate(req, cfg, Format::Gemini, model, body, stream, false)?;
+    if req.source_format == Format::Claude {
+        let limit = gj::get(body, "max_tokens");
+        if limit.kind == gj::Kind::Number {
+            gj::set_raw(&mut translated, "generationConfig.maxOutputTokens", &limit.raw);
+        }
+    }
+    Ok(translated)
+}
+
 /// `translateRequest`: the Gemini body and the action it is sent to.
 fn translate(req: &ExecRequest, cfg: &Config, count: bool) -> Result<(Vec<u8>, &'static str), ExecError> {
     let base_model = parse_suffix(&req.model).model_name;
     let (from, to) = (req.source_format, Format::Gemini);
     let stream = req.stream && !count;
     let original = g::original_request(req);
-    let original_translated = g::translate(req, cfg, to, &base_model, original, stream, false);
-    let body = g::translate(req, cfg, to, &base_model, &req.body, stream, false)?;
+    let original_translated = translate_body(req, cfg, &base_model, original, stream);
+    let body = translate_body(req, cfg, &base_model, &req.body, stream)?;
     let original_translated = crate::translate::baseline_or_working(original_translated, &body);
     let body = ck_wire::thinking::apply_thinking_with_source_payload(
         &body,
@@ -152,13 +179,6 @@ fn translate(req: &ExecRequest, cfg: &Config, count: bool) -> Result<(Vec<u8>, &
     )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
     let mut body = payload::fix_image_aspect_ratio(&base_model, body);
-    for path in [
-        "generationConfig.maxOutputTokens",
-        "generationConfig.responseMimeType",
-        "generationConfig.responseJsonSchema",
-    ] {
-        body = payload::delete(body, path);
-    }
     let action = match (count, stream) {
         (true, _) => "countTokens",
         (false, true) => "streamGenerateContent",
@@ -345,11 +365,14 @@ impl AiStudioExecutor {
             StreamOptions {
                 whole_events: true,
                 chunk: Some(ensure_colon_spaced_json),
+                ..Default::default()
             },
         )
         .with_claude_stream_errors();
         let state = Events {
             output,
+            filter_usage: req.response_format != Format::Gemini
+                && ck_translate::pair(req.response_format, Format::Gemini).is_some(),
             pending: VecDeque::new(),
             first: Some(first),
             events,
@@ -357,25 +380,10 @@ impl AiStudioExecutor {
             capture,
             metadata_logged: false,
         };
-        let stream = futures_util::stream::unfold(state, |mut state| async move {
-            loop {
-                if let Some(item) = state.pending.pop_front() {
-                    return Some((item, state));
-                }
-                if state.ended {
-                    return None;
-                }
-                let event = match state.first.take() {
-                    Some(first) => Some(first),
-                    None => state.events.recv().await,
-                };
-                state.process(event);
-            }
-        });
         Ok(ExecResponse {
             status: 200,
             headers,
-            body: ResponseBody::Stream(stream.boxed()),
+            body: ResponseBody::Stream(state.into_stream().boxed()),
         })
     }
 
@@ -409,6 +417,7 @@ impl AiStudioExecutor {
 /// The stream loop over relay events (Go's `processEvent`).
 struct Events {
     output: Output,
+    filter_usage: bool,
     pending: VecDeque<Result<Bytes, ExecError>>,
     first: Option<StreamEvent>,
     events: tokio::sync::mpsc::Receiver<StreamEvent>,
@@ -419,6 +428,24 @@ struct Events {
 }
 
 impl Events {
+    fn into_stream(self) -> impl futures_util::Stream<Item = Result<Bytes, ExecError>> {
+        futures_util::stream::unfold(self, |mut state| async move {
+            loop {
+                if let Some(item) = state.pending.pop_front() {
+                    return Some((item, state));
+                }
+                if state.ended {
+                    return None;
+                }
+                let event = match state.first.take() {
+                    Some(first) => Some(first),
+                    None => state.events.recv().await,
+                };
+                state.process(event);
+            }
+        })
+    }
+
     fn emit(&mut self, emit: Emit) -> bool {
         self.pending.extend(emit.out.into_iter().map(Ok));
         match emit.stop {
@@ -464,10 +491,14 @@ impl Events {
         match event.kind.as_str() {
             wsrelay::STREAM_CHUNK if !event.payload.is_empty() => {
                 self.capture.record(CaptureEvent::ResponseChunk(&event.payload));
-                // Go 7f2f17d7 reads usage from the raw payload, before the filter.
                 self.output.usage.response_line(Format::Gemini, &event.payload);
-                let filtered = crate::gemini_stream::filter_sse_usage_metadata(&event.payload);
-                let translated = self.output.translate(&filtered);
+                // Cross-format translators retain their existing interim-usage policy.
+                let translated = if self.filter_usage {
+                    let filtered = crate::gemini_stream::filter_sse_usage_metadata(&event.payload);
+                    self.output.translate(&filtered)
+                } else {
+                    self.output.translate(&event.payload)
+                };
                 self.emit(translated);
             }
             // Go 5ec31442 `finishStream`: the translator also sees `[DONE]`.

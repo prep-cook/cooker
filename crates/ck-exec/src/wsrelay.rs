@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use bytes::Bytes;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, GoValue};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 use crate::meta_wire;
 
@@ -32,6 +32,15 @@ pub const PONG: &str = "pong";
 
 /// `pendingChannelBuffer`: messages a request may hold before the reader waits.
 const PENDING_BUFFER: usize = 64;
+
+/// Frames waiting for the route to write them to the browser. A request that finds the
+/// queue full fails before it reaches the browser, so it can move to another credential.
+const OUT_BUFFER: usize = 64;
+
+/// Bytes those frames may hold together: 64 MiB, the relay's inbound message limit
+/// (`maxInboundMessageLen`) and the client request-body ceiling. A frame that would pass
+/// it fails like a full queue.
+const OUT_BYTES: usize = 64 << 20;
 
 /// The cause sessions end with when the reader stops without an error of its own.
 pub const CLOSED: &str = "websocket session closed";
@@ -325,18 +334,20 @@ impl Relay {
     /// `handleWebsocket` after the upgrade: a session under a new provider name, which
     /// replaces any session of that name, then `OnConnected`. Returns the session and the
     /// frames the route must write.
-    pub fn connect(self: &Arc<Self>) -> (Arc<Session>, mpsc::UnboundedReceiver<String>) {
+    pub fn connect(self: &Arc<Self>) -> (Arc<Session>, Frames) {
         self.connect_as(random_provider_name())
     }
 
     /// [`Relay::connect`] under a given name (tests).
-    pub fn connect_as(self: &Arc<Self>, provider: String) -> (Arc<Session>, mpsc::UnboundedReceiver<String>) {
-        let (out, frames) = mpsc::unbounded_channel();
+    pub fn connect_as(self: &Arc<Self>, provider: String) -> (Arc<Session>, Frames) {
+        let (out, frames) = mpsc::channel(OUT_BUFFER);
+        let frames = Frames(frames);
         let (closed, _) = watch::channel(false);
         let session = Arc::new(Session {
             provider: provider.go_lower(),
             relay: Arc::downgrade(self),
             out,
+            out_bytes: Arc::new(Semaphore::new(OUT_BYTES)),
             closed,
             pending: Mutex::new(HashMap::new()),
         });
@@ -505,11 +516,23 @@ pub async fn wait_closed(closed: &mut watch::Receiver<bool>) {
     let _ = closed.wait_for(|c| *c).await;
 }
 
+/// The frames a session queues for the route to write. Taking a frame returns its bytes
+/// to the session's budget.
+pub struct Frames(mpsc::Receiver<(String, OwnedSemaphorePermit)>);
+
+impl Frames {
+    pub async fn recv(&mut self) -> Option<String> {
+        self.0.recv().await.map(|(frame, _)| frame)
+    }
+}
+
 /// One connected browser (`wsrelay.session`).
 pub struct Session {
     provider: String,
     relay: Weak<Relay>,
-    out: mpsc::UnboundedSender<String>,
+    out: mpsc::Sender<(String, OwnedSemaphorePermit)>,
+    /// The bytes of [`OUT_BYTES`] the queued frames do not hold.
+    out_bytes: Arc<Semaphore>,
     closed: watch::Sender<bool>,
     pending: Mutex<HashMap<String, Arc<Pending>>>,
 }
@@ -651,7 +674,18 @@ impl Session {
         if self.is_closed() {
             return Err(CLOSED.into());
         }
-        self.out.send(msg.encode()).map_err(|_| CLOSED.to_owned())
+        let frame = msg.encode();
+        let not_reading = || "wsrelay: browser is not reading".to_owned();
+        let bytes = u32::try_from(frame.len()).unwrap_or(u32::MAX);
+        let held = self
+            .out_bytes
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| not_reading())?;
+        self.out.try_send((frame, held)).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => not_reading(),
+            mpsc::error::TrySendError::Closed(_) => CLOSED.to_owned(),
+        })
     }
 
     /// `session.request`.

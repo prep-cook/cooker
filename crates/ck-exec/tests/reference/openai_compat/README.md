@@ -56,3 +56,11 @@ checkout (`git -C "$reference" checkout ae3ee3be`). Every case still runs; `RSFI
 ```sh
 RSFIX_ONLY='^(responses_eof_|claude_eof_|claude_done_without|stream_multiline_with_done$)' go run . "$crate/tests/fixtures/openai_compat_go_v8.0.35.json"
 ```
+
+## Deliberate departures
+
+Two recordings were edited after generation because cooker keeps the official limit
+name where Go replaced it. `chat_max_completion_tokens_kept` and
+`stream_include_usage_false_replaced` expect `max_completion_tokens` to reach the
+upstream unchanged, without Go's substitution of `max_tokens` (o-series models reject
+`max_tokens`). Reapply both edits after regenerating.

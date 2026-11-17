@@ -30,8 +30,7 @@ use scheduling::registry;
 
 pub use runtime::state::Runtime;
 
-// ponytail: fixed 64 MiB request cap so image-heavy Claude requests pass (axum's default
-// is 2 MiB; gin has none). Make it configurable if anyone needs more.
+/// Ceiling for non-Anthropic client routes.
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 /// The API routes alone; unregistered paths get gin's bare NoRoute 404.
@@ -62,9 +61,14 @@ fn api(rt: Arc<Runtime>) -> Router {
         .route("/v1/models/", get(models::detail))
         .route("/v1/models/{*model}", get(models::detail))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route(
+            "/v1/chat/deferred-completion/{request_id}",
+            get(inference::xai_deferred::retrieve),
+        )
         .route("/v1/completions", post(openai::completions))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
+        .route("/v1/images/{request_id}", get(images::retrieve))
         .route("/v1/audio/speech", post(speech::speech))
         .route("/v1/tts", post(speech::speech))
         .route("/v1/videos", post(videos::native_post))
@@ -75,10 +79,28 @@ fn api(rt: Arc<Runtime>) -> Router {
         .route("/openai/v1/videos", post(videos::create))
         .route("/openai/v1/videos/{video_id}/content", get(videos::content))
         .route("/openai/v1/videos/{video_id}", get(videos::retrieve))
-        .route("/v1/messages", post(claude::messages))
-        .route("/v1/messages/count_tokens", post(claude::count_tokens))
+        .route(
+            "/v1/messages",
+            post(claude::messages).layer(DefaultBodyLimit::max(http::errors::ANTHROPIC_MAX_REQUEST_BYTES)),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(claude::count_tokens).layer(DefaultBodyLimit::max(http::errors::ANTHROPIC_MAX_REQUEST_BYTES)),
+        )
+        // Resume of a committed response; the stream identity travels only in `X-Ck-Stream-Id`.
+        .route("/v1/streams", get(inference::streams::resume))
         .route("/v1/responses", post(openai::responses))
         .route("/v1/responses/compact", post(openai::compact))
+        .route("/v1/responses/input_tokens", post(openai::input_tokens))
+        // Local state only: an id is never looked up upstream (`responses_state`).
+        .route(
+            "/v1/responses/{response_id}",
+            get(inference::responses_state::retrieve).delete(inference::responses_state::delete),
+        )
+        .route(
+            "/v1/responses/{response_id}/cancel",
+            post(inference::responses_state::cancel),
+        )
         .route("/backend-api/codex/responses", post(openai::responses))
         .route("/backend-api/codex/responses/compact", post(openai::compact))
         .route("/v1beta/models", get(models::gemini_list))

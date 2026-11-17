@@ -16,10 +16,10 @@ use crate::common::{
     UserTurnDrops, align_claude_tool_results, claude_message_system_reminder_text, gemini_part_is_sendable, go_lower,
     is_claude_code_attribution_text, thinking_text, trim_space,
 };
-use crate::gemini::{
+use crate::gemini_chat_request::content_node as content;
+use crate::gemini_gemini::{
     attach_default_safety_settings, merge_adjacent_contents, set_function_response_raw, set_function_response_result,
 };
-use crate::gemini_chat_request::content_node as content;
 use crate::replay_cache;
 use crate::responses_tools::{map_sanitized_function_name, sanitized_function_name_map};
 
@@ -377,21 +377,36 @@ fn provider(model: &str) -> Provider {
     sig::provider_from_model_name(model)
 }
 
-/// resolveProviderCompatibleSignature.
-fn provider_compatible(target: Provider, raw: &[u8], kind: BlockKind) -> Vec<u8> {
+/// resolveProviderCompatibleSignature, except that a valid Claude signature, on a thinking
+/// block or a tool call, goes upstream as the client holds it (ruling 68): only CLIProxyAPI's
+/// legacy `<group>#` prefix comes off, without its double-layer rewrite.
+pub(crate) fn provider_compatible(target: Provider, raw: &[u8], kind: BlockKind) -> Vec<u8> {
     if raw.is_empty() {
         return vec![];
     }
-    let signature = if target == Provider::Claude {
-        compatible_antigravity_claude_thinking_signature(raw)
-    } else {
-        sig::compatible_signature_for_provider_block(target, raw, kind)
-    };
-    signature.map(String::into_bytes).unwrap_or_default()
+    if target == Provider::Claude {
+        if compatible_antigravity_claude_thinking_signature(raw).is_none() {
+            return vec![];
+        }
+        // The check reads a trimmed view; the bytes stay as held, whitespace included, less only
+        // a legacy prefix.
+        let lead = trim_space(raw).as_ptr() as usize - raw.as_ptr() as usize;
+        return match sig::split_provider_prefix(raw) {
+            Some(_) => {
+                let hash = lead + raw[lead..].iter().position(|b| *b == b'#').unwrap_or(0);
+                [&raw[..lead], &raw[hash + 1..]].concat()
+            }
+            None => raw.to_vec(),
+        };
+    }
+    sig::compatible_signature_for_provider_block(target, raw, kind)
+        .map(String::into_bytes)
+        .unwrap_or_default()
 }
 
-/// resolveThinkingSignature: Gemini targets unwrap carriers; others use the client
-/// signature or, without one, the signature cache (cache mode), or the bypass rules.
+/// resolveThinkingSignature: Gemini targets unwrap carriers; Claude targets keep a valid
+/// client signature (ruling 68); others use the client signature or, without one, the signature
+/// cache (cache mode), or the bypass rules.
 fn resolve_thinking_signature(model: &str, text: &[u8], raw: &[u8]) -> Vec<u8> {
     let target = provider(model);
     if target == Provider::Gemini {
@@ -401,6 +416,11 @@ fn resolve_thinking_signature(model: &str, text: &[u8], raw: &[u8]) -> Vec<u8> {
         }
         return provider_compatible(target, &carrier.signature, block_kind(carrier.marked, &carrier.target));
     }
+    // Owner ruling 68: an unsigned block for a Claude model gets no cached signature.
+    // CLIProxyAPI and OmniRoute both drop unsigned and invalid blocks.
+    if target == Provider::Claude {
+        return provider_compatible(target, raw, BlockKind::Unknown);
+    }
     if replay_cache::signature_cache_enabled() {
         if !raw.is_empty() {
             return provider_compatible(target, raw, BlockKind::Unknown);
@@ -408,11 +428,6 @@ fn resolve_thinking_signature(model: &str, text: &[u8], raw: &[u8]) -> Vec<u8> {
         if !text.is_empty() {
             let cached = replay_cache::cached_signature(model, text);
             if !cached.is_empty() {
-                if target == Provider::Claude {
-                    return compatible_antigravity_claude_thinking_signature(&cached)
-                        .map(String::into_bytes)
-                        .unwrap_or_default();
-                }
                 return cached;
             }
         }
@@ -431,9 +446,6 @@ fn bypass_signature(target: Provider, raw: &[u8]) -> Vec<u8> {
         return vec![];
     }
     match target {
-        Provider::Claude => compatible_antigravity_claude_thinking_signature(raw)
-            .map(String::into_bytes)
-            .unwrap_or_default(),
         Provider::Unknown => {
             let options = ClaudeValidation {
                 strict: replay_cache::signature_bypass_strict(),
@@ -1270,7 +1282,7 @@ fn function_tools(raw: &[u8], names: &HashMap<Vec<u8>, Vec<u8>>) -> Option<Vec<u
 /// common.SplitGeminiFunctionResponseTurns: function responses get their own user turn,
 /// and after a model turn with calls, response turns come before other user turns.
 pub(crate) fn split_function_response_turns(contents: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-    use crate::gemini::has_function_response;
+    use crate::gemini_gemini::has_function_response;
     if contents.is_empty() {
         return contents;
     }

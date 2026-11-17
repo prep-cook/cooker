@@ -4,10 +4,11 @@
 //! trailing CR dropped), MCP aliases are restored per line, and each blank line ends
 //! an event. The relay stops after the event carrying `message_stop`, so anything an
 //! upstream appends after the terminal event is never forwarded. A transport read
-//! failure before `message_stop` becomes Go's `unexpected EOF`.
+//! failure before the relay finished becomes Go's `unexpected EOF`; the unterminated line
+//! and event it cut are dropped.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
 use ck_core::exec::{ExecError, ExecStream, FailureScope};
@@ -17,7 +18,7 @@ use super::alias::{self, Reverse};
 use crate::rawjson;
 
 /// Go `bufio.Scanner` buffer limit (50 MB).
-const MAX_LINE: usize = 52_428_800;
+pub(super) const MAX_LINE: usize = 52_428_800;
 
 /// `observeClaudeStreamLine`.
 fn observe(line: &[u8], message_id: &mut String, completed: &mut bool) {
@@ -80,8 +81,9 @@ struct Relay {
     /// translated loop does, instead of waiting for the event's blank line.
     eager_terminal: bool,
     done: Option<OnComplete>,
-    /// Go's usage reporter: every upstream line, before alias restore.
-    usage: ck_core::exec::UsageSink,
+    /// Go's usage reporter: every upstream line, before alias restore. Kimi's old path only
+    /// (P8 removes it); the contract accounts from the canonical stream.
+    usage: Option<ck_core::exec::UsageSink>,
     /// Request logs: every scanner line before restore (`AppendAPIResponseChunk`) and
     /// the error that ends the stream (`RecordAPIResponseError`).
     capture: ck_core::exec::CaptureSink,
@@ -95,8 +97,10 @@ impl Relay {
         }
         observe(line, &mut self.message_id, &mut self.completed);
         // reporter.ObserveResponseModel and StreamUsageBuffer.ObserveClaudeStream.
-        self.usage.response_line(ck_core::format::Format::Claude, line);
-        self.capture.record(ck_core::exec::CaptureEvent::ResponseChunk(line));
+        if let Some(usage) = &self.usage {
+            usage.response_line(ck_core::format::Format::Claude, line);
+        }
+        crate::proxy::capture_line(&self.capture, line);
         let restored = match restore_line(line, &self.reverse) {
             Ok(restored) => restored,
             Err(message) => {
@@ -188,23 +192,24 @@ impl Relay {
     }
 
     fn end(&mut self, error: Option<ExecError>) {
-        // bufio.Scanner hands an unterminated final line to the split function on EOF
-        // and on read errors alike (atEOF is true once any error is set).
-        self.take_partial();
+        let Some(mut error) = error else {
+            // A clean end makes an unterminated final line the last line, as bufio.Scanner does.
+            self.take_partial();
+            if !self.finished {
+                self.flush();
+                self.finish();
+            }
+            return;
+        };
+        // A read error before the relay finished leaves the line and the event unterminated:
+        // neither is relayed, even when it carries `message_stop`, and the error ends the body.
         if self.finished {
             return;
         }
-        self.flush();
-        if !self.completed
-            && let Some(mut error) = error
-        {
-            if error.scope == FailureScope::Transport {
-                error.body = Bytes::from_static(b"unexpected EOF");
-            }
-            self.capture_error(&error);
-            self.ready.push_back(Err(error));
+        if error.scope == FailureScope::Transport {
+            error.body = Bytes::from_static(b"unexpected EOF");
         }
-        self.finish();
+        self.fail(error);
     }
 }
 
@@ -215,7 +220,7 @@ pub(crate) fn relay(
     body: ExecStream,
     reverse: Arc<Reverse>,
     done: OnComplete,
-    usage: ck_core::exec::UsageSink,
+    usage: Option<ck_core::exec::UsageSink>,
     capture: ck_core::exec::CaptureSink,
 ) -> ExecStream {
     relay_with(body, reverse, done, false, usage, capture)
@@ -226,7 +231,7 @@ pub(crate) fn relay_translated(
     body: ExecStream,
     reverse: Arc<Reverse>,
     done: OnComplete,
-    usage: ck_core::exec::UsageSink,
+    usage: Option<ck_core::exec::UsageSink>,
     capture: ck_core::exec::CaptureSink,
 ) -> ExecStream {
     relay_with(body, reverse, done, true, usage, capture)
@@ -237,7 +242,7 @@ fn relay_with(
     reverse: Arc<Reverse>,
     done: OnComplete,
     eager_terminal: bool,
-    usage: ck_core::exec::UsageSink,
+    usage: Option<ck_core::exec::UsageSink>,
     capture: ck_core::exec::CaptureSink,
 ) -> ExecStream {
     let relay = Relay {
@@ -270,6 +275,41 @@ fn relay_with(
         }
     })
     .boxed()
+}
+
+/// A buffered cloaked body, the one body the Claude relay collects (owner ruling Q20): the
+/// old route restores its tool aliases and reads its message ID from the whole JSON. Its heap
+/// bytes charge the exchange's stream quota like codec bookkeeping, so past the limit
+/// ck-stream ends the response stream with `StorageExhausted` and the attempt fails as
+/// contract §9 states, with no fallback.
+pub(super) fn collected(
+    mut body: ExecStream,
+    response: &mut ck_stream::Writer,
+    reverse: Arc<Reverse>,
+    seen: Arc<Mutex<Option<String>>>,
+) -> ExecStream {
+    let permit = response.reserve_metadata(0);
+    let collect = async move {
+        let mut permit = permit.map_err(|e| crate::pipeline::stored(&e))?;
+        let mut data = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            let len = data.len() + chunk.len();
+            if len > data.capacity() {
+                let capacity = len.max(2 * data.capacity());
+                permit.resize(capacity).map_err(|e| crate::pipeline::stored(&e))?;
+                data.reserve_exact(capacity - data.len());
+            }
+            data.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&data);
+        // The old route completes with the top-level `id`; the ingress commits it at `done`.
+        *seen.lock().expect("message id") = Some(rawjson::string(&text, "id").trim().to_owned());
+        let restored = alias::restore_response(&text, &reverse)
+            .map_err(|m| super::plain_error(format!("restore Claude OAuth tool name from response: {m}")))?;
+        Ok(Bytes::from(restored))
+    };
+    futures_util::stream::once(collect).boxed()
 }
 
 /// `validateClaudeStreamingResponse` for buffered SSE behind a non-stream client.
@@ -351,9 +391,9 @@ mod tests {
         futures_util::stream::iter(items.into_iter().map(|r| r.map(Bytes::from_static))).boxed()
     }
 
-    /// Request logs: every scanner line before restore, then Go's
+    /// Request logs: every terminated line before restore, then Go's
     /// RecordAPIResponseError for the scanner error (`unexpected EOF`) or the restore
-    /// failure that ends the stream.
+    /// failure that ends the stream. A line the error cut is not a line.
     #[tokio::test]
     async fn request_logs_record_lines_then_the_ending_error() {
         let run = |body: ExecStream, reverse: Arc<Reverse>| async move {
@@ -376,10 +416,9 @@ mod tests {
         assert_eq!(
             run(broken, Arc::default()).await,
             [
-                "chunk event: ping",
-                "chunk data: {}",
-                "chunk ",
-                "chunk partial",
+                "chunk event: ping\n",
+                "chunk data: {}\n",
+                "chunk \n",
                 "error unexpected EOF"
             ]
         );
@@ -464,27 +503,83 @@ mod tests {
             ]
         );
         assert_eq!(done.lock().unwrap().as_deref(), Some("msg_1"));
+    }
 
-        let body = chunks(vec![
-            Ok(b"event: content_block_delta\ndata: {}\n\nevent: x\ndata: {"),
-            Err(ExecError::local(
-                502,
-                FailureScope::Transport,
-                "upstream request failed",
-            )),
-        ]);
-        let out: Vec<_> = relay(
-            body,
-            Arc::default(),
-            Box::new(|_| panic!("not completed")),
-            Default::default(),
-            Default::default(),
-        )
-        .collect()
-        .await;
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[1].as_ref().unwrap().as_ref(), b"event: x\ndata: {\n");
-        assert_eq!(out[2].as_ref().unwrap_err().body.as_ref(), b"unexpected EOF");
+    /// A read error drops the line and the event it cut, `message_stop` included, and ends
+    /// the body with `unexpected EOF`; only a relay that already finished ignores it.
+    /// Rows: bytes before the error, translated relay, events relayed, error reported.
+    #[tokio::test]
+    async fn a_read_error_drops_the_unterminated_line_and_event() {
+        const DELTA: &[u8] = b"event: content_block_delta\ndata: {}\n\n";
+        type Row = (&'static [u8], bool, &'static [&'static [u8]], bool);
+        let rows: [Row; 6] = [
+            (
+                b"event: content_block_delta\ndata: {}\n\nevent: x\ndata: {",
+                false,
+                &[DELTA],
+                true,
+            ),
+            (
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}",
+                false,
+                &[],
+                true,
+            ),
+            (
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}",
+                true,
+                &[],
+                true,
+            ),
+            (
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n",
+                false,
+                &[],
+                true,
+            ),
+            (
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n",
+                true,
+                &[b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n"],
+                false,
+            ),
+            (
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                false,
+                &[b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"],
+                false,
+            ),
+        ];
+        for (input, translated, want, failed) in rows {
+            let body = chunks(vec![
+                Ok(input),
+                Err(ExecError::local(
+                    502,
+                    FailureScope::Transport,
+                    "upstream request failed",
+                )),
+            ]);
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = completed.clone();
+            let done: OnComplete = Box::new(move |_| seen.store(true, std::sync::atomic::Ordering::Relaxed));
+            let relayed = match translated {
+                true => relay_translated(body, Arc::default(), done, None, Default::default()),
+                false => relay(body, Arc::default(), done, None, Default::default()),
+            };
+            let out: Vec<_> = relayed.collect().await;
+            let row = String::from_utf8_lossy(input);
+            let events: Vec<&[u8]> = out.iter().filter_map(|r| r.as_ref().ok()).map(|b| b.as_ref()).collect();
+            assert_eq!(events, want, "{row:?} translated={translated}");
+            let errors: Vec<&[u8]> = out
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .map(|e| e.body.as_ref())
+                .collect();
+            let want_errors: &[&[u8]] = if failed { &[b"unexpected EOF"] } else { &[] };
+            assert_eq!(errors, want_errors, "{row:?} translated={translated}");
+            let finished = completed.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(finished, !failed, "{row:?} translated={translated}: completion");
+        }
     }
 
     #[tokio::test]
@@ -500,7 +595,7 @@ mod tests {
             body,
             Arc::new(reverse),
             Box::new(|_| {}),
-            ck_core::exec::UsageSink::new(usage.clone()),
+            Some(ck_core::exec::UsageSink::new(usage.clone())),
             Default::default(),
         )
         .map(Result::unwrap)

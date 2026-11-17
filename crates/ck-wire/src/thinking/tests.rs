@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use ck_core::registry::ThinkingSupport;
 use serde_json::Value;
 
+use super::apply::run;
 use super::*;
 
 type LookupTable = Vec<(String, String, Option<ModelCaps>)>;
@@ -174,7 +175,7 @@ fn replay(fn_name: &str, input: &Value) -> Option<Value> {
         "apply_summary" => {
             let info = caps(&input["info"]);
             enc(&summary::apply_summary_config_for_provider(
-                &b(&input["body"]),
+                b(&input["body"]),
                 s(&input["format"]),
                 s(&input["model"]),
                 s(&input["provider"]),
@@ -191,7 +192,7 @@ fn replay(fn_name: &str, input: &Value) -> Option<Value> {
             &b(&input["body"]),
             s(&input["provider"]),
         )),
-        "strip_thinking" => enc(&strip_thinking_config(&b(&input["body"]), s(&input["provider"]))),
+        "strip_thinking" => enc(&strip_thinking_config(b(&input["body"]), s(&input["provider"]))),
         "parse_suffix" => {
             let r = parse_suffix(s(input));
             serde_json::json!({"model_name": r.model_name, "has_suffix": r.has_suffix, "raw_suffix": r.raw_suffix})
@@ -200,7 +201,7 @@ fn replay(fn_name: &str, input: &Value) -> Option<Value> {
             let info = caps(&input["info"]);
             match apply_provider(
                 s(&input["provider"]),
-                &b(&input["body"]),
+                b(&input["body"]),
                 &config(&input["config"]),
                 info.as_ref(),
             )
@@ -226,7 +227,7 @@ fn replay(fn_name: &str, input: &Value) -> Option<Value> {
 
 #[test]
 fn replays_every_go_thinking_call() {
-    let ran = replay_all(crate::go_calls().map(str::to_owned));
+    let ran = replay_all(crate::go_calls().map(str::to_owned), "calls");
     assert!(ran["apply_thinking"] > 300, "{ran:?}");
     assert!(ran["applier"] > 200 && ran["validate_config"] > 200, "{ran:?}");
 }
@@ -238,39 +239,131 @@ fn replays_go_thinking_matrix() {
     use std::io::BufRead;
     let gz = include_bytes!("../../tests/fixtures/go_thinking_matrix.jsonl.gz");
     let lines = std::io::BufReader::new(flate2::read::GzDecoder::new(&gz[..])).lines();
-    let ran = replay_all(lines.map(Result::unwrap));
+    let ran = replay_all(lines.map(Result::unwrap), "matrix");
     assert_eq!(ran["applier"], 17868, "{ran:?}");
     assert_eq!(ran["apply_thinking"], 8064, "{ran:?}");
 }
 
-fn replay_all(lines: impl Iterator<Item = String>) -> std::collections::BTreeMap<String, usize> {
+/// Runs `f` with the model lookups `record` recorded.
+fn with_lookups<T>(record: &Value, f: impl FnOnce() -> T) -> T {
+    let table = record["lookups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            (
+                s(&l["model"]).to_owned(),
+                s(&l["provider"]).to_owned(),
+                caps(&l["info"]),
+            )
+        })
+        .collect();
+    LOOKUPS.with(|l| *l.borrow_mut() = Some(table));
+    MISSED.with(|m| m.borrow_mut().clear());
+    let out = f();
+    LOOKUPS.with(|l| *l.borrow_mut() = None);
+    out
+}
+
+/// Every recorded pipeline call with its body as its own source: `run` reads the source before
+/// it edits the body, so naming the body (`None`) gives what borrowing a copy gives.
+#[test]
+fn the_body_as_its_own_source_matches_a_copy() {
+    use std::io::BufRead;
+    let gz = include_bytes!("../../tests/fixtures/go_thinking_matrix.jsonl.gz");
+    let matrix = std::io::BufReader::new(flate2::read::GzDecoder::new(&gz[..])).lines();
+    let mut compared = 0;
+    for line in crate::go_calls().map(str::to_owned).chain(matrix.map(Result::unwrap)) {
+        let record: Value = serde_json::from_str(&line).unwrap();
+        if record["fn"] != "apply_thinking" {
+            continue;
+        }
+        let input = &record["in"];
+        let (body, info) = (b(&input["body"]), caps(&input["info"]));
+        let resolved = input["resolved"].as_bool().unwrap().then_some(info.as_ref());
+        let think = |source: Option<&[u8]>| {
+            with_lookups(&record, || {
+                run(
+                    body.clone(),
+                    source,
+                    s(&input["model"]),
+                    s(&input["from"]),
+                    s(&input["to"]),
+                    s(&input["provider"]),
+                    resolved,
+                    summary(&input["summary"]),
+                    input["updates_changed"].as_bool().unwrap(),
+                )
+                .map_err(|e| (e.message, e.body))
+            })
+        };
+        assert_eq!(think(None), think(Some(&body)), "{input}");
+        compared += 1;
+    }
+    assert!(compared > 8_000, "{compared}");
+}
+
+/// A body the thinking leaves as is comes back in the same allocation, with nothing copied: no
+/// thinking config, and a summary for a model without thinking but no effort to strip.
+#[test]
+fn an_unchanged_body_is_handed_back() {
+    let thinking = ModelCaps {
+        id: "gpt-5".into(),
+        kind: "openai".into(),
+        thinking: Some(ThinkingSupport {
+            levels: vec!["low".into(), "high".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let plain = ModelCaps {
+        thinking: None,
+        ..thinking.clone()
+    };
+    let text = "x".repeat(200_000);
+    for (info, extra) in [(&thinking, ""), (&plain, r#","reasoning":{"summary":"auto"}"#)] {
+        let body = format!(
+            r#"{{"model":"gpt-5","input":[{{"type":"message","role":"user","content":"{text}"}}],"stream":true{extra}}}"#
+        )
+        .into_bytes();
+        let (address, len) = (body.as_ptr(), body.len());
+        let request = RequestThinking {
+            payload: None,
+            original: None,
+            model: "gpt-5",
+            from: "codex",
+            to: "codex",
+            provider: "meta",
+            resolved: Some(Some(info)),
+            has_request_transformer: false,
+            updates_changed: false,
+        };
+        let before = crate::alloc_count::bytes();
+        let out = apply_request_thinking(&request, body).unwrap();
+        let spent = crate::alloc_count::bytes() - before;
+        assert_eq!((out.as_ptr(), out.len()), (address, len), "{extra}");
+        assert!(
+            spent < len / 20,
+            "{extra}: {spent} bytes allocated for a {len}-byte body"
+        );
+    }
+}
+
+fn replay_all(lines: impl Iterator<Item = String>, suite: &str) -> std::collections::BTreeMap<String, usize> {
+    // The 2026-11-15 owner ruling replaces these Go effort outcomes, not their inputs.
+    let snapping: Value = serde_json::from_str(include_str!("../../tests/fixtures/thinking_level_snap.json")).unwrap();
     let mut ran = std::collections::BTreeMap::<String, usize>::new();
     let mut failures = Vec::new();
-    for line in lines {
+    for (index, line) in lines.enumerate() {
         let line = line.as_str();
         let record: Value = serde_json::from_str(line).unwrap();
         let fn_name = s(&record["fn"]).to_owned();
-        let table = record["lookups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| {
-                (
-                    s(&l["model"]).to_owned(),
-                    s(&l["provider"]).to_owned(),
-                    caps(&l["info"]),
-                )
-            })
-            .collect();
-        LOOKUPS.with(|l| *l.borrow_mut() = Some(table));
-        MISSED.with(|m| m.borrow_mut().clear());
-        let got = replay(&fn_name, &record["in"]);
-        LOOKUPS.with(|l| *l.borrow_mut() = None);
+        let got = with_lookups(&record, || replay(&fn_name, &record["in"]));
         let Some(got) = got else { continue };
         *ran.entry(fn_name.clone()).or_default() += 1;
-        let want = record["out"].clone();
+        let want = snapping[suite].get(index.to_string()).unwrap_or(&record["out"]);
         let missed = MISSED.with(|m| m.borrow().clone());
-        if got != want || !missed.is_empty() {
+        if &got != want || !missed.is_empty() {
             failures.push(format!(
                 "{fn_name}\n  in:   {}\n  want: {want}\n  got:  {got}\n  unrecorded lookups: {missed:?}",
                 record["in"]
@@ -299,25 +392,201 @@ fn kimi_thread_request_vectors() {
         let (from, to) = (s(&v["from"]), s(&v["to"]));
         // Go's registry: only the Codex target registers translators from these formats.
         let has_request_transformer = to == "codex" && matches!(from, "openai" | "openai-response");
-        let got = apply_request_thinking(&RequestThinking {
-            body: input,
-            payload: input,
-            original: input,
-            model: s(&v["model"]),
-            from,
-            to,
-            provider: "kimi",
-            resolved: None,
-            has_request_transformer,
-            updates_changed: false,
-        });
-        match v["err"].as_str() {
-            Some(want) => assert_eq!(got.unwrap_err().message, want, "{v}"),
-            None => assert_eq!(got.unwrap(), s(&v["out"]).as_bytes(), "{v}"),
+        // The same request with its payload and original borrowed, and named as the body.
+        for source in [Some(input), None] {
+            let request = RequestThinking {
+                payload: source,
+                original: source,
+                model: s(&v["model"]),
+                from,
+                to,
+                provider: "kimi",
+                resolved: None,
+                has_request_transformer,
+                updates_changed: false,
+            };
+            let got = apply_request_thinking(&request, input.to_vec());
+            match v["err"].as_str() {
+                Some(want) => assert_eq!(got.unwrap_err().message, want, "{v}"),
+                None => assert_eq!(got.unwrap(), s(&v["out"]).as_bytes(), "{v}"),
+            }
         }
         count += 1;
     }
     assert_eq!(count, 16);
+}
+
+#[test]
+fn reasoning_levels_snap_to_model_support() {
+    for (levels, requested, expected) in [
+        (&["high", "xhigh"][..], "minimal", "high"),
+        (&["high", "xhigh"][..], "low", "high"),
+        (&["high", "xhigh"][..], "max", "xhigh"),
+        (&["high", "xhigh"][..], "high", "high"),
+        (&["minimal", "high", "xhigh", "max"][..], "medium", "high"),
+        (&["minimal", "high", "xhigh", "max"][..], "low", "minimal"),
+        (&["high", "low"][..], "medium", "low"),
+    ] {
+        let info = ModelCaps {
+            kind: "openai".into(),
+            thinking: Some(ThinkingSupport {
+                levels: levels.iter().map(|level| (*level).into()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for from in ["openai", "claude"] {
+            for from_suffix in [false, true] {
+                assert_eq!(
+                    validate_config(Config::level(requested), Some(&info), from, "openai", from_suffix),
+                    Ok(Config::level(expected)),
+                    "{levels:?}: {requested}, {from}, suffix={from_suffix}"
+                );
+            }
+        }
+    }
+    for (levels, input, expected) in [
+        (
+            &["high", "xhigh"][..],
+            Config::level("ultra"),
+            Err(ErrorCode::UnknownLevel),
+        ),
+        (&["high", "xhigh"][..], Config::level(""), Err(ErrorCode::UnknownLevel)),
+        (&[][..], Config::level("minimal"), Ok(Config::level("minimal"))),
+        (&["high", "xhigh"][..], Config::none(), Ok(Config::none())),
+        (&["high", "xhigh"][..], Config::auto(), Ok(Config::auto())),
+    ] {
+        let info = ModelCaps {
+            kind: "openai".into(),
+            thinking: Some(ThinkingSupport {
+                zero_allowed: true,
+                dynamic_allowed: true,
+                levels: levels.iter().map(|level| (*level).into()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for from in ["openai", "claude"] {
+            assert_eq!(
+                validate_config(input.clone(), Some(&info), from, "openai", false).map_err(|e| e.code.unwrap()),
+                expected,
+                "{levels:?}: {input:?}, {from}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gemini_thinking_level_case_follows_the_target_provider() {
+    let gemini_body =
+        |level: &str| format!(r#"{{"generationConfig":{{"thinkingConfig":{{"thinkingLevel":"{level}"}}}}}}"#);
+    let levels = |kind: &str, levels: &[&str]| ModelCaps {
+        id: "m".into(),
+        kind: kind.into(),
+        thinking: Some(ThinkingSupport {
+            levels: levels.iter().map(|level| (*level).into()).collect(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    // (source level, target, target body, model levels, output path, expected spelling)
+    for (level, to, target_body, supported, path, expected) in [
+        (
+            "HIGH",
+            "openai",
+            r#"{"model":"m"}"#,
+            &["low", "medium", "high"][..],
+            "/reasoning_effort",
+            "high",
+        ),
+        (
+            "High",
+            "openai",
+            r#"{"model":"m"}"#,
+            &["low", "medium", "high"][..],
+            "/reasoning_effort",
+            "high",
+        ),
+        (
+            "HIGH",
+            "claude",
+            r#"{"model":"m"}"#,
+            &["low", "medium", "high"][..],
+            "/output_config/effort",
+            "high",
+        ),
+        (
+            "HIGH",
+            "kimi",
+            r#"{"model":"m"}"#,
+            &["low", "medium", "high"][..],
+            "/thinking/effort",
+            "high",
+        ),
+        (
+            "MINIMAL",
+            "openai",
+            r#"{"model":"m"}"#,
+            &["low", "high"][..],
+            "/reasoning_effort",
+            "low",
+        ),
+        (
+            "HIGH",
+            "gemini",
+            r#"{"generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}}"#,
+            &["low", "high"][..],
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "HIGH",
+        ),
+        (
+            "high",
+            "gemini",
+            r#"{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}"#,
+            &["low", "high"][..],
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "high",
+        ),
+    ] {
+        let info = levels(to, supported);
+        let source = gemini_body(level);
+        let request = RequestThinking {
+            payload: Some(source.as_bytes()),
+            original: Some(source.as_bytes()),
+            model: "m",
+            from: "gemini",
+            to,
+            provider: to,
+            resolved: Some(Some(&info)),
+            has_request_transformer: true,
+            updates_changed: false,
+        };
+        let out = apply_request_thinking(&request, target_body.as_bytes().to_vec()).unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            out.pointer(path).and_then(Value::as_str),
+            Some(expected),
+            "{level} -> {to}: {out}"
+        );
+    }
+    // An unknown level is still refused, whatever its case.
+    for level in ["ULTRA", "ultra"] {
+        let info = levels("openai", &["low", "high"]);
+        let source = gemini_body(level);
+        let request = RequestThinking {
+            payload: Some(source.as_bytes()),
+            original: Some(source.as_bytes()),
+            model: "m",
+            from: "gemini",
+            to: "openai",
+            provider: "openai",
+            resolved: Some(Some(&info)),
+            has_request_transformer: true,
+            updates_changed: false,
+        };
+        let err = apply_request_thinking(&request, br#"{"model":"m"}"#.to_vec()).unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::UnknownLevel), "{level}");
+    }
 }
 
 #[test]

@@ -122,6 +122,12 @@ pub struct Runtime {
     managed_config: std::sync::atomic::AtomicBool,
     /// The model routers' benchmarks and conversation bindings ([`crate::inference::model_router`]).
     pub(crate) model_router: crate::inference::model_router::State,
+    /// The stream store, committed stream handles and stream tasks.
+    streams: crate::inference::streams::Registry,
+    /// Test hook ([`crate::testing::passthrough_media_relay`]): WebRTC calls use a media relay
+    /// that hands offers and answers through unchanged.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) passthrough_media_relay: std::sync::atomic::AtomicBool,
 }
 
 /// The Codex refresh transactions under a credential file's lock: shutdown stops the
@@ -173,11 +179,30 @@ impl Runtime {
 
     /// Installs a cooldown backend before restoring state, including test backends.
     pub fn with_cooldown_backend(
+        config: Config,
+        credentials: Vec<Credential>,
+        executors: Executors,
+        db: Arc<crate::store::credential_store::CredentialDb>,
+        backend: Arc<dyn crate::store::cooldown_store::Backend>,
+    ) -> Self {
+        Self::build(
+            config,
+            credentials,
+            executors,
+            db,
+            backend,
+            #[cfg(any(test, feature = "testing"))]
+            None,
+        )
+    }
+
+    pub(crate) fn build(
         mut config: Config,
         credentials: Vec<Credential>,
         executors: Executors,
         db: Arc<crate::store::credential_store::CredentialDb>,
         backend: Arc<dyn crate::store::cooldown_store::Backend>,
+        #[cfg(any(test, feature = "testing"))] clock: Option<Arc<crate::testing::SchedulerClock>>,
     ) -> Self {
         config.auth_dir = db.auth_dir();
         let mut policy = crate::management::api::policy(&config);
@@ -208,7 +233,14 @@ impl Runtime {
             config_commit: Mutex::default(),
             managed_config: Default::default(),
             model_router: Default::default(),
+            streams: Default::default(),
+            #[cfg(any(test, feature = "testing"))]
+            passthrough_media_relay: Default::default(),
         };
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(clock) = clock {
+            assert!(rt.store.clock.set(clock).is_ok());
+        }
         rt.publish_policy(policy);
         rt.store.set_cooldown_backend(backend);
         rt.store.configure_cooldown_store(cooldown_dir);
@@ -219,6 +251,11 @@ impl Runtime {
             .session_closer
             .set(Box::new(rt.executors.credential_session_closer()));
         rt
+    }
+
+    /// The stream store and the committed streams a resume attaches to.
+    pub fn streams(&self) -> &crate::inference::streams::Registry {
+        &self.streams
     }
 
     /// The usage queue: the request path calls `enqueue` with one serialized Go
@@ -374,7 +411,7 @@ impl Runtime {
         let (enabled, strict) = signature_cache_config(&config);
         ck_translate::set_antigravity_signature_cache_config(enabled, strict);
         let dir = cooldown_dir(&config, &policy);
-        let ws_auth = crate::realtime::aistudio_relay::ws_auth(&config);
+        let relay_keys = crate::realtime::aistudio_relay::relay_keys(&config);
         let config = Arc::new(config);
         // Commits are serialized, so the catalogs are configured in commit order; the
         // config lock itself is released first, as Go releases cfgMu before
@@ -396,9 +433,8 @@ impl Runtime {
         if let Some(catalogs) = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
             catalogs.configure(&config, false);
         }
-        // Go's websocket auth change handler: turning ws-auth on ends the relay sessions
-        // that connected without a key.
-        if ws_auth && !crate::realtime::aistudio_relay::ws_auth(&previous) {
+        // A changed relay key list ends the sessions registered under the old one.
+        if relay_keys != crate::realtime::aistudio_relay::relay_keys(&previous) {
             self.executors.google.aistudio.relay.stop();
         }
         self.store.configure_cooldown_store(dir);
@@ -622,6 +658,7 @@ impl Runtime {
     pub fn begin_shutdown(&self) {
         self.codex_refreshes.admission_closed.cancel();
         self.stop_auto_refresh();
+        self.streams.begin_shutdown();
     }
 
     pub async fn shutdown_codex_refreshes(&self) {
@@ -632,6 +669,7 @@ impl Runtime {
 
     pub async fn finish_shutdown(&self) -> anyhow::Result<()> {
         self.begin_shutdown();
+        let streams = self.streams.finish_shutdown().await;
         self.codex_refreshes.shutdown.cancel();
         self.codex_refreshes.tasks.close();
         self.codex_refreshes.tasks.wait().await;
@@ -659,7 +697,7 @@ impl Runtime {
         // A recovered required projection can queue normalization during settlement.
         self.store.persistence_tasks.wait().await;
         match settled {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => streams.map_err(|error| anyhow::anyhow!("stream storage shutdown failed: {error}")),
             // An unresolved publication keeps its recovery workspace; a lost cooldown
             // checkpoint alone has nothing left to recover.
             Ok(Err(error)) => Err(error.context("configuration shutdown incomplete")),
@@ -739,7 +777,7 @@ impl Runtime {
             .ok_or_else(|| {
                 ExecError::local(
                     409,
-                    FailureScope::Request,
+                    FailureScope::Credential,
                     "credential removed or disabled during preparation",
                 )
             })?;
@@ -748,7 +786,7 @@ impl Runtime {
         if !management && self.store.tokens_refused(&current) {
             return Err(ExecError::local(
                 401,
-                FailureScope::Request,
+                FailureScope::Credential,
                 "credential tokens were refused; sign in again",
             ));
         }
@@ -831,7 +869,7 @@ impl Runtime {
         if current.disabled {
             return Err(ExecError::local(
                 409,
-                FailureScope::Request,
+                FailureScope::Credential,
                 "credential disabled during preparation",
             ));
         }
@@ -1706,6 +1744,8 @@ pub struct CredentialStore {
     inner: RwLock<Inner>,
     policy: RwLock<Arc<Policy>>,
     scheduler: Mutex<Scheduler>,
+    #[cfg(any(test, feature = "testing"))]
+    clock: std::sync::OnceLock<Arc<crate::testing::SchedulerClock>>,
     attempts: AtomicU64,
     stats: [AtomicU64; 3],
     prepare_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -1888,6 +1928,8 @@ impl CredentialStore {
             inner: RwLock::new(inner),
             policy: RwLock::new(Arc::new(Policy::default())),
             scheduler: Mutex::default(),
+            #[cfg(any(test, feature = "testing"))]
+            clock: Default::default(),
             attempts: AtomicU64::new(0),
             stats: Default::default(),
             prepare_locks: Mutex::default(),
@@ -1909,6 +1951,22 @@ impl CredentialStore {
             session_closer: std::sync::OnceLock::new(),
             registrations: Mutex::new(registrations),
         })
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(clock) = self.clock.get() {
+            return clock.now();
+        }
+        Instant::now()
+    }
+
+    fn wall(&self) -> std::time::SystemTime {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(clock) = self.clock.get() {
+            return clock.wall();
+        }
+        std::time::SystemTime::now()
     }
 
     pub fn credential_backend(&self) -> Arc<crate::store::credential_store::CredentialDb> {
@@ -2134,7 +2192,7 @@ impl CredentialStore {
             let policy = self.policy.read().unwrap_or_else(PoisonError::into_inner).clone();
             let inner = self.read();
             let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-            let (now, wall) = (Instant::now(), std::time::SystemTime::now());
+            let (now, wall) = (self.now(), self.wall());
             for record in &records {
                 let Some(c) = inner.creds.iter().find(|c| c.id == record.auth_id.trim()) else {
                     continue;
@@ -2162,12 +2220,12 @@ impl CredentialStore {
             return;
         }
         let writer = self.cooldown_write.lock().unwrap_or_else(PoisonError::into_inner);
-        let wall = std::time::SystemTime::now();
+        let wall = self.wall();
         let mut records = {
             let policy = self.policy.read().unwrap_or_else(PoisonError::into_inner).clone();
             let inner = self.read();
             let scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-            let now = Instant::now();
+            let now = self.now();
             inner
                 .creds
                 .iter()
@@ -2347,7 +2405,7 @@ impl CredentialStore {
             return false;
         }
         let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
+        let now = self.now();
         let mut cleared = false;
         for id in replaced {
             cleared |= scheduler.clear_unauthorized(id, now);
@@ -2408,7 +2466,7 @@ impl CredentialStore {
     ) -> Result<Lease, AcquireError> {
         let allowed = |c: &Credential| (!self.grant_blocks(c)).then(|| admit(c)).flatten();
         let admit: &Admit<'_> = &allowed;
-        let now = Instant::now();
+        let now = self.now();
         let credential = {
             let inner = self.read();
             let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2439,7 +2497,7 @@ impl CredentialStore {
     pub fn suspension(&self, credential: &Credential, model: &str) -> crate::scheduling::registry::Suspension {
         use crate::scheduling::registry::Suspension;
         let scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
+        let now = self.now();
         let live = |m: &str| {
             scheduler
                 .cooldowns
@@ -2468,7 +2526,7 @@ impl CredentialStore {
     pub fn blocked(&self, credential: &Credential, model: &str) -> bool {
         let scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
         self.grant_blocks(credential)
-            || scheduler.cooling(credential, model, Instant::now())
+            || scheduler.cooling(credential, model, self.now())
             || scheduler.tokens_rejected(credential)
     }
 
@@ -2547,7 +2605,7 @@ impl CredentialStore {
         attempted: &[String],
         admit: &Admit<'_>,
     ) -> Option<Duration> {
-        self.retry_wait_at(selection, policy, status, attempted, admit, Instant::now())
+        self.retry_wait_at(selection, policy, status, attempted, admit, self.now())
     }
 
     fn retry_wait_at(
@@ -2599,7 +2657,7 @@ impl CredentialStore {
         self.scheduler
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .accept_probe_picked(&lease.credential, &lease.execution_model, lease.picked, Instant::now());
+            .accept_probe_picked(&lease.credential, &lease.execution_model, lease.picked, self.now());
     }
 
     fn record(&self, lease: &Lease, outcome: &Outcome) {
@@ -2624,7 +2682,7 @@ impl CredentialStore {
             .iter()
             .any(|c| c.id == lease.credential.id && c.revision == lease.credential.revision)
         {
-            let (now, wall) = (Instant::now(), std::time::SystemTime::now());
+            let (now, wall) = (self.now(), self.wall());
             let persist = self
                 .cooldown_dir
                 .read()
@@ -3596,7 +3654,7 @@ impl CredentialStore {
         self.scheduler
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .cooldowns_of(id, Instant::now())
+            .cooldowns_of(id, self.now())
     }
 
     /// Clears the cooldowns of one credential (Go `Manager.ResetQuota`); returns the
@@ -6028,7 +6086,7 @@ pub(crate) mod tests {
         rt.store.reconcile(Vec::new());
         drop(guard);
         let error = worker.await.unwrap().unwrap_err();
-        assert_eq!(error.scope, FailureScope::Request);
+        assert_eq!(error.scope, FailureScope::Credential);
         assert!(rt.store.snapshot().is_empty());
         rt.start_auto_refresh();
         let first = rt.refresh_task.lock().unwrap().clone().unwrap();

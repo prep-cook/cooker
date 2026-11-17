@@ -1482,6 +1482,7 @@ async fn ordinary_http_reads_and_write_responses_mask_every_secret() {
         "header-http-secret",
         "proxy-http-secret",
         "github-http-secret",
+        "relay-http-secret",
     ];
     for (path, body) in [(
         "/admin/v1/r/provider/main",
@@ -1494,14 +1495,24 @@ async fn ordinary_http_reads_and_write_responses_mask_every_secret() {
             assert!(!text.contains(secret));
         }
     }
-    let response = f
-        .request(wreq::Method::PATCH, "/admin/v1/r/setting/server")
-        .json(&json!({"github-token": secrets[3]}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    assert!(!response.text().await.unwrap().contains(secrets[3]));
+    for (method, path, body, secret) in [
+        (
+            wreq::Method::PATCH,
+            "/admin/v1/r/setting/server",
+            json!({"github-token": secrets[3]}),
+            secrets[3],
+        ),
+        (
+            wreq::Method::PUT,
+            "/admin/v1/r/setting/oauth",
+            json!({"spec": {"providers": {"aistudio": {"relay-keys": [secrets[4]]}}}}),
+            secrets[4],
+        ),
+    ] {
+        let response = f.request(method, path).json(&body).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+        assert!(!response.text().await.unwrap().contains(secret), "{path}");
+    }
     let head = f.head();
     for path in [
         "/admin/v1/r/provider".to_owned(),

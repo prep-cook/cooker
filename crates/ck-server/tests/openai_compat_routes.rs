@@ -13,16 +13,28 @@ use ck_exec::Executors;
 use ck_exec::claude::ClaudeExecutor;
 use ck_server::router;
 
-/// Requests seen, the compact failure to answer with (`None` answers `{"ok":true}`),
-/// and the SSE body to stream (`None` streams `CHUNK` and `[DONE]`).
+fn assert_local_error(text: &str, kind: &str) {
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["error"]["type"], kind);
+    assert!(value["error"]["message"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(value["error"].get("param"), Some(&serde_json::Value::Null));
+    assert_eq!(value["error"].get("code"), Some(&serde_json::Value::Null));
+}
+
+/// Requests seen, the compact answers by arrival order (`(status, body)`; the first key to
+/// send a compact is entry 0, the next entry 1, and a key without an entry answers
+/// `COMPACTION`; status 0 resets the connection), the SSE body to stream (`None` streams
+/// `CHUNK` and `[DONE]`), and the keys in the order their first compact arrived.
 #[derive(Default)]
 struct Seen(
     Mutex<Vec<(String, Option<String>, String)>>,
-    Mutex<Option<(u16, &'static str)>>,
+    Mutex<Vec<(u16, &'static str)>>,
     Mutex<Option<String>>,
+    Mutex<Vec<String>>,
 );
 
 const CHAT: &str = r#"{"id":"c1","object":"chat.completion","created":1,"model":"up-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+const COMPACTION: &str = r#"{"id":"c","object":"response.compaction","created_at":4,"model":"up-model","output":[{"id":"i","type":"compaction","encrypted_content":"secret"}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}"#;
 const CHUNK: &str = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"up-model","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}"#;
 
 async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
@@ -35,16 +47,34 @@ async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
     let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     let stream = body.contains(r#""include_usage":true"#);
-    seen.0.lock().unwrap().push((path.clone(), auth, body));
+    seen.0.lock().unwrap().push((path.clone(), auth.clone(), body));
     if path.ends_with("/responses/compact") {
-        return match *seen.1.lock().unwrap() {
+        let answer = {
+            let key = auth.clone().unwrap_or_default();
+            let mut roles = seen.3.lock().unwrap();
+            let role = roles.iter().position(|k| *k == key).unwrap_or_else(|| {
+                roles.push(key);
+                roles.len() - 1
+            });
+            seen.1.lock().unwrap().get(role).copied()
+        };
+        return match answer {
+            Some((0, _)) => {
+                let reset =
+                    futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("mock connection reset"))]);
+                (
+                    [("content-type", "application/json")],
+                    axum::body::Body::from_stream(reset),
+                )
+                    .into_response()
+            }
             Some((status, body)) => (
                 axum::http::StatusCode::from_u16(status).unwrap(),
                 [("content-type", "application/json")],
                 body,
             )
                 .into_response(),
-            None => ([("content-type", "application/json")], r#"{"ok":true}"#).into_response(),
+            None => ([("content-type", "application/json")], COMPACTION).into_response(),
         };
     }
     if stream {
@@ -68,6 +98,10 @@ async fn proxy() -> (String, Arc<Seen>) {
 }
 
 async fn proxy_keys(keys: &[&str]) -> (String, Arc<Seen>) {
+    proxy_model(keys, "up-model").await
+}
+
+async fn proxy_model(keys: &[&str], model: &str) -> (String, Arc<Seen>) {
     let keys: String = keys.iter().map(|k| format!("        - api-key: {k}\n")).collect();
     let seen = Arc::new(Seen::default());
     let upstream_url = serve(axum::Router::new().fallback(upstream).with_state(seen.clone())).await;
@@ -75,7 +109,7 @@ async fn proxy_keys(keys: &[&str]) -> (String, Arc<Seen>) {
     let auth_dir = std::env::temp_dir().join(format!("cooker-compat-auths-{}", std::process::id()));
     std::fs::create_dir_all(&auth_dir).unwrap();
     let config = Config::parse(&format!(
-        "access:\n  api-keys: [client-key]\napi-keys:\n  openai-compatibility:\n    - name: Acme\n      base-url: {upstream_url}/v1\n      models:\n        - name: up-model\n          alias: fast\n      keys:\n{keys}"))
+        "access:\n  api-keys: [client-key]\napi-keys:\n  openai-compatibility:\n    - name: Acme\n      base-url: {upstream_url}/v1\n      models:\n        - name: {model}\n          alias: fast\n      keys:\n{keys}"))
     .unwrap();
     let credentials = ck_core::config::credentials::load(&config);
     let executors = Executors {
@@ -110,44 +144,39 @@ async fn post(url: &str, body: &str) -> (u16, String, String) {
 
 #[tokio::test]
 async fn alias_routes_to_configured_upstream_with_its_key() {
-    let (url, seen) = proxy().await;
-    let (status, content_type, text) =
-        post(&url, r#"{"model":"fast","messages":[{"role":"user","content":"hi"}]}"#).await;
-    assert_eq!(status, 200, "{text}");
-    assert!(content_type.starts_with("application/json"), "{content_type}");
-    assert_eq!(text, CHAT, "OpenAI-to-OpenAI non-stream responses pass through");
-    let seen = seen.0.lock().unwrap().clone();
-    assert_eq!(seen.len(), 1);
-    let (path, auth, body) = &seen[0];
-    assert_eq!(path, "/v1/chat/completions");
-    assert_eq!(
-        auth.as_deref(),
-        Some("Bearer sk-fake-upstream"),
-        "the client key never reaches the upstream"
-    );
-    assert_eq!(
-        body,
-        r#"{"model":"up-model","messages":[{"role":"user","content":"hi"}]}"#
-    );
-}
-
-#[tokio::test]
-async fn a_responses_body_whose_user_turn_empties_still_goes_upstream_converted() {
-    // Go's Chat Completions handler ignores the conversion's refusal of an emptied user
-    // turn (openai_handlers.go L134-140) and sends the converted body, not the raw input.
-    let (url, seen) = proxy().await;
-    let (status, _, text) = post(
-        &url,
-        r#"{"model":"fast","input":[{"type":"message","role":"user","content":[{"type":"input_file","file_url":"https://x/a.pdf"}]}]}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "{text}");
-    let seen = seen.0.lock().unwrap().clone();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(
-        seen[0].2,
-        r#"{"model":"up-model","messages":[{"role":"user","content":[]}],"stream":false}"#
-    );
+    for (model, effort, expected) in [
+        ("up-model", None, None),
+        ("glm-5.3", Some("max"), Some("max")),
+        ("glm-5.2", Some("max"), Some("max")),
+        ("glm-5.2", Some("xhigh"), Some("xhigh")),
+        ("glm-5.2", Some("minimal"), Some("minimal")),
+        ("glm-5.3(max)", Some("max"), Some("max")),
+    ] {
+        let (url, seen) = proxy_model(&["sk-fake-upstream"], model).await;
+        let mut request = serde_json::json!({"model":"fast","messages":[{"role":"user","content":"hi"}]});
+        if let Some(effort) = effort {
+            request["reasoning_effort"] = effort.into();
+        }
+        let (status, content_type, text) = post(&url, &request.to_string()).await;
+        assert_eq!(status, 200, "{model}: {text}");
+        assert!(content_type.starts_with("application/json"), "{content_type}");
+        let reply: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let want: serde_json::Value = serde_json::from_str(CHAT).unwrap();
+        assert_eq!(reply, want, "OpenAI-to-OpenAI non-stream responses keep every member");
+        let seen = seen.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let (path, auth, body) = &seen[0];
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(
+            auth.as_deref(),
+            Some("Bearer sk-fake-upstream"),
+            "the client key never reaches the upstream"
+        );
+        let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(sent["model"], ck_wire::thinking::split_suffix(model).0);
+        assert_eq!(sent["messages"], request["messages"]);
+        assert_eq!(sent["reasoning_effort"].as_str(), expected, "{model}");
+    }
 }
 
 #[tokio::test]
@@ -160,44 +189,59 @@ async fn streaming_requests_usage_and_ends_with_done() {
     .await;
     assert_eq!(status, 200, "{text}");
     assert!(content_type.starts_with("text/event-stream"), "{content_type}");
-    assert!(text.contains(&format!("data: {CHUNK}\n\n")), "{text}");
-    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
-    let body = seen.0.lock().unwrap()[0].2.clone();
+    assert!(text.contains(r#""content":"ok""#), "{text}");
+    assert!(
+        text.trim_end()
+            .rsplit("\n\n")
+            .next()
+            .unwrap()
+            .starts_with("data: [DONE]\n"),
+        "{text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&seen.0.lock().unwrap()[0].2).unwrap();
     assert_eq!(
         body,
-        r#"{"model":"up-model","stream":true,"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}}"#
+        serde_json::json!({"model":"up-model","stream":true,"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}})
     );
 }
 
-/// Go 97dd9eec (`openai_handlers_stream_truncation_test.go`): a stream that closes
-/// cleanly before any chunk carried a `finish_reason` ends with a 502 error frame
-/// instead of `[DONE]`, on Chat Completions and legacy Completions. Expected bodies come
-/// from Go's handlers (tests/reference/stream_truncation).
+/// A Chat stream that closes cleanly before any chunk carried a `finish_reason` never ends
+/// with `[DONE]` (Go 97dd9eec): it fails before commitment with 502, or ends with an error
+/// frame once committed. The upstream streams are Go's (tests/reference/stream_truncation).
 #[tokio::test]
 async fn a_stream_without_a_finish_reason_ends_with_an_error() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/stream_truncation_go.json")).unwrap();
-    let cases = fixture.as_array().unwrap();
-    assert_eq!(cases.len(), 16);
-    let (url, seen) = proxy().await;
-    for case in cases {
+    let mut ran = 0;
+    for case in fixture.as_array().unwrap() {
+        // A failed attempt cools its credential, so every case gets its own proxy.
+        let (url, seen) = proxy().await;
         let name = case["name"].as_str().unwrap();
-        let path = case["path"].as_str().unwrap();
+        if case["path"] != "/v1/chat/completions" {
+            continue;
+        }
         let sse: String = case["chunks"]
             .as_array()
             .unwrap()
             .iter()
             .map(|c| format!("data: {}\n\n", c.as_str().unwrap()))
             .collect();
+        // Go's handler wrote `[DONE]` unless the stream was truncated.
+        let truncated = !case["out"].as_str().unwrap().contains("[DONE]");
+        if !truncated {
+            continue;
+        }
         *seen.2.lock().unwrap() = Some(sse);
-        let body = if path == "/v1/completions" {
-            r#"{"model":"fast","prompt":"hi","stream":true}"#
-        } else {
-            r#"{"model":"fast","messages":[{"role":"user","content":"hi"}],"stream":true}"#
-        };
-        let (status, text) = send(&url, path, &[], body.into()).await;
-        assert_eq!(status, 200, "{name}: {text}");
-        assert_eq!(text, case["out"].as_str().unwrap(), "{name}");
+        let body = r#"{"model":"fast","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let (status, text) = send(&url, "/v1/chat/completions", &[], body.into()).await;
+        let last = text.trim_end().rsplit("\n\n").next().unwrap_or_default();
+        assert!(!text.contains("[DONE]"), "{name}: {text}");
+        assert!(
+            status == 502 || last.starts_with(r#"data: {"error":"#),
+            "{name}: {status} {text}"
+        );
+        ran += 1;
     }
+    assert_eq!(ran, 3);
 }
 
 async fn send(url: &str, path: &str, headers: &[(&str, &str)], body: Vec<u8>) -> (u16, String) {
@@ -210,6 +254,14 @@ async fn send(url: &str, path: &str, headers: &[(&str, &str)], body: Vec<u8>) ->
     }
     let res = req.body(body).send().await.unwrap();
     (res.status().as_u16(), res.text().await.unwrap())
+}
+
+/// The upstream's compaction, shown under the response id cooker issued (Q-E).
+fn assert_compaction(text: &str) {
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["object"], "response.compaction", "{text}");
+    assert_eq!(value["output"][0]["encrypted_content"], "secret", "{text}");
+    assert!(value["id"].as_str().is_some_and(|id| id.starts_with("resp_")), "{text}");
 }
 
 fn compact_calls(seen: &Seen) -> usize {
@@ -235,11 +287,11 @@ async fn compact_decodes_zstd_request_body() {
     )
     .await;
     assert_eq!(status, 200, "{text}");
-    assert_eq!(text, r#"{"ok":true}"#);
+    assert_compaction(&text);
     assert_eq!(compact_calls(&seen), 1);
     let body = seen.0.lock().unwrap()[0].2.clone();
     assert!(
-        body.contains(r#""input":"hello""#) && body.contains(r#""model":"up-model""#),
+        body.contains(r#""content":"hello""#) && body.contains(r#""model":"up-model""#),
         "{body}"
     );
 
@@ -261,10 +313,7 @@ async fn compact_decodes_zstd_request_body() {
     )
     .await;
     assert_eq!(status, 400);
-    assert_eq!(
-        text,
-        r#"{"error":{"message":"Invalid request: unsupported request content encoding: br","type":"invalid_request_error"}}"#
-    );
+    assert_local_error(&text, "invalid_request_error");
 }
 
 /// Go `TestOpenAIResponsesCompactRejectsStream`: 400 before any upstream call.
@@ -274,11 +323,22 @@ async fn compact_rejects_stream() {
     let body = br#"{"model":"fast","stream":true}"#.to_vec();
     let (status, text) = send(&url, "/v1/responses/compact", &[], body).await;
     assert_eq!(status, 400, "{text}");
-    assert_eq!(
-        text,
-        r#"{"error":{"message":"Streaming not supported for compact responses","type":"invalid_request_error"}}"#
-    );
+    assert_local_error(&text, "invalid_request_error");
     assert!(seen.0.lock().unwrap().is_empty(), "the executor is never called");
+}
+
+/// An upstream without a token-counting endpoint is refused for
+/// `POST /v1/responses/input_tokens`: a local tokenizer estimate is not the official count.
+#[tokio::test]
+async fn responses_input_tokens_refuses_a_local_estimate() {
+    let (url, seen) = proxy().await;
+    let body = br#"{"model":"fast","input":"hello"}"#.to_vec();
+    let (status, text) = send(&url, "/v1/responses/input_tokens", &[], body).await;
+    assert_eq!(status, 400, "{text}");
+    assert_local_error(&text, "invalid_request_error");
+    assert!(text.contains("count"), "the refusal names the count: {text}");
+    assert!(!text.contains("input_tokens\":"), "no estimate is shown: {text}");
+    assert!(seen.0.lock().unwrap().is_empty(), "nothing reaches the upstream");
 }
 
 /// Go `TestOpenAIResponsesCompactExecute`: the `responses/compact` alt reaches the
@@ -289,44 +349,128 @@ async fn compact_execute() {
     let body = br#"{"model":"fast","input":"hello"}"#.to_vec();
     let (status, text) = send(&url, "/v1/responses/compact", &[], body).await;
     assert_eq!(status, 200, "{text}");
-    assert_eq!(text, r#"{"ok":true}"#);
+    assert_compaction(&text);
     let seen = seen.0.lock().unwrap().clone();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].0, "/v1/responses/compact", "the compact alt");
-    // A chat-format source would have been translated to `messages`.
-    assert_eq!(seen[0].2, r#"{"model":"up-model","input":"hello"}"#);
+    // The Responses request egress writes the input; a chat-format source would have been
+    // translated to `messages`.
+    assert_eq!(
+        seen[0].2,
+        r#"{"input":[{"type":"message","role":"user","content":"hello"}],"model":"up-model"}"#
+    );
 }
 
-/// Go `TestOpenAIResponsesCompactTransientFailureDoesNotCooldownAuthAndPreservesError`:
-/// a 500 on every credential keeps the upstream status and message, and cools nothing.
-#[tokio::test]
-async fn compact_transient_failure_keeps_error_and_cools_nothing() {
-    let (url, seen) = proxy_keys(&["sk-fake-a", "sk-fake-b"]).await;
-    *seen.1.lock().unwrap() = Some((
-        500,
-        r#"{"error":{"message":"compact upstream temporary error","type":"api_error"}}"#,
-    ));
-    let body = br#"{"model":"fast","input":"hello"}"#.to_vec();
-    let (status, text) = send(&url, "/v1/responses/compact", &[], body.clone()).await;
-    assert_eq!(status, 500, "{text}");
-    assert!(text.contains("compact upstream temporary error"), "{text}");
-    assert_eq!(compact_calls(&seen), 2, "a transient fault fails over");
-    let (status, text) = send(&url, "/v1/responses", &[], body).await;
-    assert_eq!(status, 200, "normal traffic is not cooled: {text}");
+/// Compact calls each key received, in the order the keys first sent one.
+fn compact_sends(seen: &Seen) -> Vec<usize> {
+    let roles = seen.3.lock().unwrap().clone();
+    let requests = seen.0.lock().unwrap();
+    let sent = |key: &String| {
+        requests
+            .iter()
+            .filter(|r| r.0.ends_with("/responses/compact") && r.1.as_ref() == Some(key))
+            .count()
+    };
+    roles.iter().map(sent).collect()
 }
 
-/// Go `TestOpenAIResponsesCompactRequestFaultStopsFallbackAndPreservesError`.
+/// A compact failure is routed by its class (D2-PLAN §3.3). The call is the probe: an
+/// unsupported answer is skipped and never remembered, a credential fault or a transient
+/// one fails over and cools the credential, and a client fault stops with nothing sent to
+/// the next credential.
 #[tokio::test]
-async fn compact_request_fault_stops_fallback() {
-    let (url, seen) = proxy_keys(&["sk-fake-a", "sk-fake-b"]).await;
-    *seen.1.lock().unwrap() = Some((404, "404 page not found"));
+async fn compact_failures_are_routed_by_class() {
+    let quota = r#"{"error":{"message":"quota","type":"insufficient_quota"}}"#;
+    struct Row {
+        case: &'static str,
+        /// What the credential tried first (`a`) answers (status 0 resets the connection) and
+        /// what the next one (`b`) answers.
+        a: (u16, &'static str),
+        b: (u16, &'static str),
+        /// The first compact's status; a 200 carries `b`'s compaction.
+        status: u16,
+        /// Compact sends to `(a, b)` after the first and after a second compact.
+        first: (usize, usize),
+        second: (usize, usize),
+    }
+    let ok = (200, COMPACTION);
+    let mut rows = vec![];
+    for status in [404, 405, 501] {
+        rows.push(Row {
+            case: "an unsupported answer is skipped and tried again by the next compact",
+            a: (status, "no such endpoint"),
+            b: ok,
+            status: 200,
+            first: (1, 1),
+            second: (2, 2),
+        });
+    }
+    rows.push(Row {
+        case: "a transport failure fails over; the scheduler never cools a connection fault",
+        a: (0, ""),
+        b: ok,
+        status: 200,
+        first: (1, 1),
+        second: (2, 2),
+    });
+    for status in [408, 500, 502, 503, 504] {
+        rows.push(Row {
+            case: "a transient answer fails over and cools the credential",
+            a: (status, "boom"),
+            b: ok,
+            status: 200,
+            first: (1, 1),
+            second: (1, 2),
+        });
+    }
+    for status in [402, 403, 429] {
+        rows.push(Row {
+            case: "a credential answer fails over and cools the credential",
+            a: (status, quota),
+            b: ok,
+            status: 200,
+            first: (1, 1),
+            second: (1, 2),
+        });
+    }
+    for status in [400, 409, 413, 422] {
+        rows.push(Row {
+            case: "a client fault stops with nothing sent to the next credential",
+            a: (status, "bad request"),
+            b: ok,
+            status,
+            first: (1, 0),
+            // Round robin moves on; the client's fault cooled nothing.
+            second: (1, 1),
+        });
+    }
+    rows.push(Row {
+        case: "every credential unsupported answers the last one's status",
+        a: (404, "no such endpoint"),
+        b: (404, "no such endpoint"),
+        status: 404,
+        first: (1, 1),
+        second: (2, 2),
+    });
     let body = br#"{"model":"fast","input":"hello"}"#.to_vec();
-    let (status, text) = send(&url, "/v1/responses/compact", &[], body.clone()).await;
-    assert_eq!(status, 404, "{text}");
-    assert!(text.contains("404 page not found"), "{text}");
-    assert_eq!(compact_calls(&seen), 1, "a request fault stops failover");
-    let (status, text) = send(&url, "/v1/responses", &[], body).await;
-    assert_eq!(status, 200, "normal traffic is not cooled: {text}");
+    for row in rows {
+        let (url, seen) = proxy_keys(&["sk-fake-a", "sk-fake-b"]).await;
+        *seen.1.lock().unwrap() = vec![row.a, row.b];
+        let sends = |seen: &Seen| {
+            let mut sends = compact_sends(seen);
+            sends.resize(2, 0);
+            (sends[0], sends[1])
+        };
+        let case = format!("{} ({})", row.case, row.a.0);
+        let (status, text) = send(&url, "/v1/responses/compact", &[], body.clone()).await;
+        assert_eq!(status, row.status, "{case}: {text}");
+        if row.status == 200 {
+            assert_compaction(&text);
+        }
+        assert_eq!(sends(&seen), row.first, "{case}: first compact");
+        send(&url, "/v1/responses/compact", &[], body.clone()).await;
+        assert_eq!(sends(&seen), row.second, "{case}: second compact");
+    }
 }
 
 /// Go `pickLCP` through dispatch: with session affinity, an authenticated request

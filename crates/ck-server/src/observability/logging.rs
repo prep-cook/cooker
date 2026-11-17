@@ -823,6 +823,9 @@ fn format_line(now: chrono::NaiveDateTime, level: &Level, caller: Option<(&str, 
     if let Some((file, number)) = caller {
         line.push_str(&format!("[{}:{number}] ", caller_path(file)));
     }
+    // The prefix is cooker's own text. The message and fields are redacted word by word,
+    // whatever field carried a credential (owner ruling Settled 60).
+    let prefix = line.len();
     line.push_str(fields.message.trim_end_matches(['\r', '\n']));
     let mut rest = fields.rest;
     // ponytail: Go prints only the known fields; Rust call sites also log structured
@@ -838,8 +841,16 @@ fn format_line(now: chrono::NaiveDateTime, level: &Level, caller: Option<(&str, 
         }
     }
     line.push('\n');
+    if let std::borrow::Cow::Owned(body) = ck_wire::redact::urls_in(&line[prefix..]) {
+        line.truncate(prefix);
+        line.push_str(&body);
+    }
     line
 }
+
+#[cfg(test)]
+#[path = "logging_url_tests.rs"]
+mod url_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1420,7 +1431,7 @@ mod tests {
         assert!(lines[0].contains("] [23456789] [warn ] ["), "{written}");
     }
 
-    struct SharedWriter(std::sync::Arc<Mutex<Vec<u8>>>);
+    pub(super) struct SharedWriter(pub(super) std::sync::Arc<Mutex<Vec<u8>>>);
 
     impl Write for SharedWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {

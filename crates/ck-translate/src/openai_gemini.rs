@@ -8,14 +8,14 @@ use sha2::{Digest, Sha256};
 
 use crate::common::{go_lower, go_runes, is_gemini_thought_part, trim_space};
 use crate::stream::GoStream;
-use crate::{Error, Registered, ResponseCtx, gemini};
+use crate::{Error, Registered, ResponseCtx, gemini_gemini};
 
 pub static PAIR: Registered = registered!(
     Gemini -> OpenAI,
     request: |ctx, body| Ok(convert(ctx.model, body, ctx.stream)),
     non_stream: non_stream,
     go_stream: go_stream,
-    token_count: Some(gemini::token_count),
+    token_count: Some(gemini_gemini::token_count),
 );
 
 fn first_of<'a>(value: &Res<'a>, paths: [&str; 2]) -> Res<'a> {

@@ -1,4 +1,5 @@
 {
+  "contract_updates": "F33: empty response.incomplete retains its wire response instead of becoming a fabricated 502; other expectations remain Go recordings.",
   "alpha_search": [
     {
       "input": "{\"model\":\"m\",\"prompt_cache_key\":\"k\",\"q\":\"a<b\", \"n\": [1, 2]}",
@@ -569,12 +570,7 @@
         "body": "{\"model\":\"gpt-5.4\",\"input\":[],\"stream\":true,\"instructions\":\"\",\"tools\":[{\"type\":\"image_generation\",\"output_format\":\"png\"}]}"
       },
       "output": {
-        "error": {
-          "credential_scoped": false,
-          "message": "stream error: upstream terminated with incomplete empty response (0 tokens)",
-          "request_scoped": true,
-          "status": 502
-        }
+        "payload": "{\"type\":\"response.incomplete\",\"response\":{\"output\":[],\"usage\":{\"output_tokens\":0}}}"
       }
     },
     {

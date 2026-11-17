@@ -33,6 +33,8 @@ pub fn error_detail(status: u16, message: &str, kind: &str) -> Response {
     let detail = crate::http::gojson::Obj::new()
         .str("message", message)
         .str("type", kind)
+        .raw("param", "null")
+        .raw("code", "null")
         .finish();
     gin_json(status, crate::http::gojson::Obj::new().raw("error", &detail).finish())
 }
@@ -46,18 +48,6 @@ pub fn sse(body: Body) -> Response {
     h.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     res
-}
-
-/// `requests.streaming.keepalive-seconds` (0 or absent disables heartbeats).
-pub fn keepalive(cfg: &Config) -> Option<Duration> {
-    let seconds = cfg
-        .document
-        .get("requests")
-        .and_then(|r| r.get("streaming"))
-        .and_then(|s| s.get("keepalive-seconds"))
-        .and_then(serde_yaml_ng::Value::as_i64)
-        .unwrap_or(0);
-    (seconds > 0).then(|| Duration::from_secs(seconds as u64))
 }
 
 /// `requests.passthrough-headers` (Go `PassthroughHeadersEnabled`): upstream response
@@ -155,6 +145,7 @@ pub fn write_error_headers(dst: &mut axum::http::HeaderMap, src: &axum::http::He
         if reserved_response_header(name.as_str())
             || hop_by_hop(name.as_str())
             || name == axum::http::header::CONTENT_TYPE
+            || (name == "request-id" && dst.contains_key(name))
         {
             continue;
         }
@@ -278,35 +269,6 @@ pub fn ensure_frame(event: Bytes) -> Bytes {
     }
 }
 
-/// The `data:` payloads of one SSE frame, joined with newlines.
-pub fn data_payload(frame: &[u8]) -> Option<Vec<u8>> {
-    let mut out: Option<Vec<u8>> = None;
-    for line in frame.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line).trim_ascii();
-        let Some(data) = line.strip_prefix(b"data:") else {
-            continue;
-        };
-        let data = data.trim_ascii();
-        match &mut out {
-            Some(buf) => {
-                buf.push(b'\n');
-                buf.extend_from_slice(data);
-            }
-            None => out = Some(data.to_vec()),
-        }
-    }
-    out
-}
-
-/// The `event:` name of one SSE frame.
-pub fn event_name(frame: &[u8]) -> String {
-    frame
-        .split(|&b| b == b'\n')
-        .find_map(|line| line.trim_ascii().strip_prefix(b"event:"))
-        .map(|name| String::from_utf8_lossy(name.trim_ascii()).into_owned())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,18 +325,9 @@ mod tests {
     }
 
     #[test]
-    fn frames_and_payloads() {
+    fn frames() {
         assert_eq!(ensure_frame(Bytes::from_static(b"{}")), "data: {}\n\n");
         assert_eq!(ensure_frame(Bytes::from_static(b"data: {}\n")), "data: {}\n\n");
-        assert_eq!(
-            data_payload(b"event: x\r\ndata: {\"a\":1}\r\n\r\n").unwrap(),
-            b"{\"a\":1}"
-        );
-        assert_eq!(
-            event_name(b"event: response.completed\ndata: {}\n\n"),
-            "response.completed"
-        );
-        assert!(data_payload(b": ping\n\n").is_none());
     }
 
     /// Go `handlers.FilterUpstreamHeaders` (tests/reference/server/main.go

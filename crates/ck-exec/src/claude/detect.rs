@@ -128,6 +128,23 @@ pub(crate) fn native_user_agent(user_agent: &str) -> bool {
     }
 }
 
+/// Whether the headers carry any Claude Code client signal [`detect`] reads: the claude-cli
+/// User-Agent, `x-app`, the session header, a Stainless SDK header, or a Claude Code or
+/// OAuth beta. It over-approximates detection without the body (contract G6).
+pub(crate) fn claude_code_signals(headers: &HeaderMap) -> bool {
+    let beta = |b: &str| b.starts_with("claude-code-") || b.starts_with("oauth-");
+    strip_prefix_ci(raw_header(headers, "user-agent").trim(), "claude-cli/").is_some()
+        || headers.contains_key("x-app")
+        || headers.contains_key("x-claude-code-session-id")
+        || headers.keys().any(|name| name.as_str().starts_with("x-stainless-"))
+        || headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|b| beta(b.trim()))
+}
+
 fn has_claude_code_beta(headers: &HeaderMap) -> bool {
     headers
         .get_all("anthropic-beta")

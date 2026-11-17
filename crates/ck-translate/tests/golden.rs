@@ -396,6 +396,11 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
             actual = expected.clone();
         }
     }
+    if invents_max_tokens(client, upstream, f, bytes) {
+        for out in &mut expected {
+            gj::delete(out, "max_tokens");
+        }
+    }
     let mut errors = early;
     errors.extend(normalize(&mut actual, &dynamics, Some((start, end))));
     normalize(&mut expected, &dynamics, None);
@@ -410,6 +415,26 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
     errors
 }
 
+/// Owner ruling Q-H: Go's Chat and Gemini to Claude request translators send a guessed
+/// `max_tokens` (32000, 64000 or the registry's) when the client set no limit. Rust sends
+/// none; the Claude executor fills the `model-catalog` default or the registered limit.
+fn invents_max_tokens(client: Format, upstream: Format, f: &Value, bytes: bool) -> bool {
+    let request = matches!(f["path"].as_str(), Some("request" | "request_compat"));
+    if !request || upstream != Format::Claude {
+        return false;
+    }
+    let input = field(&f["input"], bytes);
+    let set = |path: &str| {
+        let value = gj::get(&input, path);
+        value.exists() && value.kind != gj::Kind::Null
+    };
+    match client {
+        Format::OpenAI => !set("max_tokens") && !set("max_completion_tokens"),
+        Format::Gemini => !gj::get(&input, "generationConfig.maxOutputTokens").exists(),
+        _ => false,
+    }
+}
+
 /// Pair fixtures (recorded at 6fecc6e) whose behaviour a later Go commit changed, each
 /// replayed at v8.0.35 by the named golden instead.
 const SUPERSEDED: &[(&str, &str)] = &[(
@@ -417,6 +442,77 @@ const SUPERSEDED: &[(&str, &str)] = &[(
     "the v8.0.35 schema cleaner (a0fd8448, c558d320): ck-wire gemini_schema.json.gz; \
          the same fixture recorded at v8.0.35 matches",
 )];
+
+/// Fixtures whose Go output an owner ruling replaced, with the ruling. Every listed fixture
+/// must still fail, so an entry cannot outlive the difference it records.
+const RULED: &[(&str, &[&str], &str)] = &[
+    (
+        "claude->antigravity",
+        &[
+            "claude-antigravity/seed-cache",
+            "claude-antigravity/sig/cache-hit@claude-sonnet-4-6",
+            "claude-antigravity/sig/cache-hit@claude-opus-4-6-thinking",
+            "claude-antigravity/sig/empty-text@claude-sonnet-4-6",
+            "claude-antigravity/sig/empty-text@claude-opus-4-6-thinking",
+            "claude-antigravity/sig/native@claude-sonnet-4-6",
+            "claude-antigravity/sig/native@claude-opus-4-6-thinking",
+            "claude-antigravity/sig/gpt@claude-sonnet-4-6",
+            "claude-antigravity/sig/gpt@claude-opus-4-6-thinking",
+            "antigravity-claude/thinking@claude-sonnet-4-6",
+            "antigravity-claude/non-stream/0@claude-sonnet-4-6",
+            "TestConvertClaudeRequestToAntigravity_ThinkingBlocks:973",
+            "TestConvertClaudeRequestToAntigravity_BypassModeNormalizesESignature:1349",
+            "TestConvertClaudeRequestToAntigravity_BypassModePreservesShortValidSignature:1385",
+            "TestConvertClaudeRequestToAntigravity_CacheModeAcceptsNativeSignature:1470",
+            "TestConvertClaudeRequestToAntigravity_ToolUse_DoesNotReuseThinkingSignature:2068",
+            "TestConvertClaudeRequestToAntigravity_ReorderThinking:2106",
+            "TestConvertClaudeRequestToAntigravity_ReorderThinkingAndTextBeforeFunctionCall:2313",
+            "TestConvertClaudeRequestToAntigravity_ClaudeThinkingPreservesToolResultAdjacency:2499",
+            "TestConvertClaudeRequestToAntigravity_TrailingSignedThinking_Kept:2843",
+            "TestConvertClaudeRequestToAntigravity_BypassMode_KeepsNonEmptyThinking:3644",
+            "TestConvertAntigravityResponseToClaude_PreservesClaudeThoughtAndToolSignatures:893",
+            "TestConvertAntigravityResponseToClaude_PreservesClaudeThoughtAndToolSignatures:907",
+            "TestConvertAntigravityResponseToClaude_EmitsNativeSignaturesWithoutProviderPrefixes:1403",
+            "TestConvertAntigravityResponseToClaude_EmitsNativeSignaturesWithoutProviderPrefixes:1438",
+            "TestConvertAntigravityResponseToClaude_TextAndSignatureInSameChunk:648:stream",
+            "TestConvertAntigravityResponseToClaude_SignatureOnlyChunk:706:stream",
+            "TestConvertAntigravityResponseToClaude_SignatureOnlyChunkWithoutThoughtFlag:757:stream",
+            "TestConvertAntigravityResponseToClaude_PreservesClaudeThoughtAndToolSignatures:914:stream",
+            "TestConvertAntigravityResponseToClaude_EmitsNativeSignaturesWithoutProviderPrefixes:1425:stream",
+        ],
+        "Settled 68 (docs/OPEN-QUESTIONS.md): a Claude model's thinking and tool-call signatures pass between client \
+     and upstream unchanged, and no cached signature fills an unsigned block; \
+     ck-exec tests/exec_antigravity.rs pins the ruled behaviour",
+    ),
+    (
+        "gemini->antigravity",
+        &[
+            "gemini-antigravity/claude/claude#/claude-sonnet-4-6",
+            "gemini-antigravity/claude/claude#/Claude-Opus-4-6-Thinking",
+            "gemini-antigravity/claude/parts/claude-sonnet-4-6",
+            "gemini-antigravity/claude/parts/Claude-Opus-4-6-Thinking",
+            "TestConvertGeminiRequestToAntigravity_ClaudeModelNormalizesStrictClaudeThoughtSignature:127",
+        ],
+        "Settled 68 (docs/OPEN-QUESTIONS.md): a Claude model's thought signature goes upstream as the \
+         client holds it, without the double-layer rewrite",
+    ),
+    (
+        "openai-response->antigravity",
+        &[
+            "responses-antigravity/claude/mixed@claude-sonnet-4-6",
+            "responses-antigravity/claude/mixed@Claude-Opus-4-6-Thinking",
+            "responses-antigravity/envelope/claude/mixed@claude-sonnet-4-6",
+            "responses-antigravity/envelope/claude/mixed@Claude-Opus-4-6-Thinking",
+            "responses-antigravity/claude/role-items@claude-sonnet-4-6",
+            "responses-antigravity/claude/role-items@Claude-Opus-4-6-Thinking",
+            "TestConvertOpenAIResponsesRequestToAntigravity_ClaudeReasoningKeepsClaudeSignature:59",
+            "TestConvertOpenAIResponsesRequestToAntigravity_EmptyClaudeReasoningDoesNotShiftLaterSignature:202",
+            "TestConvertOpenAIResponsesRequestToAntigravity_EmptyClaudeReasoningBeforeFunctionDoesNotShiftLaterSignature:239",
+        ],
+        "Settled 68 (docs/OPEN-QUESTIONS.md): a reasoning item's Claude signature goes upstream as the \
+         client holds it, without the double-layer rewrite; ck-exec tests/exec_antigravity.rs pins it",
+    ),
+];
 
 #[test]
 fn reference_goldens() {
@@ -426,6 +522,7 @@ fn reference_goldens() {
     assert!(!files.is_empty());
     let mut failures = vec![];
     let mut total = 0;
+    let mut ruled = 0;
     // Per pending entry: fixtures matched, and how many of them failed.
     let mut pending_matched = vec![0; PENDING.len()];
     let mut pending_failed = vec![0; PENDING.len()];
@@ -466,6 +563,17 @@ fn reference_goldens() {
                 continue;
             }
             let errors = check(client, upstream, f, bytes, false);
+            let pair_name = format!("{}->{}", client.as_str(), upstream.as_str());
+            if RULED
+                .iter()
+                .any(|(p, names, _)| *p == pair_name && names.contains(&f["name"].as_str().unwrap()))
+            {
+                ruled += 1;
+                if errors.is_empty() {
+                    failures.push(format!("{name}: matches Go again; remove it from RULED"));
+                }
+                continue;
+            }
             let pending = pending(&format!("{}->{}", client.as_str(), upstream.as_str()), f);
             if let Some(i) = pending {
                 pending_matched[i] += 1;
@@ -477,6 +585,10 @@ fn reference_goldens() {
                 }
             }
         }
+    }
+    let listed: usize = RULED.iter().map(|(_, names, _)| names.len()).sum();
+    if ruled != listed {
+        failures.push(format!("RULED lists {listed} fixtures but {ruled} exist"));
     }
     let keys = PENDING.iter().map(|(pair, key, _)| format!("{pair} {key}"));
     for ((key, matched), failed) in keys.zip(&pending_matched).zip(&pending_failed) {

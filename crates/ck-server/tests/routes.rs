@@ -1,6 +1,5 @@
 //! Route surface through the real runtime, Claude executor and a local mock upstream.
-//! Expected shapes come from the Go handlers they port (cited per assertion); the Go
-//! binary comparison for the same routes lives in harness/fixtures.py.
+//! Success, routing and retry recordings retain their contracts; HTTP errors follow F13/F14.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -18,6 +17,36 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 const MODEL: &str = "claude-sonnet-4-6";
+
+fn assert_openai_error(text: &str) -> Value {
+    let value: Value = serde_json::from_str(text).unwrap();
+    let error = value["error"].as_object().expect("error object");
+    assert!(error["message"].as_str().is_some_and(|s| !s.is_empty()), "{text}");
+    assert!(error["type"].as_str().is_some_and(|s| !s.is_empty()), "{text}");
+    assert_eq!(error.get("param"), Some(&Value::Null));
+    let code = error.get("code").expect("nullable code is required");
+    assert!(code.is_null() || code.is_string(), "{text}");
+    value
+}
+
+fn assert_claude_error_body(text: &str, kind: &str) -> Value {
+    let value: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], kind);
+    assert!(value["error"]["message"].as_str().is_some_and(|s| !s.is_empty()));
+    let id = value["request_id"].as_str().expect("local request_id");
+    assert!(!id.is_empty());
+    value
+}
+
+fn assert_claude_error(text: &str, headers: &wreq::header::HeaderMap, kind: &str) -> Value {
+    let value = assert_claude_error_body(text, kind);
+    assert_eq!(
+        value["request_id"].as_str().unwrap(),
+        headers["request-id"].to_str().unwrap()
+    );
+    value
+}
 
 fn event(kind: &str, data: Value) -> String {
     format!("event: {kind}\ndata: {data}\n\n")
@@ -48,6 +77,42 @@ fn sse() -> String {
             serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
         ),
         event("message_stop", serde_json::json!({"type":"message_stop"})),
+    ]
+    .concat()
+}
+
+/// A Meta stream calling the `apply_patch` function the bridge declared; the completion lists
+/// no output.
+fn meta_patch_sse() -> String {
+    let arguments = serde_json::json!({"input": "*** Begin Patch\n*** End Patch"}).to_string();
+    let call = serde_json::json!({"id":"fc_1","type":"function_call","status":"completed","call_id":"call_p",
+        "name":"apply_patch","arguments":arguments});
+    let response = |status: &str| {
+        serde_json::json!({"id":"resp_up","object":"response","created_at":1,"status":status,"model":"muse-wonder-1.0",
+            "output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}})
+    };
+    [
+        event(
+            "response.created",
+            serde_json::json!({"type":"response.created","response":response("in_progress")}),
+        ),
+        event(
+            "response.output_item.added",
+            serde_json::json!({"type":"response.output_item.added","output_index":0,"item":call}),
+        ),
+        event(
+            "response.function_call_arguments.done",
+            serde_json::json!({"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,
+                "arguments":arguments}),
+        ),
+        event(
+            "response.output_item.done",
+            serde_json::json!({"type":"response.output_item.done","output_index":0,"item":call}),
+        ),
+        event(
+            "response.completed",
+            serde_json::json!({"type":"response.completed","response":response("completed")}),
+        ),
     ]
     .concat()
 }
@@ -121,6 +186,20 @@ async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
             )
                 .into_response()
         }
+        "Bearer fake-meta" => ([("content-type", "text/event-stream")], meta_patch_sse()).into_response(),
+        "Bearer fake-prompt" => (
+            [("content-type", "text/event-stream")],
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_prompt\",\"model\":\"stored-model\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n",
+        ).into_response(),
+        _ if body["compaction"].is_object() => (
+            [("content-type", "application/json")],
+            serde_json::json!({"id":"msg_c","type":"message","role":"assistant","model":body["model"],
+                "content":[{"type":"compaction","content":"summary","signature":"sig-c"}],"stop_reason":"compaction",
+                "stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,
+                "iterations":[{"type":"compaction","input_tokens":9,"output_tokens":3}]}})
+            .to_string(),
+        )
+            .into_response(),
         _ if body["stream"] == Value::Bool(true) => ([("content-type", "text/event-stream")], sse()).into_response(),
         _ => (
             [("content-type", "application/json")],
@@ -190,7 +269,7 @@ async fn post(url: &str, path: &str, body: &str) -> (u16, wreq::header::HeaderMa
 #[tokio::test]
 async fn chat_completions_translate_and_stream_upstream_for_non_stream_clients() {
     let p = proxy("", vec![oauth("a.json", "fake-ok", serde_json::json!({}))]).await;
-    let body = format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hello"}}]}}"#);
+    let body = format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"hello"}}]}}"#);
     let (status, headers, text) = post(&p.url, "/v1/chat/completions", &body).await;
     assert_eq!(status, 200, "{text}");
     assert_eq!(headers["content-type"], "application/json");
@@ -209,102 +288,57 @@ async fn chat_completions_translate_and_stream_upstream_for_non_stream_clients()
     assert_eq!(parts[1].len(), 16);
     assert_eq!(parts[2].as_bytes()[14], b'7', "UUIDv7: {trace}");
 
-    // Streaming: OpenAI frames and a closing [DONE] (openai_handlers.go WriteDone).
-    let stream_body =
-        format!(r#"{{"model":"{MODEL}","stream":true,"messages":[{{"role":"user","content":"hello"}}]}}"#);
+    // Streaming: OpenAI frames, each with its resume cursor, and a closing [DONE].
+    let stream_body = format!(
+        r#"{{"model":"{MODEL}","stream":true,"max_tokens":5,"messages":[{{"role":"user","content":"hello"}}]}}"#
+    );
     let (status, headers, text) = post(&p.url, "/v1/chat/completions", &stream_body).await;
     assert_eq!(status, 200);
     assert_eq!(headers["content-type"], "text/event-stream");
-    assert_eq!(headers["connection"], "keep-alive");
     assert!(text.starts_with("data: {"), "{text}");
-    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert!(
+        text.trim_end()
+            .rsplit("\n\n")
+            .next()
+            .unwrap()
+            .starts_with("data: [DONE]\nid: v1.e."),
+        "{text}"
+    );
     assert!(text.contains(r#""content":"hi""#));
 }
 
-/// Go `StartNonStreamingKeepAlive` (M2-0036), expectations from the Go golden
-/// `nonstream_keepalive` (tests/reference/server/main.go): a result within one interval
-/// is untouched; a slower one commits 200 `application/json` with a `\n` per interval,
-/// then the rendered body, even when it is an error.
-///
-/// Synchronisation decides every outcome, never a wall-clock margin: the fast cases use
-/// an interval that cannot elapse during the test, and a held mock answers only after
-/// the test has read the first keep-alive newline. Which calls run the keep-alive at all
-/// is `dispatch::tests::nonstream_keepalive_only_for_nonstream_generate`.
+/// Nothing reaches the client before commitment (D2-PLAN §5.1): a slow answer sends no
+/// keep-alive newline and keeps its own status and headers.
 #[tokio::test]
-async fn nonstream_keepalive_commits_like_go() {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/server_go.json")).unwrap();
-    let golden = |name: &str| {
-        fixture["nonstream_keepalive"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == name)
-            .unwrap()
-            .clone()
-    };
-    // Splits the keep-alive newlines from the rendered body.
-    let split = |text: &str| {
-        let rest = text.trim_start_matches('\n');
-        (text.len() - rest.len(), rest.to_owned())
-    };
-    let body = format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"hi"}}]}}"#);
-
-    // A result before the first tick is answered as without a keep-alive.
-    let never = "requests:\n  nonstream-keepalive-interval: 86400\n";
-    for (token, case) in [("fake-ok", "fast_ok"), ("fake-bad", "fast_error")] {
-        let want = golden(case);
-        let p = proxy(never, vec![oauth("a.json", token, serde_json::json!({}))]).await;
-        let (status, headers, text) = post(&p.url, "/v1/messages", &body).await;
-        assert_eq!(u64::from(status), want["status"].as_u64().unwrap(), "{text}");
-        assert_eq!(headers["content-type"], want["content_type"].as_str().unwrap());
-        assert!(headers.get("content-length").is_some(), "{headers:?}");
-        assert_eq!(split(&text).0, 0, "{text:?}");
-        if case == "fast_error" {
-            assert_eq!(text, want["body"].as_str().unwrap());
-        }
-    }
-
-    // A result after the first tick: the mock holds its reply until the client has read
-    // a keep-alive newline, so the commit always precedes the result.
-    let every_second = "requests:\n  nonstream-keepalive-interval: 1\n";
-    for (token, path, case) in [
-        ("fake-held-ok", "/v1/chat/completions", "slow_ok"),
-        ("fake-held-bad", "/v1/messages", "slow_error"),
+async fn codec_routes_send_no_keepalive_before_commitment() {
+    let messages = format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"hi"}}]}}"#);
+    let responses = format!(r#"{{"model":"{MODEL}","max_output_tokens":5,"input":"hi"}}"#);
+    for (token, path, body, status) in [
+        ("fake-held-ok", "/v1/chat/completions", &messages, 200),
+        ("fake-held-ok", "/v1/messages", &messages, 200),
+        ("fake-held-bad", "/v1/messages", &messages, 400),
+        ("fake-held-ok", "/v1/responses", &responses, 200),
     ] {
-        let want = golden(case);
-        let p = proxy(every_second, vec![oauth("a.json", token, serde_json::json!({}))]).await;
-        let res = wreq::Client::new()
+        let p = proxy("", vec![oauth("a.json", token, serde_json::json!({}))]).await;
+        let request = wreq::Client::new()
             .post(format!("{}{path}", p.url))
             .header("authorization", "Bearer client-key")
             .body(body.clone())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(u64::from(res.status().as_u16()), want["status"].as_u64().unwrap());
-        let headers = res.headers().clone();
-        assert_eq!(headers["content-type"], want["content_type"].as_str().unwrap());
-        assert!(headers.get("content-length").is_none(), "{headers:?}");
-        let mut chunks = res.bytes_stream();
-        let mut text = Vec::new();
-        while text.is_empty() {
-            text.extend_from_slice(&chunks.next().await.unwrap().unwrap());
-        }
-        assert!(text.iter().all(|&b| b == b'\n'), "{:?}", String::from_utf8_lossy(&text));
+            .send();
+        let request = tokio::spawn(request);
+        p.seen.arrived.notified().await;
+        // Two seconds pass while the upstream holds its answer.
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        assert!(
+            !request.is_finished(),
+            "{path}: the response committed before the answer"
+        );
         p.seen.release.notify_one();
-        while let Some(chunk) = chunks.next().await {
-            text.extend_from_slice(&chunk.unwrap());
-        }
-        let text = String::from_utf8(text).unwrap();
-        let (newlines, rest) = split(&text);
-        assert!(newlines >= 1, "{text:?}");
-        let (want_newlines, want_rest) = split(want["body"].as_str().unwrap());
-        assert_eq!(want_newlines, 1);
-        if case == "slow_error" {
-            assert_eq!(rest, want_rest);
-        } else {
-            let reply: Value = serde_json::from_str(&rest).unwrap();
-            assert_eq!(reply["choices"][0]["message"]["content"], "hi");
-        }
+        let res = request.await.unwrap().unwrap();
+        assert_eq!(res.status().as_u16(), status, "{path}");
+        assert_eq!(res.headers()["content-type"], "application/json", "{path}");
+        let text = res.text().await.unwrap();
+        assert!(text.starts_with('{'), "{path}: {text:?}");
     }
 }
 
@@ -403,28 +437,319 @@ async fn passthrough_headers_follow_go() {
     }
 }
 
+/// Chat, Anthropic and Gemini requests decode with their client codec before selection
+/// (D2-PLAN §3.1): a request the codec refuses answers in the route's error shape and sends
+/// nothing, and a valid one commits on the contract arm, which names its stream in
+/// `X-Ck-Stream-Id`. Routes without a codec refuse every request (Q8).
 #[tokio::test]
-async fn legacy_completions_convert_both_ways() {
-    let p = proxy("", vec![oauth("a.json", "fake-ok", serde_json::json!({}))]).await;
-    let body = format!(r#"{{"model":"{MODEL}","prompt":"say hi","max_tokens":9}}"#);
-    let (status, _, text) = post(&p.url, "/v1/completions", &body).await;
-    assert_eq!(status, 200, "{text}");
-    let reply: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(reply["object"], "text_completion");
-    assert_eq!(reply["choices"][0]["text"], "hi");
-    let seen = p.seen.requests.lock().unwrap().clone();
-    assert_eq!(seen[0].1["messages"][0]["content"][0]["text"], "say hi");
-    assert_eq!(seen[0].1["max_tokens"], 9);
-    let (_, _, text) = post(
-        &p.url,
-        "/v1/completions",
-        &body.replace("\"max_tokens\"", "\"stream\":true,\"max_tokens\""),
+async fn codec_routes_decode_before_selection_and_commit_on_the_contract_arm() {
+    struct Row {
+        path: String,
+        body: String,
+        status: u16,
+        /// Upstream requests the row sends.
+        sends: usize,
+        /// The answer came from the contract arm.
+        stream_id: bool,
+        /// Text the client's body contains.
+        reply: &'static str,
+        /// Text the upstream body contains.
+        upstream: &'static str,
+    }
+    let user = r#"{"role":"user","content":"hello"}"#;
+    let chat = |extra: &str| format!(r#"{{"model":"{MODEL}","max_tokens":5{extra},"messages":[{user}]}}"#);
+    let messages = |extra: &str| format!(r#"{{"model":"{MODEL}","max_tokens":5{extra},"messages":[{user}]}}"#);
+    let gemini = |method: &str| format!("/v1beta/models/{MODEL}:{method}");
+    let contents =
+        r#"{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"generationConfig":{"maxOutputTokens":5}}"#
+            .to_owned();
+    // Signed thinking from an earlier Claude turn reaches a Claude upstream unchanged.
+    let signed = format!(
+        r#"{{"model":"{MODEL}","max_tokens":5,"stream":true,"messages":[{{"role":"user","content":"q"}},{{"role":"assistant","content":[{{"type":"thinking","thinking":"t","signature":"sig-1"}},{{"type":"text","text":"a"}}]}},{user}]}}"#
+    );
+    let ok = |path: String, body: String, reply| Row {
+        path,
+        body,
+        status: 200,
+        sends: 1,
+        stream_id: true,
+        reply,
+        upstream: "",
+    };
+    let refused = |path: String, body: String, status, reply| Row {
+        path,
+        body,
+        status,
+        sends: 0,
+        stream_id: false,
+        reply,
+        upstream: "",
+    };
+    let chat_path = || "/v1/chat/completions".to_owned();
+    let messages_path = || "/v1/messages".to_owned();
+    let responses_path = || "/v1/responses".to_owned();
+    let responses = |extra: &str| format!(r#"{{"model":"{MODEL}","max_output_tokens":5{extra},"input":"hello"}}"#);
+    let rows = [
+        ok(chat_path(), chat(""), r#""content":"hi""#),
+        ok(chat_path(), chat(r#","stream":true"#), "data: [DONE]"),
+        ok(messages_path(), messages(""), r#""text":"hi""#),
+        ok(messages_path(), messages(r#","stream":true"#), "event: message_stop"),
+        ok(gemini("generateContent"), contents.clone(), r#""text":"hi""#),
+        ok(gemini("streamGenerateContent"), contents.clone(), "data: {"),
+        Row {
+            upstream: r#""signature":"sig-1""#,
+            ..ok(messages_path(), signed, "event: message_stop")
+        },
+        // `max_tokens: 0` pre-warms Anthropic's prompt cache and reaches the upstream as sent.
+        Row {
+            upstream: r#""max_tokens":0"#,
+            ..ok(
+                messages_path(),
+                format!(r#"{{"model":"{MODEL}","max_tokens":0,"messages":[{user}]}}"#),
+                r#""text":"hi""#,
+            )
+        },
+        // An effort the model lacks snaps to its nearest level (Settled 59): Sonnet 4.6 has
+        // `low` to `max`, so `minimal` goes as `low`.
+        Row {
+            upstream: r#""effort":"low""#,
+            ..ok(
+                chat_path(),
+                chat(r#","reasoning_effort":"minimal""#),
+                r#""content":"hi""#,
+            )
+        },
+        refused(chat_path(), "{".into(), 400, "invalid_request_error"),
+        refused(messages_path(), "{".into(), 400, r#""type":"error""#),
+        refused(gemini("generateContent"), "{".into(), 400, "INVALID_ARGUMENT"),
+        // A Responses-shaped body is not converted to Chat.
+        refused(
+            chat_path(),
+            format!(r#"{{"model":"{MODEL}","input":"hello"}}"#),
+            400,
+            "invalid_request_error",
+        ),
+        // Nothing invents a `max_tokens` (Q-H): an Anthropic client sends one, and a Chat client
+        // bound for Anthropic without one or a configured default is refused before sending.
+        refused(
+            messages_path(),
+            format!(r#"{{"model":"{MODEL}","messages":[{user}]}}"#),
+            400,
+            "invalid_request_error",
+        ),
+        refused(
+            chat_path(),
+            format!(r#"{{"model":"{MODEL}","messages":[{user}]}}"#),
+            400,
+            "invalid_request_error",
+        ),
+        ok(responses_path(), responses(""), r#""status":"completed""#),
+        ok(
+            responses_path(),
+            responses(r#","stream":true"#),
+            "event: response.completed",
+        ),
+        ok(
+            "/backend-api/codex/responses".into(),
+            responses(r#","stream":true"#),
+            "event: response.completed",
+        ),
+        // A Codex CLI turn: `store: false` and the whole conversation as input.
+        Row {
+            upstream: r#""earlier answer""#,
+            ..ok(
+                responses_path(),
+                format!(
+                    r#"{{"model":"{MODEL}","max_output_tokens":5,"store":false,"stream":true,"input":[{user},{{"role":"assistant","content":"earlier answer"}},{user}]}}"#
+                ),
+                "event: response.completed",
+            )
+        },
+        refused(responses_path(), "{".into(), 400, "invalid_request_error"),
+        // A compaction carrier that does not hold an Anthropic block is malformed.
+        refused(
+            responses_path(),
+            format!(
+                r#"{{"model":"{MODEL}","max_output_tokens":5,"input":[{{"type":"compaction","encrypted_content":"ck.anthropic-compaction.v1.e30"}}]}}"#
+            ),
+            400,
+            "invalid_request_error",
+        ),
+        // Q-G: `conversation` is refused; an id cooker never issued is not found.
+        refused(
+            responses_path(),
+            responses(r#","conversation":"conv_1""#),
+            400,
+            r#""param":"conversation""#,
+        ),
+        refused(
+            responses_path(),
+            responses(r#","previous_response_id":"resp_upstream""#),
+            400,
+            "previous_response_not_found",
+        ),
+        refused(
+            "/v1/completions".into(),
+            format!(r#"{{"model":"{MODEL}","prompt":"hi"}}"#),
+            501,
+            "unsupported_endpoint",
+        ),
+        refused(
+            "/v1beta/interactions".into(),
+            format!(r#"{{"model":"{MODEL}","input":"hi"}}"#),
+            501,
+            r#"{"error":{"code":"unimplemented","message":"#,
+        ),
+    ];
+    for row in rows {
+        let p = proxy("", vec![oauth("a.json", "fake-ok", serde_json::json!({}))]).await;
+        let (status, headers, text) = post(&p.url, &row.path, &row.body).await;
+        let case = format!("{} {}", row.path, row.body);
+        assert_eq!(status, row.status, "{case}: {text}");
+        assert_eq!(
+            headers.get("x-ck-stream-id").is_some(),
+            row.stream_id,
+            "{case}: {headers:?}"
+        );
+        assert!(text.contains(row.reply), "{case}: {text}");
+        let seen = p.seen.requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), row.sends, "{case}");
+        if !row.upstream.is_empty() {
+            assert!(seen[0].1.to_string().contains(row.upstream), "{case}: {}", seen[0].1);
+        }
+    }
+}
+
+/// Settled 54 and Q-E through the real route: cooker issues the response id, and a
+/// `previous_response_id` turn resends the stored conversation to whichever candidate serves it.
+#[tokio::test]
+async fn responses_continuation_resends_the_stored_turn_after_failover() {
+    let forced = Credential {
+        id: "claude:apikey:1".into(),
+        provider: "claude".into(),
+        source: Source::Config {
+            section: "claude-api-key".into(),
+            index: 0,
+        },
+        disabled: false,
+        label: "claude-apikey".into(),
+        attributes: [("api_key", "fake-ok"), ("auth_kind", "apikey")]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect(),
+        metadata: serde_json::json!({"access_token":"fake-ok","models":[{"name":MODEL,"alias":"friendly","force-mapping":true}]})
+            .as_object()
+            .unwrap()
+            .clone(),
+        revision: 0,
+    };
+    let p = proxy(
+        "",
+        vec![
+            oauth("a.json", "fake-fail", serde_json::json!({})),
+            oauth("b.json", "fake-ok", serde_json::json!({})),
+            forced,
+        ],
     )
     .await;
-    assert!(
-        text.contains(r#""object":"text_completion""#) && text.ends_with("data: [DONE]\n\n"),
-        "{text}"
+    // (first turn's model, next turn's model, next turn streamed). `friendly` force-maps to
+    // MODEL on one credential, which still shows the alias, issues local ids and resends.
+    for (first, next, stream) in [
+        (MODEL, MODEL, false),
+        (MODEL, MODEL, true),
+        ("friendly", "friendly", false),
+        (MODEL, "friendly", true),
+    ] {
+        let case = format!("{first} then {next}, stream {stream}");
+        let body = format!(r#"{{"model":"{first}","max_output_tokens":5,"input":"first question"}}"#);
+        let (status, headers, text) = post(&p.url, "/v1/responses", &body).await;
+        assert_eq!(status, 200, "{case}: {text}");
+        assert!(headers.get("x-ck-stream-id").is_some(), "{case}: {headers:?}");
+        let reply: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(reply["model"], first, "{case}");
+        let id = reply["id"].as_str().unwrap().to_owned();
+        assert!(
+            id.starts_with("resp_") && id.len() == 37,
+            "{case}: a cooker id, not the upstream's: {id}"
+        );
+        p.seen.requests.lock().unwrap().clear();
+
+        let body = format!(
+            r#"{{"model":"{next}","max_output_tokens":5,"stream":{stream},"previous_response_id":"{id}","input":"second"}}"#
+        );
+        let (status, _, text) = post(&p.url, "/v1/responses", &body).await;
+        assert_eq!(status, 200, "{case}: {text}");
+        assert!(!text.contains(&id), "{case}: the new turn has its own id: {text}");
+        assert!(text.contains(&format!(r#""model":"{next}""#)), "{case}: {text}");
+        let seen = std::mem::take(&mut *p.seen.requests.lock().unwrap());
+        let (token, sent) = seen.last().unwrap();
+        assert_eq!(token, "Bearer fake-ok", "{case}");
+        let sent = sent.to_string();
+        for part in ["first question", r#""hi""#, "second"] {
+            assert!(sent.contains(part), "{case}: {part} resent: {sent}");
+        }
+        assert!(!sent.contains("previous_response_id"), "{case}: {sent}");
+    }
+}
+
+/// A Meta account serves a Responses client's custom `apply_patch` on the exchange path: the
+/// call comes back as the custom tool under a cooker id, and a `previous_response_id` turn
+/// resends the stored call to Meta as the function it takes.
+#[tokio::test]
+async fn meta_serves_apply_patch_and_its_continuation() {
+    let meta = Credential {
+        id: "meta:apikey:1".into(),
+        provider: "meta".into(),
+        source: Source::Config {
+            section: "meta-api-key".into(),
+            index: 0,
+        },
+        disabled: false,
+        label: "meta".into(),
+        attributes: [("api_key".to_owned(), "fake-meta".to_owned())].into_iter().collect(),
+        metadata: serde_json::Map::new(),
+        revision: 0,
+    };
+    let p = proxy("", vec![meta]).await;
+    let tool = r#"{"type":"custom","name":"apply_patch","description":"Patch","format":{"type":"grammar","syntax":"lark","definition":"start: x"}}"#;
+    let body = format!(r#"{{"model":"muse-wonder-1.0","input":"patch it","tools":[{tool}]}}"#);
+    let (status, _, text) = post(&p.url, "/v1/responses", &body).await;
+    assert_eq!(status, 200, "{text}");
+    let reply: Value = serde_json::from_str(&text).unwrap();
+    let call = &reply["output"][0];
+    assert_eq!(call["type"], "custom_tool_call", "{text}");
+    assert_eq!(call["name"], "apply_patch", "{text}");
+    assert_eq!(call["input"], "*** Begin Patch\n*** End Patch", "{text}");
+    let id = reply["id"].as_str().unwrap().to_owned();
+    assert!(id.starts_with("resp_") && id != "resp_up", "{id}");
+    p.seen.requests.lock().unwrap().clear();
+
+    let body = format!(
+        r#"{{"model":"muse-wonder-1.0","previous_response_id":"{id}","input":[{{"type":"custom_tool_call_output","call_id":"call_p","output":"done"}}],"tools":[{tool}]}}"#
     );
+    let (status, _, text) = post(&p.url, "/v1/responses", &body).await;
+    assert_eq!(status, 200, "{text}");
+    let seen = std::mem::take(&mut *p.seen.requests.lock().unwrap());
+    let (token, sent) = seen.last().unwrap();
+    assert_eq!(token, "Bearer fake-meta");
+    assert_eq!(sent["tools"][0]["type"], "function", "{sent}");
+    let kinds: Vec<_> = sent["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["type"].clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["message", "function_call", "function_call_output"],
+        "the stored call resent as the function: {sent}"
+    );
+    assert_eq!(sent["input"][1]["name"], "apply_patch", "{sent}");
+    assert!(
+        sent["input"][1]["arguments"].as_str().unwrap().contains("Begin Patch"),
+        "{sent}"
+    );
+    assert!(sent.get("previous_response_id").is_none(), "{sent}");
 }
 
 #[tokio::test]
@@ -456,15 +781,12 @@ async fn failover_stop_rules_and_cooldown_contracts() {
     let (status, _, text) = post(
         &p.url,
         "/v1/chat/completions",
-        &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#),
     )
     .await;
     assert_eq!(status, 400);
-    // BuildErrorResponseBody passes the upstream JSON through.
-    assert_eq!(
-        text,
-        r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#
-    );
+    let error = assert_openai_error(&text);
+    assert_eq!(error["error"]["type"], "invalid_request_error");
     assert_eq!(p.seen.requests.lock().unwrap().len(), 1);
 
     // Quota: the 429 cools the only credential; the next request is a model cooldown
@@ -473,7 +795,7 @@ async fn failover_stop_rules_and_cooldown_contracts() {
     let (status, headers, text) = post(
         &p.url,
         "/v1/chat/completions",
-        &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#),
     )
     .await;
     assert_eq!(status, 429);
@@ -485,29 +807,28 @@ async fn failover_stop_rules_and_cooldown_contracts() {
     let (status, headers, text) = post(
         &p.url,
         "/v1/chat/completions",
-        &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#),
     )
     .await;
     assert_eq!(status, 429);
     let retry: u64 = headers["retry-after"].to_str().unwrap().parse().unwrap();
     // The Claude executor adds its quota fuzz on top of the upstream 30s.
     assert!(retry >= 30, "{retry}");
-    let cooldown: Value = serde_json::from_str(&text).unwrap();
+    let cooldown = assert_openai_error(&text);
+    assert_eq!(cooldown["error"]["type"], "rate_limit_error");
     assert_eq!(cooldown["error"]["code"], "model_cooldown");
     assert_eq!(cooldown["error"]["provider"], "claude");
     assert_eq!(cooldown["error"]["last_upstream_error"], "rate_limit_error: slow down");
-    assert!(
-        text.starts_with(r#"{"error":{"code":"model_cooldown","last_upstream_error""#),
-        "sorted keys: {text}"
-    );
-    let (status, _, text) = post(
+    assert!(cooldown["error"]["reset_seconds"].is_u64() && cooldown["error"]["reset_time"].is_string());
+    let (status, headers, text) = post(
         &p.url,
         "/v1/messages",
-        &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#),
     )
     .await;
     assert_eq!(status, 429);
-    assert!(text.starts_with(r#"{"type":"error","error":{"type":"rate_limit_error","message":"All credentials for model claude-sonnet-4-6 are cooling down via provider claude"#), "{text}");
+    let error = assert_claude_error(&text, &headers, "rate_limit_error");
+    assert!(error["error"]["message"].as_str().unwrap().contains("slow down"));
     assert_eq!(
         p.seen.requests.lock().unwrap().len(),
         1,
@@ -518,7 +839,8 @@ async fn failover_stop_rules_and_cooldown_contracts() {
 #[tokio::test]
 async fn mid_stream_failure_ends_with_route_error_frame() {
     let p = proxy("", vec![oauth("a.json", "fake-break", serde_json::json!({}))]).await;
-    let body = format!(r#"{{"model":"{MODEL}","stream":true,"messages":[{{"role":"user","content":"x"}}]}}"#);
+    let body =
+        format!(r#"{{"model":"{MODEL}","stream":true,"max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#);
     let (status, _, text) = post(&p.url, "/v1/chat/completions", &body).await;
     assert_eq!(status, 200, "{text}");
     let last = text.trim_end().rsplit("\n\n").next().unwrap();
@@ -598,13 +920,13 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
         revision: 0,
     };
     key.attributes.insert("prefix".into(), "team".into());
-    let p = proxy("", vec![key]).await;
+    let p = proxy("", vec![key.clone()]).await;
     // Chat Completions so the request translator writes the resolved model; the Claude
     // identity path does not rewrite `model` yet (Go's registry fallback does).
     let (status, _, text) = post(
         &p.url,
         "/v1/chat/completions",
-        r#"{"model":"team/friendly","messages":[{"role":"user","content":"x"}]}"#,
+        r#"{"model":"team/friendly","max_tokens":5,"messages":[{"role":"user","content":"x"}]}"#,
     )
     .await;
     assert_eq!(status, 200, "{text}");
@@ -612,6 +934,39 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
     assert_eq!(seen[0].1["model"], MODEL, "alias resolved to the upstream name");
     let reply: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(reply["model"], "friendly", "force-mapping rewrites the response model");
+    // An alias passes the candidate's fence whichever arm serves it, and nothing invents a
+    // `max_tokens` (Q-H): the catalog default is sent, a payload default rule does not replace
+    // it (Settled 49) but serves when no catalog or registered limit exists and it matches the
+    // request body, and otherwise the only candidate is refused before any upstream request.
+    let catalog = format!("model-catalog: [{{match: {MODEL}, overrides: {{default-max-tokens: 777}}}}]\n");
+    let payload = "requests:\n  payload:\n    default:\n      - models: [{name: \"*\", protocol: claude}]\n        params: {max_tokens: 16384}\n";
+    let both = format!("{catalog}{payload}");
+    let unless_system = "requests:\n  payload:\n    default:\n      - models: [{name: \"*\", protocol: claude, not-exist: [system]}]\n        params: {max_tokens: 16384}\n";
+    let unlimited = r#"{"model":"team/friendly","messages":[{"role":"user","content":"x"}]}"#;
+    let system =
+        r#"{"model":"team/friendly","messages":[{"role":"system","content":"s"},{"role":"user","content":"x"}]}"#;
+    // (config, request, force-mapping, status, sent max_tokens)
+    let rows = [
+        (String::new(), unlimited, true, 400, None),
+        (catalog, unlimited, true, 200, Some(777)),
+        (both.clone(), unlimited, true, 200, Some(777)),
+        (both, unlimited, false, 200, Some(777)),
+        (payload.to_owned(), unlimited, true, 200, Some(16384)),
+        (payload.to_owned(), unlimited, false, 200, Some(16384)),
+        (unless_system.to_owned(), unlimited, false, 200, Some(16384)),
+        (unless_system.to_owned(), system, true, 400, None),
+        (unless_system.to_owned(), system, false, 400, None),
+    ];
+    for (config, body, force, status, sent) in rows {
+        let mut key = key.clone();
+        key.metadata["models"][0]["force-mapping"] = Value::Bool(force);
+        let p = proxy(&config, vec![key]).await;
+        let (got, _, text) = post(&p.url, "/v1/chat/completions", body).await;
+        assert_eq!(got, status, "{config} {body} force {force}: {text}");
+        let seen = p.seen.requests.lock().unwrap().clone();
+        let max_tokens = seen.first().map(|request| request.1["max_tokens"].clone());
+        assert_eq!(max_tokens, sent.map(Value::from), "{config} {body} force {force}");
+    }
     // The registry lists the alias and its prefixed copy, not the upstream name.
     let models: Value = wreq::Client::new()
         .get(format!("{}/v1/models", p.url))
@@ -633,7 +988,7 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
     let (status, _, _) = post(
         &p.url,
         "/v1/messages",
-        &format!(r#"{{"model":"{MODEL}","messages":[]}}"#),
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"x"}}]}}"#),
     )
     .await;
     assert_eq!(status, 400);
@@ -716,48 +1071,148 @@ async fn misc_routes_match_go() {
     let other = callback("/anthropic/callback?state=siwc&code=c").await.unwrap();
     assert_eq!(other.status().as_u16(), 200);
     assert_eq!(other.headers()["content-type"], "text/html; charset=utf-8");
-    // Interactions validation (interactions_handlers.go).
-    let (status, _, text) = post(&p.url, "/v1beta/interactions", r#"{"model":"a","agent":"b"}"#).await;
-    assert_eq!(
-        (status, text.as_str()),
-        (
-            400,
-            r#"{"error":{"message":"request requires exactly one of model or agent","type":"invalid_request_error"}}"#
-        )
-    );
     // Gemini action parsing (gemini_handlers.go).
     let (status, _, text) = post(&p.url, "/v1beta/models/x", "{}").await;
-    assert_eq!(
-        (status, text.as_str()),
-        (
-            404,
-            r#"{"error":{"message":"/v1beta/models/x not found.","type":"invalid_request_error"}}"#
-        )
-    );
+    assert_eq!(status, 404);
+    let error: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(error["error"]["code"], 404);
+    assert_eq!(error["error"]["status"], "NOT_FOUND");
+    assert!(error["error"]["message"].as_str().is_some_and(|s| !s.is_empty()));
     let (status, _, text) = post(&p.url, &format!("/v1beta/models/{MODEL}:embed"), "{}").await;
     assert_eq!((status, text.as_str()), (200, ""));
-    // Compact through Claude (v8.0.35 2bc236d2): one non-stream summary turn, sealed
-    // into a single compaction item.
+    // Compact through Claude runs native compaction (C2), which needs a `max_tokens` nothing
+    // here supplies (Q-H): it is refused before any upstream call.
     let (status, _, text) = post(
         &p.url,
         "/v1/responses/compact",
         &format!(r#"{{"model":"{MODEL}","input":"x","stream":false}}"#),
     )
     .await;
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("max_tokens is required"), "{text}");
+    assert!(p.seen.requests.lock().unwrap().is_empty());
+}
+
+/// Settled 71 through the real route: a Claude compact runs Anthropic's native compaction,
+/// the client receives the signed block inside a Responses `compaction` item, and a later
+/// request carrying that item sends the block first and leaves out the messages before it.
+#[tokio::test]
+async fn claude_compaction_reaches_a_responses_client_and_replays_first() {
+    let catalog = format!("model-catalog: [{{match: {MODEL}, overrides: {{default-max-tokens: 777}}}}]\n");
+    let p = proxy(&catalog, vec![oauth("claude.json", "fake-ok", serde_json::json!({}))]).await;
+    let body = format!(r#"{{"model":"{MODEL}","input":"x"}}"#);
+    let (status, _, text) = post(&p.url, "/v1/responses/compact", &body).await;
     assert_eq!(status, 200, "{text}");
-    let answer: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(answer["object"], "response.compaction");
-    assert_eq!(answer["output"].as_array().unwrap().len(), 1);
-    assert_eq!(answer["output"][0]["type"], "compaction");
-    assert_eq!(answer["usage"]["total_tokens"], 6);
-    let seen = p.seen.requests.lock().unwrap().clone();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].1["stream"], false);
-    assert!(
-        seen[0].1["messages"]
-            .to_string()
-            .contains("Please provide a concise and comprehensive summary")
+    let reply: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(reply["object"], "response.compaction", "{text}");
+    let item = reply["output"][0].clone();
+    assert_eq!(item["type"], "compaction", "{text}");
+    assert!(item["encrypted_content"].is_string(), "{text}");
+    let sent = std::mem::take(&mut *p.seen.requests.lock().unwrap());
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1["compaction"], serde_json::json!({"type":"summarize"}));
+
+    let body = serde_json::json!({"model":MODEL,"max_output_tokens":5,"input":[
+        {"role":"user","content":"before"},
+        item,
+        {"role":"user","content":"after"},
+    ]});
+    let (status, _, text) = post(&p.url, "/v1/responses", &body.to_string()).await;
+    assert_eq!(status, 200, "{text}");
+    let sent = std::mem::take(&mut *p.seen.requests.lock().unwrap());
+    let messages = &sent[0].1["messages"];
+    assert_eq!(
+        messages[0]["content"][0],
+        serde_json::json!({"type":"compaction","content":"summary","signature":"sig-c"}),
+        "{messages}"
     );
+    assert!(!messages.to_string().contains("before"), "{messages}");
+}
+
+#[tokio::test]
+async fn reusable_prompts_route_only_to_native_resolvers_without_a_model() {
+    let prompt = serde_json::json!({"id":"pmpt_test","version":"2","variables":{"name":"Ada"}});
+    for (native, disabled, explicit, cooling, prompt, expected) in [
+        (None, false, false, false, prompt.clone(), 400),
+        (Some(false), true, false, false, prompt.clone(), 400),
+        (Some(false), false, false, false, prompt.clone(), 200),
+        (Some(true), false, false, false, prompt.clone(), 200),
+        (None, false, true, false, prompt.clone(), 200),
+        (Some(true), false, true, false, prompt.clone(), 200),
+        (Some(false), false, false, true, prompt, 429),
+        (Some(false), false, false, false, Value::Null, 400),
+        (Some(false), false, false, false, serde_json::json!({}), 400),
+        (Some(false), false, false, false, serde_json::json!({"id":7}), 400),
+    ] {
+        for stream in [false, true] {
+            let mut credentials = vec![oauth("claude.json", "fake-ok", serde_json::json!({}))];
+            if let Some(api_key) = native {
+                let token = if cooling { "fake-quota" } else { "fake-prompt" };
+                let metadata =
+                    serde_json::json!({"type":"codex","access_token":token,"expired":"2099-01-01T00:00:00Z"});
+                let mut credential = Credential::from_file(
+                    Path::new("/fake"),
+                    Path::new("/fake/codex.json"),
+                    metadata.as_object().unwrap().clone(),
+                )
+                .unwrap();
+                if api_key {
+                    credential.attributes.insert("api_key".into(), token.into());
+                }
+                credential.disabled = disabled;
+                credentials.push(credential);
+            }
+            let p = proxy("", credentials).await;
+            let mut body = serde_json::json!({"prompt":prompt,"input":"hi","stream":stream});
+            if explicit {
+                // Claude answers it, which needs a `max_tokens` (Q-H).
+                body["model"] = MODEL.into();
+                body["max_output_tokens"] = 5.into();
+            }
+            if cooling {
+                let (status, _, text) = post(&p.url, "/v1/responses", &body.to_string()).await;
+                assert_eq!(status, 429, "{text}");
+                let mut sends = p.seen.requests.lock().unwrap();
+                assert_eq!(sends.len(), 1, "{sends:?}");
+                sends.clear();
+            }
+            let (status, _, text) = post(&p.url, "/v1/responses", &body.to_string()).await;
+            assert_eq!(
+                status, expected,
+                "native={native:?} disabled={disabled} explicit={explicit} cooling={cooling} stream={stream} prompt={prompt}: {text}"
+            );
+            let sends = p.seen.requests.lock().unwrap();
+            if expected == 400 {
+                let error = assert_openai_error(&text);
+                assert_eq!(error["error"]["type"], "invalid_request_error");
+                // The Responses codec refuses a prompt without a string `id` at ingress.
+                let message = if prompt.get("id").is_some_and(Value::is_string) {
+                    "model is required"
+                } else {
+                    "invalid protocol schema"
+                };
+                assert!(error["error"]["message"].as_str().unwrap().contains(message), "{text}");
+                assert!(sends.is_empty(), "{sends:?}");
+            } else if cooling {
+                let error = assert_openai_error(&text);
+                assert_eq!(error["error"]["type"], "rate_limit_error");
+                assert_eq!(error["error"]["code"], "model_cooldown");
+                assert!(error["error"]["reset_seconds"].as_u64().unwrap() > 0);
+                assert!(sends.is_empty(), "{sends:?}");
+            } else {
+                assert_eq!(sends.len(), 1, "{sends:?}");
+                if explicit {
+                    assert_eq!(sends[0].0, "Bearer fake-ok");
+                    assert_eq!(sends[0].1["model"], MODEL);
+                } else {
+                    assert_eq!(sends[0].0, "Bearer fake-prompt");
+                    assert_eq!(sends[0].1.get("model"), None);
+                    assert_eq!(sends[0].1["prompt"], body["prompt"]);
+                    assert!(text.contains("stored-model"), "{text}");
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1012,65 +1467,45 @@ async fn empty_stream_fails_over_and_reports_empty_stream() {
 
     let empty: Reply = Box::new(|| ([("content-type", "text/event-stream")], "").into_response());
     let (url, _, _) = scripted_proxy("", &["fake-a"], vec![empty]).await;
-    let (status, _, text) = post(&url, "/v1/messages", &body).await;
-    assert_eq!(status, 500);
-    assert_eq!(
-        text,
-        r#"{"type":"error","error":{"type":"api_error","message":"empty_stream: upstream stream closed before first payload"}}"#
-    );
+    let (status, headers, text) = post(&url, "/v1/messages", &body).await;
+    // The contract arm's empty upstream stream is a local 502, so its detail is redacted.
+    assert_eq!(status, 502, "{text}");
+    let error = assert_claude_error(&text, &headers, "api_error");
+    assert_eq!(error["error"]["message"], "Bad Gateway");
 }
 
-/// Go handlers_stream.go: `requests.streaming.bootstrap-retries` re-runs a stream that
-/// failed before its first payload, independently of request-retry.
+/// A codec route sends nothing before the first byte of the answer (D2-PLAN §5.1): a stream
+/// that broke before it moves to the next credential, and with none left it is the answer.
 #[tokio::test]
-async fn bootstrap_retries_rerun_a_stream_that_broke_before_its_first_payload() {
-    let broken: Reply = Box::new(|| {
-        // A reset before any body byte: the executor's first item is the error (Go: a
-        // channel error before the first payload). Go's Claude stream flushes any bytes
-        // that did arrive, even a partial line, as a payload before the error.
-        let body =
-            futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("reset"))]).then(|item| async move {
-                // Let hyper send the response head before the reset.
-                if item.is_err() {
+async fn a_stream_broken_before_its_first_byte_moves_to_the_next_credential() {
+    let broken = || -> Reply {
+        Box::new(|| {
+            // A reset before any body byte: the executor's first item is the error.
+            let body =
+                futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("reset"))]).then(|item| async move {
+                    // Let hyper send the response head before the reset.
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                item
-            });
-        (
-            [("content-type", "text/event-stream")],
-            axum::body::Body::from_stream(body),
-        )
-            .into_response()
-    });
-    let body = format!(r#"{{"model":"{MODEL}","stream":true,"max_tokens":5,"messages":[]}}"#);
-    let config = "requests:\n  streaming:\n    bootstrap-retries: 1\n";
-    let (url, script, _) = scripted_proxy(config, &["fake-a"], vec![broken, sse_reply()]).await;
-    let (status, _, text) = post(&url, "/v1/messages", &body).await;
-    assert_eq!(status, 200, "{text}");
-    assert_eq!(script.calls.lock().unwrap().len(), 2);
-
-    let broken: Reply = Box::new(|| {
-        // A reset before any body byte: the executor's first item is the error (Go: a
-        // channel error before the first payload). Go's Claude stream flushes any bytes
-        // that did arrive, even a partial line, as a payload before the error.
-        let body =
-            futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("reset"))]).then(|item| async move {
-                // Let hyper send the response head before the reset.
-                if item.is_err() {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                item
-            });
-        (
-            [("content-type", "text/event-stream")],
-            axum::body::Body::from_stream(body),
-        )
-            .into_response()
-    });
-    let (url, script, _) = scripted_proxy("", &["fake-a"], vec![broken, sse_reply()]).await;
-    let (status, _, _) = post(&url, "/v1/messages", &body).await;
-    assert_eq!(status, 500, "without bootstrap retries the transport fault is final");
-    assert_eq!(script.calls.lock().unwrap().len(), 1);
+                    item
+                });
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(body),
+            )
+                .into_response()
+        })
+    };
+    let body = format!(r#"{{"model":"{MODEL}","stream":true,"max_output_tokens":5,"input":"x"}}"#);
+    // (credentials, status, upstream calls)
+    for (tokens, status, calls) in [(&["fake-a", "fake-b"][..], 200, 2), (&["fake-a"][..], 500, 1)] {
+        let (url, script, _) = scripted_proxy("", tokens, vec![broken(), sse_reply()]).await;
+        let (got, _, text) = post(&url, "/v1/responses", &body).await;
+        assert_eq!(got, status, "{tokens:?}: {text}");
+        let seen = script.calls.lock().unwrap().clone();
+        assert_eq!(seen.len(), calls, "{tokens:?}");
+        if calls == 2 {
+            assert_ne!(seen[0], seen[1], "the retry is another credential");
+        }
+    }
 }
 
 /// Go net/http: no Content-Length set by the handler means chunked above 2048 bytes and
@@ -1114,7 +1549,8 @@ async fn response_framing_follows_go_net_http() {
         res.headers().get("content-type").unwrap(),
         "application/json; charset=utf-8"
     );
-    assert_eq!(res.text().await.unwrap(), r#"{"error":"Missing API key"}"#);
+    let error = assert_openai_error(&res.text().await.unwrap());
+    assert_eq!(error["error"]["type"], "authentication_error");
 }
 
 /// Go `RequestPathMetadataKey` is gin's `FullPath()`: route templates in gin syntax.
@@ -1216,7 +1652,7 @@ async fn usage_queue_records_every_attempt() {
     assert_eq!(ok["access_token_sha256"].as_str().unwrap().len(), 64);
 
     // A streamed attempt publishes once the stream ends, with the merged usage.
-    let body = format!(r#"{{"model":"{MODEL}","stream":true,"messages":[]}}"#);
+    let body = format!(r#"{{"model":"{MODEL}","stream":true,"max_tokens":5,"messages":[]}}"#);
     let (status, _, _) = post(&p.url, "/v1/messages", &body).await;
     assert_eq!(status, 200);
     let records = pop();
@@ -1240,7 +1676,7 @@ async fn usage_queue_records_every_attempt() {
 #[tokio::test]
 async fn responses_route_prepares_codex_orphan_delegation() {
     let input = r#"[{"type":"function_call","call_id":"c1","name":"create_thread","namespace":"codex_app","arguments":"{}"},{"type":"function_call_output","call_id":"c1","name":"create_thread","namespace":"codex_app","output":"paired"},{"type":"function_call_output","call_id":"c1","name":"create_thread","namespace":"codex_app","output":"second <one>"}]"#;
-    let body = format!(r#"{{"model":"{MODEL}","input":{input}}}"#);
+    let body = format!(r#"{{"model":"{MODEL}","max_output_tokens":5,"input":{input}}}"#);
     let send = |url: String, body: String| async move {
         let res = wreq::Client::new()
             .post(format!("{url}/v1/responses"))
@@ -1276,84 +1712,4 @@ async fn responses_route_prepares_codex_orphan_delegation() {
     assert_eq!(send(p.url.clone(), body).await, 200);
     let upstream = p.seen.requests.lock().unwrap()[0].1.to_string();
     assert!(upstream.contains(rewritten), "{upstream}");
-}
-
-/// Session turns (the Responses WebSocket) run through `dispatch::run`: the pin
-/// excludes every other credential in every round, the callback sees each attempted
-/// credential, and attempts go through `execute_in_session`.
-#[tokio::test]
-async fn session_turns_honour_pin_callback_and_session() {
-    use ck_core::exec::{Caller, ExecSession, Operation};
-    use ck_core::format::Format;
-    use ck_server::inference::dispatch::{self, Call, SessionTurn};
-    let p = proxy(
-        "",
-        vec![
-            oauth("a.json", "fake-ok", serde_json::json!({})),
-            oauth("b.json", "fake-fail", serde_json::json!({})),
-        ],
-    )
-    .await;
-    let selected = Arc::new(Mutex::new(Vec::<String>::new()));
-    let turn = |pinned: Option<&str>, continuation: bool| {
-        let seen = selected.clone();
-        Arc::new(SessionTurn {
-            session: ExecSession {
-                id: "ws-1".into(),
-                continuation,
-            },
-            pinned: pinned.map(str::to_owned),
-            on_selected: Some(Box::new(move |c| seen.lock().unwrap().push(c.id.clone()))),
-        })
-    };
-    let call = |turn| Call {
-        entry: Format::Claude,
-        response: Format::Claude,
-        operation: Operation::Generate,
-        model: MODEL.into(),
-        body: Bytes::from(format!(r#"{{"model":"{MODEL}","stream":true,"messages":[]}}"#)),
-        stream: true,
-        alt: None,
-        headers: Default::default(),
-        caller: Caller {
-            principal: "client-key".into(),
-            source: "authorization",
-            provider: String::new(),
-        },
-        forced_provider: None,
-        selection_model: None,
-        execution_session: Some("ws-1".into()),
-        request_path: "/v1/responses".into(),
-        peer: None,
-        turn: Some(turn),
-        media: None,
-    };
-    let tokens = || -> Vec<String> { p.seen.requests.lock().unwrap().drain(..).map(|r| r.0).collect() };
-
-    // Pinned to the failing credential: no failover to a.json.
-    let result = dispatch::run(&p.rt, call(turn(Some("b.json"), false)), &dispatch::Trace::default()).await;
-    let error = result.err().expect("pinned credential fails");
-    assert_eq!(error.failure.status(), 500);
-    assert_eq!(tokens(), ["Bearer fake-fail"]);
-    assert_eq!(*selected.lock().unwrap(), ["b.json"]);
-
-    // Pinned to the healthy one: served there, and the callback names it.
-    selected.lock().unwrap().clear();
-    let done = dispatch::run(&p.rt, call(turn(Some("a.json"), false)), &dispatch::Trace::default()).await;
-    assert!(matches!(done, Ok(dispatch::Done::Stream { .. })));
-    drop(done);
-    assert_eq!(tokens(), ["Bearer fake-ok"]);
-    assert_eq!(*selected.lock().unwrap(), ["a.json"]);
-
-    // A continuation turn needs the session's upstream socket; a Claude credential
-    // cannot hold one, so execute_in_session refuses without calling upstream.
-    selected.lock().unwrap().clear();
-    let result = dispatch::run(&p.rt, call(turn(Some("a.json"), true)), &dispatch::Trace::default()).await;
-    let error = result.err().expect("continuation needs an upstream session");
-    assert!(
-        error.failure.text().contains("upstream_http_replay_required"),
-        "{}",
-        error.failure.text()
-    );
-    assert!(tokens().is_empty());
 }

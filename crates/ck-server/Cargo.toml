@@ -23,6 +23,7 @@ ck-wire.workspace = true
 ck-core.workspace = true
 ck-exec.workspace = true
 ck-translate.workspace = true
+ck-stream.workspace = true
 futures-util.workspace = true
 gjson = "0.8.1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }

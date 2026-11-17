@@ -95,22 +95,19 @@ pub(crate) fn text_part(text: &[u8]) -> Vec<u8> {
 fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Result<Vec<u8>, Error> {
     let mut drops = common::UserTurnDrops::default();
     let user_id = common::derive_claude_user_id(raw);
-    let mut out = br#"{"model":"","max_tokens":32000,"messages":[],"metadata":{}}"#.to_vec();
+    let mut out = br#"{"model":"","max_tokens":0,"messages":[],"metadata":{}}"#.to_vec();
     gj::set_str(&mut out, "metadata.user_id", &user_id);
-    gj::set_int(
-        &mut out,
-        "max_tokens",
-        crate::claude_responses::default_max_tokens(model),
-    );
     let root = gj::parse(raw);
     thinking_config(&mut out, &root, model);
     gj::set_str(&mut out, "model", model);
-    // Go's firstExisting: a JSON null does not count.
+    // Go's firstExisting: a JSON null does not count. Without a client limit the body carries
+    // none: the executor fills the configured or registered one, never a guess (owner Q-H).
     let max_tokens = [root.get("max_tokens"), root.get("max_completion_tokens")]
         .into_iter()
         .find(|r| r.exists() && r.kind != Kind::Null);
-    if let Some(max_tokens) = max_tokens {
-        gj::set_int(&mut out, "max_tokens", max_tokens.int());
+    match max_tokens {
+        Some(max_tokens) => _ = gj::set_int(&mut out, "max_tokens", max_tokens.int()),
+        None => _ = gj::delete(&mut out, "max_tokens"),
     }
     let top_p = root.get("top_p");
     if top_p.exists() {

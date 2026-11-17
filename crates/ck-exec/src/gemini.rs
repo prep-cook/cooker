@@ -30,6 +30,7 @@ use crate::gemini_payload as payload;
 use crate::gemini_stream::{self as sse, ClaudeInputTokens};
 use crate::payload_barrier::Barrier;
 use crate::proxy::{self, GoClients, GoHeaders, Hooks, Proxy, Upstream};
+pub(crate) use crate::types::status_err;
 
 /// Providers this executor serves (`NewGeminiExecutor`, `NewGeminiInteractionsExecutor`).
 pub const PROVIDERS: [&str; 2] = ["gemini", "gemini-interactions"];
@@ -60,37 +61,12 @@ impl Default for GeminiExecutor {
     }
 }
 
-/// Same status-only classification as the other API-key executors.
-fn scope_for(status: u16) -> FailureScope {
-    match status {
-        401 | 402 | 403 | 408 | 429 | 500.. => FailureScope::Credential,
-        _ => FailureScope::Request,
-    }
-}
-
-/// `statusErr{code, msg}`: no retry hint, no headers; an empty message reads `status N`.
-pub(crate) fn status_err(status: u16, message: impl Into<Bytes>) -> ExecError {
-    let mut body: Bytes = message.into();
-    if body.is_empty() {
-        body = Bytes::from(format!("status {status}"));
-    }
-    ExecError {
-        status,
-        scope: scope_for(status),
-        body,
-        headers: Box::default(),
-        retry_after: None,
-        direct: false,
-        addon: None,
-    }
-}
-
 pub(crate) fn bad_gateway() -> ExecError {
     status_err(502, EMPTY_TRANSLATION)
 }
 
 /// `geminiAPIKey`: the attribute as stored.
-fn api_key(credential: &Credential) -> &str {
+pub(crate) fn api_key(credential: &Credential) -> &str {
     credential
         .attributes
         .get("api_key")
@@ -99,7 +75,7 @@ fn api_key(credential: &Credential) -> &str {
 }
 
 /// `resolveGeminiBaseURL`.
-fn base_url(credential: &Credential) -> String {
+pub(crate) fn base_url(credential: &Credential) -> String {
     let custom = credential
         .attributes
         .get("base_url")
@@ -233,18 +209,20 @@ pub(crate) fn apply_thinking(
     provider: &str,
     resolved: Option<&Resolved>,
 ) -> Result<Vec<u8>, ExecError> {
-    thinking::apply_request_thinking(&RequestThinking {
-        body: &body,
-        payload: &req.body,
-        original: &req.original_body,
-        model: &req.model,
-        from: from.as_str(),
-        to: to.as_str(),
-        provider,
-        resolved: resolved.map(|r| Some(&r.caps)),
-        has_request_transformer: ck_translate::pair(from, to).is_some(),
-        updates_changed: false,
-    })
+    thinking::apply_request_thinking(
+        &RequestThinking {
+            payload: Some(&req.body[..]),
+            original: Some(&req.original_body[..]),
+            model: &req.model,
+            from: from.as_str(),
+            to: to.as_str(),
+            provider,
+            resolved: resolved.map(|r| Some(&r.caps)),
+            has_request_transformer: ck_translate::pair(from, to).is_some(),
+            updates_changed: false,
+        },
+        body.to_vec(),
+    )
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))
 }
 
@@ -274,6 +252,7 @@ fn request_headers(credential: &Credential, req: &ExecRequest) -> GoHeaders {
         headers.set("x-goog-api-key", key);
     }
     set_custom_headers(&mut headers, credential, req);
+    headers.set("User-Agent", "cooker");
     headers
 }
 
@@ -400,7 +379,7 @@ pub(crate) fn captured_lines(lines: ExecStream, capture: CaptureSink) -> ExecStr
     }
     lines
         .inspect(move |item| match item {
-            Ok(line) => capture.record(CaptureEvent::ResponseChunk(line)),
+            Ok(line) => crate::proxy::capture_line(&capture, line),
             Err(error) => capture.record(CaptureEvent::ResponseError(&String::from_utf8_lossy(&error.body))),
         })
         .boxed()
@@ -414,7 +393,7 @@ pub(crate) async fn error_from(capture: &CaptureSink, upstream: Upstream) -> Exe
         .await
         .unwrap_or_default();
     capture.record(CaptureEvent::ResponseChunk(&body));
-    status_err(status, body)
+    status_err(status, body).from_upstream()
 }
 
 /// `io.ReadAll` of the whole response, then Go's status check (countTokens and
@@ -426,7 +405,7 @@ async fn read_then_check(capture: &CaptureSink, upstream: Upstream) -> Result<(h
     let limit = if ok { usize::MAX } else { proxy::MAX_ERROR_BODY };
     let data = read_captured(capture, upstream, limit).await?;
     if !ok {
-        return Err(status_err(status, data));
+        return Err(status_err(status, data).from_upstream());
     }
     Ok((headers, data))
 }
@@ -476,7 +455,7 @@ pub(crate) fn claude_error(req: &ExecRequest, out: &[u8]) -> Result<(), ExecErro
         return Ok(());
     }
     req.usage.publish_failure_with_usage(502, &String::from_utf8_lossy(out));
-    Err(status_err(502, Bytes::copy_from_slice(out)))
+    Err(status_err(502, Bytes::copy_from_slice(out)).from_upstream())
 }
 
 impl GeminiExecutor {
@@ -487,7 +466,7 @@ impl GeminiExecutor {
         }
     }
 
-    fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
+    pub(crate) fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
         self.clients.get(&Proxy::effective(credential, cfg))
     }
 
@@ -780,7 +759,11 @@ impl Output {
             translator,
             client,
             raw: alt(req).is_some(),
-            claude: ClaudeInputTokens::new(req.source_format, upstream, client, original_request(req).clone()),
+            // A canonical attempt accounts the answer's usage, so no estimate may enter it.
+            claude: match options.reported_usage {
+                true => ClaudeInputTokens::new(req.source_format, upstream, client, Bytes::new()).disabled(),
+                false => ClaudeInputTokens::new(req.source_format, upstream, client, original_request(req).clone()),
+            },
             usage: req.usage.clone(),
             capture: req.capture().clone(),
             claude_errors: false,

@@ -1,9 +1,10 @@
-//! Route error shapes: Go's `BuildErrorResponseBody` (OpenAI, Responses, Gemini and
-//! Interactions routes) and `toClaudeError` (Claude routes).
+//! Protocol-specific errors before HTTP commitment and within legacy SSE writers.
 
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::header;
 use axum::response::Response;
 use serde_json::Value;
+
+use ck_core::exec::FailureScope;
 
 use crate::http::gojson::{self, Obj};
 use crate::inference::dispatch::Failure;
@@ -42,8 +43,9 @@ pub(crate) fn compact_json(json: &str) -> String {
     String::from_utf8(out).expect("compacting valid UTF-8 JSON keeps it UTF-8")
 }
 
-/// Go `BuildErrorResponseBody`: valid JSON passes through compacted (v8.0.35
-/// cd9e5ace), anything else is wrapped in an OpenAI error envelope typed by status.
+/// OpenAI errors always have an object envelope with `message`, `type` and nullable
+/// `param` and `code`. Members an upstream or the scheduler adds (a numeric `code`,
+/// `model`, `provider`, `reset_seconds`, ...) are kept.
 pub fn openai_body(status: u16, text: &str) -> String {
     let status = if status == 0 { 500 } else { status };
     let text = if gojson::trim(text).is_empty() {
@@ -51,8 +53,51 @@ pub fn openai_body(status: u16, text: &str) -> String {
     } else {
         text
     };
+    let kind = match status {
+        401 => "authentication_error",
+        403 => "permission_error",
+        429 => "rate_limit_error",
+        408 | 500.. => "server_error",
+        _ => "invalid_request_error",
+    };
+    let mut detail = match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(mut root)) => match root.remove("error") {
+            Some(Value::Object(error)) if error.get("message").is_some_and(Value::is_string) => error,
+            _ => serde_json::Map::new(),
+        },
+        _ => serde_json::Map::new(),
+    };
+    if detail.is_empty() {
+        detail.insert("message".into(), text.into());
+    }
+    if !detail.get("type").is_some_and(Value::is_string) {
+        detail.insert("type".into(), kind.into());
+    }
+    for name in ["param", "code"] {
+        detail.entry(name).or_insert(Value::Null);
+    }
+    // The four official members first, as OpenAI orders them; the rest follow sorted.
+    let mut out = Obj::new();
+    for name in ["message", "type", "param", "code"] {
+        let value = detail.remove(name).unwrap_or(Value::Null);
+        out = out.raw(name, &gojson::sorted(&value));
+    }
+    for (name, value) in &detail {
+        out = out.raw(name, &gojson::sorted(value));
+    }
+    Obj::new().raw("error", &out.finish()).finish()
+}
+
+/// Legacy stream errors keep Go's payload shape; HTTP nullable fields do not apply.
+pub(crate) fn openai_stream_body(status: u16, text: &str) -> String {
+    let status = if status == 0 { 500 } else { status };
+    let text = if gojson::trim(text).is_empty() {
+        gojson::status_text(status)
+    } else {
+        text
+    };
     let trimmed = gojson::trim(text);
-    if !trimmed.is_empty() && serde_json::from_str::<Value>(trimmed).is_ok() {
+    if serde_json::from_str::<Value>(trimmed).is_ok() {
         return compact_json(trimmed);
     }
     let (kind, code) = match status {
@@ -78,6 +123,7 @@ fn claude_type(status: u16) -> &'static str {
         402 => "billing_error",
         403 => "permission_error",
         404 => "not_found_error",
+        409 => "conflict_error",
         413 => "request_too_large",
         429 => "rate_limit_error",
         // v8.0.27 (42d484f) adds 408.
@@ -88,13 +134,16 @@ fn claude_type(status: u16) -> &'static str {
     }
 }
 
-/// Go `toClaudeError` + `claudeErrorDetailFromText`. A missing thread state also gets
-/// `details.error_code: thread_not_found`, Anthropic's signal to replay the whole
-/// conversation (v8.0.27, 5c959cb).
+/// Anthropic SSE errors have no HTTP request identity.
 pub fn claude_body(status: u16, text: &str) -> String {
+    claude_envelope(status, text, false, false)
+}
+
+fn claude_envelope(status: u16, text: &str, normalize_type: bool, redact_message: bool) -> String {
     let mut message = text_for(status, text);
     let thread_not_found = crate::scheduling::classify::is_claude_thread_not_found(status, &message);
     let mut kind = claude_type(status).to_owned();
+    let mut code = None;
     if let Ok(Value::Object(payload)) = serde_json::from_str::<Value>(&message) {
         let field = |obj: &serde_json::Map<String, Value>, key: &str| {
             obj.get(key)
@@ -104,6 +153,11 @@ pub fn claude_body(status: u16, text: &str) -> String {
                 .map(str::to_owned)
         };
         if let Some(Value::Object(err)) = payload.get("error") {
+            code = err
+                .get("details")
+                .and_then(|v| v.get("error_code"))
+                .and_then(Value::as_str)
+                .and_then(safe_claude_code);
             kind = field(err, "type").unwrap_or(kind);
             if let Some(m) = field(err, "message").or_else(|| field(err, "code")) {
                 message = m;
@@ -115,64 +169,106 @@ pub fn claude_body(status: u16, text: &str) -> String {
             }
         }
     }
+    if redact_message {
+        let reason = gojson::status_text(status);
+        message = if reason.is_empty() {
+            "The request failed."
+        } else {
+            reason
+        }
+        .to_owned();
+    }
+    if normalize_type
+        && !matches!(
+            kind.as_str(),
+            "invalid_request_error"
+                | "authentication_error"
+                | "billing_error"
+                | "permission_error"
+                | "not_found_error"
+                | "conflict_error"
+                | "request_too_large"
+                | "rate_limit_error"
+                | "api_error"
+                | "timeout_error"
+                | "overloaded_error"
+        )
+    {
+        kind = claude_type(status).to_owned();
+    }
     let mut detail = Obj::new().str("type", &kind).str("message", &message);
-    if thread_not_found {
-        detail = detail.raw("details", r#"{"error_code":"thread_not_found"}"#);
+    if let Some(code) = code.or(thread_not_found.then_some("thread_not_found")) {
+        detail = detail.raw("details", &Obj::new().str("error_code", code).finish());
     }
     Obj::new().str("type", "error").raw("error", &detail.finish()).finish()
 }
 
-/// Writes a failure with the route's body shape.
-pub fn write(failure: &Failure, body: fn(u16, &str) -> String) -> Response {
-    write_with(failure, body, |_, raw| raw.clone())
+fn safe_claude_code(code: &str) -> Option<&'static str> {
+    match code {
+        "compaction_unavailable" => Some("compaction_unavailable"),
+        "compaction_block_misplaced" => Some("compaction_block_misplaced"),
+        "compaction_signature_invalid" => Some("compaction_signature_invalid"),
+        "compaction_content_mismatch" => Some("compaction_content_mismatch"),
+        "compaction_nothing_to_summarize" => Some("compaction_nothing_to_summarize"),
+        "thread_not_found" => Some("thread_not_found"),
+        _ => None,
+    }
 }
 
-/// [`write`] with the direct response's body rewritten by `direct_body`.
-fn write_with(
-    failure: &Failure,
-    body: fn(u16, &str) -> String,
-    direct_body: impl FnOnce(u16, &bytes::Bytes) -> bytes::Bytes,
-) -> Response {
-    // Go `writeDirectErrorResponse`: the filtered headers as given, JSON by default.
-    if let Some(e) = failure.direct() {
-        let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut res = Response::new(axum::body::Body::from(direct_body(e.status, &e.body)));
-        *res.status_mut() = status;
-        let headers = crate::http::respond::filter_upstream_headers(&e.headers);
+/// Builds the client's envelope even when an executor requested a direct response.
+fn write(failure: &Failure, render: impl FnOnce(u16, &str) -> Response) -> Response {
+    let status = failure.status();
+    let mut response = render(status, &failure.text());
+    if let Some(error) = failure.direct() {
+        let headers = crate::http::respond::filter_upstream_headers(&error.headers);
         for name in headers.keys() {
+            if name == header::CONTENT_TYPE || name == "request-id" {
+                continue;
+            }
             for value in headers.get_all(name) {
-                res.headers_mut().append(name.clone(), value.clone());
+                response.headers_mut().append(name.clone(), value.clone());
             }
         }
-        if !res.headers().contains_key(header::CONTENT_TYPE) {
-            res.headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        }
-        return res;
     }
-    let status = failure.status();
-    let text = text_for(status, &failure.text());
-    let mut res = crate::http::respond::json(status, "application/json", body(status, &text));
     if let Some(seconds) = failure.retry_after() {
-        res.headers_mut().insert(header::RETRY_AFTER, seconds.into());
+        response.headers_mut().insert(header::RETRY_AFTER, seconds.into());
     }
-    res
+    response
+}
+
+/// Q8: an OpenAI route S1 has no codec for refuses every request with 501.
+pub fn not_implemented(message: &str) -> Response {
+    let detail = Obj::new()
+        .str("message", message)
+        .str("type", "invalid_request_error")
+        .raw("param", "null")
+        .str("code", "unsupported_endpoint")
+        .finish();
+    crate::http::respond::json(501, "application/json", Obj::new().raw("error", &detail).finish())
 }
 
 pub fn openai(failure: &Failure) -> Response {
-    write(failure, openai_body)
+    write(failure, |status, text| {
+        crate::http::respond::json(status, "application/json", openai_body(status, text))
+    })
 }
 
 pub fn claude(failure: &Failure) -> Response {
-    // Go's Claude `WriteErrorResponse` marks a direct missing-thread answer too.
-    write_with(failure, claude_body, |status, raw| {
-        let text = String::from_utf8_lossy(raw);
-        if crate::scheduling::classify::is_claude_thread_not_found(status, &text) {
-            bytes::Bytes::from(claude_body(status, &text))
-        } else {
-            raw.clone()
-        }
+    // Only text this process wrote about its own executors, credentials or scheduling is
+    // hidden. Upstream messages and local request-scoped 4xx errors, which name what the
+    // client sent, pass through.
+    let redact_message = match failure {
+        Failure::Exec(error) => !error.upstream && !(error.scope == FailureScope::Request && error.status < 500),
+        Failure::UnknownModel(_) | Failure::ImageOnly(_) | Failure::SpeechOnly(_) | Failure::Cooldown { .. } => false,
+        Failure::Unavailable { .. } => true,
+    };
+    write(failure, |status, text| {
+        crate::http::errors::anthropic_body(status, claude_envelope(status, text, true, redact_message))
     })
+}
+
+pub fn gemini(failure: &Failure) -> Response {
+    write(failure, crate::http::errors::gemini)
 }
 
 #[cfg(test)]
@@ -180,37 +276,147 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openai_envelope_matches_go() {
+    fn openai_envelope_preserves_official_fields() {
+        let input = r#"{"error":{"message":"invalid parameter","type":"invalid_request_error","param":"model","code":"unknown_parameter"}}"#;
         assert_eq!(
-            openai_body(500, "status 500"),
-            r#"{"error":{"message":"status 500","type":"server_error","code":"internal_server_error"}}"#
+            serde_json::from_str::<Value>(&openai_body(400, input)).unwrap(),
+            serde_json::from_str::<Value>(input).unwrap()
         );
-        assert_eq!(openai_body(400, " {\"a\":1} "), r#"{"a":1}"#);
-        // Recorded from Go v8.0.35 BuildErrorResponseBody, including its
-        // TestBuildErrorResponseBody_CompactsPrettyPrintedJSON input.
-        for (text, want) in [
-            (
-                "{\n  \"error\": {\n    \"code\": 500,\n    \"message\": \"Internal error encountered.\",\n    \"status\": \"INTERNAL\"\n  }\n}",
-                r#"{"error":{"code":500,"message":"Internal error encountered.","status":"INTERNAL"}}"#,
-            ),
-            (" [ 1 ,\t2 ]\r\n", "[1,2]"),
-            (
-                "{\"a b\" : \"x  y\\n <&> \\u2028 \u{2028}\", \"n\" : [ ] }",
-                "{\"a b\":\"x  y\\n <&> \\u2028 \u{2028}\",\"n\":[]}",
-            ),
-            ("{\"q\":\"a\\\" b\" , \"r\" : 1}", r#"{"q":"a\" b","r":1}"#),
-            ("\"  spaced  \"", "\"  spaced  \""),
-        ] {
-            assert_eq!(openai_body(502, text), want, "{text:?}");
+        for text in ["plain text", "[]", "null", r#"{"ok":true}"#] {
+            let value: Value = serde_json::from_str(&openai_body(400, text)).unwrap();
+            assert_eq!(value["error"]["message"], text);
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert_eq!(value["error"].get("param"), Some(&Value::Null));
+            assert_eq!(value["error"].get("code"), Some(&Value::Null));
         }
-        assert_eq!(
-            openai_body(422, "bad <x>"),
-            r#"{"error":{"message":"bad \u003cx\u003e","type":"invalid_request_error"}}"#
+    }
+
+    #[test]
+    fn openai_envelope_keeps_members_the_upstream_or_scheduler_adds() {
+        // (input, member, expected)
+        let rows = [
+            (
+                r#"{"error":{"message":"m","code":429}}"#,
+                "code",
+                serde_json::json!(429),
+            ),
+            (
+                r#"{"error":{"message":"m","type":"t","param":"p","code":"c","status":"RESOURCE_EXHAUSTED"}}"#,
+                "status",
+                serde_json::json!("RESOURCE_EXHAUSTED"),
+            ),
+            (
+                r#"{"error":{"code":"model_cooldown","model":"x","provider":"claude","reset_seconds":3,"reset_time":"3s","last_upstream_error":"e","message":"m"}}"#,
+                "reset_seconds",
+                serde_json::json!(3),
+            ),
+            (
+                r#"{"error":{"code":"model_cooldown","model":"x","provider":"claude","reset_seconds":3,"reset_time":"3s","last_upstream_error":"e","message":"m"}}"#,
+                "last_upstream_error",
+                serde_json::json!("e"),
+            ),
+        ];
+        for (input, member, want) in rows {
+            let value: Value = serde_json::from_str(&openai_body(429, input)).unwrap();
+            assert_eq!(value["error"][member], want, "{input}");
+            assert!(value["error"]["type"].is_string(), "{input}");
+            assert!(value["error"].get("param").is_some(), "{input}");
+            assert!(value["error"].get("code").is_some(), "{input}");
+        }
+    }
+
+    #[test]
+    fn claude_route_hides_local_executor_text_but_not_upstream_or_client_correctable_text() {
+        use ck_core::exec::ExecError;
+        let local = ExecError::local(401, FailureScope::Credential, "missing refresh token");
+        // An upstream answer need not carry headers (Meta, Antigravity, AI Studio).
+        let upstream = ExecError::local(429, FailureScope::Model, "quota exhausted").from_upstream();
+        // A refused token refresh keeps the endpoint's status; its scope is the credential's.
+        let refresh = ExecError::local(
+            400,
+            FailureScope::Credential,
+            "token refresh failed with status 400: invalid_grant",
         );
-        assert_eq!(
-            openai_body(429, ""),
-            r#"{"error":{"message":"Too Many Requests","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#
+        let compact = ExecError::local(
+            400,
+            FailureScope::Request,
+            "This model does not support compaction; choose a model that does.",
         );
+        let unavailable = Failure::Unavailable {
+            code: "auth_not_found",
+            providers: vec!["claude".into()],
+            model: "m".into(),
+            cause: None,
+            retry_after: None,
+        };
+        // (failure, message the client sees)
+        let rows = [
+            (Failure::Exec(local), "Unauthorized"),
+            (Failure::Exec(refresh), "Bad Request"),
+            (Failure::Exec(upstream), "quota exhausted"),
+            (
+                Failure::Exec(compact),
+                "This model does not support compaction; choose a model that does.",
+            ),
+            (Failure::UnknownModel("nope".into()), "unknown provider for model nope"),
+            (unavailable, "Service Unavailable"),
+        ];
+        for (failure, want) in rows {
+            let response = claude(&failure);
+            let bytes = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["message"], want, "{value}");
+        }
+    }
+
+    #[test]
+    fn claude_reconstruction_keeps_documented_codes_and_drops_the_rest() {
+        // (status, upstream body, type, message, details.error_code)
+        let rows = [
+            (
+                400,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"content mismatch","details":{"error_code":"compaction_content_mismatch","account":"secret"}},"request_id":"upstream-secret"}"#,
+                "invalid_request_error",
+                "content mismatch",
+                Some("compaction_content_mismatch"),
+            ),
+            (
+                529,
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"try later","details":{"error_code":"compaction_unavailable"}}}"#,
+                "overloaded_error",
+                "try later",
+                Some("compaction_unavailable"),
+            ),
+            (409, "conflict", "conflict_error", "conflict", None),
+            (
+                429,
+                r#"{"error":{"type":"vendor_quota_error","message":"usage limit reached","details":{"error_code":"private_code","account":"secret"}}}"#,
+                "rate_limit_error",
+                "usage limit reached",
+                None,
+            ),
+        ];
+        for (status, body, kind, message, code) in rows {
+            let error =
+                ck_core::exec::ExecError::local(status, ck_core::exec::FailureScope::Request, body).from_upstream();
+            let response = claude(&Failure::Exec(error));
+            let bytes = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            let mut want = serde_json::json!({"type": kind, "message": message});
+            if let Some(code) = code {
+                want["details"] = serde_json::json!({"error_code": code});
+            }
+            assert_eq!(value["error"], want, "{body}");
+            assert!(!value.to_string().contains("secret"), "{body}");
+        }
     }
 
     #[test]
@@ -275,8 +481,13 @@ mod tests {
                 .block_on(axum::body::to_bytes(res.into_body(), usize::MAX))
                 .unwrap()
         };
-        assert_eq!(read(claude(&direct(&upstream))), marked.as_bytes());
-        assert_eq!(read(openai(&direct(&upstream))), upstream.as_bytes());
-        assert_eq!(read(claude(&direct("not found"))), "not found".as_bytes());
+        let response: Value = serde_json::from_slice(&read(claude(&direct(&upstream)))).unwrap();
+        assert_eq!(response["error"]["details"]["error_code"], "thread_not_found");
+        assert!(response["request_id"].is_string());
+        let response: Value = serde_json::from_slice(&read(openai(&direct(&upstream)))).unwrap();
+        assert!(response["error"]["message"].is_string());
+        assert!(response["error"].get("param").is_some());
+        let response: Value = serde_json::from_slice(&read(claude(&direct("not found")))).unwrap();
+        assert_eq!(response["error"]["type"], "not_found_error");
     }
 }

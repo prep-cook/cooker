@@ -60,7 +60,7 @@ UI scale/layout values remain in `ui/DESIGN.md` and code limits in `ui/CONVENTIO
 | Status check interval while several jobs run | | | Orchestrator; decision 13 |
 | Commit subject length | 72 characters; source: CONTRIBUTING.md, Commits and pull request titles | A setting, not measured | .github/scripts/pr-title.py checks PR titles; commit hook absent |
 | Linux release sizes | Binary 52000000 B; text 35000000 B; rodata 11000000 B; zero tolerance; source: bench/budgets.txt size.x86_64-unknown-linux-gnu | | bench/gate.sh size |
-| Duplicate linked crate versions | 11 crates, zero tolerance; source: bench/budgets.txt deps.x86_64-unknown-linux-gnu.duplicate_crates | | bench/gate.sh size |
+| Duplicate linked crate versions | 12 crates, zero tolerance; source: bench/budgets.txt deps.x86_64-unknown-linux-gnu.duplicate_crates | | bench/gate.sh size |
 | Linux idle | With 1 and 2000 credentials: 3 wakeups, 1 CPU tick, 6 threads; RSS 33500 and 85800 KB with 10% tolerance, measured in the Dockerfile perf stage; source: bench/budgets.txt idle.linux | | bench/gate.sh idle |
 | Field-mix soak peak | 173072 KB with 20% tolerance; source: bench/budgets.txt soak.field.peak_hwm_kb | | bench/soak.sh |
 | Request heap budgets | Per-route peak bytes, allocations and held bytes with keyed tolerances in bench/budgets.txt alloc.* | | crates/ck-server/tests/alloc_budget.rs through nextest |
@@ -72,9 +72,37 @@ UI scale/layout values remain in `ui/DESIGN.md` and code limits in `ui/CONVENTIO
 | Select all, main thread | ≤ baseline | | ui/tools/perf/run.mjs; before-release comparison |
 | Contrast, project targets | Body ≥ 10:1; secondary and status text ≥ 5:1 | Moon dark: body 11.86, lowest 3.94; Main dark: body 13.39, lowest 3.16; Dawn light, both palettes: body 8.69, lowest 2.86 (browser, 1440 px, en; host/date not recorded); Exceptions lists misses | Browser measurement, by hand |
 | Contrast, WCAG AA | Normal text 4.5:1; large text, UI components and focus indicators 3:1 | Neutral and optional-palette measurements under Exceptions; optional palettes have an owner exception | Browser measurement, by hand |
+| Upstream stream deadlines per attempt | Before headers 600 s; idle between upstream chunks 300 s; total 3600 s; integers > 0; before output the attempt fails over without cooling the credential, after output the client gets the protocol error event; old execute arm and live sessions excluded | Owner ruling 2026-11-15 (adopt 2, bifrost reference); defaults chosen in #210 | `requests.upstream-timeouts` in crates/ck-core/src/config; deadline rows in crates/ck-server/tests/stream_pipeline.rs |
 | Dashboard session lifetime | Default session 7 days; remember-this-device 30 days | Owner setting, 2026-11-13 | `SHORT` and `LONG` in crates/ck-server/src/management/api/session.rs; `dashboard_session_cookie_signs_in_reads_and_signs_out` in crates/ck-server/tests/management.rs |
 
 Historical source evidence: `bench/budgets.txt` records dated compiler/runner measurements and tolerances; `ui/REQUIREMENTS.md` retains historical dashboard measurements. Dates, hosts and load are stated only where recorded.
+
+## Deploy-only stream settings
+
+S1 fixes this configuration contract; `ck-stream::Config` implements it for the store, while production bootstrap integration remains part of the S1 execution cutover. All seven values are read and validated at startup. Every change requires a restart. Configured overrides remain supported within the validation and owner ceilings in `docs/INTERNAL-STREAM.md`, §6.4. Schema declarations must mark these values deploy-only; runtime configuration publication must not hot-apply them.
+
+| Setting | Classification | Contract reference |
+| --- | --- | --- |
+| `stream.pool_directory` | Deploy-only; restart required | Private directory and file lifecycle, §6.3 |
+| `stream.pool_bytes` | Deploy-only; restart required | Startup tmpfs/cgroup caps and total ceiling, §6.4 |
+| `stream.startup_reserve_bytes` | Deploy-only; restart required | Prebacked warm frames within the pool cap, preserved by decay, §6.4–6.5 |
+| `stream.max_frames` | Deploy-only; restart required | Derived capped-pool default and combined exchange quota, §6.4 |
+| `stream.max_event_bytes` | Deploy-only; restart required | Provisional event limit and startup validation, §6.4 |
+| `stream.max_metadata_bytes` | Deploy-only; restart required | Metadata limit (8 MiB default, owner number) and checked capacity validation, §6.4 |
+| `stream.cache_ttl` | Deploy-only; restart required | Last-read expiry, §6.4 |
+
+These values need no live-editable admin page or page exception under `crates/AGENTS.md`, Admin panel. Later hot-change support must include its admin page in the same change. Owner-approved codec/pipeline tolerances in `docs/INTERNAL-STREAM.md`, §9.2, allow at most 5% regression per pipeline metric and 0% for memory/storage (2026-11-14 morning, option B); codec CPU and allocation-count rows are reported against absolute per-event budgets instead (2026-11-15). They do not change the existing budgets above or the §9.3 storage gate.
+
+## Deploy-only realtime settings
+
+Read and validated at startup; every change requires a restart. Defaults come from established gateways and libraries (Settled 58).
+
+| Setting | Default | Classification | Source of the default |
+| --- | --- | --- | --- |
+| `realtime.ping-interval-seconds` | 30 | Deploy-only; restart required | Half the read deadline, following SignalR's recommended 2:1 timeout-to-keepalive ratio; below the 60 s idle timeouts of nginx and AWS ALB |
+| `realtime.read-timeout-seconds` | 60 | Deploy-only; restart required | gorilla/websocket pongWait 60 s; nginx WebSocket proxying 60 s (proxy_read_timeout); AWS ALB idle timeout 60 s |
+| `realtime.write-timeout-seconds` | 10 | Deploy-only; restart required | gorilla/websocket writeWait 10 s |
+| `realtime.max-sockets-per-key` | 0 (no limit) | Deploy-only; restart required | nginx limit_conn applies only when configured; same convention as codex.live-media-relay.max-sessions |
 
 ## Enforcement
 
@@ -154,6 +182,11 @@ Intentional designs that look like defects:
 | Polling pauses in hidden tabs | Avoid work for an unseen dashboard | Existing ui/REQUIREMENTS.md design |
 | ProviderIcon.tsx draws brand marks from vendored providerMarks.ts path data | Lucide lacks brand marks; monochrome vendored artwork follows text color; check:ui permits that file's SVG | Existing ui/REQUIREMENTS.md design; attribution/license provenance stays in the existing source and notices |
 | Optional Rosé Pine palettes (Main, Moon, Dawn) may fall below WCAG AA | Preserve the optional palettes' published colors; the default Neutral palette must meet AA. Measurements below distinguish AA failures from stricter project-target misses. | An owner, 2026-11-13: 「主題的話是例外的」 |
+| An Anthropic request the Claude OAuth cloak or Claude Code identity shapes goes upstream as prepared from the client's own bytes | The cloak's detection reads the client's member order and `cch` signs the body built from those bytes; re-encoding would change the identity, session and fingerprint (`docs/EXECUTION-CONTRACT.md`, G5) | An owner, 2026-11-16: 「別的按建議」, adopting option (a): 「在契約加一條 G5：把客戶端的原始位元組傳進執行器，只有 cloak 原樣送出，作為唯一的直通例外」 |
+| Antigravity answers `/responses/compact` from a local summary turn, and its executor runs CLIProxyAPI's translators on the client protocol's own encoding | The owners use CLIProxyAPI's Antigravity behaviour as the reference; docs/EXECUTION-CONTRACT.md §3 otherwise runs only a native compact (Settled 68-70) | An owner, 2026-11-15 23:30: 「可以参考 CPA gemini的」「我不用gemini」「你抄一下把」 |
+| Live-session messages (Realtime, Live, WebRTC), media and control alike, are forwarded as received; only a metadata projection enters the internal stream, and client-to-upstream messages are validated before forwarding | No gateway component consumes media bytes, and the sessions are provider-locked and same-protocol, so conversion would add latency, copies and storage for nothing; resume is meaningless because session state depends on what the user heard | An owner (xz-dev), 2026-11-15: 「如果是实时传输优化（比如 Realtime 或者 WebRTC 这种根本不存在需要保存数据进行断线重连而是每次都发送的新的数据）那么我们不需要 SSE 保存数据，只需要借用 SSE 数据管线传输元数据而非还有数据本身，避免破坏延迟和增加无意义的数据转换和传输」 |
+| Anthropic Messages and token counting accept bodies up to 128 MB while other client routes keep 64 MiB | Anthropic's documented request ceiling is 128 MB; a smaller `server.max-request-body-bytes` still applies | 2026-11-16, 「F14 提高 TUI 不遮蔽 按建議」 (`docs/OPEN-QUESTIONS.md`, Settled 66) |
+| The Claude relay collects the body of a non-streaming cloaked generation, bounded by the exchange's stream quota | Restoring its tool aliases and reading its message ID need the whole JSON, and the upstream request must stay the old route's byte for byte, so the upstream cannot be asked to stream (`docs/EXECUTION-CONTRACT.md`, G5) | An owner, 2026-11-16: 「ok 合理，就按照它说的」, adopting Q20 option (a): 「例外允許 Claude 轉接收集有大小上限的 body，只限偽裝的非串流請求」 |
 | Rust files and functions listed in tools/rust-size-ratchet.txt exceed the 600-line file and 80-line function caps | New and rewritten code meets the caps; existing items are refactored case by case later, and each entry may only go down (tools/check-rust-size.py `--update` lowers or removes, never adds or raises) | An owner, 2026-11-14: 「会不会太严厉需要的就做吧」 |
 
 Contrast inventory copied from `ui/REQUIREMENTS.md`. Browser rows cover rendered sign-in/System pages, open menus and info/error banners at 1440 px in English. Palette rows are computed mapped pairs, not proof they appear in a measured page. Dawn applies to both Rosé Pine palettes. Disabled text is exempt where noted; that does not exempt placeholder text.

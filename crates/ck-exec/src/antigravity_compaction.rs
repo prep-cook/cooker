@@ -37,16 +37,6 @@ pub(crate) fn statusless(message: impl Into<String>) -> ck_core::exec::ExecError
     ck_core::exec::ExecError::local(0, ck_core::exec::FailureScope::Model, message)
 }
 
-/// `ResponsesCompactionSourcePayload`: the body, unless only the original request
-/// carries the trigger or the body is empty.
-pub(crate) fn source_payload<'a>(body: &'a [u8], original: &'a [u8]) -> &'a [u8] {
-    if (!has_trigger(body) && has_trigger(original)) || (body.is_empty() && !original.is_empty()) {
-        original
-    } else {
-        body
-    }
-}
-
 /// `DropForeignResponsesCompactionItems`: compaction items whose `encrypted_content`
 /// is not a CPA capsule (`RecognizedAntigravityCompactionCapsule`) are removed. `None`
 /// when nothing was dropped.

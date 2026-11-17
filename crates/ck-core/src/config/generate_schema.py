@@ -89,6 +89,8 @@ schema["fields"].pop("plugins")
 schema["fields"]["oauth"]["fields"].pop("auth-dir")
 # Client aliases are removed, not part of the canonical writable schema.
 schema["fields"]["oauth"]["fields"]["providers"]["fields"]["codex"]["fields"].pop("optimize-multi-agent-v2", None)
+# Only a listed relay key registers an AI Studio browser; Go's `ws-auth` switch is removed.
+schema["fields"]["oauth"]["fields"]["providers"]["fields"]["aistudio"] = {"fields": {"relay-keys": {"list": "string"}}}
 families = source.split("var v8KeyFamilies = []configPath{", 1)[1].split("func buildV8Paths", 1)[0]
 shared = ["priority", "prefix", "proxy-url", "headers", "models", "excluded-models", "disable-cooling", "request-retry", "request-scoped-errors"]
 for old, family in re.findall(r'\{"([^"]+)", "([^"]+)"\}', families):
@@ -105,6 +107,10 @@ for old, family in re.findall(r'\{"([^"]+)", "([^"]+)"\}', families):
         group["fields"]["keys"] = {"list": key}
     put("api-keys." + family, {"list": group})
 schema["fields"]["config-version"] = "version"
+# Nothing sends bytes before an attempt's first answer byte, so the non-stream keep-alive and
+# stream bootstrap retries are removed (Q-F).
+schema["fields"]["requests"]["fields"].pop("nonstream-keepalive-interval")
+schema["fields"]["requests"]["fields"]["streaming"]["fields"].pop("bootstrap-retries")
 # cooker additions (docs/DIFFERENCES-FROM-GO.md). Go starts with them and ignores
 # them; a config edit through its v8 Management API moves them into comments.
 put("oauth.providers.codex.chatgpt-keep-alive", "bool")
@@ -114,7 +120,11 @@ providers = {"fields": {"exclude": {"list": "string"}, "order": {"list": "opaque
 put("routing.providers", copy.deepcopy(providers))
 schema["fields"]["worker-threads"] = "int"
 schema["fields"]["artificial-analysis"] = {"fields": {"api-key": "string", "url": "string", "cache-file": "string"}}
+schema["fields"]["model-catalog"] = {"list": {"fields": {"match": "string", "overrides": {"fields": {"default-max-tokens": {"optional": "int"}}}}}}
 schema["fields"]["model-routers"] = {"list": {"fields": {"name": "string", "tier": "string", "judge": "opaque", "models": {"list": "opaque"}, "fallback-models": "int", "providers": providers}}}
+put("requests.upstream-timeouts", {"fields": {key: "int" for key in ["header-seconds", "idle-seconds", "total-seconds"]}})
+realtime = ["ping-interval-seconds", "read-timeout-seconds", "write-timeout-seconds", "max-sockets-per-key"]
+schema["fields"]["realtime"] = {"fields": {key: "int" for key in realtime}}
 schema["fields"].pop("home", None)
 Path(__file__).with_name("schema.json").write_text(json.dumps(schema, indent=2) + "\n")
 print(f"Generated schema from {revision}")

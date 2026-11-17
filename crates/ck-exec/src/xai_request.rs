@@ -11,26 +11,25 @@ use ck_core::format::Format;
 use ck_translate::RequestCtx;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, GoValue, Kind, Res};
-use ck_wire::thinking::{self, ModelCaps, RequestThinking, parse_suffix};
+use ck_wire::thinking::parse_suffix;
 
-use crate::openai_compat_payload::{self as compat, set_bool_if_different, set_str_if_different};
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_response::{
-    self as response, CUSTOM, ClientToolKey, FUNCTION, NAMESPACE, NamespaceRef, NamespaceRefs, WEB_SEARCH, text,
+    self as response, CUSTOM, FUNCTION, NAMESPACE, NamespaceRef, NamespaceRefs, WEB_SEARCH, text,
 };
 use ck_translate::apply_patch_responses as apply_patch;
 
 use crate::xai::PROVIDER;
+use crate::xai_shape::Inbound;
 const IMAGE_GENERATION: &str = "image_generation";
 const TOOL_SEARCH: &str = "tool_search";
 const X_SEARCH: &str = "x_search";
 const CLIENT_WEB_SEARCH_ALIAS: &str = "clientfn_web_search";
-pub(crate) const MAX_TOOLS: usize = 200;
+pub(crate) const MAX_TOOLS: usize = 1000;
 const CODEX_APP_NAMESPACE: &str = "codex_app";
 const AUTOMATION_UPDATE: &str = "automation_update";
 const SAFE_FUNCTION_PARAMETERS: &str = r#"{"type":"object","properties":{},"additionalProperties":true}"#;
 const X_SEARCH_TOOL: &str = r#"{"type":"x_search"}"#;
-const COMPOSER_PREFIX: &str = "grok-composer-";
 
 /// `xaiPreparedRequest`.
 pub(crate) struct Prepared {
@@ -38,16 +37,14 @@ pub(crate) struct Prepared {
     pub original_payload: Vec<u8>,
     pub body: Vec<u8>,
     pub namespace_tools: NamespaceRefs,
-    pub client_declared_tools: HashSet<ClientToolKey>,
     pub session_id: String,
     pub replay_scope: ReplayScope,
-    pub filter_internal_x_search: bool,
     pub web_search_alias: String,
     /// `helps.ApplyPatchResponsesState`.
     pub apply_patch: apply_patch::State,
     /// Go `finalizePayload`'s captured baseline and target protocol.
-    rule_original: Vec<u8>,
-    rule_protocol: Format,
+    pub rule_original: Vec<u8>,
+    pub rule_protocol: Format,
 }
 
 impl Prepared {
@@ -75,21 +72,44 @@ fn bad_request(message: impl Into<String>) -> ExecError {
     ExecError::local(400, FailureScope::Request, message)
 }
 
+/// Refuse generation constraints before translation can discard their native spelling.
+fn validate_controls(body: &[u8], source: Format) -> Result<(), ExecError> {
+    let root = gj::parse(body);
+    for &(canonical, snake, camel) in ck_translate::responses::request::XAI_REFUSED_CONTROLS {
+        let parents: &[&str] = if source == Format::Gemini {
+            &["generation_config", "generationConfig"]
+        } else {
+            &[""]
+        };
+        for parent in parents {
+            let nested = (!parent.is_empty()).then(|| root.get(parent));
+            let controls = nested.as_ref().unwrap_or(&root);
+            for field in [canonical, snake, camel] {
+                let value = controls.get(field);
+                if !value.exists() || value.kind == Kind::Null {
+                    continue;
+                }
+                let refused = match canonical {
+                    "n" => value.int() != 1,
+                    "logprobs" => value.kind != Kind::False,
+                    "response_format" => value.get("type").str() == "json_object",
+                    _ => true,
+                };
+                if refused {
+                    return Err(bad_request(format!("xAI Responses cannot preserve {field}")));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `opts.OriginalRequest`, else the payload.
 pub(crate) fn original(req: &ExecRequest) -> &[u8] {
     if req.original_body.is_empty() {
         &req.body
     } else {
         &req.original_body
-    }
-}
-
-/// `helps.PayloadRequestedModel`.
-pub(crate) fn requested_model(req: &ExecRequest) -> &str {
-    if req.requested_model.trim().is_empty() {
-        req.model.trim()
-    } else {
-        req.requested_model.trim()
     }
 }
 
@@ -148,7 +168,14 @@ fn preserve_output_controls(mut body: Vec<u8>, source: &[u8], from: Format) -> V
     if usable(&max) {
         gj::set_raw(&mut body, "max_output_tokens", max.raw());
     }
-    for field in ["temperature", "top_p", "top_k"] {
+    for field in [
+        "temperature",
+        "top_p",
+        "top_k",
+        "parallel_tool_calls",
+        "safety_identifier",
+        "search_parameters",
+    ] {
         let value = gj::get(source, field);
         if usable(&value) {
             gj::set_raw(&mut body, field, value.raw());
@@ -157,7 +184,8 @@ fn preserve_output_controls(mut body: Vec<u8>, source: &[u8], from: Format) -> V
     body
 }
 
-/// `prepareResponsesRequestTo`.
+/// `prepareResponsesRequestTo`: the client body translated to the Responses shape, then
+/// [`crate::xai_shape::shape`].
 pub(crate) fn prepare(
     req: &ExecRequest,
     cfg: &Config,
@@ -166,10 +194,11 @@ pub(crate) fn prepare(
     replay_store: &replay::Store,
     downstream_websocket: bool,
 ) -> Result<Prepared, ExecError> {
+    if req.alt.as_deref() != Some(crate::xai::COMPACT_ALT) {
+        validate_controls(&req.body, req.source_format)?;
+    }
     let base_model = parse_suffix(&req.model).model_name;
     let original_payload = original(req).to_vec();
-    // cliproxyauth.ResolvedModelInfo, bound by dispatch for configured xai-api-key models.
-    let caps = req.resolved_model.as_ref().map(|r| ModelCaps::from(&r.info));
     let is_compat = req.resolved_model.as_ref().is_some_and(|r| r.is_compat());
     let client = crate::codex_client::Client::new(&req.headers, cfg, PROVIDER, is_compat);
     let original_translated = translate(req, &client, to, &base_model, stream, &original_payload);
@@ -177,35 +206,28 @@ pub(crate) fn prepare(
     let original_translated = crate::translate::baseline_or_working(original_translated, &body);
     let original_translated = preserve_output_controls(original_translated, &original_payload, req.source_format);
     let body = preserve_output_controls(body, &req.body, req.source_format);
-    let mut body = thinking::apply_request_thinking(&RequestThinking {
-        body: &body,
-        payload: &req.body,
-        original: &original_payload,
-        model: &req.model,
-        from: req.source_format.as_str(),
-        // Go passes the executor identifier as the target format.
-        to: PROVIDER,
-        provider: PROVIDER,
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer: false,
-        updates_changed: false,
-    })
-    .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
-    set_str_if_different(&mut body, "model", &base_model);
-    set_bool_if_different(&mut body, "stream", stream);
-    for key in [
-        "previous_response_id",
-        "prompt_cache_retention",
-        "safety_identifier",
-        "stream_options",
-    ] {
-        gj::delete(&mut body, key);
-    }
-    body = ck_wire::codex_client::rewrite_multi_agent_v2_input(&req.headers, &body, &client.settings, false);
-    let mut apply_patch = apply_patch::State::new(req.source_format, &original_payload, &original_translated);
-    // A plain Go error (translator/common NormalizeApplyPatchResponsesRequest).
-    body = apply_patch::normalize_executor_request(&body, Some(&original_payload))
-        .map_err(crate::openai_compat::plain_err)?;
+    let mut inbound = Inbound::of(req);
+    inbound.downstream_websocket = downstream_websocket;
+    let mut prepared = crate::xai_shape::shape(&inbound, cfg, replay_store, stream, to, body, &original_translated)?;
+    prepared.original_payload = original_payload;
+    prepared.rule_original = original_translated;
+    Ok(prepared)
+}
+
+/// What the tool rewrites leave besides the body.
+pub(crate) struct Tools {
+    pub fold: bool,
+    pub namespace_tools: NamespaceRefs,
+    pub web_search_alias: String,
+}
+
+/// The `tools` and `tool_choice` rewrites of `prepareResponsesRequestTo`; folded namespace
+/// dispatchers holding a patch tool are registered with `apply_patch`.
+pub(crate) fn shape_tools(
+    mut body: Vec<u8>,
+    cfg: &Config,
+    apply_patch: &mut apply_patch::State,
+) -> Result<(Vec<u8>, Tools), ExecError> {
     let will_inject = inject_x_search(cfg);
     let fold = should_fold_namespace_tools(&body, will_inject);
     let namespace_tools = collect_namespace_refs(&body, fold);
@@ -214,7 +236,6 @@ pub(crate) fn prepare(
             apply_patch.add_dispatcher(name, &r.namespace);
         }
     }
-    let client_declared_tools = response::client_declared_tool_keys(&body);
     body = normalize_tools(body, fold);
     body = promote_additional_tools(body);
     let mut web_search_alias = String::new();
@@ -230,78 +251,31 @@ pub(crate) fn prepare(
     if will_inject && !requires_hosted_tool_only_any(&body) {
         body = ensure_native_x_search_tool(body);
     }
-    body = clamp_tools_limit(body, MAX_TOOLS, &namespace_tools);
-    let replay_scope = replay::scope(req, &body, downstream_websocket);
-    body = replay::apply(replay_store, &replay_scope, body);
+    if gj::get(&body, "tools").array().len() > MAX_TOOLS {
+        return Err(bad_request("xAI supports at most 1000 tools"));
+    }
+    let tools = Tools {
+        fold,
+        namespace_tools,
+        web_search_alias,
+    };
+    Ok((body, tools))
+}
+
+/// The `input` rewrites of `prepareResponsesRequestTo` after reasoning replay, with the
+/// instructions, `stop` and image references.
+pub(crate) fn shape_input(mut body: Vec<u8>, tools: &Tools) -> Vec<u8> {
     body = normalize_input_custom_tool_calls(body);
-    body = normalize_input_namespace_tool_calls(body, fold);
-    if !web_search_alias.is_empty() {
-        body = alias_web_search_input(body, &web_search_alias, &namespace_tools);
+    body = normalize_input_namespace_tool_calls(body, tools.fold);
+    if !tools.web_search_alias.is_empty() {
+        body = alias_web_search_input(body, &tools.web_search_alias, &tools.namespace_tools);
     }
     body = response::normalize_input_reasoning_items(body);
     body = response::sanitize_input_encrypted_content(body);
     ck_wire::codex_client::normalize_codex_instructions(&mut body);
     // stop is a Chat Completions field xAI's Responses API rejects.
     gj::delete(&mut body, "stop");
-    body = normalize_image_refs(body);
-    let session_id = composer_session_id(req, &base_model);
-    if !session_id.is_empty() {
-        set_str_if_different(&mut body, "prompt_cache_key", &session_id);
-    }
-    Ok(Prepared {
-        filter_internal_x_search: response::request_has_native_x_search(&body),
-        base_model,
-        original_payload,
-        body,
-        namespace_tools,
-        client_declared_tools,
-        session_id,
-        replay_scope,
-        web_search_alias,
-        apply_patch,
-        rule_original: original_translated,
-        rule_protocol: to,
-    })
-}
-
-/// `xaiExecutionSessionID`.
-pub(crate) fn execution_session_id(req: &ExecRequest) -> String {
-    if let Some(s) = req
-        .execution_session
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return s.to_owned();
-    }
-    let key = text(&gj::get(&req.body, "prompt_cache_key"));
-    if !key.is_empty() {
-        return key;
-    }
-    // helps.DerivedSessionUUID("xai", ...).
-    match req.derived_session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(derived) => uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_OID,
-            format!("cli-proxy-api\0{PROVIDER}\0derived-session\0{derived}").as_bytes(),
-        )
-        .to_string(),
-        None => String::new(),
-    }
-}
-
-/// `xaiResolveComposerSessionID`: the conversation id Grok composer models need.
-fn composer_session_id(req: &ExecRequest, base_model: &str) -> String {
-    let session = execution_session_id(req);
-    if !session.is_empty() {
-        return session;
-    }
-    if !base_model.trim().go_lower().starts_with(COMPOSER_PREFIX) {
-        return String::new();
-    }
-    if let Some(key) = compat::claude_code_prompt_cache(base_model, &req.body, &req.headers) {
-        return key;
-    }
-    uuid::Uuid::new_v4().to_string()
+    normalize_image_refs(body)
 }
 
 /// Grok version prefix of a model name (`xaiParseGrokVersionPrefix`).
@@ -681,7 +655,7 @@ fn should_fold_namespace_tools(body: &[u8], will_inject: bool) -> bool {
     if will_inject && !response::request_has_native_x_search(body) && !requires_hosted_tool_only_any(body) {
         count += 1;
     }
-    count > MAX_TOOLS
+    count > 200
 }
 
 /// Go `json.Marshal` of a string.
@@ -1037,30 +1011,6 @@ fn has_function_tool_named(body: &[u8], name: &str) -> bool {
             .any(|item| &*item.get("type").bytes() == b"additional_tools" && item.get("tools").array().iter().any(is))
 }
 
-/// `clampXAIToolsLimit`: at most `max` tools, namespace dispatchers first.
-fn clamp_tools_limit(body: Vec<u8>, max: usize, refs: &NamespaceRefs) -> Vec<u8> {
-    let tools = gj::get(&body, "tools");
-    if !tools.is_array() || tools.array().len() <= max {
-        return body;
-    }
-    let (mut dispatchers, mut regular) = (Vec::new(), Vec::new());
-    for tool in tools.array() {
-        if refs.get(&text(&tool.get("name"))).is_some_and(|r| r.dispatcher) {
-            dispatchers.push(tool.raw().to_vec());
-        } else {
-            regular.push(tool.raw().to_vec());
-        }
-    }
-    dispatchers.truncate(max);
-    let room = max - dispatchers.len();
-    regular.truncate(room);
-    dispatchers.extend(regular);
-    let Ok(updated) = gj::try_set_raw(&body, "tools", response::marshal_raw(&dispatchers)) else {
-        return body;
-    };
-    normalize_tool_choice_for_tools(prune_orphaned_tool_choice(updated))
-}
-
 /// `promoteXAIAdditionalTools`: Responses Lite `additional_tools` input items move into
 /// the top-level tools; xAI rejects the item type.
 fn promote_additional_tools(body: Vec<u8>) -> Vec<u8> {
@@ -1374,7 +1324,7 @@ fn normalize_input_namespace_tool_calls(mut body: Vec<u8>, fold: bool) -> Vec<u8
 /// `normalizeXAIImageRefs`: `image`, `images` and `reference_images` entries anywhere
 /// in the payload use xAI's `url` field instead of OpenAI's `image_url`. Go re-encodes
 /// the whole document when it changes anything.
-pub(crate) fn normalize_image_refs(body: Vec<u8>) -> Vec<u8> {
+fn normalize_image_refs(body: Vec<u8>) -> Vec<u8> {
     if !gj::valid(&body) {
         return body;
     }

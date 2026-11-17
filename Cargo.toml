@@ -20,6 +20,7 @@ exclude = ["tests/"]
 
 [workspace.dependencies]
 # A release bumps the versions with workspace.package.version.
+ck-stream = { path = "crates/ck-stream", version = "0.4.1" }
 ck-wire = { path = "crates/ck-wire", version = "0.4.1" }
 ck-core = { path = "crates/ck-core", version = "0.4.1" }
 ck-exec = { path = "crates/ck-exec", version = "0.4.1" }

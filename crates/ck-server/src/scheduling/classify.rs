@@ -231,24 +231,38 @@ pub fn is_request_invalid(e: &ExecError) -> bool {
     is_request_fault(status, &text)
 }
 
-/// Faults that stop a `responses/compact` request without failover.
-pub fn is_compact_fault(e: &ExecError) -> bool {
-    let status = go_status(e);
-    let text = error_text(e);
-    if credential_scoped(e) || is_cloudflare(status, &text) || is_invalid_grant(status, &text) {
-        return false;
-    }
-    is_request_fault(status, &text) || matches!(status, 400 | 404 | 405 | 409 | 413 | 422 | 501)
+/// How dispatch treats a failed `responses/compact` attempt (D2-PLAN §3.3). The call is
+/// the probe: nothing is cached, so a credential that answered "unsupported" is tried again
+/// by the next compact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactClass {
+    /// The credential's own fault: the ordinary error policy and cooldown apply.
+    Credential,
+    /// The upstream has no compact endpoint (404, 405, 501): skip it, cool nothing.
+    Unsupported,
+    /// The request is at fault: stop, no failover, cool nothing.
+    ClientFault,
+    /// Transport, 408, 500 and the other 5xx: fail over and count a failure.
+    Transient,
 }
 
-/// Compact failures that must not change credential availability.
-pub fn is_compact_neutral(e: &ExecError) -> bool {
+/// Classifies a compact failure by the first matching row, in this order.
+pub fn compact_class(e: &ExecError) -> CompactClass {
     let status = go_status(e);
     let text = error_text(e);
-    !(credential_scoped(e)
+    if credential_scoped(e)
         || is_cloudflare(status, &text)
         || is_invalid_grant(status, &text)
-        || matches!(status, 401 | 402 | 403 | 429))
+        || matches!(status, 401 | 402 | 403 | 429)
+    {
+        CompactClass::Credential
+    } else if matches!(status, 404 | 405 | 501) {
+        CompactClass::Unsupported
+    } else if explicit_request_scoped(e) || is_request_fault(status, &text) || matches!(status, 400 | 409 | 413 | 422) {
+        CompactClass::ClientFault
+    } else {
+        CompactClass::Transient
+    }
 }
 
 /// A count_tokens 404 that names no model: the endpoint is missing, not the model.
@@ -547,7 +561,7 @@ mod tests {
             assert!(!skips_cooldown(&e), "{message}");
             assert!(!is_retry_round(&e), "{message}");
             assert!(!is_transport(&e), "{message}");
-            assert!(is_compact_neutral(&e) && !is_compact_fault(&e), "{message}");
+            assert_eq!(compact_class(&e), CompactClass::Transient, "{message}");
             assert!(!is_request_invalid(&e), "{message}");
         }
     }
@@ -654,10 +668,52 @@ mod tests {
             &upstream(404, r#"{"error":{"code":"model_not_found"}}"#),
             "claude-x"
         ));
-        assert!(is_compact_fault(&upstream(404, "nope")) && is_compact_neutral(&upstream(404, "nope")));
-        assert!(!is_compact_neutral(&upstream(429, "quota")));
         let mut empty = upstream(500, "");
         empty.body = Bytes::new();
         assert_eq!(error_text(&empty), "status 500");
+    }
+
+    /// The first matching row decides how dispatch treats a failed compact (D2-PLAN §3.3).
+    #[test]
+    fn a_compact_failure_falls_in_the_first_matching_class() {
+        for (error, class) in [
+            (upstream(401, "no"), CompactClass::Credential),
+            (upstream(402, "pay"), CompactClass::Credential),
+            (upstream(403, "no"), CompactClass::Credential),
+            (upstream(429, "quota"), CompactClass::Credential),
+            (upstream(400, "invalid_grant"), CompactClass::Credential),
+            (
+                upstream(403, "<title>Just a moment...</title> cloudflare"),
+                CompactClass::Credential,
+            ),
+            (upstream(404, "nope"), CompactClass::Unsupported),
+            (upstream(405, "nope"), CompactClass::Unsupported),
+            // Before the generic 5xx bucket, and before a request-fault body.
+            (upstream(501, "not implemented"), CompactClass::Unsupported),
+            (
+                upstream(404, r#"{"error":{"type":"invalid_request_error"}}"#),
+                CompactClass::Unsupported,
+            ),
+            (upstream(400, "bad"), CompactClass::ClientFault),
+            (upstream(409, "bad"), CompactClass::ClientFault),
+            (upstream(413, "bad"), CompactClass::ClientFault),
+            (upstream(422, "bad"), CompactClass::ClientFault),
+            (
+                upstream(500, r#"{"error":{"code":"context_length_exceeded"}}"#),
+                CompactClass::ClientFault,
+            ),
+            (upstream(408, "slow"), CompactClass::Transient),
+            (upstream(500, "boom"), CompactClass::Transient),
+            (upstream(502, "boom"), CompactClass::Transient),
+            (upstream(503, "boom"), CompactClass::Transient),
+            (upstream(504, "boom"), CompactClass::Transient),
+            (upstream(599, "boom"), CompactClass::Transient),
+            (
+                ExecError::local(502, FailureScope::Transport, "reset"),
+                CompactClass::Transient,
+            ),
+        ] {
+            assert_eq!(compact_class(&error), class, "{error:?}");
+        }
     }
 }

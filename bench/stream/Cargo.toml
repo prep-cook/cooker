@@ -1,0 +1,17 @@
+[package]
+name = "ck-stream-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+ck-stream = { path = "../../crates/ck-stream" }
+serde_json = "1"
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "macros"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

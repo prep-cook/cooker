@@ -20,7 +20,7 @@ pub static PAIR: Registered = registered!(
     request: |ctx, body| convert(ctx.model, body, ctx.stream),
     non_stream: non_stream,
     go_stream: go_stream,
-    token_count: Some(crate::gemini::token_count),
+    token_count: Some(crate::gemini_gemini::token_count),
 );
 
 fn string(res: &Res<'_>) -> Vec<u8> {
@@ -33,7 +33,7 @@ fn string(res: &Res<'_>) -> Vec<u8> {
 /// ConvertGeminiRequestToClaude. A user turn left empty because its only attachment
 /// has no Claude equivalent is refused.
 fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, Error> {
-    let mut out = br#"{"model":"","max_tokens":32000,"messages":[],"metadata":{}}"#.to_vec();
+    let mut out = br#"{"model":"","max_tokens":0,"messages":[],"metadata":{}}"#.to_vec();
     gj::set_str(&mut out, "metadata.user_id", derive_claude_user_id(raw));
     let root = gj::parse(raw);
     gj::set_str(&mut out, "model", model);
@@ -44,6 +44,11 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, Error> {
     let config = root.get("generationConfig");
     if config.exists() {
         copy_generation_config(&mut out, &config, model);
+    }
+    // Without a client limit the body carries none: the executor fills the configured or
+    // registered one, never a guess (owner Q-H).
+    if !config.get("maxOutputTokens").exists() {
+        gj::delete(&mut out, "max_tokens");
     }
     let mut messages = Accumulator::default();
     let parts = first(&root, "systemInstruction", "system_instruction").get("parts");

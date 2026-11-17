@@ -9,7 +9,9 @@ use super::{is_empty_object, with_bool, with_int, with_str, without};
 use crate::gostr::GoStr;
 use crate::json;
 
-pub(crate) type ApplyFn = fn(&[u8], &Config, Option<&ModelCaps>) -> Result<Vec<u8>, Error>;
+/// An applier edits the body it is given and returns it: unchanged fields cost nothing, and
+/// changed ones are edited in place.
+pub(crate) type ApplyFn = fn(Vec<u8>, &Config, Option<&ModelCaps>) -> Result<Vec<u8>, Error>;
 
 fn native(provider: &str) -> Option<ApplyFn> {
     Some(match provider {
@@ -32,28 +34,28 @@ pub(crate) fn applier(provider: &str) -> Option<ApplyFn> {
 /// Public entry for callers that need one applier directly (Go `GetProviderApplier`).
 pub fn apply_provider(
     provider: &str,
-    body: &[u8],
+    body: Vec<u8>,
     config: &Config,
     info: Option<&ModelCaps>,
 ) -> Option<Result<Vec<u8>, Error>> {
     applier(provider).map(|f| f(body, config, info))
 }
 
-fn object_or_empty(body: &[u8]) -> Vec<u8> {
-    if body.is_empty() || !json::valid(body) {
+fn object_or_empty(body: Vec<u8>) -> Vec<u8> {
+    if body.is_empty() || !json::valid(&body) {
         b"{}".to_vec()
     } else {
-        body.to_vec()
+        body
     }
 }
 
-fn delete_all(body: &[u8], paths: &[&str]) -> Vec<u8> {
-    paths.iter().fold(body.to_vec(), |acc, path| without(&acc, path))
+fn delete_all(body: Vec<u8>, paths: &[&str]) -> Vec<u8> {
+    paths.iter().fold(body, |acc, path| without(acc, path))
 }
 
 fn delete_if_empty_object(body: Vec<u8>, path: &str) -> Vec<u8> {
     if is_empty_object(&body, path) {
-        without(&body, path)
+        without(body, path)
     } else {
         body
     }
@@ -63,7 +65,7 @@ fn delete_if_empty_object(body: Vec<u8>, path: &str) -> Vec<u8> {
 
 /// `Apply` of the gemini/antigravity appliers. `prefix` is the thinkingConfig path.
 fn gemini_like(
-    body: &[u8],
+    body: Vec<u8>,
     config: &Config,
     info: Option<&ModelCaps>,
     prefix: &str,
@@ -73,45 +75,56 @@ fn gemini_like(
         let body = object_or_empty(body);
         let claude = antigravity && info.is_some_and(|i| i.id.go_lower().contains("claude"));
         if config.mode == Mode::Auto {
-            return Ok(gemini_budget(&body, config, info, prefix, claude));
+            return Ok(gemini_budget(body, config, info, prefix, claude));
         }
         if config.mode == Mode::Level || (config.mode == Mode::None && !config.level.is_empty()) {
-            return Ok(gemini_level(&body, config, prefix));
+            return Ok(gemini_level(body, config, prefix));
         }
-        return Ok(gemini_budget(&body, config, info, prefix, claude));
+        return Ok(gemini_budget(body, config, info, prefix, claude));
     }
     let info_ref = info.expect("user-defined handles None");
     let Some(support) = info_ref.thinking.as_ref() else {
-        return Ok(body.to_vec());
+        return Ok(body);
     };
     let body = object_or_empty(body);
     if antigravity {
         let claude = info_ref.id.go_lower().contains("claude");
         if matches!(config.mode, Mode::Auto | Mode::Budget) {
-            return Ok(gemini_budget(&body, config, info, prefix, claude));
+            return Ok(gemini_budget(body, config, info, prefix, claude));
         }
         if !support.levels.is_empty() {
-            return Ok(gemini_level(&body, config, prefix));
+            return Ok(gemini_level(body, config, prefix));
         }
-        return Ok(gemini_budget(&body, config, info, prefix, claude));
+        return Ok(gemini_budget(body, config, info, prefix, claude));
     }
     Ok(match config.mode {
-        Mode::Level => gemini_level(&body, config, prefix),
-        Mode::None if !support.levels.is_empty() => gemini_level(&body, config, prefix),
-        _ => gemini_budget(&body, config, info, prefix, false),
+        Mode::Level => gemini_level(body, config, prefix),
+        Mode::None if !support.levels.is_empty() => gemini_level(body, config, prefix),
+        _ => gemini_budget(body, config, info, prefix, false),
     })
 }
 
-fn gemini(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
+fn gemini(body: Vec<u8>, config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
     gemini_like(body, config, info, "generationConfig.thinkingConfig", false)
 }
 
-fn antigravity(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
+fn antigravity(body: Vec<u8>, config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
     gemini_like(body, config, info, "request.generationConfig.thinkingConfig", true)
 }
 
-fn gemini_level(body: &[u8], config: &Config, prefix: &str) -> Vec<u8> {
+fn gemini_level(body: Vec<u8>, config: &Config, prefix: &str) -> Vec<u8> {
+    if config.mode != Mode::None && config.mode != Mode::Level {
+        return body;
+    }
     let p = |k: &str| format!("{prefix}.{k}");
+    let thoughts = include_thoughts(&body, prefix);
+    // Levels are canonical lower case; a Gemini client keeps the spelling it sent.
+    let sent = json::get(&body, &p("thinkingLevel")).str().into_owned();
+    let level = if sent.trim().go_eq_fold(&config.level) {
+        sent.trim()
+    } else {
+        &config.level
+    };
     let mut result = delete_all(
         body,
         &[
@@ -122,24 +135,18 @@ fn gemini_level(body: &[u8], config: &Config, prefix: &str) -> Vec<u8> {
             &p("include_thoughts"),
         ],
     );
-    if config.mode == Mode::None {
-        if config.budget == 0 && config.level.is_empty() {
-            return without(&result, prefix);
-        }
-        if !config.level.is_empty() {
-            result = with_str(&result, &p("thinkingLevel"), &config.level);
-        }
-        return include_thoughts(result, body, prefix);
+    if config.mode == Mode::None && config.budget == 0 && config.level.is_empty() {
+        return without(result, prefix);
     }
-    if config.mode != Mode::Level {
-        return body.to_vec();
+    if !config.level.is_empty() || config.mode == Mode::Level {
+        result = with_str(result, &p("thinkingLevel"), level);
     }
-    result = with_str(&result, &p("thinkingLevel"), &config.level);
-    include_thoughts(result, body, prefix)
+    with_include_thoughts(result, thoughts, prefix)
 }
 
-fn gemini_budget(body: &[u8], config: &Config, info: Option<&ModelCaps>, prefix: &str, claude: bool) -> Vec<u8> {
+fn gemini_budget(body: Vec<u8>, config: &Config, info: Option<&ModelCaps>, prefix: &str, claude: bool) -> Vec<u8> {
     let p = |k: &str| format!("{prefix}.{k}");
+    let thoughts = include_thoughts(&body, prefix);
     let mut result = delete_all(
         body,
         &[
@@ -164,39 +171,47 @@ fn gemini_budget(body: &[u8], config: &Config, info: Option<&ModelCaps>, prefix:
         }
         let min = info.thinking.as_ref().map_or(0, |t| t.min);
         if min > 0 && budget >= 0 && budget < min {
-            result = without(&result, prefix);
+            result = without(result, prefix);
             budget = -2;
         } else if from_model && effective_max > 0 {
-            result = with_int(&result, "request.generationConfig.maxOutputTokens", effective_max);
+            result = with_int(result, "request.generationConfig.maxOutputTokens", effective_max);
         }
         // Go signals "drop thinking" with -2, so a caller budget of -2 also skips the field.
         if budget == -2 {
-            return include_thoughts(result, body, prefix);
+            return with_include_thoughts(result, thoughts, prefix);
         }
     }
-    result = with_int(&result, &p("thinkingBudget"), budget);
-    include_thoughts(result, body, prefix)
+    result = with_int(result, &p("thinkingBudget"), budget);
+    with_include_thoughts(result, thoughts, prefix)
 }
 
-/// Carries the original `includeThoughts`/`include_thoughts` boolean, canonically.
-fn include_thoughts(result: Vec<u8>, original: &[u8], prefix: &str) -> Vec<u8> {
-    for key in ["includeThoughts", "include_thoughts"] {
-        let path = format!("{prefix}.{key}");
-        match json::get(original, &path).kind {
-            json::Kind::True => return with_bool(&result, &format!("{prefix}.includeThoughts"), true),
-            json::Kind::False => return with_bool(&result, &format!("{prefix}.includeThoughts"), false),
-            _ => {}
+/// The original `includeThoughts`/`include_thoughts` boolean, read before the edits drop it.
+fn include_thoughts(original: &[u8], prefix: &str) -> Option<bool> {
+    ["includeThoughts", "include_thoughts"].iter().find_map(|key| {
+        match json::get(original, &format!("{prefix}.{key}")).kind {
+            json::Kind::True => Some(true),
+            json::Kind::False => Some(false),
+            _ => None,
         }
+    })
+}
+
+/// Carries the original `includeThoughts` boolean, canonically.
+fn with_include_thoughts(result: Vec<u8>, thoughts: Option<bool>, prefix: &str) -> Vec<u8> {
+    match thoughts {
+        Some(thoughts) => with_bool(result, &format!("{prefix}.includeThoughts"), thoughts),
+        None => result,
     }
-    result
 }
 
 // ---- Interactions ----
 
-fn interactions(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
+fn interactions(body: Vec<u8>, config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
     let body = object_or_empty(body);
+    let summaries = interactions_summaries(&body);
+    let summaries = summaries.as_deref();
     let result = delete_all(
-        &body,
+        body,
         &[
             "generation_config.thinking_level",
             "generation_config.thinkingLevel",
@@ -216,31 +231,40 @@ fn interactions(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Resul
         ],
     );
     Ok(match config.mode {
-        Mode::Level => interactions_level(result, &body, &config.level, info),
-        Mode::Budget => interactions_budget(result, &body, config.budget, info),
-        Mode::Auto => interactions_summaries(result, &body),
-        Mode::None if !config.level.is_empty() => interactions_level(result, &body, &config.level, info),
-        Mode::None if config.budget > 0 => interactions_budget(result, &body, config.budget, info),
+        Mode::Level => interactions_level(result, summaries, &config.level, info),
+        Mode::Budget => interactions_budget(result, summaries, config.budget, info),
+        Mode::Auto => with_summaries(result, summaries),
+        Mode::None if !config.level.is_empty() => interactions_level(result, summaries, &config.level, info),
+        Mode::None if config.budget > 0 => interactions_budget(result, summaries, config.budget, info),
         Mode::None => result,
     })
 }
 
-fn interactions_budget(result: Vec<u8>, original: &[u8], budget: i64, info: Option<&ModelCaps>) -> Vec<u8> {
+fn interactions_budget(result: Vec<u8>, summaries: Option<&str>, budget: i64, info: Option<&ModelCaps>) -> Vec<u8> {
     match convert_budget_to_level(budget) {
-        None | Some(LEVEL_NONE) | Some(LEVEL_AUTO) => interactions_summaries(result, original),
-        Some(level) => interactions_level(result, original, level, info),
+        None | Some(LEVEL_NONE) | Some(LEVEL_AUTO) => with_summaries(result, summaries),
+        Some(level) => interactions_level(result, summaries, level, info),
     }
 }
 
-fn interactions_level(mut result: Vec<u8>, original: &[u8], level: &str, info: Option<&ModelCaps>) -> Vec<u8> {
+fn interactions_level(mut result: Vec<u8>, summaries: Option<&str>, level: &str, info: Option<&ModelCaps>) -> Vec<u8> {
     let level = normalize_interactions_level(level, info);
     if !level.is_empty() {
-        result = with_str(&result, "generation_config.thinking_level", &level);
+        result = with_str(result, "generation_config.thinking_level", &level);
     }
-    interactions_summaries(result, original)
+    with_summaries(result, summaries)
 }
 
-fn interactions_summaries(result: Vec<u8>, original: &[u8]) -> Vec<u8> {
+fn with_summaries(result: Vec<u8>, summaries: Option<&str>) -> Vec<u8> {
+    match summaries {
+        Some(summaries) => with_str(result, "generation_config.thinking_summaries", summaries),
+        None => result,
+    }
+}
+
+/// The original's `thinking_summaries`, from the field or an `include_thoughts` boolean,
+/// read before the edits drop them.
+fn interactions_summaries(original: &[u8]) -> Option<String> {
     for path in [
         "generation_config.thinking_summaries",
         "generation_config.thinkingSummaries",
@@ -249,24 +273,22 @@ fn interactions_summaries(result: Vec<u8>, original: &[u8]) -> Vec<u8> {
         if v.kind == json::Kind::String {
             let normalized = v.str().trim().go_lower();
             if normalized == "auto" || normalized == "none" {
-                return with_str(&result, "generation_config.thinking_summaries", &normalized);
+                return Some(normalized);
             }
         }
     }
-    for path in [
+    [
         "generation_config.thinking_config.include_thoughts",
         "generation_config.thinking_config.includeThoughts",
         "generation_config.thinkingConfig.include_thoughts",
         "generation_config.thinkingConfig.includeThoughts",
-    ] {
-        let value = match json::get(original, path).kind {
-            json::Kind::True => "auto",
-            json::Kind::False => "none",
-            _ => continue,
-        };
-        return with_str(&result, "generation_config.thinking_summaries", value);
-    }
-    result
+    ]
+    .iter()
+    .find_map(|path| match json::get(original, path).kind {
+        json::Kind::True => Some("auto".to_owned()),
+        json::Kind::False => Some("none".to_owned()),
+        _ => None,
+    })
 }
 
 fn normalize_interactions_level(level: &str, info: Option<&ModelCaps>) -> String {
@@ -296,30 +318,29 @@ fn normalize_interactions_level(level: &str, info: Option<&ModelCaps>) -> String
 /// Go `disableThinking`: `thinking` becomes `{"type": <disable_type>}`, since neither
 /// off type accepts other thinking fields (budget_tokens, display, block_binding), and
 /// the effort is left to the model default.
-fn claude_disable(body: &[u8], disable_type: &str) -> Vec<u8> {
-    let mut result = body.to_vec();
-    json::set_raw(&mut result, "thinking", b"{}");
-    result = with_str(&result, "thinking.type", disable_type);
-    result = without(&result, "output_config.effort");
+fn claude_disable(mut body: Vec<u8>, disable_type: &str) -> Vec<u8> {
+    json::set_raw(&mut body, "thinking", b"{}");
+    let result = with_str(body, "thinking.type", disable_type);
+    let result = without(result, "output_config.effort");
     delete_if_empty_object(result, "output_config")
 }
 
-fn claude_adaptive(body: &[u8], effort: Option<&str>) -> Vec<u8> {
-    let mut result = with_str(body, "thinking.type", "adaptive");
-    result = without(&result, "thinking.budget_tokens");
+fn claude_adaptive(body: Vec<u8>, effort: Option<&str>) -> Vec<u8> {
+    let result = with_str(body, "thinking.type", "adaptive");
+    let result = without(result, "thinking.budget_tokens");
     match effort {
-        Some(effort) => with_str(&result, "output_config.effort", effort),
-        None => delete_if_empty_object(without(&result, "output_config.effort"), "output_config"),
+        Some(effort) => with_str(result, "output_config.effort", effort),
+        None => delete_if_empty_object(without(result, "output_config.effort"), "output_config"),
     }
 }
 
-fn claude_enabled(body: &[u8], budget: Option<i64>) -> Vec<u8> {
-    let mut result = with_str(body, "thinking.type", "enabled");
-    result = match budget {
-        Some(budget) => with_int(&result, "thinking.budget_tokens", budget),
-        None => without(&result, "thinking.budget_tokens"),
+fn claude_enabled(body: Vec<u8>, budget: Option<i64>) -> Vec<u8> {
+    let result = with_str(body, "thinking.type", "enabled");
+    let result = match budget {
+        Some(budget) => with_int(result, "thinking.budget_tokens", budget),
+        None => without(result, "thinking.budget_tokens"),
     };
-    result = without(&result, "output_config.effort");
+    let result = without(result, "output_config.effort");
     delete_if_empty_object(result, "output_config")
 }
 
@@ -345,8 +366,8 @@ fn claude_rejects_disabled(model: &str) -> bool {
 /// or the body's `model` for an alias; docs/DIFFERENCES-FROM-GO.md).
 // ponytail: a fixed model list for models the registry cannot describe; drop it if Go
 // starts deciding by name too.
-fn claude_off_unregistered(body: &[u8], model: &str) -> Vec<u8> {
-    if claude_rejects_disabled(model) || claude_rejects_disabled(&json::get(body, "model").str()) {
+fn claude_off_unregistered(body: Vec<u8>, model: &str) -> Vec<u8> {
+    if claude_rejects_disabled(model) || claude_rejects_disabled(&json::get(&body, "model").str()) {
         return claude_adaptive(body, Some("low"));
     }
     claude_disable(body, "disabled")
@@ -354,7 +375,7 @@ fn claude_off_unregistered(body: &[u8], model: &str) -> Vec<u8> {
 
 /// Go `disableThinking` with registry capabilities: the model's `DisableType` (Go
 /// ad9e456d; `between_tools` on claude-sonnet-5-5), else `disabled`.
-fn claude_off(body: &[u8], disable_type: &str) -> Vec<u8> {
+fn claude_off(body: Vec<u8>, disable_type: &str) -> Vec<u8> {
     claude_disable(
         body,
         if disable_type.is_empty() {
@@ -365,41 +386,41 @@ fn claude_off(body: &[u8], disable_type: &str) -> Vec<u8> {
     )
 }
 
-fn claude(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
+fn claude(body: Vec<u8>, config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
     let model = info.map_or("", |i| i.id.as_str());
     if is_user_defined_model(info) {
         let body = object_or_empty(body);
         // Go `applyCompatibleClaude` disables with `disabled`, whatever the model.
         return Ok(match config.mode {
-            Mode::None => claude_off_unregistered(&body, model),
-            Mode::Auto => claude_enabled(&body, None),
+            Mode::None => claude_off_unregistered(body, model),
+            Mode::Auto => claude_enabled(body, None),
             Mode::Level if config.level.is_empty() => body,
-            Mode::Level => claude_adaptive(&body, Some(&config.level)),
-            Mode::Budget if config.budget == 0 => claude_off_unregistered(&body, model),
-            Mode::Budget => claude_enabled(&body, Some(config.budget)),
+            Mode::Level => claude_adaptive(body, Some(&config.level)),
+            Mode::Budget if config.budget == 0 => claude_off_unregistered(body, model),
+            Mode::Budget => claude_enabled(body, Some(config.budget)),
         });
     }
     let info = info.expect("user-defined handles None");
     let Some(support) = info.thinking.as_ref() else {
-        return Ok(body.to_vec());
+        return Ok(body);
     };
     let body = object_or_empty(body);
     let adaptive = !support.levels.is_empty();
     let budget = match config.mode {
-        Mode::None => return Ok(claude_off(&body, &support.disable_type)),
-        Mode::Level if adaptive && !config.level.is_empty() => return Ok(claude_adaptive(&body, Some(&config.level))),
+        Mode::None => return Ok(claude_off(body, &support.disable_type)),
+        Mode::Level if adaptive && !config.level.is_empty() => return Ok(claude_adaptive(body, Some(&config.level))),
         Mode::Level => match super::convert_level_to_budget(&config.level) {
             Some(budget) => budget,
             None => return Ok(body),
         },
         Mode::Budget => config.budget,
-        Mode::Auto if adaptive => return Ok(claude_adaptive(&body, None)),
-        Mode::Auto => return Ok(claude_enabled(&body, None)),
+        Mode::Auto if adaptive => return Ok(claude_adaptive(body, None)),
+        Mode::Auto => return Ok(claude_enabled(body, None)),
     };
     if budget == 0 {
-        return Ok(claude_off(&body, &support.disable_type));
+        return Ok(claude_off(body, &support.disable_type));
     }
-    let result = claude_enabled(&body, Some(budget));
+    let result = claude_enabled(body, Some(budget));
     Ok(normalize_claude_budget(result, budget, info))
 }
 
@@ -417,7 +438,7 @@ fn normalize_claude_budget(mut body: Vec<u8>, budget: i64, info: &ModelCaps) -> 
         (0, false)
     };
     if from_model && effective_max > 0 {
-        body = with_int(&body, "max_tokens", effective_max);
+        body = with_int(body, "max_tokens", effective_max);
     }
     let mut adjusted = budget;
     if effective_max > 0 && adjusted >= effective_max {
@@ -428,14 +449,14 @@ fn normalize_claude_budget(mut body: Vec<u8>, budget: i64, info: &ModelCaps) -> 
         return body;
     }
     if adjusted != budget {
-        body = with_int(&body, "thinking.budget_tokens", adjusted);
+        body = with_int(body, "thinking.budget_tokens", adjusted);
     }
     body
 }
 
 // ---- OpenAI chat and Codex/xAI Responses share one effort rule. ----
 
-fn effort_applier(body: &[u8], config: &Config, info: Option<&ModelCaps>, path: &str) -> Result<Vec<u8>, Error> {
+fn effort_applier(body: Vec<u8>, config: &Config, info: Option<&ModelCaps>, path: &str) -> Result<Vec<u8>, Error> {
     if is_user_defined_model(info) {
         let body = object_or_empty(body);
         let effort = match config.mode {
@@ -449,18 +470,18 @@ fn effort_applier(body: &[u8], config: &Config, info: Option<&ModelCaps>, path: 
                 None => return Ok(body),
             },
         };
-        return Ok(with_str(&body, path, &effort));
+        return Ok(with_str(body, path, &effort));
     }
     let info = info.expect("user-defined handles None");
     let Some(support) = info.thinking.as_ref() else {
-        return Ok(body.to_vec());
+        return Ok(body);
     };
     if config.mode != Mode::Level && config.mode != Mode::None {
-        return Ok(body.to_vec());
+        return Ok(body);
     }
     let body = object_or_empty(body);
     if config.mode == Mode::Level {
-        return Ok(with_str(&body, path, &config.level));
+        return Ok(with_str(body, path, &config.level));
     }
     let mut effort = String::new();
     if config.budget == 0 && (support.zero_allowed || has_level(&support.levels, LEVEL_NONE)) {
@@ -477,29 +498,29 @@ fn effort_applier(body: &[u8], config: &Config, info: Option<&ModelCaps>, path: 
     if effort.is_empty() {
         return Ok(body);
     }
-    Ok(with_str(&body, path, &effort))
+    Ok(with_str(body, path, &effort))
 }
 
-fn openai(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
+fn openai(body: Vec<u8>, config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
     effort_applier(body, config, info, "reasoning_effort")
 }
 
-fn codex(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
+fn codex(body: Vec<u8>, config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
     effort_applier(body, config, info, "reasoning.effort")
 }
 
 // ---- Kimi ----
 
-fn kimi(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
+fn kimi(body: Vec<u8>, config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
     let user_defined = is_user_defined_model(info);
     if !user_defined && info.and_then(|i| i.thinking.as_ref()).is_none() {
-        return Ok(body.to_vec());
+        return Ok(body);
     }
     let body = object_or_empty(body);
     let effort = match config.mode {
         Mode::Level if config.level.is_empty() => return Ok(body),
         Mode::Level => config.level.clone(),
-        Mode::None if config.level.is_empty() || config.level == LEVEL_NONE => return Ok(kimi_disabled(&body)),
+        Mode::None if config.level.is_empty() || config.level == LEVEL_NONE => return Ok(kimi_disabled(body)),
         Mode::None => config.level.clone(),
         Mode::Budget => match convert_budget_to_level(config.budget) {
             Some(level) => level.into(),
@@ -507,13 +528,13 @@ fn kimi(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8
         },
         Mode::Auto => LEVEL_AUTO.into(),
     };
-    let result = without(&body, "reasoning_effort");
-    let result = with_str(&result, "thinking.type", "enabled");
-    Ok(with_str(&result, "thinking.effort", &effort))
+    let result = without(body, "reasoning_effort");
+    let result = with_str(result, "thinking.type", "enabled");
+    Ok(with_str(result, "thinking.effort", &effort))
 }
 
-fn kimi_disabled(body: &[u8]) -> Vec<u8> {
+fn kimi_disabled(body: Vec<u8>) -> Vec<u8> {
     let result = without(body, "thinking");
-    let result = without(&result, "reasoning_effort");
-    with_str(&result, "thinking.type", "disabled")
+    let result = without(result, "reasoning_effort");
+    with_str(result, "thinking.type", "disabled")
 }

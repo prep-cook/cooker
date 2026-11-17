@@ -9,7 +9,6 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ck_core::config::Config;
@@ -29,22 +28,17 @@ use crate::openai_compat_payload::{self as compat, ensure_responses_usage_detail
 use crate::xai_auth::{self, CLI_CHAT_PROXY_BASE_URL, DEFAULT_API_BASE_URL, metadata_string};
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_request::{self as request, Prepared};
-use crate::xai_response::{self as response, NamespaceRestorer, OutputItems, XSearchFilter, text};
+use crate::xai_response::{self as response, NamespaceRestorer, OutputItems, text};
 use ck_translate::apply_patch_responses as apply_patch;
 
 pub const PROVIDER: &str = "xai";
 
 pub(crate) const COMPACT_ALT: &str = "responses/compact";
 /// `scanner.Buffer(nil, 52_428_800)`.
-const MAX_LINE: usize = 52_428_800;
+pub(crate) const MAX_LINE: usize = 52_428_800;
 const DISCONNECTED: &str = "xai stream error: stream disconnected before response.completed or response.incomplete";
 /// Keep in sync with the Grok CLI version the chat proxy expects (`xaiClientVersionValue`).
 const CLIENT_VERSION: &str = "1.0.44";
-const IMAGES_GENERATIONS: &str = "/images/generations";
-const IMAGES_EDITS: &str = "/images/edits";
-const VIDEOS_GENERATIONS: &str = "/videos/generations";
-const VIDEOS_EDITS: &str = "/videos/edits";
-const VIDEOS_EXTENSIONS: &str = "/videos/extensions";
 
 /// Go `url.Parse(raw)` succeeds with an `http` or `https` scheme and a host (the video
 /// content URL check of the videos handler).
@@ -63,23 +57,8 @@ pub struct XaiExecutor {
     rewrite: Option<UrlRewrite>,
     /// The upstream Responses WebSocket sessions (xai_ws.rs).
     pub(crate) ws: Arc<crate::xai_ws::Ws>,
-}
-
-/// The payload rules on an image or video body (Go's media finalizer: the body's
-/// model, else the routed one; protocol `openai`; the client body as the baseline).
-fn media_rules(req: &ExecRequest, cfg: &Config, payload: Vec<u8>) -> Vec<u8> {
-    let mut model = text(&gj::get(&req.body, "model")).trim().to_owned();
-    if model.is_empty() {
-        model = req.model.trim().to_owned();
-    }
-    crate::payload_barrier::Barrier {
-        executor: PROVIDER,
-        model: &model,
-        protocol: "openai",
-        root: "",
-        original: &req.body,
-    }
-    .apply(cfg, req, payload)
+    /// Media and deferred jobs this process created or charged (xai_media.rs).
+    pub(crate) jobs: crate::xai_media::VideoJobs,
 }
 
 pub(crate) fn apply_patch_error() -> ExecError {
@@ -116,7 +95,7 @@ pub(crate) fn parse_bool(raw: &str) -> Option<bool> {
 
 /// `xaiUsingAPI`: the official API path for chat and media. OAuth defaults to the Grok
 /// CLI chat proxy.
-fn using_api(c: &Credential) -> bool {
+pub(crate) fn using_api(c: &Credential) -> bool {
     if let Some(value) = parse_bool(attribute(c, "using_api")) {
         return value;
     }
@@ -150,7 +129,7 @@ fn is_cli_chat_proxy(url: &str) -> bool {
 
 /// `xaiChatBaseURL`: chat and media. Without `using_api` an empty or default base URL
 /// becomes the CLI chat proxy; an explicit other base URL is kept.
-fn chat_base_url(c: &Credential) -> String {
+pub(crate) fn chat_base_url(c: &Credential) -> String {
     let (_, base) = creds(c);
     if using_api(c) {
         return if base.is_empty() {
@@ -166,7 +145,7 @@ fn chat_base_url(c: &Credential) -> String {
 }
 
 /// `xaiCompactBaseURL`: the chat proxy has no `/responses/compact`.
-fn compact_base_url(c: &Credential) -> String {
+pub(crate) fn compact_base_url(c: &Credential) -> String {
     let (_, base) = creds(c);
     if base.is_empty() || is_cli_chat_proxy(&base) {
         DEFAULT_API_BASE_URL.to_owned()
@@ -177,7 +156,7 @@ fn compact_base_url(c: &Credential) -> String {
 
 /// `TrackHTTPClient` on a response: the first body byte marks TTFT (the caller marked
 /// the round-trip start before sending).
-fn track_first_byte(mut upstream: wire::Upstream, usage: &ck_core::exec::UsageSink) -> wire::Upstream {
+pub(crate) fn track_first_byte(mut upstream: wire::Upstream, usage: &ck_core::exec::UsageSink) -> wire::Upstream {
     if usage.enabled() {
         let usage = usage.clone();
         let mut marked = false;
@@ -231,7 +210,7 @@ pub(crate) fn before_reporter<T>(
 /// `recordXAIRequest` with the request's own headers. Go logs every xAI request as a POST;
 /// this logs the method actually sent, so a video poll shows as a GET
 /// (docs/DIFFERENCES-FROM-GO.md).
-fn capture_request(
+pub(crate) fn capture_request(
     req: &ExecRequest,
     credential: &Credential,
     method: &str,
@@ -247,7 +226,7 @@ fn capture_request(
 pub(crate) const HTTP_USAGE_EVENTS: [&str; 2] = ["response.completed", "response.incomplete"];
 
 /// `strings.TrimSuffix(baseURL, "/") + path`.
-fn endpoint(base: &str, path: &str) -> String {
+pub(crate) fn endpoint(base: &str, path: &str) -> String {
     format!("{}{path}", base.strip_suffix('/').unwrap_or(base))
 }
 
@@ -284,40 +263,48 @@ fn default_headers(token: &str, stream: bool, session: &str) -> GoHeaders {
 
 /// `applyXAICustomHeaders`: `header:*` attributes with the client headers and the
 /// canonical session for `$CPA-SESSION-ID`.
-fn apply_custom(h: &mut GoHeaders, credential: &Credential, req: &ExecRequest) {
-    let session = ck_wire::session::cpa_session_id(req.session.as_deref());
-    for (name, value) in ck_wire::headers::custom_headers(&credential.attributes, &req.headers, session.as_deref()) {
+fn apply_custom(h: &mut GoHeaders, credential: &Credential, client: &HeaderMap, session: Option<&str>) {
+    let session = ck_wire::session::cpa_session_id(session);
+    for (name, value) in ck_wire::headers::custom_headers(&credential.attributes, client, session.as_deref()) {
         h.set(&name, value);
     }
 }
 
 /// `applyXAIHeaders`.
-fn plain_headers(c: &Credential, token: &str, stream: bool, session: &str, req: &ExecRequest) -> GoHeaders {
-    let mut h = default_headers(token, stream, session);
-    apply_custom(&mut h, c, req);
-    h
+pub(crate) fn plain_headers(c: &Credential, token: &str, stream: bool, session: &str, req: &ExecRequest) -> GoHeaders {
+    request_headers(
+        c,
+        (token, stream, session),
+        (&req.headers, req.session.as_deref()),
+        false,
+    )
 }
 
-/// `applyXAIChatHeaders`: the Grok CLI identity when an OAuth credential talks to the
-/// chat proxy.
-fn chat_headers(c: &Credential, token: &str, stream: bool, session: &str, req: &ExecRequest) -> GoHeaders {
-    if using_api(c) {
-        return plain_headers(c, token, stream, session, req);
-    }
+/// `applyXAIChatHeaders` when `chat` (the Grok CLI identity when an OAuth credential talks to
+/// the chat proxy), else `applyXAIHeaders`. `client` is the client's headers and session.
+pub(crate) fn request_headers(
+    c: &Credential,
+    (token, stream, session): (&str, bool, &str),
+    client: (&HeaderMap, Option<&str>),
+    chat: bool,
+) -> GoHeaders {
     let mut h = default_headers(token, stream, session);
-    if is_cli_chat_proxy(&chat_base_url(c)) {
+    if chat && !using_api(c) && is_cli_chat_proxy(&chat_base_url(c)) {
         h.set("X-XAI-Token-Auth", "xai-grok-cli");
         h.set("x-grok-client-version", CLIENT_VERSION);
         h.set("User-Agent", format!("xai-grok-workspace/{CLIENT_VERSION}"));
         h.set("x-grok-client-identifier", "grok-shell");
         h.set("x-authenticateresponse", "authenticate-response");
     }
-    apply_custom(&mut h, c, req);
+    apply_custom(&mut h, c, client.0, client.1);
+    if ck_core::registry::dynamic::is_api_key(c) {
+        h.set("User-Agent", "cooker");
+    }
     h
 }
 
 /// `url.PathEscape`.
-fn path_escape(s: &str) -> String {
+pub(crate) fn path_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'$' | b'&' | b'+' | b':' | b'=' | b'@')
@@ -369,16 +356,6 @@ fn translate_non_stream(req: &ExecRequest, p: &Prepared, to: Format, data: &[u8]
     }))
 }
 
-/// `xaiInputHasItemType`.
-pub(crate) fn input_has_item_type(body: &[u8], item_type: &str) -> bool {
-    let input = gj::get(body, "input");
-    input.is_array()
-        && input
-            .array()
-            .iter()
-            .any(|item| &*item.get("type").bytes() == item_type.as_bytes())
-}
-
 /// `xaiRemoveInputItemsByType`: the input array is always rebuilt.
 pub(crate) fn remove_input_items(mut body: Vec<u8>, item_type: &str) -> Vec<u8> {
     let input = gj::get(&body, "input");
@@ -405,6 +382,13 @@ impl XaiExecutor {
             clients: Clients::new(client),
             ..Self::default()
         }
+    }
+
+    /// The executor with a video job table that holds at most `capacity` jobs and pending creates
+    /// (E-Q5; the default is 4096).
+    pub fn with_video_capacity(mut self, capacity: usize) -> Self {
+        self.jobs = crate::xai_media::VideoJobs::with_clock(std::sync::Arc::new(std::time::Instant::now), capacity);
+        self
     }
 
     /// Sends every upstream request to `rewrite(url)` instead of `url`.
@@ -436,6 +420,11 @@ impl XaiExecutor {
         xai_auth::refresh(&auth, credential).await
     }
 
+    /// Closes the upstream socket the client connection `id` holds.
+    pub fn close_session(&self, id: &str) {
+        self.ws.close(id);
+    }
+
     /// Execute / ExecuteStream / CountTokens. `downstream_websocket` marks a turn of a
     /// downstream Responses WebSocket (Go `DownstreamWebsocket(ctx)`).
     pub async fn execute(
@@ -458,11 +447,6 @@ impl XaiExecutor {
             }
             return self.compact(credential, &req, cfg, downstream_websocket).await;
         }
-        if req.stream && input_has_item_type(&req.body, "compaction_trigger") {
-            return self
-                .compaction_trigger(credential, &req, cfg, downstream_websocket)
-                .await;
-        }
         self.chat(credential, req, cfg, downstream_websocket).await
     }
 
@@ -483,7 +467,8 @@ impl XaiExecutor {
         req.usage.usage_required();
         req.usage.request_for(PROVIDER, &prepared.body);
         prepared.finalize_body(cfg, &req);
-        let headers = chat_headers(credential, &token, true, &prepared.session_id, &req);
+        let client_headers = (&req.headers, req.session.as_deref());
+        let headers = request_headers(credential, (&token, true, &prepared.session_id), client_headers, true);
         let client = self.clients.for_credential(credential, cfg);
         let url = self.url(endpoint(&base, "/responses"));
         let capture = capture_request(&req, credential, "POST", &url, &headers, &prepared.body);
@@ -534,18 +519,8 @@ impl XaiExecutor {
                 downstream_websocket,
             ),
         )?;
-        let mut body = std::mem::take(&mut p.body);
-        gj::delete(&mut body, "stream");
-        gj::delete(&mut body, "tools");
-        body = request::normalize_tool_choice_for_tools(body);
-        for field in ["max_output_tokens", "temperature", "top_p", "top_k", "stop"] {
-            gj::delete(&mut body, field);
-        }
-        body = remove_input_items(body, "compaction_trigger");
         let previous = text(&gj::get(&req.body, "previous_response_id"));
-        if !previous.is_empty() {
-            gj::set_str(&mut body, "previous_response_id", previous);
-        }
+        let body = crate::xai_shape::compact_body(std::mem::take(&mut p.body), &previous);
         req.usage.request_for(PROVIDER, &body);
         p.body = p.finalize(cfg, req, body);
         let headers = plain_headers(credential, &token, false, &p.session_id, req);
@@ -598,32 +573,6 @@ impl XaiExecutor {
         })
     }
 
-    /// `executeCompactionTriggerStream`: a streaming turn carrying `compaction_trigger`
-    /// runs compact and answers with the six SSE frames of a completed response.
-    async fn compaction_trigger(
-        &self,
-        credential: &Credential,
-        req: &ExecRequest,
-        cfg: &Config,
-        downstream_websocket: bool,
-    ) -> Result<ExecResponse, ExecError> {
-        let (p, data, mut headers) = self.compact_request(credential, req, cfg, downstream_websocket).await?;
-        req.usage.publish();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("text/event-stream"),
-        );
-        let frames: Vec<Result<Bytes, ExecError>> = compaction_frames(&p, &data, SystemTime::now())
-            .into_iter()
-            .map(|f| Ok(Bytes::from(f)))
-            .collect();
-        Ok(ExecResponse {
-            status: 200,
-            headers,
-            body: ResponseBody::Stream(futures_util::stream::iter(frames).boxed()),
-        })
-    }
-
     /// CountTokens: O200kBase estimate of the prepared body, no upstream call.
     async fn count_tokens(&self, req: &ExecRequest, cfg: &Config) -> Result<ExecResponse, ExecError> {
         let mut p = request::prepare(req, cfg, false, Format::Codex, &self.replay, false)?;
@@ -645,275 +594,22 @@ impl XaiExecutor {
             body: ResponseBody::Buffered(Bytes::from(payload)),
         })
     }
-
-    /// `executeImages`: the JSON body, image references in xAI's shape, to
-    /// `/images/edits` or `/images/generations` by the inbound route.
-    pub async fn images(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        request_path: &str,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        let cfg = scoped(credential, cfg);
-        let path = if request_path.ends_with(IMAGES_EDITS) {
-            IMAGES_EDITS
-        } else {
-            IMAGES_GENERATIONS
-        };
-        let payload = media_rules(&req, cfg.as_ref(), request::normalize_image_refs(req.body.to_vec()));
-        self.media(credential, &req, cfg.as_ref(), wreq::Method::POST, path, payload, false)
-            .await
-    }
-
-    /// `executeVideos`: generations, edits and extensions by the inbound route; any other
-    /// route with a `request_id` polls `GET /videos/{request_id}`.
-    pub async fn videos(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        request_path: &str,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        let cfg = scoped(credential, cfg);
-        let payload = media_rules(&req, cfg.as_ref(), request::normalize_image_refs(req.body.to_vec()));
-        let route = [VIDEOS_EDITS, VIDEOS_EXTENSIONS, VIDEOS_GENERATIONS]
-            .into_iter()
-            .find(|p| request_path.ends_with(p));
-        let request_id = text(&gj::get(&payload, "request_id"));
-        let (method, path) = match route {
-            Some(path) => (wreq::Method::POST, path.to_owned()),
-            None if !request_id.is_empty() => (wreq::Method::GET, format!("/videos/{}", path_escape(&request_id))),
-            None => (wreq::Method::POST, VIDEOS_GENERATIONS.to_owned()),
-        };
-        self.media(credential, &req, cfg.as_ref(), method, &path, payload, true)
-            .await
-    }
-
-    /// The shared media request: plain xAI headers on the chat base URL, the whole
-    /// response returned as is. `payload` is sent with a POST; a GET poll sends no body,
-    /// though Go's capture still logs the payload.
-    #[allow(clippy::too_many_arguments)]
-    async fn media(
-        &self,
-        credential: &Credential,
-        req: &ExecRequest,
-        cfg: &Config,
-        method: wreq::Method,
-        path: &str,
-        payload: Vec<u8>,
-        idempotent: bool,
-    ) -> Result<ExecResponse, ExecError> {
-        let logged = payload.as_slice();
-        let body = (method == wreq::Method::POST).then(|| payload.clone());
-        let (token, _) = creds(credential);
-        let mut headers = plain_headers(credential, &token, false, "", req);
-        if idempotent && method == wreq::Method::POST {
-            let header = |name: &str| {
-                req.headers
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::trim)
-                    .unwrap_or_default()
-                    .to_owned()
-            };
-            // The handler's `Idempotency-Key` metadata, else the client's own header.
-            let mut key = header("Idempotency-Key");
-            if key.is_empty() {
-                key = header("x-idempotency-key");
-            }
-            if !key.is_empty() {
-                headers.set("x-idempotency-key", key);
-            }
-        }
-        let url = self.url(endpoint(&chat_base_url(credential), path));
-        let (status, headers, data) = self
-            .send_buffered(credential, req, cfg, method, &url, headers, body, logged)
-            .await?;
-        if !(200..300).contains(&status) {
-            let mut error = response::status_error(status, &data);
-            error.headers = Box::new(headers);
-            return Err(error);
-        }
-        // Go only observes the response model here (no usage parse): a Codex-format line
-        // that is not a terminal event carries exactly that.
-        if req.usage.enabled() {
-            req.usage.response_line(Format::Codex, &data);
-        }
-        Ok(ExecResponse {
-            status: 200,
-            headers,
-            body: ResponseBody::Buffered(data),
-        })
-    }
 }
-
-impl XaiExecutor {
-    /// One request whose whole response body is read: captured, timed and canceled like
-    /// every xAI call. `logged` is what the capture records as the body.
-    #[allow(clippy::too_many_arguments)]
-    async fn send_buffered(
-        &self,
-        credential: &Credential,
-        req: &ExecRequest,
-        cfg: &Config,
-        method: wreq::Method,
-        url: &str,
-        headers: GoHeaders,
-        body: Option<Vec<u8>>,
-        logged: &[u8],
-    ) -> Result<(u16, HeaderMap, Bytes), ExecError> {
-        let client = self.clients.for_credential(credential, cfg);
-        let route = |_: &url::Url| {
-            Ok(crate::proxy::Route {
-                client: client.clone(),
-                order: None,
-            })
-        };
-        let capture = capture_request(req, credential, method.as_str(), url, &headers, logged);
-        req.usage.round_trip_started();
-        let send = crate::proxy::send_request(&route, method, url, headers, body.map(Bytes::from), None);
-        let upstream = fail_if_canceled(&req.usage, send).await;
-        capture.sent(&upstream);
-        let upstream = track_first_byte(upstream?, &req.usage);
-        let status = upstream.status;
-        let headers = upstream.headers.clone();
-        let data = fail_if_canceled(&req.usage, wire::read_all(upstream)).await;
-        capture.read(&data);
-        Ok((status, headers, data?))
-    }
-
-    /// `executeSpeech`: the speech handler's JSON to `/tts` on the compact base URL (the
-    /// official API unless a custom non-chat-proxy base URL is set; the chat proxy does
-    /// not serve `/tts`, `xaiSpeechRequestURL`), with payload rules for the
-    /// `openai` protocol. The raw audio comes back with the upstream headers.
-    pub async fn speech(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        let cfg = scoped(credential, cfg);
-        let mut model = text(&gj::get(&req.body, "model"));
-        if model.is_empty() {
-            model = req.model.trim().to_owned();
-        }
-        let payload = ck_wire::payload::apply(
-            &ck_wire::payload::Rules::of(cfg.as_ref()),
-            &ck_wire::payload::Request {
-                target_executor: PROVIDER,
-                model: &model,
-                requested_model: request::requested_model(&req),
-                protocol: "openai",
-                from_protocol: SPEECH_SOURCE,
-                root: "",
-                original: &req.body,
-                request_path: &req.request_path,
-                headers: Some(&req.headers),
-            },
-            req.body.to_vec(),
-        );
-        let (token, _) = creds(credential);
-        let mut headers = plain_headers(credential, &token, false, "", &req);
-        // Official TTS answers with raw audio; the media default asks for JSON.
-        headers.set("Accept", "*/*");
-        let url = self.url(endpoint(&compact_base_url(credential), "/tts"));
-        let (status, headers, data) = self
-            .send_buffered(
-                credential,
-                &req,
-                cfg.as_ref(),
-                wreq::Method::POST,
-                &url,
-                headers,
-                Some(payload.clone()),
-                &payload,
-            )
-            .await?;
-        if !(200..300).contains(&status) {
-            let mut error = response::status_error(status, &data);
-            if error.status == 404 && !speech_model_unavailable(&data) {
-                // Go's `xaiSpeechRequestError` (an unknown voice, say): neither rotated nor
-                // cooled. A request scope without upstream headers is the explicit marker
-                // (classify::explicit_request_scoped); Go's xAI status errors carry none.
-                error.scope = FailureScope::Request;
-            } else {
-                error.headers = Box::new(headers);
-            }
-            return Err(error);
-        }
-        // `EnsurePublished`: one record without usage; the audio is never parsed.
-        req.usage.publish();
-        Ok(ExecResponse {
-            status: 200,
-            headers,
-            body: ResponseBody::Buffered(data),
-        })
-    }
-}
-
-/// Go's `openai-speech` handler type, the speech request's source format.
-const SPEECH_SOURCE: &str = "openai-speech";
-
-/// `xaiSpeechModelUnavailablePatterns`: the auth manager's model-support phrases.
-const SPEECH_MODEL_UNAVAILABLE: [&str; 12] = [
-    "model_not_found",
-    "model_not_supported",
-    "model is not supported",
-    "model is unsupported",
-    "model not supported",
-    "unsupported model",
-    "model is not available",
-    "model not available",
-    "model is unavailable",
-    "model unavailable",
-    "not available for your plan",
-    "not available for your account",
-];
-
-/// `xaiSpeechModelUnavailable`: the error body says the speech model itself is missing,
-/// unsupported or unavailable, rather than a request value being wrong.
-fn speech_model_unavailable(body: &[u8]) -> bool {
-    let names = |text: &str| {
-        let lower = text.go_lower();
-        SPEECH_MODEL_UNAVAILABLE.iter().any(|p| lower.contains(p))
-    };
-    if !gj::valid(body) {
-        return names(&String::from_utf8_lossy(body));
-    }
-    [
-        "code",
-        "error.code",
-        "type",
-        "error.type",
-        "error",
-        "error.message",
-        "message",
-        "detail",
-    ]
-    .iter()
-    .any(|path| names(&gj::get(body, path).str()))
-}
-
 /// The Execute scan over a buffered SSE body: the first completed or incomplete
 /// response, with streamed output items restored, translated for the client.
 fn buffered(req: &ExecRequest, mut p: Prepared, store: &replay::Store, data: &[u8]) -> Result<Bytes, ExecError> {
     let mut items = OutputItems::default();
-    let mut filter = XSearchFilter::new(p.filter_internal_x_search, std::mem::take(&mut p.client_declared_tools));
     let mut restorer = NamespaceRestorer::new(std::mem::take(&mut p.namespace_tools));
     for line in data.split(|b| *b == b'\n') {
         let Some(rest) = line.strip_prefix(b"data:") else {
             continue;
         };
-        let event = response::normalize_summary_data(trim_space(rest).to_vec());
+        let event = trim_space(rest).to_vec();
         p.apply_patch.remember_dispatcher_event(&event);
         let mut event = restorer.restore(event);
         if !p.web_search_alias.is_empty() {
             event = response::restore_web_search_name(event, &p.web_search_alias);
         }
-        let Some(event) = filter.apply(event).filter(|e| !e.is_empty()) else {
-            continue;
-        };
         let (events, bridge_error) = p.apply_patch.transform(&event);
         if bridge_error.is_some() {
             return Err(apply_patch_error());
@@ -928,7 +624,7 @@ fn buffered(req: &ExecRequest, mut p: Prepared, store: &replay::Store, data: &[u
             match kind.as_slice() {
                 b"response.output_item.done" => items.collect(&event),
                 b"response.completed" | b"response.incomplete" => {
-                    let completed = response::normalize_summary_data(items.patch(&event));
+                    let completed = items.patch(&event);
                     if kind == b"response.completed" {
                         // Only a completed turn carries replayable terminal state.
                         replay::cache_completed(store, &p.replay_scope, &completed);
@@ -970,7 +666,6 @@ struct Pipeline {
     responses: bool,
     apply_patch: apply_patch::State,
     items: OutputItems,
-    filter: XSearchFilter,
     restorer: NamespaceRestorer,
     alias: String,
     store: Arc<replay::Store>,
@@ -1002,7 +697,6 @@ impl Pipeline {
             responses: req.response_format == Format::OpenAIResponse,
             apply_patch: p.apply_patch,
             items: OutputItems::default(),
-            filter: XSearchFilter::new(p.filter_internal_x_search, p.client_declared_tools),
             restorer: NamespaceRestorer::new(p.namespace_tools),
             alias: p.web_search_alias,
             store,
@@ -1061,7 +755,7 @@ impl Pipeline {
                     b"response.output_item.done" => self.items.collect(&event),
                     b"response.completed" | b"response.incomplete" => {
                         // Reconstructed only after the bridge restored dispatcher children.
-                        let event = response::normalize_summary_data(self.items.patch(&event));
+                        let event = self.items.patch(&event);
                         if &*gj::get(&event, "type").bytes() == b"response.completed" {
                             replay::cache_completed(&self.store, &self.scope, &event);
                         }
@@ -1090,7 +784,7 @@ impl Pipeline {
     fn line(&mut self, line: &[u8]) -> bool {
         if line.starts_with(b"event:") {
             if let Some(pending) = self.pending.take()
-                && !self.emit(response::summary_event_line(&pending, ""))
+                && !self.emit(pending)
             {
                 return false;
             }
@@ -1098,46 +792,29 @@ impl Pipeline {
             return true;
         }
         if let Some(rest) = line.strip_prefix(b"data:") {
-            let events = response::normalize_summary_data_events(trim_space(rest).to_vec());
-            let had_pending = self.pending.is_some();
-            for (i, event) in events.into_iter().enumerate() {
-                self.apply_patch.remember_dispatcher_event(&event);
-                let mut event = self.restorer.restore(event);
-                if !self.alias.is_empty() {
-                    event = response::restore_web_search_name(event, &self.alias);
-                }
-                let Some(event) = self.filter.apply(event).filter(|e| !e.is_empty()) else {
-                    if had_pending && i == 0 {
-                        self.pending = None;
-                    }
-                    continue;
-                };
-                // ObserveResponseModel and, for terminal events, StreamUsageBuffer.Observe.
-                let name = gj::get(&event, "type").str().into_owned();
-                if self.usage.enabled() {
-                    self.usage
-                        .response_line(Format::Codex, &response::usage_line(&event, &HTTP_USAGE_EVENTS));
-                    if HTTP_USAGE_EVENTS.contains(&name.as_str()) && response::codex_usage_ok(&event) {
-                        self.usage_seen = true;
-                    }
-                }
-                if had_pending {
-                    let event_line = match self.pending.take() {
-                        Some(pending) if i == 0 => response::summary_event_line(&pending, &name),
-                        _ => format!("event: {name}").into_bytes(),
-                    };
-                    if !self.emit(event_line) {
-                        return false;
-                    }
-                }
-                if !self.emit([&b"data: "[..], &event].concat()) {
-                    return false;
+            let event = trim_space(rest).to_vec();
+            self.apply_patch.remember_dispatcher_event(&event);
+            let mut event = self.restorer.restore(event);
+            if !self.alias.is_empty() {
+                event = response::restore_web_search_name(event, &self.alias);
+            }
+            let name = gj::get(&event, "type").str().into_owned();
+            if self.usage.enabled() {
+                self.usage
+                    .response_line(Format::Codex, &response::usage_line(&event, &HTTP_USAGE_EVENTS));
+                if HTTP_USAGE_EVENTS.contains(&name.as_str()) && response::codex_usage_ok(&event) {
+                    self.usage_seen = true;
                 }
             }
-            return true;
+            if let Some(pending) = self.pending.take()
+                && !self.emit(pending)
+            {
+                return false;
+            }
+            return self.emit([&b"data: "[..], &event].concat());
         }
         if let Some(pending) = self.pending.take()
-            && !self.emit(response::summary_event_line(&pending, ""))
+            && !self.emit(pending)
         {
             return false;
         }
@@ -1148,7 +825,7 @@ impl Pipeline {
     /// scan error or the client's final frames.
     fn end(&mut self, scan_error: Option<ExecError>) {
         if let Some(pending) = self.pending.take()
-            && !self.emit(response::summary_event_line(&pending, ""))
+            && !self.emit(pending)
         {
             return;
         }
@@ -1198,7 +875,7 @@ impl Pipeline {
                 match fail_if_canceled(&st.usage, lines.next()).await {
                     Some(Ok(line)) => {
                         // AppendAPIResponseChunk per scanned line.
-                        st.capture.chunk(&line);
+                        st.capture.line(&line);
                         st.line(&line);
                     }
                     Some(Err(error)) => st.end(Some(error)),
@@ -1210,163 +887,11 @@ impl Pipeline {
     }
 }
 
-// --- compaction trigger stream (xaiBuildCompactionTriggerStreamChunks) -------------------
-
-/// `xaiCompactionResponseID`.
-pub(crate) fn compaction_response_id(data: &[u8], now: SystemTime) -> String {
-    let id = text(&gj::get(data, "id"));
-    if !id.is_empty() {
-        if id.starts_with("resp_") {
-            return id;
-        }
-        return format!("resp_{}", id.strip_prefix("cmp_").unwrap_or(&id));
-    }
-    let nanos = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    format!("resp_xai_compaction_{nanos}")
-}
-
-/// `xaiCompactionItemID`.
-fn compaction_item_id(response_id: &str) -> String {
-    match response_id.strip_prefix("resp_") {
-        Some(suffix) if !suffix.is_empty() => format!("cmp_{suffix}"),
-        _ => format!("cmp_{response_id}"),
-    }
-}
-
-/// `xaiCompactionOutputItem`.
-pub(crate) fn compaction_item(data: &[u8], response_id: &str) -> Vec<u8> {
-    let first = gj::get(data, "output.0");
-    let mut item = if first.exists() && first.kind == Kind::Json {
-        first.raw().to_vec()
-    } else {
-        br#"{"type":"compaction"}"#.to_vec()
-    };
-    if !gj::get(&item, "type").exists() {
-        gj::set_str(&mut item, "type", "compaction");
-    }
-    if !gj::get(&item, "id").exists() {
-        gj::set_str(&mut item, "id", compaction_item_id(response_id));
-    }
-    item
-}
-
-/// `xaiBuildCompactionBaseResponse`.
-fn compaction_base(p: &Prepared, data: &[u8], response_id: &str, created_at: i64, status: &str) -> Vec<u8> {
-    let mut out = br#"{"id":"","object":"response","created_at":0,"status":"","background":false,"error":null,"incomplete_details":null,"output":[]}"#.to_vec();
-    gj::set_str(&mut out, "id", response_id);
-    gj::set_int(&mut out, "created_at", created_at);
-    gj::set_str(&mut out, "status", status);
-    let model = gj::get(data, "model").str().into_owned();
-    if !model.is_empty() {
-        gj::set_str(&mut out, "model", model);
-    } else if !p.base_model.is_empty() {
-        gj::set_str(&mut out, "model", &p.base_model);
-    }
-    for field in [
-        "instructions",
-        "max_output_tokens",
-        "max_tool_calls",
-        "parallel_tool_calls",
-        "previous_response_id",
-        "prompt_cache_key",
-        "reasoning",
-        "text",
-        "tool_choice",
-        "tools",
-        "top_logprobs",
-        "top_p",
-        "truncation",
-        "user",
-        "metadata",
-    ] {
-        let value = gj::get(&p.body, field);
-        if value.exists() {
-            gj::set_raw(&mut out, field, value.raw());
-        }
-    }
-    out
-}
-
-/// `xaiBuildSSEFrame`.
-fn sse_frame(name: &str, data: &[u8]) -> Vec<u8> {
-    [b"event: ", name.as_bytes(), b"\ndata: ", data, b"\n\n"].concat()
-}
-
-/// `xaiBuildCompactionTriggerStreamChunks`.
-pub(crate) fn compaction_frames(p: &Prepared, data: &[u8], now: SystemTime) -> Vec<Vec<u8>> {
-    let response_id = compaction_response_id(data, now);
-    let unix = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let or_now = |v: i64| if v == 0 { unix } else { v };
-    let created_at = or_now(gj::get(data, "created_at").int());
-    let completed_at = or_now(gj::get(data, "completed_at").int());
-    let item = compaction_item(data, &response_id);
-    let output = [&b"["[..], &item, b"]"].concat();
-    let mut created = compaction_base(p, data, &response_id, created_at, "in_progress");
-    let mut in_progress = compaction_base(p, data, &response_id, created_at, "in_progress");
-    let mut completed = compaction_base(p, data, &response_id, created_at, "completed");
-    let mut model = gj::get(&p.original_payload, "model").str().into_owned();
-    if model.is_empty() {
-        model = p.base_model.clone();
-    }
-    if model.is_empty() {
-        model = gj::get(data, "model").str().into_owned();
-    }
-    if !model.is_empty() {
-        gj::set_str(&mut created, "model", &model);
-        gj::set_str(&mut in_progress, "model", &model);
-    }
-    gj::set_int(&mut completed, "completed_at", completed_at);
-    gj::set_raw(&mut completed, "output", &output);
-    let usage = gj::get(data, "usage");
-    if usage.exists() {
-        gj::set_raw(&mut completed, "usage", usage.raw());
-    }
-    let with = |template: &[u8], key: &str, raw: &[u8]| {
-        let mut out = template.to_vec();
-        gj::set_raw(&mut out, key, raw);
-        out
-    };
-    let created = with(
-        br#"{"type":"response.created","sequence_number":0}"#,
-        "response",
-        &created,
-    );
-    let in_progress = with(
-        br#"{"type":"response.in_progress","sequence_number":1}"#,
-        "response",
-        &in_progress,
-    );
-    let added = with(
-        br#"{"type":"response.output_item.added","sequence_number":2,"output_index":0}"#,
-        "item",
-        &item,
-    );
-    let keepalive = br#"{"type":"keepalive","sequence_number":3}"#;
-    let done = with(
-        br#"{"type":"response.output_item.done","sequence_number":4,"output_index":0}"#,
-        "item",
-        &item,
-    );
-    let completed = ensure_responses_usage_details(&with(
-        br#"{"type":"response.completed","sequence_number":5}"#,
-        "response",
-        &completed,
-    ));
-    vec![
-        sse_frame("response.created", &created),
-        sse_frame("response.in_progress", &in_progress),
-        sse_frame("response.output_item.added", &added),
-        sse_frame("keepalive", keepalive),
-        sse_frame("response.output_item.done", &done),
-        sse_frame("response.completed", &completed),
-    ]
-}
-
 // --- token counting (xai_executor_tokens.go) ----------------------------------------------
 
 /// `countXAIInputTokens`: O200kBase over instructions, input, function tools and the
 /// text format, joined by newlines.
-fn count_input_tokens(body: &[u8]) -> Result<i64, String> {
+pub(crate) fn count_input_tokens(body: &[u8]) -> Result<i64, String> {
     let encoder = crate::tokenizer::encoder(crate::tokenizer::Encoding::O200kBase)?;
     if body.is_empty() {
         return Ok(0);

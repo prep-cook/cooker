@@ -34,6 +34,8 @@ pub(crate) const EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
 const PROMPT_CACHING_EVICT: &str = "prompt-caching-evict-2026-05-12";
 const CACHE_DIAGNOSIS: &str = "cache-diagnosis-2026-04-07";
 const REDACT_THINKING: &str = "redact-thinking-2026-02-12";
+/// Anthropic native compaction (owner ruling, Q7 reversal).
+const COMPACTION: &str = "compact-2026-09-04";
 const AFK_MODE: &str = "afk-mode-2026-01-31";
 
 /// Sent on every "cli" entrypoint Messages request, after claude-code-20250219.
@@ -358,13 +360,35 @@ pub(crate) fn with_extended_ttl(betas: &str) -> String {
     parts.join(",")
 }
 
-/// Adds the beta required by `thinking.block_binding`, including after custom headers.
-pub(crate) fn with_thinking_binding(betas: &str) -> String {
-    let mut parts = dedup(betas, "");
-    if !parts.iter().any(|p| p == THINKING_BINDING) {
-        parts.push(THINKING_BINDING.into());
+/// The documented betas `body` needs on every path, custom headers included, added to `betas`;
+/// `None` when it needs none, so the header stays as built: thinking binding for
+/// `thinking.block_binding`, and compaction for a body that asks for one (`"compaction"`). A
+/// body carrying a compaction block gets its beta from the fence ([`with_compaction`]).
+pub(crate) fn documented(betas: &str, body: &str) -> Option<String> {
+    let binding = rawjson::get(body, "thinking.block_binding").exists();
+    let compaction = rawjson::get(body, "compaction").exists();
+    let mut betas = (binding || compaction).then(|| dedup(betas, ""))?;
+    for (needed, beta) in [(binding, THINKING_BINDING), (compaction, COMPACTION)] {
+        if needed && !betas.iter().any(|b| b == beta) {
+            betas.push(beta.into());
+        }
     }
-    parts.join(",")
+    Some(betas.join(","))
+}
+
+/// Adds the compaction beta to the built header when `carries`: the fenced request holds an
+/// Anthropic compaction block by `ck_translate::anthropic::compaction::requested`, the one
+/// test the fence's placement check also uses, and Anthropic reads a replayed block only with
+/// the beta, whatever path built the header or wherever the client placed the block.
+pub(crate) fn with_compaction(h: &mut super::headers::GoHeader, carries: bool) {
+    if !carries {
+        return;
+    }
+    let mut betas = dedup(h.get("Anthropic-Beta"), "");
+    if !betas.iter().any(|b| b == COMPACTION) {
+        betas.push(COMPACTION.into());
+    }
+    h.set("Anthropic-Beta", betas.join(","));
 }
 
 /// Removes the recovery beta when the executor performs client-side recovery instead.

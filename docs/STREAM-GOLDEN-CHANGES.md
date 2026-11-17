@@ -1,0 +1,256 @@
+# Stream golden changes and acceptance inventory
+
+S1 replaces pair translation with boundary codecs. This ledger records changed contracts without regenerating Go expectations. Phase A freezes the input inventory at post-W1 `b518060ea1e43ef4b266591986ca92321e6289b5`; it does not claim S1 semantic coverage has passed.
+
+## Ledger rules
+
+Keep existing fixture inputs and their provenance. Keep exact-byte assertions for decoded media and opaque signatures. Replace wire-shape assertions only when the cited contract changes. Do not bless a wholesale rewrite of expected output.
+
+A fixture ID is its repository path plus its recorded `name` and occurrence index. For files without names, use the JSON pointer/index. An inline case uses its file and test symbol. Record one row per changed case when its codec lands. A file-level group below is an inventory, not permission to skip its individual cases.
+
+| Fixture ID | Route / direction / mode | Old behavior | Required behavior | Authority | Replacement semantic assertion | Status / evidence |
+| --- | --- | --- | --- | --- | --- | --- |
+| `crates/ck-translate/tests/golden.rs::fragmented_sse_keeps_tool_state_request_local` | Chat client / Claude response decode and Chat encode / stream | One buffered tool chunk at block stop; empty state after a separate stop | Start, each argument fragment, then end; request-local state | INTERNAL-STREAM §3.3, §3.6, §9.1; L03 | Observe the first argument fragment before block stop; preserve call ID and exact argument sequence under every input fragmentation | Required in Phase C; not implemented |
+| `crates/ck-translate/tests/golden.rs::openai_passthrough_is_byte_oriented` | Chat same-protocol / request and response / stream | Invalid UTF-8 passes unchanged | Client 400 or upstream terminal error; binary media remains valid | INTERNAL-STREAM §2 C2, §3.7, §7, §9.1 | Invalid text never reaches upstream or emits success; valid multibyte text survives split reads; arbitrary decoded media bytes remain exact | Required in Phase C; not implemented |
+| `crates/ck-translate/tests/golden.rs::registration_matches_go` | Same-protocol Claude and pair count wiring | Missing registry entries use model-only/raw fallback | Every accepted boundary converts through the internal stream | INTERNAL-STREAM §2 Conversion, §9.1 | Delete registry-wiring assertions; exercise same-protocol field preservation, validation and count semantics through codecs | Required in Phase C; not implemented |
+| `crates/ck-exec/tests/fixtures/xai_ws_go.json`: `basic_then_previous`, `repeated_response_id`, `target_change_replays_transcript`, `continuation_without_socket`, `continuation_on_socket`, `websockets_disabled_continuation`, `RewritesRepeatedResponseIDForDownstream`, `RewritesRepeatedResponseIDWithoutPreviousResponseID`, `ReplaysTranscriptWhenAuthChanges` | xAI Responses WebSocket turn / upstream socket / stream | Per-connection transcript and response-id map; `-xai-N` ids downstream; transcript replay on a new target; `replay_required` for a continuation without a socket | Each turn sends its own expanded request without `previous_response_id`; no transcript or id map; xAI ids reach the stream as sent; a lost socket is redialed by the next turn | EXECUTION-CONTRACT §12; E-PLAN E9c | `crates/ck-exec/tests/exec_xai/socket.rs::turns_send_their_own_history_and_keep_xai_ids`, `::the_turn_after_a_closed_socket_dials_and_sends_only_its_request`; `ck-server` `realtime::websocket::tests::an_xai_websockets_credential_continues_over_http` for the old session path | Deleted in E9c; replacement passes |
+| `crates/ck-exec/tests/fixtures/xai_ws_go.json`: `compaction_from_transcript`, `compaction_fresh_input`, `compaction_previous_only`, `compaction_empty_context`, `compaction_invalid_response`, `RequiredUpstreamRejectsCompactionHTTPFallback`, `CompactionTriggerUsesHTTPCompactWithRecordedContext`, `CompactionTriggerFreshSessionFallback/*` (3) | xAI Responses WebSocket turn / upstream socket / stream | A `compaction_trigger` turn compacted locally through HTTP `/responses/compact` from the transcript | `compaction_trigger` reaches xAI over the socket unchanged; xAI compacts | Settled 64 (Q17) | `crates/ck-exec/tests/exec_xai/socket.rs::compaction_trigger_reaches_xai_unchanged` | Deleted in E9c; replacement passes |
+| `crates/ck-exec/tests/fixtures/xai_ws_go.json`: `warmup_generate_false`, `CompletesGenerateFalseWarmup`, `usage_on_done`, `usage_ignores_incomplete` | xAI Responses WebSocket turn / upstream socket / stream | Synthesized warmup completion; `response.done` ends the turn with its usage; incomplete usage not recorded | Warmup completion kept; `response.done` enters the ingress as the completion, its `response.status` deciding the end; incomplete usage is recorded, as on the HTTP contract path | EXECUTION-CONTRACT §12; E-PLAN E9c | `crates/ck-exec/tests/exec_xai/socket.rs::a_warmup_turn_completes_after_created`; `::upstream_endings_are_attempt_failures_without_a_second_send` rows `done as the only terminal` and `incomplete` | Deleted in E9c; replacement passes |
+| `crates/ck-exec/tests/fixtures/xai_ws_go.json`: `error_frames`, `StopsOnBareErrorPayload`, `close_message_too_big`, `upstream_closes_mid_turn`, `binary_frame`, `handshake_rejected`, `HandshakeFreeUsageExhaustedSetsRetryAfter` | xAI Responses WebSocket turn / upstream socket / stream | Errors and socket loss as downstream chunks or stream errors; a failed send redialed and resent | Error frames and closes keep their status mapping; socket loss is a transport-scope attempt failure; nothing is sent twice in a turn | EXECUTION-CONTRACT §12; E-PLAN E9c | `crates/ck-exec/tests/exec_xai/socket.rs::upstream_endings_are_attempt_failures_without_a_second_send`, `::turns_that_fail_before_sending` | Deleted in E9c; replacement passes |
+| `crates/ck-exec/tests/fixtures/xai_ws_go.json`: `reasoning_summary_events`, `NormalizesReasoningTextEvents`, `RestoresNamespaceToolCalls`, `RestoresAliasedWebSearch`, `DoesNotRestoreNamespacedClientfnWebSearch`, `PreservesClientSameNameToolsWithXSearch`, `PreservesNormalizedCustomSameNameToolWithXSearch` | xAI Responses WebSocket turn / upstream socket / stream | xAI line rules applied inside the socket transport | Frames reach the same xAI line rules (`xai_events`) as HTTP generation | EXECUTION-CONTRACT §12; E-PLAN E9c | `crates/ck-exec/tests/exec_xai/socket.rs::a_turn_sends_one_create_and_passes_frames_unchanged`; the rules themselves through `exec_xai::parity::responses_uploads_match_the_go_executor` and `exec_xai::flow::reasoning_text_becomes_a_summary` | Deleted in E9c; replacement passes |
+| `crates/ck-exec/tests/fixtures/xai_ws_go.json`: `ApplyPatchTransport/*` (10), `ApplyPatchIncompleteEOF` | xAI Responses WebSocket turn / upstream socket / stream | apply_patch bridge inside the socket transport; a cut call fails with 502 | The shared bridge in `xai_events`; a body ending or failing with a call open fails as the bridge 502 | EXECUTION-CONTRACT §12; E-PLAN E9c | `crates/ck-exec/tests/exec_xai/socket.rs::upstream_endings_are_attempt_failures_without_a_second_send` row `drop during an apply_patch call`; `exec_xai::parity::responses_uploads_match_the_go_executor` | Deleted in E9c; replacement passes |
+| `crates/ck-exec/tests/fixtures/xai_ws_go.json`: `KeepalivePingDuringUpload_WithSession`; `crates/ck-exec/tests/reference/xai_ws/` (generator) | xAI Responses WebSocket turn / upstream socket / stream | Ping answered during a turn; Go generator for the removed transport | The shared reader answers pings while the writer is held; the generator is deleted with its transport (recorded source: `9007b88b`) | EXECUTION-CONTRACT §12; E-PLAN E9c | `crates/ck-exec/src/xai_ws_tests.rs::a_ping_is_answered_while_the_writer_is_held` | Deleted in E9c; replacement passes |
+| `crates/ck-server/tests/fixtures/speech_go.json`: every 200 scenario on `/v1/audio/speech` and `/v1/tts` (12) | Speech / response / raw | The audio buffered, then sent with the upstream `Content-Length`; the requested format's media type unless header passthrough was on | The audio streams from its first byte on the execution contract and is resumable on `/v1/streams`: no `Content-Length`, `Cache-Control: no-store`, `X-Ck-Stream-Id`; the upstream's media type whenever it names audio, else the requested format's; an answer without an audio byte fails over, and 500 `empty_stream` when every credential gives one | E-PLAN §2.3 (E7), INTERNAL-STREAM §6.7 (D3) | `media_go.rs::media_routes_match_go` keeps status, body bytes, media type and upstream requests; `stream_media.rs` checks commitment at the first byte and raw resume | E7a |
+| `crates/ck-server/tests/fixtures/media_go.json`: `gen_xai_url_format`, `gen_xai_stream`, `gen_xai_stream_url`, `gen_compat`, `gen_compat_url`, `gen_compat_stream`, `edit_json_xai_one_image`, `edit_json_xai_stream`, `edit_json_compat`, `edit_multipart_compat`, `slow_gen_xai`, `slow_gen_xai_stream`, `slow_gen_compat_stream` | Images / response / buffered and SSE | The body rebuilt or relayed with `Content-Length`, events with `Cache-Control: no-cache`, keepalive comments or a leading newline while waiting; `created` dropped from events, `revised_prompt` trimmed, xAI `mime_type` dropped | Served on the execution contract from the images codec: no `Content-Length`, `Cache-Control: no-store`, `X-Ck-Stream-Id`, `id: v1.e.N` on each event, no keepalive; every result names `created` or `created_at` (0 when the source has none) and the settings the source reported; `revised_prompt` as sent; xAI `mime_type`, `file_output` and `storage_error` kept (X19) | E-PLAN §2.3 (E7), INTERNAL-STREAM §6.7 (D3), TRIAGE F28 | `media_go.rs::media_routes_match_go` keeps status, media type and upstream requests; `stream_media.rs` checks commitment at the first image and event resume; `images_codec.rs` checks the X19 members | E7b |
+| `crates/ck-server/tests/fixtures/media_go.json`: `edit_json_xai_one_image`, `edit_json_xai_stream`, `edit_json_compat` (upstream requests) | Images / request / xAI and OpenAI-compatible edits | xAI references without `type`; a JSON edit to an OpenAI-compatible upstream forwarded with the client's `image` string | xAI references `{"type":"image_url","url":…}` as the old path sent them; an OpenAI-compatible edit whose image is a URL or file id goes as the Images JSON body with `images:[{"image_url":…}]`, one with image data as the multipart form | Images codec (#162), E7 | `exec_media.rs::media_requests_reach_the_upstream_in_the_official_shape`, `images_codec.rs` | E7b |
+| `crates/ck-server/tests/fixtures/media_go.json`: `gen_xai_b64`, `edit_multipart_xai`, `edit_json_xai_two_images`, `edit_multipart_xai_stream`, `edit_multipart_compat_stream` | Images / request / refused | Sent upstream: `quality` to xAI, `image` merged into `images`, form `stream` read as any Go bool or `YES`, form `n` of `x` dropped, a file part without Content-Type sniffed | 400 before any send: xAI has no `quality` control (#175); `image` and `images` are exclusive (X18); a form's `stream` is `true` or `false`, `n` a number, and a file part names its media type | TRIAGE F28 (X18), images codec (#162, #175) | `exec_media.rs::refused_media_requests_send_nothing`, `images_codec.rs` | E7b |
+| `crates/ck-server/tests/fixtures/media_go.json`: `slow_gen_xai_stream_error`, `slow_gen_compat_error`, `slow_gen_compat_stream_error` | Images / response / upstream error before the first image | 200 with keepalives, then an `error` event or JSON body | The upstream status and error as an HTTP response: nothing is committed before the first image | E-PLAN §2.3 (E7) | `media_go.rs` status and error type | E7b |
+| `crates/ck-server/tests/fixtures/media_go.json`: `gen_xai_no_output`, `gen_xai_invalid_upstream_json`, `slow_gen_xai_stream_no_output`, `gen_compat_stream_empty` | Images / response / answer without an image | 502 (500 for the empty compat stream) from the handler after one request, or 200 with an `error` event | The attempt fails and the next credential gets the request; the last failure answers 502 `server_error`. The fixture gives the second xAI key the same reply Go's one request received | D2 failover, E7 | `media_go.rs` status, error type and both requests; `stream_media.rs` failover row | E7b |
+| `crates/ck-server/tests/fixtures/media_go.json`: `gen_compat_stream` (input) | Images / response / SSE | The partial preview `AA` relayed as sent | The fixture's preview is `AA==`: the images codec decodes base64 strictly, and Go relayed the padded value unchanged | Images codec (#162) | `media_go.rs` body | E7b |
+| `crates/ck-server/tests/fixtures/media_go.json`: `edit_json_xai_missing_image` | Images / request / refused | `Content-Type: application/json; charset=utf-8` | `application/json`, as every other cooker error | E7 | `media_go.rs` headers | E7b |
+| `crates/ck-server/tests/codex_alpha.rs::alpha_search_serves_eligible_credentials_and_fails_over_before_answering` (was `alpha_search_uses_policy_eligible_credential_and_passes_upstream_through`) | Codex Alpha Search / request and response / buffered | One credential, no failover: the upstream status, body and `Content-Type` relayed unchanged (a 418 `text/plain` body reached the client); body never validated, so a duplicate `id` or invalid JSON went upstream; selector errors as `{"error":"<text>"}` | Served on the execution contract from the search codec: an upstream refusal fails over to the next eligible credential; the client gets the result JSON with its native members (`application/json`, `X-Ck-Stream-Id`, byte resume); a body that is not a search request, a duplicate member included, is 400 before selection; selector errors through the shared OpenAI error renderer; still no usage record | E-PLAN §2.3 (E7), E7c plan | `codex_alpha.rs` table rows (result round trip, failover, unknown model, ineligible credentials, client errors, no usage record, resume); `search_codec.rs` stream rows | E7c |
+| `crates/ck-server/tests/fixtures/media_go.json`: `video_create_json`, `video_create_form_urlencoded`, `video_create_multipart`, `slow_video_create` | OpenAI Videos create / response / buffered | The body rebuilt by the route (`object`, `progress`, `status`, `id`, `model`, `prompt`, `seconds`, `size`, `created_at`) with `Content-Length`; a leading newline keepalive while a slow upstream answered; the xAI body in the route's member order | Served on the execution contract: the `video.job` record written by the video codec's OpenAI egress, the same members in the order `id`, `object`, `status`, job fields, then the request's members kept for the client; no `Content-Length`, `Cache-Control: no-store`, `X-Ck-Stream-Id`, no keepalive; the xAI body in the codec's option order (`resolution` before `aspect_ratio`) | E-PLAN §2.3 (E7), E7c-PLAN, INTERNAL-STREAM §5.24, §6.7 (D3) | `media_go.rs::media_routes_match_go` keeps status, member values and upstream requests; `stream_media.rs::video_jobs_are_served_to_their_caller_on_their_credential_and_charged_once` checks the create's members | E7c |
+| `crates/ck-server/tests/fixtures/media_go.json`: `video_retrieve_pinned`, `video_retrieve_pinned_again`, `video_retrieve_pinned_to_creator`, `video_retrieve_pinned_to_creator_again`, `video_retrieve_preview_model` | OpenAI Videos retrieve / response / buffered | The body rebuilt by the route with `Content-Length`; a failed job named the top-level xAI `code` over the error's own and gained `progress: 0` | Served on the execution contract through the OpenAI job egress: same member values in the codec's order, no `Content-Length`, `Cache-Control: no-store`, `X-Ck-Stream-Id`; a failed job's `error` is the job's own `{code, message}` as xAI sent it, without an invented `progress`; `expired` and `cancelled` stay distinct instead of `failed` (L17) | E-PLAN §2.3 (E7), INTERNAL-STREAM §5.24, L17 | `media_go.rs::media_routes_match_go`; `ck-translate/tests/video_codec.rs::video_job_egress_keeps_status_and_identity_and_refuses_what_a_dialect_lacks` | E7c |
+| `crates/ck-server/tests/fixtures/media_go.json`: `video_content`, `slow_video_content_download` | OpenAI Videos content / response / raw | The file relayed with the host's `Content-Length`, `Content-Disposition`, `ETag`, `Last-Modified` and `Cache-Control` | Served on the execution contract from the job's credential: the bytes from their first byte with the host's media type, no `Content-Length` or other host headers, `Cache-Control: no-store`, `X-Ck-Stream-Id`, resumable by byte cursor | E-PLAN §2.3 (E7), INTERNAL-STREAM §6.7 (D3) | `media_go.rs::media_routes_match_go` keeps status, body bytes, media type and upstream requests; `stream_media.rs` checks resume and the download's proxy | E7c |
+| `crates/ck-server/tests/fixtures/media_go.json`: `native_generations`, `native_retrieve_pinned`, `native_videos_root`, `native_edits`, `native_extensions`, `slow_native_retrieve` | xAI Videos native / request and response / buffered | The upstream body relayed with `Content-Length` and a leading newline keepalive while a slow upstream answered; the client body forwarded in its own member order | Served on the execution contract: the `video.job` record written back as xAI sent it, except the status word, which is xAI's documented one (`queued` reads `pending`); no `Content-Length`, `Cache-Control: no-store`, `X-Ck-Stream-Id`, no keepalive; the request in the codec's option order (`model` first) | E-PLAN §2.3 (E7), INTERNAL-STREAM §5.23, §5.24 | `media_go.rs::media_routes_match_go` | E7c |
+| `crates/ck-server/tests/fixtures/media_go.json`: `video_create_missing_id` (input: a second upstream reply), and the credential each later video scenario's upstream request names | Video create / response / buffered | An answer naming no job was a 502 after one request | The answer fails its attempt before anything reached the client and fails over to the next credential (contract failover before commitment), so the scenario scripts the second credential's answer; both refused, the client gets 502. The extra request moves the round-robin rotation, so later scenarios' first request names the other key (`native_retrieve_upstream_error` changes only in that key) | E-PLAN §2.3 "failover before commitment" | `media_go.rs::media_routes_match_go` | E7c |
+
+No fixture expectations change in Phase A. Later rows must include a test name, command/result and commit, or an explicit unsupported-operation reason. Empty output, a missing registry arm and a skipped test are not semantic passes. Existing `golden.rs::PENDING` entries remain input obligations; they are not accepted losses.
+
+## Chat reference checkpoints
+
+The old pair registry and its goldens remain unchanged until integration cutover. These new boundary tests prove individual Chat contracts, not full reference-codec acceptance.
+
+| Test in `crates/ck-translate/tests/chat_codec.rs` | Contract and observed result | Commit |
+| --- | --- | --- |
+| `completed_request_fields_and_messages_publish_before_the_body_ends` | Completed root fields and messages publish before EOF; parent containers precede children and pointers are assigned once. | `1405cb20` |
+| `late_destination_rejection_keeps_published_prefix_without_success` | A late unsupported semantic preserves the canonical prefix but emits no request.end or done and authorizes no upstream body. | `1405cb20` |
+| `completed_message_media_is_available_before_later_request_fields` | Media for a completed message is available before later root fields arrive. This does not prove flushing inside an unfinished media string. | `1405cb20` |
+| `request_controls::native_controls_custom_declarations_and_nullable_values_survive_fence` | Native nullable controls, custom declarations and simultaneous sampling values survive the capability fence. | `04b6c056` |
+| `request_controls::late_invalid_native_semantics_never_publish_request_end` | Invalid late native controls cannot authorize upstream encoding. | `04b6c056` |
+| `response_media::native_audio_fragments_reassemble_across_every_base64_boundary` | Native audio reconstructs exact decoded bytes across source-event quartet boundaries in both downstream modes. | `04b6c056` |
+| `response_media::unfinished_native_audio_cannot_publish_successful_choice_finish` | An unfinished audio quartet produces an error without successful item or response completion. | `04b6c056` |
+
+At `1405cb20`, fmt check, clippy with warnings denied, and `cargo nextest run -p ck-translate -p ck-stream --locked --no-fail-fast` passed: 149 tests passed, one existing storage test skipped. Unfinished-string/media publication, full Chat media/provenance/usage/terminal coverage and final independent review remain acceptance obligations.
+
+At `04b6c056`, the same fmt, clippy and two-crate nextest gates passed: 170 tests passed, one existing storage test skipped. The intervening media checkpoint also covers structured content, native media, recursive response provenance, usage details and malformed terminals. Full acceptance still requires unfinished-string publication/source retirement, complete request controls and provenance, final-snapshot reconciliation, stable logical-media identity, mutation/deletion semantics and independent final-tree review.
+
+
+## Registry inventory: 30 arms
+
+Source: `crates/ck-translate/src/lib.rs:283-315`. Each row names one current `(client, upstream)` arm, not a new pair API. `openai` means Chat; `openai-response` means Responses; `codex` and `antigravity` name wire envelopes, not extra client routes.
+
+Fixture paths are `crates/ck-translate/tests/fixtures/pairs/<stem>.json`. Counts below are recorded cases by `path`: R=request, C=request_compat, E=request_envelope, S=stream, B=non_stream, T=token_count. A dash means no recorded cases, not unsupported semantics. Every row has request decode/upstream encode and upstream decode/client encode obligations, including buffered and streamed delivery. Count applicability comes from the operation/provider tables below, not a missing token-count renderer.
+
+| Client | Upstream | Fixture stem | R | C | E | S | B | T |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| openai | openai | openai-openai | 247 | - | - | 8 | 3 | - |
+| openai | claude | openai-claude | 329 | 133 | - | 19 | 80 | - |
+| openai-response | codex | openai-response-codex | 188 | - | - | 18 | 11 | - |
+| openai-response | claude | openai-response-claude | 486 | 14 | - | 216 | 255 | - |
+| claude | openai | claude-openai | 358 | 243 | - | 84 | 44 | 3 |
+| gemini | gemini | gemini-gemini | 121 | - | - | 10 | 11 | 3 |
+| openai | gemini | openai-gemini | 353 | - | - | 21 | 23 | - |
+| claude | gemini | claude-gemini | 339 | 243 | - | 44 | 72 | 3 |
+| openai | codex | openai-codex | 381 | - | - | 62 | 93 | - |
+| openai-response | gemini | openai-response-gemini | 380 | - | - | 236 | 155 | - |
+| claude | codex | claude-codex | 417 | 254 | - | 91 | 80 | 3 |
+| gemini | codex | gemini-codex | 152 | - | - | 22 | 24 | 3 |
+| interactions | codex | interactions-codex | 54 | - | - | 21 | 19 | - |
+| openai-response | openai | openai-response-openai | 346 | - | - | 171 | 78 | - |
+| gemini | openai | gemini-openai | 153 | - | - | 12 | 14 | 3 |
+| interactions | interactions | interactions-interactions | 49 | - | - | 4 | 6 | - |
+| interactions | gemini | interactions-gemini | 180 | - | - | 17 | 23 | - |
+| gemini | interactions | gemini-interactions | 170 | - | - | 12 | 12 | - |
+| openai | interactions | openai-interactions | 283 | - | - | 25 | 30 | - |
+| interactions | openai | interactions-openai | 72 | - | - | 16 | 10 | - |
+| openai-response | interactions | openai-response-interactions | 212 | - | - | 451 | 99 | - |
+| interactions | openai-response | interactions-openai-response | 78 | - | - | 23 | 17 | - |
+| interactions | claude | interactions-claude | 139 | - | - | 19 | 30 | - |
+| claude | interactions | claude-interactions | 318 | 245 | - | 22 | 50 | - |
+| gemini | claude | gemini-claude | 214 | - | - | 18 | 38 | 3 |
+| gemini | antigravity | gemini-antigravity | 172 | - | - | 19 | 20 | 3 |
+| openai | antigravity | openai-antigravity | 362 | - | - | 35 | 13 | - |
+| openai-response | antigravity | openai-response-antigravity | 330 | - | 20 | 29 | 37 | - |
+| interactions | antigravity | interactions-antigravity | 195 | - | - | 28 | 28 | - |
+| claude | antigravity | claude-antigravity | 583 | - | - | 92 | 83 | 3 |
+
+These 30 files contain 12,143 cases. Native Claude→Claude is outside this registry and still requires full codec coverage. Native Responses and provider-native media/duplex paths also require conversion even when today's executor bypasses a pair. The 49 registration entries in `sdk_registry.json` enumerate registered and unregistered combinations; they are not 49 Rust registry arms.
+
+## Existing fixture inventory
+
+All paths below are relative to the repository root. Globs denote the complete matched set at the pinned baseline, including error and rejection cases. Preserve `tests/reference/` and its recorded source revisions; do not run its generators for S1 acceptance. The xAI WebSocket generator and `xai_ws_go.json` were deleted with their transport; the ledger rows above name each case and its replacement. Fixture presence is not proof that its old assertion meets the new contract.
+
+| Input set | Existing contents and consumers | S1 treatment |
+| --- | --- | --- |
+| `crates/ck-translate/tests/fixtures/pairs/*.json` | 30 files above; `tests/golden.rs` | Preserve inputs; replace only ruled wire/loss assertions with semantic coverage |
+| `crates/ck-translate/tests/fixtures/apply_patch_responses.json` | 139 scenarios; `tests/apply_patch_responses.rs` | Structured/custom argument history, incremental tools and terminal failures |
+| `crates/ck-translate/tests/fixtures/claude_tool_search.json` | 72 fixtures; `golden.rs::tool_search_goldens` | Preserve namespaces, tool declarations and correlated results |
+| `crates/ck-translate/tests/fixtures/codex_chat_go.json` | 7 requests, 4 non-stream and 3 stream cases; `src/codex_chat_response.rs` | Responses identities, signatures, media and terminal reconciliation |
+| `crates/ck-translate/tests/fixtures/go_helpers.json` | 436 calls; `src/go_helper_tests.rs` | Keep contractual helper semantics; remove obsolete pair implementation assertions |
+| `crates/ck-translate/tests/fixtures/sdk_registry.json` | 49 registrations and 42 vectors; `tests/sdk_translator.rs` | Replace fallback/wiring assertions; do not preserve the registry as architecture |
+| `crates/ck-translate/tests/{registry_overlay,web_search_overlay}.rs` | Inline registry/capability/search cases | Migrate consumer-visible capabilities and search semantics, delete wiring-only checks |
+| `crates/ck-exec/src/claude/testdata/*.json` | 9 files: `go_captures`, `go_executor`, `go_executor_tool_search`, `go_executor_v8.0.27`, `go_executor_v8.0.35`, `go_unit`, `go_unit_tool_search`, `go_unit_v8.0.27`, `go_unit_v8.0.35` | Preserve auth/cloak/cache preparation at the boundary; migrate payload, capture and usage assertions |
+| `crates/ck-exec/tests/device_fixtures/devin/*.json` | 58 files; `src/devin_tests.rs` and related cases | Connect/protobuf/gzip envelopes, trailer order, all recorded client formats, count estimate, truncation and media refusals; auth-only files remain boundary tests |
+| `crates/ck-exec/tests/device_fixtures/kimi/*.json` | 44 files; `src/kimi_tests.rs` and related cases | Claude delegation, Chat/Responses stream and buffered output, count, apply_patch, compact rejection, gzip/redirect and failure cases |
+| `crates/ck-exec/tests/device_fixtures/meta/*.json` | 38 files; `src/meta_tests.rs` and related cases | Responses stream/buffered collection, count, compact rejection, usage and malformed/truncated output; retain auth-only coverage |
+| `crates/ck-exec/tests/fixtures/*.json` | 34 files, grouped below | Preserve provider inputs and provenance; migrate transport/codec/accounting assertions |
+| `crates/ck-server/tests/fixtures/*.json` | 24 files, grouped below | Route, capture, media, truncation and lifecycle inputs; unrelated management/model data remains unchanged |
+| `crates/ck-server/tests/fixtures/lcp_go.jsonl.zst` | Scheduler trace corpus | Scheduling policy stays unchanged; migrate only execution-envelope callers |
+| `crates/ck-server/tests/ws_fixtures/ws_vectors.json` | WS error-frame vectors; `src/realtime/websocket_requests_tests.rs` | Error frame shape. The end-to-end corpus and `tests/ws_e2e.rs` were removed with the old handler (E9a) |
+| `harness/fixtures.py`, `harness/evidence/{2026-10-02,2026-10-02-ultra-claude}.json.gz` | Differential request corpus and historical evidence | Keep input provenance; no regenerated Go expectations or claimed S1 pass |
+
+The 34 executor fixture filenames, all under `crates/ck-exec/tests/fixtures/`:
+
+| Family | Files |
+| --- | --- |
+| Google and relay | `aistudio_go.json`, `aistudio_go_v8.0.35.json`, `antigravity_go.json`, `antigravity_helpers_go.json`, `antigravity_replay_go.json`, `antigravity_v8_0_27_go.json`, `antigravity_v8_0_35_go.json`, `gemini_go.json`, `gemini_go_v8.0.35.json`, `vertex_go.json`, `vertex_go_v8.0.35.json` |
+| Claude | `claude_ratelimit_go.json` |
+| Codex | `codex_chrome_hello.json`, `codex_client_translate_go.json`, `codex_go.json`, `codex_go_v8.0.35.json`, `codex_live_go.json`, `codex_siwc_bind_go.json`, `codex_siwc_expiry_go.json`, `codex_siwc_go.json`, `codex_tokens_go.json`, `codex_tool_schema_go.json`, `codex_web_search_history_go.json`, `codex_ws_deflate_go.json`, `codex_ws_errors.json` |
+| OpenAI-compatible | `openai_compat_go.json`, `openai_compat_go_v8.0.35.json` |
+| xAI | `xai_auth_go.json`, `xai_go.json`, `xai_go_v8.0.35.json` |
+| Shared boundary | `go_url_string.json`, `multipart_form_go.json`, `payload_media_go.json`, `proxy_go.json` |
+
+The 24 server JSON fixture filenames, all under `crates/ck-server/tests/fixtures/`:
+
+| Family | Files |
+| --- | --- |
+| Inference/media | `body_limit_go.json`, `codex_builtins_go.json`, `codex_tool_search_go.json`, `media_go.json` (74 scenarios), `speech_go.json` (31 scenarios), `passthrough_errors_go.json` (3 scenarios), `stream_truncation_go.json` (16 cases) |
+| Realtime | `codex_live_tunnel_go.json`, `codex_live_ws_end_go.json`, `codex_live_ws_go.json`, `codex_live_ws_raw_go.json`, `realtime_http_go.json` (56 cases) |
+| Capture/usage/dispatch | `capture_go.json`, `upstream_capture_go.json`, `observe_go.json`, `server_go.json`, `server_go_v8.0.35.json` |
+| Adjacent unchanged input | `codex_models_go.json`, `config_diff_go.json`, `config_v8_auth_index_go.json`, `manage_go.json`, `model_definitions_go.json`, `quota_probe_go.json`, `safe_mode_go.json` |
+
+Additional inline route acceptance inputs live in `crates/ck-server/tests/{routes,legacy_go,claude_passthrough,gemini_routes,openai_compat_routes,codex_alpha,codex_routed_images,realtime,aistudio_relay,xai_usage_cancel,alloc_budget,scheduler_attempts}.rs` and the corresponding `src/inference/`, `src/realtime/` and executor unit tests. Existing names containing “passthrough” do not exempt their traffic from conversion. Core configuration, wire helper and binary CLI fixtures are outside codec replacement; retain their unchanged contracts when migrating callers.
+
+## Route and mode inventory
+
+Evidence: `crates/ck-server/src/lib.rs:60-101`, `src/inference/gemini.rs:42-45`, `src/inference/codex_alpha.rs:22-25`, `src/realtime/websocket.rs:65-66`, `src/realtime/api.rs:79-106`, `src/realtime/aistudio_relay.rs:49-59`. Paths after `src/` in this paragraph belong to `ck-server`.
+
+Every accepted row requires all four boundary roles from INTERNAL-STREAM §5: client decode, upstream encode, upstream decode and client encode. JSON requests include embedded media and history. Streaming and buffered client modes must each be tested against every upstream delivery mode the provider uses. Unsupported mapped semantics fail at `request.end` with zero upstream sends; existing unsupported operations stay unsupported.
+
+| Route / method | Operation and modes | Provider / fixture coverage input | Spec |
+| --- | --- | --- | --- |
+| POST `/v1/chat/completions` | Generate; JSON request; buffered JSON or SSE response | All applicable provider rows below; openai registry rows; `openai_compat_routes.rs`, `routes.rs` | §5.3–5.4 |
+| POST `/v1/completions` | Legacy prompt/text/token-array forms; buffered or SSE, logprobs and choices | Generate providers via Chat shaping; `legacy_go.rs`; L12–L13 | §5.13–5.14 |
+| POST `/v1/messages` | Messages; buffered or SSE, signatures/cache/tools | All applicable providers; claude registry rows and native Claude; `claude_passthrough.rs` | §5.1–5.2 |
+| POST `/v1/messages/count_tokens` | Count; buffered JSON only | Provider count modes below; allocation and executor count fixtures | §5.15–5.16 |
+| POST `/v1/responses`, `/backend-api/codex/responses` | Responses generation; buffered or SSE; encrypted/history/tool/media content | Responses registry rows and native Responses paths | §5.5–5.6 |
+| POST `/v1/responses/compact`, `/backend-api/codex/responses/compact` | Compact; buffered only; reject `stream=true` | Supported compact providers below; preserve unsupported responses | §5.17–5.18 |
+| GET `/v1/responses`, `/backend-api/codex/responses` | WS create/append, continuation, controls and response messages | Codex/xAI sessions and ordinary executor fallback; `src/realtime/websocket_tests.rs` | §5.7–5.8 |
+| POST `/v1beta/models/{model}:generateContent` | Gemini buffered generation | Gemini registry rows and applicable providers; `gemini_routes.rs` | §5.9–5.10 |
+| POST `/v1beta/models/{model}:streamGenerateContent` | Gemini SSE and non-SSE `alt` output; JSON/array framing | Same providers; test both egress encodings | §5.9–5.10 |
+| POST `/v1beta/models/{model}:countTokens` | Count; buffered JSON | Provider count modes; native count wrapper/details | §5.15–5.16 |
+| POST `/v1beta/interactions` | Model or agent; buffered/SSE, continuation, tools/media | Interactions registry rows; Gemini Interactions and Devin envelopes | §5.11–5.12 |
+| POST `/v1/images/generations` | JSON request; buffered results or native/emulated SSE | Codex, OpenAI-compatible, xAI; `media_go.json`, `codex_routed_images.rs` | §5.19–5.20 |
+| POST `/v1/images/edits` | JSON/multipart image and mask input; buffered/SSE output | Same image providers; multipart/payload-media fixtures | §5.19–5.20 |
+| POST `/v1/audio/speech`, `/v1/tts` | Speech JSON input; raw audio output and media metadata | xAI; `speech_go.json`; L16 | §5.21–5.22 |
+| POST `/v1/videos`, `/v1/videos/generations` | Native video create; JSON/media input, job JSON output | xAI; `media_go.json` | §5.23–5.24 |
+| POST `/v1/videos/edits`, `/v1/videos/extensions` | Native video edit/extend; media references, job JSON | xAI; `media_go.json` | §5.23–5.24 |
+| GET `/v1/videos/{request_id}` | Native job retrieval | xAI; job identity/status and affinity | §5.23–5.24 |
+| POST `/openai/v1/videos` | OpenAI-shaped video create; JSON/multipart input | xAI; `media_go.json` | §5.23–5.24 |
+| GET `/openai/v1/videos/{video_id}` | OpenAI-shaped job retrieval; buffered JSON | xAI; L17 status distinctions | §5.23–5.24 |
+| GET `/openai/v1/videos/{video_id}/content` | Finite binary download | xAI; exact bytes/MIME, truncation and byte resume | §5.23–5.24 |
+| POST `/v1/live`, `/v1/realtime`, `/v1/realtime/calls` | SDP offer/answer; bidirectional WebRTC packet media and data-channel controls | Codex Live; realtime fixtures and real loopback peers; both feature builds | §5.25–5.26 |
+| GET `/v1/realtime` without `call_id` | Realtime WS JSON/binary, audio, controls and turns | Codex Live; `realtime.rs`, live WS fixtures | §5.25–5.26 |
+| GET `/v1/live/{call_id}`, `/v1/realtime/calls/{call_id}`, `/v1/realtime?call_id=...` | Sideband WS on an existing call | Codex Live; live WS/tunnel fixtures; call ID is not a resume ID | §5.25–5.26 |
+| POST `/v1/realtime/calls/{call_id}/hangup` | Explicit session close; cancel owned work | Codex Live; `realtime_http_go.json` | §4, §5.25 |
+| POST `/v1/alpha/search`, `/backend-api/codex/alpha/search` | Alpha search request/result JSON | Codex; `codex_alpha.rs`; no raw-body exemption | §4, §5.26 |
+| GET `/v1/ws` | AI Studio browser relay; JSON/binary request/response envelopes; S1 adds header-capable Fetch framing | `wsrelay::PATH`, Gemini codec, `aistudio_relay.rs`, AI Studio fixtures | §5.26, §6.7 |
+| GET `/v1/streams?after=<cursor>` (S1 contract, not existing route) | Authenticated retained HTTP/WS delivery; WebRTC client-peer reattachment | Every preceding resumable output, including buffered/raw output and duplex directions | §6.7 |
+| POST `/v1/streams` (S1 contract, not existing route) | Header-authenticated duplex input and client-peer signaling for Fetch clients; never creates an inference session | Browser Responses/realtime and AI Studio relay; accepted-prefix cursor and duplicate suppression | §6.7 |
+
+Excluded from inference conversion: health/root/dashboard/management, model discovery (`/v1/models` and `/v1beta/models` GET families), OAuth callbacks, credential authentication, and ephemeral-key issuance (`POST /v1/realtime/client_secrets`, `/v1/realtime/sessions`). Transport handshakes remain boundary work, but their SDP and inference content are not exempt.
+
+Existing 501 operations remain 501: POST `/v1/realtime/transcription_sessions`; GET/POST `/v1/realtime/translations`; POST `/v1/realtime/translations/client_secrets`; POST `/v1/realtime/calls/{call_id}/{accept,reject,refer}`. Unknown Gemini action strings are not implemented inference operations. Do not add providers, SIP, transcription or translation features to fill a matrix cell.
+
+## Provider and delivery matrix
+
+The sole selector is `crates/ck-exec/src/lib.rs:164-184`; image/video/speech selectors are at `:187-233`, session selection at `:236-260`. Provider aliases below are current dispatch inputs, not new compatibility aliases. “Buffered + stream” describes client delivery; even a buffered client may consume an upstream stream internally. Test local upstreams only.
+
+| Provider selector | Wire boundary and generate modes | Count mode | Compact / special modes | Evidence in `crates/ck-exec/src/` |
+| --- | --- | --- | --- | --- |
+| `claude` | Messages; API-key and OAuth preparation; native and cross-format; buffered + stream | Local estimate or delegated upstream count | Summary compaction; bound signatures/redaction/cache and tool aliases | `claude.rs::execute_delegated`, `run`, `compact`, `count_tokens` |
+| `codex` | Responses HTTP/SSE and WS; buffered + stream; continuation | Local shaped-request estimate | Native compact, image tools, alpha search, Live/Realtime | `codex.rs::execute`, `codex_duplex.rs`, `codex_live.rs` |
+| `kimi`, `kimi-ai`, `kimi.ai`, `kimi.com` | Claude delegation for Claude clients; Chat and Responses branches for others; buffered + stream | Upstream Claude count | Responses compact returns 501; streaming compact rejected | `kimi.rs:122-159,754-762` |
+| `meta` | Responses envelope; buffered collection or streamed events | Local token estimate | Compact returns 501 | `meta.rs:184-191`, `count_tokens` |
+| `devin` | Interactions inside Connect/protobuf frames, including gzip/trailers; buffered + stream | Local body-length estimate | No compact-specific implementation; do not count ordinary generation under a compact alt as supported compact | `devin.rs::prepare_request`, `execute` |
+| `openai-compatibility`, `openai-compatible-*` | Chat; buffered + stream | Local translated-Chat estimate | Nonstream Responses compact; images JSON/multipart and buffered/SSE output | `openai_compat.rs:35-39,390-395`, `count_tokens` |
+| `gemini`, `gemini-interactions` | Gemini generation or Interactions; buffered + stream | Upstream count | Compact returns 501 | `gemini.rs::execute`, `count_tokens` |
+| `vertex` | Vertex Gemini envelope; buffered + stream | Upstream count | Compact returns 501 | `vertex.rs::execute`, `handles` |
+| `aistudio` | Gemini over registered browser relay; buffered + stream | Relay count | Compact returns 501; relay JSON/binary reconnect | `aistudio.rs::execute`, `count_tokens`; `wsrelay.rs` |
+| `antigravity` | Wrapped Gemini response/request, replay and provider preparation; buffered + stream | Upstream count | Summary compaction; reject streamed compact route | `antigravity.rs::execute`, `compact`, `count_tokens` |
+| `xai` | Responses HTTP and WS sessions; buffered + stream | Local shaped-request estimate | Native compact, compaction-trigger stream, images, video and raw speech | `xai.rs::execute`, `compact`, `speech`; `xai_ws.rs` |
+
+For each generate row, cover the five public request families (Chat, Messages, Responses, Gemini, Interactions) wherever current routing and capability policy admit them, plus legacy through Chat. The 30-arm table provides exact recorded pairs; it does not grant unsupported capabilities. Preserve each mapped refusal and record its input and zero-send assertion. Count endpoints use the provider's existing count implementation, not generation billed as count. Media selectors admit only their listed providers; no missing media executor becomes an implementation task.
+
+Responses WS uses retained sessions on Codex/xAI. Other executors use ordinary execution where supported; continuation requiring a retained upstream session returns the existing replay-required error rather than inventing a session. Test both HTTP and WS upstream choices independently of the client's protocol. WebRTC without `media-relay` must fail visibly; with it, all media must pass through codecs, including configurations that previously negotiated direct media.
+
+## Semantic acceptance obligations
+
+Every applicable route/provider/mode cell remains pending until its implementation records consumer-visible evidence. Use the fixture IDs above and the following loss IDs to locate cases; do not mark an entire family passed from one representative round-trip.
+
+| Loss IDs | Replacement assertion | Required dimensions |
+| --- | --- | --- |
+| L01, L04, L06 | Preserve block-bound signatures, redaction/encryption, signature-only parts and native item identity | Request history and response; all four codec roles; native and cross-protocol |
+| L02, L09, L18 | Preserve absent/null/zero, TTL buckets, corrected snapshots and terminal finishes; account once per attempt | Stream/buffered/count, realtime and resume; failed attempts |
+| L03 | Emit tool start/fragments/end incrementally without invented arguments | Fragmented SSE, custom text, structured history and multiple calls/choices |
+| L05, L14 | Keep unknown events, grounding/code/context and non-function lifecycle through egress | Destination emission or content-free B9 drop; nested unknown fields |
+| L07, L08 | Keep every part in order; choose index 0, not array element 0, at single-choice egress | Interleaved choices, multiple same-kind parts and empty strings |
+| L10, L11, L12, L16 | Preserve audio modalities, independent sampling, legacy fields and speech instructions | Requests; late capability refusal before any upstream send |
+| L13 | Preserve logprobs-only events without fabricated text | Stream and buffered legacy/Chat projections |
+| L15 | Keep image creation time, revised prompt and per-image identity | Native, emulated stream and buffered image results |
+| L17 | Preserve native expired/cancelled/failed status and job identity | Create/retrieve/edit/extend and binary content |
+
+Storage, flow and security acceptance are independent of fixture fidelity: complete-prefix publication, generation/lease safety, cross-frame parsing, metadata/frame limits, 100 ms collection and 50,000-byte encoded data records, actual slow downstream, pre-delivery retry, post-commit failure, disconnect/resume, no duplicate usage, last-read expiry/LRU and shutdown. Resume tests use the exact API/cursors in INTERNAL-STREAM §6.7 and inspect access/application logs, capture/spools and client storage for ID leakage.
+
+## Old baseline build provenance
+
+Captured on 2026-11-14 from post-W1 `b518060ea1e43ef4b266591986ca92321e6289b5`. The build used isolated checkout `/scratch/ssd/s1a-old`, `CARGO_TARGET_DIR=/scratch/ssd/s1a-old-target` and `TMPDIR=/scratch/ssd/s1a-old-target/tmp`; the checkout and target were removed after capture. The retained executables and `fix-baseline-*` provenance records are in the maintainer-held directory `/home/zakk/code/jev-router/p4/s1-baseline/`, outside the repository, not in a public artifact store. Later builds must not overwrite them.
+
+| Artifact in that directory | SHA-256 | Size |
+| --- | --- | ---: |
+| `cooker-b518060e` | `4f89bd8e13abd3078adea569b7c61805b2a2f5d366219e4ae24883b28ea7a9fc` | 41,747,480 bytes |
+| `claude_latency-b518060e` | `9f5fecbebb3b411f60292a2d2b72a3aeaf9a88e521ac3d9add4f76a564cc0d79` | 34,443,032 bytes |
+
+| Field | Capture environment |
+| --- | --- |
+| Compiler | `rustc 1.99.0 (b940084d7 2026-09-28)`, full compiler commit `b940084d7eb6a299eb4bfeb8e34901bc051e7ac4`, LLVM 23.1.1 |
+| Cargo / target | Cargo 1.99.0 (`5f94df478 2026-08-27`); `x86_64-unknown-linux-gnu` |
+| Profile | `--locked --release -j 8`; workspace release profile: thin LTO, one codegen unit, `strip = true` |
+| Features / flags | No explicit feature flags or custom Rust/compiler/linker environment flags; Cargo fingerprints record no `cooker` or `ck-server` features for the gateway, and `ck-server/testing` for the latency example through its dev self-dependency. `media-relay` and `pprof` are disabled in both. |
+| Embedded dashboard | `npm ci --no-audit --no-fund` then `npm run build` in the old checkout's `ui/`, because `ui/dist` was absent; Node v26.13.1, npm 11.20.0 |
+| CPU / affinity | AMD Ryzen 9 9950X3D 16-Core Processor; x86_64, 16 cores / 32 threads; inherited affinity CPUs 0-31 |
+| Kernel / page size | Linux `7.3.4-gentoo-cjk-zakk`, `#1 SMP PREEMPT_DYNAMIC Fri Nov 13 15:40:29 AEDT 2026`; 4,096-byte pages |
+| Build filesystem | `/scratch/ssd` on ZFS dataset `vmpool/scratch` |
+| Host load at capture start/end | 1/5/15-minute averages: 1.77 / 1.92 / 2.26 at 2026-11-14 08:22:14 +11:00; 19.65 / 13.26 / 6.71 at 08:26:42 +11:00 after the builds. Full records: `fix-baseline-environment.log`. These are build-host loads, not benchmark results. |
+
+Reproduction commands, from the isolated old checkout with the target and temporary directories above:
+
+```sh
+cargo build --manifest-path /scratch/ssd/s1a-old/Cargo.toml --locked --release -j 8 -p cooker --bin cooker
+cargo build --manifest-path /scratch/ssd/s1a-old/Cargo.toml --locked --release -j 8 -p ck-server --example claude_latency
+```
+
+The pinned `ck-translate` package has library and test targets, but no standalone codec benchmark executable (`crates/ck-translate/Cargo.toml`; captured Cargo target inventory). Phase C's codec comparison interface must exercise equivalent fixtures through the pinned old pair API and the new boundary roles; neither the gateway nor the latency executable is a substitute for that codec harness.
+
+Phase A checks validate documentation and the current dependency table only. Codec/pipeline tolerances remain PROPOSED in INTERNAL-STREAM §9.2 and require owner approval. Both old executable builds completed in the release profile; the copied gateway reports `cooker 0.4.1` with `--version`. No old-binary benchmark, S1 runtime gate or storage regression gate has run as part of this ledger freeze.

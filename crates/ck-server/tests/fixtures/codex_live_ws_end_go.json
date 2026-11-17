@@ -4,8 +4,7 @@
   "upstream_received": [
    {
     "kind": "close",
-    "data": "relay closed",
-    "code": 1011
+    "code": 1001
    }
   ]
  },
@@ -14,7 +13,7 @@
   "upstream_received": [
    {
     "kind": "close",
-    "code": 1000
+    "code": 1001
    }
   ]
  },
@@ -23,8 +22,7 @@
   "upstream_received": [
    {
     "kind": "close",
-    "data": "relay closed",
-    "code": 1011
+    "code": 1001
    }
   ]
  }

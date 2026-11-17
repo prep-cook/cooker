@@ -131,13 +131,14 @@ pub(crate) fn uses_max_completion_tokens(compat: Option<&Compat>, upstream: &str
         .is_some_and(|m| m.use_max_completion_tokens)
 }
 
-/// `NormalizeOpenAIMaxTokens`.
+/// `NormalizeOpenAIMaxTokens` in one direction: a model configured for `max_completion_tokens`
+/// gets `max_tokens` renamed. Go also renamed `max_completion_tokens` to the deprecated
+/// `max_tokens` for every other model, which o-series models reject; the official name stays.
 pub(crate) fn normalize_max_tokens(mut payload: Vec<u8>, use_max_completion_tokens: bool) -> Vec<u8> {
-    let (from, to) = if use_max_completion_tokens {
-        ("max_tokens", "max_completion_tokens")
-    } else {
-        ("max_completion_tokens", "max_tokens")
-    };
+    if !use_max_completion_tokens {
+        return payload;
+    }
+    let (from, to) = ("max_tokens", "max_completion_tokens");
     let source = gj::get(&payload, from);
     let (has_from, raw) = (source.exists(), source.raw().to_vec());
     let has_to = gj::get(&payload, to).exists();
@@ -810,10 +811,12 @@ mod tests {
             br#"{"x":1,"max_completion_tokens":1.50}"#
         );
         assert_eq!(normalize_max_tokens(br#"{"x":1}"#.to_vec(), true), br#"{"x":1}"#);
-        assert_eq!(
-            normalize_max_tokens(br#"{"max_tokens":2,"max_completion_tokens":3}"#.to_vec(), false),
-            br#"{"max_tokens":2}"#
-        );
+        for kept in [
+            br#"{"max_tokens":2,"max_completion_tokens":3}"#.as_slice(),
+            br#"{"max_completion_tokens":3}"#,
+        ] {
+            assert_eq!(normalize_max_tokens(kept.to_vec(), false), kept);
+        }
     }
 
     #[test]

@@ -8,14 +8,18 @@ use sha2::{Digest, Sha256};
 
 use crate::common::{format_rfc3339_utc, go_lower, is_gemini_thought_part, trim_space};
 use crate::stream::GoStream;
-use crate::{Error, Registered, ResponseCtx, gemini};
+use crate::{Error, Registered, ResponseCtx, gemini_gemini};
+#[path = "codex_gemini_request.rs"]
+mod request;
+use crate::responses_policy::Policy;
+pub(crate) use request::convert_with_policy;
 
 pub static PAIR: Registered = registered!(
     Gemini -> Codex,
-    request: |ctx, body| Ok(convert(ctx.model, body)),
+    request: |ctx, body| Ok(convert_with_policy(ctx.model, body, Policy::Codex)),
     non_stream: non_stream,
     go_stream: go_stream,
-    token_count: Some(gemini::token_count),
+    token_count: Some(gemini_gemini::token_count),
 );
 
 const NAME_LIMIT: usize = 64;
@@ -250,196 +254,6 @@ fn effort_of(level: &Res<'_>) -> Vec<u8> {
     go_lower(trim_space(&level.bytes()))
 }
 
-/// ConvertGeminiRequestToCodex.
-fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
-    let mut out = br#"{"model":"","instructions":"","input":[]}"#.to_vec();
-    let root = gj::parse(raw);
-    let names = short_name_map(raw);
-    let mut items: Vec<Vec<u8>> = vec![];
-    let mut pending: Vec<Vec<u8>> = vec![];
-    let mut counter = 0u64;
-    let mut next_id = || {
-        counter += 1;
-        format!("call_gemini_{counter:016}").into_bytes()
-    };
-
-    gj::set_str(&mut out, "model", model);
-    let tier = root.get("service_tier");
-    if tier.kind == Kind::String && matches!(go_lower(trim_space(&tier.s)).as_slice(), b"priority" | b"fast") {
-        gj::set_str(&mut out, "service_tier", "priority");
-    }
-
-    let system = first_of(&root, ["system_instruction.parts", "systemInstruction.parts"]);
-    if system.is_array() {
-        let parts: Vec<Vec<u8>> = system
-            .array()
-            .iter()
-            .filter(|p| !is_gemini_thought_part(p) && p.get("text").exists())
-            .map(|p| typed_text("input_text", &p.get("text").bytes()))
-            .collect();
-        if !parts.is_empty() {
-            let mut message = br#"{"type":"message","role":"developer","content":[]}"#.to_vec();
-            gj::set_raw(&mut message, "content", gj::join(&parts));
-            items.push(message);
-        }
-    }
-
-    let contents = root.get("contents");
-    if contents.is_array() {
-        for content in contents.array() {
-            let mut role = content.get("role").bytes().into_owned();
-            if role == b"model" {
-                role = b"assistant".to_vec();
-            }
-            let parts = content.get("parts");
-            if !parts.is_array() {
-                continue;
-            }
-            for part in parts.array() {
-                if is_gemini_thought_part(&part) {
-                    continue;
-                }
-                let text = part.get("text");
-                if text.exists() {
-                    let kind = if role == b"assistant" {
-                        "output_text"
-                    } else {
-                        "input_text"
-                    };
-                    items.push(message_with_part(&role, &typed_text(kind, &text.bytes())));
-                    continue;
-                }
-                if let Some(content_part) = inline_data_part(&part).or_else(|| file_data_part(&part)) {
-                    items.push(message_with_part(&role, &content_part));
-                    continue;
-                }
-                let call = part.get("functionCall");
-                if call.exists() {
-                    let mut item = br#"{"type":"function_call"}"#.to_vec();
-                    let name = call.get("name");
-                    if name.exists() {
-                        gj::set_str(&mut item, "name", mapped_name(&names, &name.bytes()));
-                    }
-                    let args = call.get("args");
-                    if args.exists() {
-                        gj::set_str(&mut item, "arguments", &args.raw);
-                    }
-                    let mut id = call_id(&call);
-                    if id.is_empty() {
-                        id = next_id();
-                    }
-                    gj::set_str(&mut item, "call_id", &id);
-                    pending.push(id);
-                    items.push(item);
-                    continue;
-                }
-                let response = part.get("functionResponse");
-                if response.exists() {
-                    let mut item = br#"{"type":"function_call_output"}"#.to_vec();
-                    let result = response.get("response.result");
-                    let body = response.get("response");
-                    if result.exists() {
-                        gj::set_str(&mut item, "output", result.bytes());
-                    } else if body.exists() {
-                        gj::set_str(&mut item, "output", &body.raw);
-                    }
-                    let custom = call_id(&response);
-                    let id = if !custom.is_empty() {
-                        if let Some(position) = pending.iter().position(|p| *p == custom) {
-                            pending.remove(position);
-                        }
-                        custom
-                    } else if !pending.is_empty() {
-                        pending.remove(0)
-                    } else {
-                        next_id()
-                    };
-                    gj::set_str(&mut item, "call_id", &id);
-                    items.push(item);
-                }
-            }
-        }
-    }
-    gj::set_items(&mut out, "input", &items);
-
-    let tools = root.get("tools");
-    if tools.is_array() {
-        let mut tool_items: Vec<Vec<u8>> = vec![];
-        gj::set_str(&mut out, "tool_choice", "auto");
-        for tool in tools.array() {
-            let declarations = tool.get("functionDeclarations");
-            if !declarations.is_array() {
-                continue;
-            }
-            for declaration in declarations.array() {
-                let mut item = b"{}".to_vec();
-                gj::set_str(&mut item, "type", "function");
-                let name = declaration.get("name");
-                if name.exists() {
-                    gj::set_str(&mut item, "name", mapped_name(&names, &name.bytes()));
-                }
-                let description = declaration.get("description");
-                if description.exists() {
-                    gj::set_str(&mut item, "description", description.bytes());
-                }
-                let parameters = first_of(&declaration, ["parameters", "parametersJsonSchema"]);
-                if parameters.exists() {
-                    gj::set_raw(&mut item, "parameters", clean_parameters(&parameters));
-                }
-                gj::set_bool(&mut item, "strict", false);
-                tool_items.push(item);
-            }
-        }
-        gj::set_raw(&mut out, "tools", gj::join(&tool_items));
-    }
-
-    gj::set_bool(&mut out, "parallel_tool_calls", true);
-    set_tool_choice(&mut out, &root.get("toolConfig.functionCallingConfig"));
-
-    // Google's Python SDK sends snake_case thinking fields.
-    let mut effort: Option<Vec<u8>> = None;
-    let config = root.get("generationConfig");
-    if config.exists() {
-        let level = first_of(&config, ["thinkingLevel", "thinking_level"]);
-        let thinking = config.get("thinkingConfig");
-        if level.exists() {
-            effort = Some(effort_of(&level)).filter(|e| !e.is_empty());
-        } else if thinking.is_object() {
-            let level = first_of(&thinking, ["thinkingLevel", "thinking_level"]);
-            if level.exists() {
-                effort = Some(effort_of(&level)).filter(|e| !e.is_empty());
-            } else {
-                let budget = first_of(&thinking, ["thinkingBudget", "thinking_budget"]);
-                if budget.exists() {
-                    effort = ck_wire::thinking::convert_budget_to_level(budget.int()).map(|l| l.as_bytes().to_vec());
-                }
-            }
-        }
-    }
-    gj::set_str(
-        &mut out,
-        "reasoning.effort",
-        effort.unwrap_or_else(|| b"medium".to_vec()),
-    );
-    gj::set_bool(&mut out, "stream", true);
-    gj::set_bool(&mut out, "store", false);
-    gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
-
-    let paths = ck_wire::gemini_schema::walk(&gj::get(&out, "tools"), b"type");
-    for path in paths {
-        let full = [&b"tools."[..], &path].concat();
-        let value = gj::get(&out, &full);
-        if value.kind != Kind::String {
-            continue;
-        }
-        let lower = go_lower(&value.s);
-        if lower != value.s.as_ref() {
-            gj::set_str(&mut out, &full, &lower);
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------------------
 // Responses (codex_gemini_response.go)
 
@@ -591,13 +405,17 @@ impl State {
             }
         }
 
-        match kind.as_slice() {
+        self.translate_event(&root, &kind, &item, out)
+    }
+
+    fn translate_event(&mut self, root: &Res<'_>, kind: &[u8], item: &Res<'_>, mut out: Vec<u8>) -> Vec<Vec<u8>> {
+        match kind {
             b"response.created" => {
                 gj::set_str(&mut out, "modelVersion", root.get("response.model").bytes());
                 gj::set_str(&mut out, "responseId", root.get("response.id").bytes());
                 self.response_id = root.get("response.id").bytes().into_owned();
             }
-            b"response.reasoning_summary_text.delta" => {
+            b"response.reasoning_summary_text.delta" | b"response.reasoning_text.delta" => {
                 let mut part = br#"{"thought":true,"text":""}"#.to_vec();
                 gj::set_str(&mut part, "text", root.get("delta").bytes());
                 gj::set_items(&mut out, "candidates.0.content.parts", &[part]);
@@ -680,22 +498,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
             incomplete_reason(&response.get("incomplete_details.reason").bytes()),
         );
     }
-    let id = response.get("id");
-    if id.exists() {
-        gj::set_str(&mut out, "responseId", id.bytes());
-    }
-    let created_at = response.get("created_at");
-    if created_at.exists() {
-        gj::set_str(&mut out, "createTime", format_rfc3339_utc(created_at.int()));
-    }
-    let usage = response.get("usage");
-    if usage.exists() {
-        let input = usage.get("input_tokens").int();
-        let output = usage.get("output_tokens").int();
-        gj::set_int(&mut out, "usageMetadata.promptTokenCount", input);
-        gj::set_int(&mut out, "usageMetadata.candidatesTokenCount", output);
-        gj::set_int(&mut out, "usageMetadata.totalTokenCount", input.wrapping_add(output));
-    }
+    non_stream_metadata(&mut out, &response);
     let output = response.get("output");
     if output.is_array() {
         let mut parts: Vec<Vec<u8>> = vec![];
@@ -750,4 +553,23 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
         }
     }
     Ok(out)
+}
+
+fn non_stream_metadata(out: &mut Vec<u8>, response: &Res<'_>) {
+    let id = response.get("id");
+    if id.exists() {
+        gj::set_str(out, "responseId", id.bytes());
+    }
+    let created_at = response.get("created_at");
+    if created_at.exists() {
+        gj::set_str(out, "createTime", format_rfc3339_utc(created_at.int()));
+    }
+    let usage = response.get("usage");
+    if usage.exists() {
+        let input = usage.get("input_tokens").int();
+        let output = usage.get("output_tokens").int();
+        gj::set_int(out, "usageMetadata.promptTokenCount", input);
+        gj::set_int(out, "usageMetadata.candidatesTokenCount", output);
+        gj::set_int(out, "usageMetadata.totalTokenCount", input.wrapping_add(output));
+    }
 }

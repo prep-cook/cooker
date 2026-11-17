@@ -5,20 +5,24 @@
 use std::sync::Arc;
 
 use axum::Extension;
-use axum::body::{Body, Bytes};
+use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{MatchedPath, OriginalUri, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::HeaderMap;
 use axum::response::Response;
-use ck_core::exec::{Caller, Operation};
+use ck_core::exec::{Caller, ExecError, FailureScope, Operation};
 use ck_core::format::Format;
 use ck_wire::gostr::{GoStr, trim_space};
 use ck_wire::json::{self as gj, Kind};
 
 use crate::http::gojson::trim;
 use crate::inference::claude::read_failed;
-use crate::inference::dispatch::{self, Call, Done, Media, MediaKind};
+use ck_translate::audio;
+
+use crate::http::egress::{self, Framing, Protocol};
+use crate::inference::dispatch::{self, Call, Failure, Media, MediaKind};
 use crate::inference::images::{bad_request, text};
+use crate::inference::media::Decoded;
 use crate::{Runtime, inference::errors};
 
 const DEFAULT_MODEL: &str = "grok-tts";
@@ -44,7 +48,9 @@ const VOICES: [(&str, &str); 11] = [
     ("verse", "lumen"),
 ];
 
-/// `handleXAISpeech`, for both routes.
+/// `handleXAISpeech`, for both routes. The request is checked and normalized as Go's handler
+/// does, decoded by the speech codec into the exchange, and served on the execution contract:
+/// the audio streams to the client from its first byte, resumable on `/v1/streams`.
 #[allow(clippy::too_many_arguments)]
 pub async fn speech(
     State(rt): State<Arc<Runtime>>,
@@ -58,11 +64,6 @@ pub async fn speech(
 ) -> Response {
     let body = match body {
         Ok(body) => body,
-        // Past the shared request limit: Go (no limit by default) reads an identity body
-        // whole and fails the 1 MiB check. A compressed body's decoded size is unknown.
-        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE && identity(&headers) => {
-            return bad_request("request body is larger than 1MB");
-        }
         Err(rejection) => return read_failed(&rejection),
     };
     let body = match crate::inference::openai::read_body(&headers, body, limit.0) {
@@ -78,16 +79,30 @@ pub async fn speech(
             "Model {requested} is not supported on /v1/audio/speech. Use {DEFAULT_MODEL}."
         ));
     };
-    let (payload, format) = match build_payload(&body) {
+    let request = match normalize(&body, model) {
         Ok(built) => built,
         Err(message) => return bad_request(&message),
+    };
+    let output = egress::Output {
+        protocol: Protocol::Speech,
+        operation: OPERATION,
+        framing: Framing::Raw,
+    };
+    let decode = |writer: &mut ck_stream::Writer, _: &ck_stream::Store| {
+        let mut decoder = audio::Decoder::new(writer, DECODED_LIMIT).map_err(refused)?;
+        decoder.advance(writer, &request).map_err(refused)?;
+        decoder.finish(writer).map_err(refused)
+    };
+    let decoded = match Decoded::new(&rt, &caller, output, decode, |error| refused(error.into())) {
+        Ok(decoded) => decoded,
+        Err(failure) => return errors::openai(&failure),
     };
     let call = Call {
         entry: Format::OpenAI,
         response: Format::OpenAI,
         operation: Operation::Generate,
         model: model.to_owned(),
-        body: Bytes::from(payload),
+        body: Bytes::from(request),
         stream: false,
         alt: None,
         headers,
@@ -97,59 +112,41 @@ pub async fn speech(
         execution_session: None,
         request_path: dispatch::route_path(matched.as_ref(), &uri),
         peer: dispatch::peer(peer),
-        turn: None,
+        socket: None,
         media: Some(Arc::new(Media {
             kind: MediaKind::Speech,
             pinned: None,
-            on_selected: None,
-            sse: false,
             disallow_free: false,
         })),
     };
-    // A speech call's headers are the downstream ones Go hands its handler: the final
-    // filtered headers under passthrough, else what interceptors changed.
-    dispatch::serve(&rt, call, move |result| async move {
-        match result {
-            Ok(Done::Buffered { headers, body }) => audio(format, headers.get(header::CONTENT_TYPE).cloned(), body),
-            Ok(Done::Stream { .. }) => unreachable!("a non-stream call is buffered"),
-            Err(failure) => errors::openai(&failure),
+    decoded
+        .serve(&rt, call, move |result| async move {
+            match result {
+                Err(failure) => errors::openai(&failure),
+                Ok(_) => unreachable!("speech is served on the execution contract"),
+            }
+        })
+        .await
+}
+
+const OPERATION: ck_translate::codec::Operation =
+    ck_translate::codec::Operation::Media(ck_translate::codec::Media::Speech);
+
+/// The normalized request is at most six bytes per body byte (an invalid byte becomes
+/// `\ufffd`), plus the defaults.
+const DECODED_LIMIT: u64 = 8 * MAX_BODY as u64;
+
+/// What the speech codec refused of a normalized request: storage is a resource failure,
+/// anything else a gateway defect, since normalization already produced a valid request.
+fn refused(failure: audio::RequestFailure) -> Failure {
+    let error = match failure.error {
+        ck_translate::codec::Error::Storage(error) => dispatch::stored(&error),
+        error => {
+            tracing::error!(target: "ck_dispatch", %error, "speech request ingress defect");
+            ExecError::local(500, FailureScope::Request, "stream.producer_lost")
         }
-    })
-    .await
-}
-
-/// No `Content-Encoding`, or `identity` (Go `ReadRequestBody` returns such a body raw).
-fn identity(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::CONTENT_ENCODING)
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned())
-        .is_none_or(|e| e.is_empty() || e.eq_ignore_ascii_case("identity"))
-}
-
-/// The audio response: the upstream Content-Type unless it names no audio type
-/// (`speechResponseContentType`), then the format's own.
-fn audio(format: &str, upstream: Option<HeaderValue>, body: Bytes) -> Response {
-    let content_type = match upstream {
-        Some(value) if !content_type_needs_default(value.to_str().unwrap_or_default()) => value,
-        _ => HeaderValue::from_static(match format {
-            "wav" => "audio/wav",
-            "pcm" => "audio/pcm",
-            _ => "audio/mpeg",
-        }),
     };
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(header::CONTENT_TYPE, content_type);
-    response
-}
-
-/// `speechContentTypeNeedsDefault`.
-fn content_type_needs_default(content_type: &str) -> bool {
-    let media = content_type.split(';').next().unwrap_or_default();
-    matches!(
-        trim(media).go_lower().as_str(),
-        "" | "application/json" | "application/octet-stream" | "text/plain"
-    )
+    Failure::Exec(error)
 }
 
 /// `speechRoutingModel`: the OpenAI TTS models and Grok TTS route to `grok-tts`; the
@@ -178,10 +175,12 @@ fn model_base(model: &str) -> String {
     trim(model).go_lower()
 }
 
-/// `buildXAISpeechPayload`: the xAI `/tts` body (`json.Marshal` of a map, so keys sorted)
-/// and the audio format the client asked for. Strings stay Go byte strings: an invalid
-/// UTF-8 byte counts as one rune and marshals as one `\ufffd`.
-fn build_payload(raw: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
+/// `buildXAISpeechPayload`, as the OpenAI speech request the speech codec decodes: Go's
+/// checks and defaults (`input` else `text`, at most 60,000 runes; `voice` else `voice_id`,
+/// mapped; `language` else `auto`; a positive `speed`; the output format). Strings stay Go
+/// byte strings: an invalid UTF-8 byte counts as one rune and marshals as one `\ufffd`. MP3
+/// sends no `output_format`.
+fn normalize(raw: &[u8], model: &str) -> Result<Vec<u8>, String> {
     if !gj::valid(raw) {
         return Err("body must be valid JSON".into());
     }
@@ -208,7 +207,7 @@ fn build_payload(raw: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
     if language.is_empty() {
         language = b"auto".to_vec();
     }
-    let (format, output) = output_format(raw)?;
+    let output = output_format(raw)?;
     let speed = gj::get(raw, "speed");
     let speed = if speed.kind == Kind::Number && speed.float() > 0.0 {
         let value = speed.float();
@@ -217,20 +216,22 @@ fn build_payload(raw: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
     } else {
         None
     };
-    let mut body = br#"{"language":"#.to_vec();
+    let mut body = br#"{"model":"#.to_vec();
+    body.extend(gj::quote(model.as_bytes()));
+    body.extend(br#","input":"#);
+    body.extend(gj::quote(&input));
+    body.extend(br#","voice":"#);
+    body.extend(gj::quote(map_voice(&voice).as_bytes()));
+    body.extend(br#","language":"#);
     body.extend(gj::quote(&language));
-    if let Some((codec, rate)) = output {
-        body.extend(format!(r#","output_format":{{"codec":"{codec}","sample_rate":{rate}}}"#).bytes());
-    }
     if let Some(speed) = &speed {
         body.extend(format!(r#","speed":{speed}"#).bytes());
     }
-    body.extend(br#","text":"#);
-    body.extend(gj::quote(&input));
-    body.extend(br#","voice_id":"#);
-    body.extend(gj::quote(map_voice(&voice)));
+    if let Some((codec, rate)) = output {
+        body.extend(format!(r#","output_format":{{"codec":"{codec}","sample_rate":{rate}}}"#).bytes());
+    }
     body.push(b'}');
-    Ok((body, format))
+    Ok(body)
 }
 
 /// `mapXAISpeechVoice`: lower case (Go's `strings.ToLower` turns each invalid byte into
@@ -258,14 +259,14 @@ fn map_voice(voice: &[u8]) -> String {
 /// object, else MP3. MP3 sends no `output_format`.
 type Output = Option<(&'static str, i64)>;
 
-fn output_format(raw: &[u8]) -> Result<(&'static str, Output), String> {
+fn output_format(raw: &[u8]) -> Result<Output, String> {
     let response_format = trim(&text(raw, "response_format")).go_lower();
     if !response_format.is_empty() {
         return codec_format(&response_format, DEFAULT_SAMPLE_RATE);
     }
     let native = gj::get(raw, "output_format");
     if !native.exists() {
-        return Ok(("mp3", None));
+        return Ok(None);
     }
     if !native.is_object() {
         return Err("output_format must be an object".into());
@@ -286,38 +287,12 @@ fn output_format(raw: &[u8]) -> Result<(&'static str, Output), String> {
 }
 
 /// `speechCodecFormat`.
-fn codec_format(codec: &str, rate: i64) -> Result<(&'static str, Output), String> {
+fn codec_format(codec: &str, rate: i64) -> Result<Output, String> {
     let rate = if rate <= 0 { DEFAULT_SAMPLE_RATE } else { rate };
     match codec {
-        "" | "mp3" => Ok(("mp3", None)),
-        "wav" => Ok(("wav", Some(("wav", rate)))),
-        "pcm" => Ok(("pcm", Some(("pcm", rate)))),
+        "" | "mp3" => Ok(None),
+        "wav" => Ok(Some(("wav", rate))),
+        "pcm" => Ok(Some(("pcm", rate))),
         _ => Err("response_format must be mp3, wav, or pcm".into()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Under passthrough the upstream type wins unless it names no audio; the speech
-    /// goldens run without passthrough, so only the format default reaches them.
-    #[test]
-    fn upstream_content_type_kept_only_when_it_names_audio() {
-        let content_type = |format, upstream: Option<&'static str>| {
-            let response = audio(format, upstream.map(HeaderValue::from_static), Bytes::new());
-            response.headers()[header::CONTENT_TYPE].to_str().unwrap().to_owned()
-        };
-        assert_eq!(
-            content_type("wav", Some("audio/ogg; codecs=opus")),
-            "audio/ogg; codecs=opus"
-        );
-        assert_eq!(
-            content_type("wav", Some(" Application/JSON ; charset=utf-8")),
-            "audio/wav"
-        );
-        assert_eq!(content_type("pcm", Some("text/plain")), "audio/pcm");
-        assert_eq!(content_type("mp3", Some("application/octet-stream")), "audio/mpeg");
-        assert_eq!(content_type("pcm", None), "audio/pcm");
     }
 }

@@ -13,6 +13,7 @@ use crate::scheduling::registry::Spec;
 use crate::{
     Runtime,
     http::{gojson, respond},
+    inference::errors,
 };
 
 const CLAUDE_MAX_INPUT: i64 = 200_000;
@@ -51,16 +52,67 @@ async fn list(rt: Arc<Runtime>, OriginalUri(uri): OriginalUri, headers: HeaderMa
     if let Some(version) = query_value(&uri, "client_version") {
         return answer(crate::inference::codex_models::response(&rt, &version), detail).await;
     }
-    let registry = rt.registry();
-    // Model routers (cooker only) list after the registry's models.
-    let routers = crate::inference::model_router::listed(&rt.config());
-    let models = registry.available_with(|c, m| rt.suspension(c, m)).chain(&routers);
-    let body = if anthropic {
-        claude_list(models, disable_cloaking())
+    if anthropic {
+        // Detail lookups see the full catalog; a cursor would hide the requested model.
+        let page = match detail.is_none().then(|| ClaudePage::parse(&uri)).transpose() {
+            Ok(page) => page,
+            Err(message) => return respond::gin_json(400, errors::claude_body(400, &message)),
+        };
+        let registry = rt.registry();
+        // Model routers (cooker only) list after the registry's models.
+        let routers = crate::inference::model_router::listed(&rt.config());
+        let models = registry.available_with(|c, m| rt.suspension(c, m)).chain(&routers);
+        match claude_list(models, disable_cloaking(), page.as_ref()) {
+            Ok(body) => answer(respond::gin_json(200, body), detail).await,
+            Err(message) => respond::gin_json(400, errors::claude_body(400, &message)),
+        }
     } else {
-        openai_list(models)
-    };
-    answer(respond::gin_json(200, body), detail).await
+        let registry = rt.registry();
+        // Model routers (cooker only) list after the registry's models.
+        let routers = crate::inference::model_router::listed(&rt.config());
+        let models = registry.available_with(|c, m| rt.suspension(c, m)).chain(&routers);
+        answer(respond::gin_json(200, openai_list(models)), detail).await
+    }
+}
+
+/// The Anthropic list's cursor/limit query parameters, parsed and validated at the
+/// route boundary.
+#[derive(Debug)]
+struct ClaudePage {
+    before_id: Option<String>,
+    after_id: Option<String>,
+    limit: usize,
+}
+
+impl ClaudePage {
+    /// Parses `before_id`, `after_id` and `limit` (default 20, 1..=1000); `Err` is the
+    /// message of the `invalid_request_error` to answer, as the official API does for an
+    /// out-of-range limit or a cursor the catalog does not contain.
+    fn parse(uri: &axum::http::Uri) -> Result<Self, String> {
+        let before = query_value(uri, "before_id");
+        let after = query_value(uri, "after_id");
+        let limit = match query_value(uri, "limit") {
+            None => 20,
+            Some(raw) => match raw.parse::<usize>() {
+                Ok(limit) => limit,
+                Err(_) => {
+                    return Err(format!(
+                        "limit: Input should be a valid integer, e.g. `20`. Input was '{raw}'."
+                    ));
+                }
+            },
+        };
+        if !(1..=1000).contains(&limit) {
+            return Err(format!(
+                "limit: Input should be between 1 and 1000, e.g. `20`. Input was '{limit}'."
+            ));
+        }
+        Ok(Self {
+            before_id: before,
+            after_id: after,
+            limit,
+        })
+    }
 }
 
 /// Go `WriteModelListResponse`: with `detail`, the answer is that model's entry from the
@@ -173,6 +225,23 @@ fn query_value(uri: &axum::http::Uri, key: &str) -> Option<String> {
     pairs.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
+/// The positions of the cursor ids in the served catalog. `Err` names the first cursor
+/// the catalog does not contain, as an unknown cursor is an `invalid_request_error`.
+fn cursor_positions(
+    data: &[(String, String, Value)],
+    before_id: &Option<String>,
+    after_id: &Option<String>,
+) -> Result<(Option<usize>, Option<usize>), String> {
+    let pos = |id: Option<&String>| id.map(|id| data.iter().position(|(_, cid, _)| cid == id));
+    let (before, after) = (pos(before_id.as_ref()), pos(after_id.as_ref()));
+    let missing = |name: &str, id: &str| format!("{name}: Value not found for `{name}`: {id}. Input was '{id}'.");
+    match (before, after) {
+        (_, Some(None)) => Err(missing("after_id", after_id.as_deref().unwrap_or_default())),
+        (Some(None), _) => Err(missing("before_id", before_id.as_deref().unwrap_or_default())),
+        (before, after) => Ok((before.flatten(), after.flatten())),
+    }
+}
+
 /// Go `OpenAIModels`: id, object, created and owned_by only.
 pub fn openai_list<'a>(models: impl Iterator<Item = &'a Spec>) -> String {
     let data: Vec<Value> = models
@@ -231,8 +300,16 @@ pub fn grok_list<'a>(models: impl Iterator<Item = &'a Spec>) -> String {
         .finish()
 }
 
-/// Go `convertModelToMap(model, "claude")` plus `claudemodels.BuildResponse`.
-pub fn claude_list<'a>(models: impl Iterator<Item = &'a Spec>, disable_cloaking: bool) -> String {
+/// Go `convertModelToMap(model, "claude")` plus `claudemodels.BuildResponse`. With
+/// `page`, the answer is that slice of the ordered catalog: `after_id` returns the page
+/// after that entry, `before_id` the page ending just before it, and `has_more`
+/// reports whether results remain in the requested direction. Every entry carries
+/// `created_at` (epoch when unknown) as the documented field set requires.
+fn claude_list<'a>(
+    models: impl Iterator<Item = &'a Spec>,
+    disable_cloaking: bool,
+    page: Option<&ClaudePage>,
+) -> Result<String, String> {
     let mut data: Vec<(String, String, Value)> = models
         .map(|m| {
             let id = if disable_cloaking {
@@ -249,9 +326,7 @@ pub fn claude_list<'a>(models: impl Iterator<Item = &'a Spec>, disable_cloaking:
             entry.insert("id".into(), id.clone().into());
             entry.insert("object".into(), "model".into());
             entry.insert("owned_by".into(), m.owned_by.clone().into());
-            if m.created > 0 {
-                entry.insert("created_at".into(), rfc3339(m.created).into());
-            }
+            entry.insert("created_at".into(), rfc3339(m.created.max(0)).into());
             entry.insert("type".into(), "model".into());
             entry.insert("display_name".into(), display.clone().into());
             let input = if m.context_length > 0 {
@@ -270,10 +345,42 @@ pub fn claude_list<'a>(models: impl Iterator<Item = &'a Spec>, disable_cloaking:
         })
         .collect();
     data.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let first = data.first().map(|d| d.1.clone()).unwrap_or_default();
-    let last = data.last().map(|d| d.1.clone()).unwrap_or_default();
+    let (data, has_more) = match page {
+        None => (data, false),
+        Some(page) => {
+            let (before, after) = cursor_positions(&data, &page.before_id, &page.after_id)?;
+            let (start, end, more) = match (before, after) {
+                // A page ending just before `before_id`, taken from its end backwards and, with
+                // `after_id` too, starting no earlier than just after it.
+                (Some(before), after) => {
+                    let floor = after.map_or(0, |after| after + 1).min(before);
+                    let start = before.saturating_sub(page.limit).max(floor);
+                    (start, before, start > floor)
+                }
+                // A page starting just after `after_id`.
+                (None, Some(after)) => {
+                    let start = (after + 1).min(data.len());
+                    let end = (start + page.limit).min(data.len());
+                    (start, end, end < data.len())
+                }
+                // No cursor: the first page.
+                (None, None) => {
+                    let end = page.limit.min(data.len());
+                    (0, end, end < data.len())
+                }
+            };
+            (data[start..end].to_vec(), more)
+        }
+    };
+    let first = data.first().map(|d| d.1.clone()).map_or(Value::Null, Value::String);
+    let last = data.last().map(|d| d.1.clone()).map_or(Value::Null, Value::String);
     let data: Vec<Value> = data.into_iter().map(|d| d.2).collect();
-    gojson::sorted(&json!({ "data": data, "has_more": false, "first_id": first, "last_id": last }))
+    Ok(gojson::sorted(&json!({
+        "data": data,
+        "has_more": has_more,
+        "first_id": first,
+        "last_id": last
+    })))
 }
 
 /// `time.Unix(s, 0).UTC().Format(time.RFC3339)`.
@@ -428,9 +535,112 @@ mod tests {
             r#"{"data":[{"created":5,"id":"gpt-x","object":"model","owned_by":"openai"}],"object":"list"}"#
         );
         assert_eq!(
-            claude_list([&spec, &claude].into_iter(), false),
-            r#"{"data":[{"display_name":"A","id":"claude-a","max_input_tokens":10,"max_tokens":64000,"object":"model","owned_by":"anthropic","type":"model"},{"created_at":"1970-01-01T00:00:05Z","display_name":"B","id":"claude-fable-5-dd-x-tpg","max_input_tokens":200000,"max_tokens":64000,"object":"model","owned_by":"openai","type":"model"}],"first_id":"claude-a","has_more":false,"last_id":"claude-fable-5-dd-x-tpg"}"#
+            claude_list([&spec, &claude].into_iter(), false, None),
+            Ok(r#"{"data":[{"created_at":"1970-01-01T00:00:00Z","display_name":"A","id":"claude-a","max_input_tokens":10,"max_tokens":64000,"object":"model","owned_by":"anthropic","type":"model"},{"created_at":"1970-01-01T00:00:05Z","display_name":"B","id":"claude-fable-5-dd-x-tpg","max_input_tokens":200000,"max_tokens":64000,"object":"model","owned_by":"openai","type":"model"}],"first_id":"claude-a","has_more":false,"last_id":"claude-fable-5-dd-x-tpg"}"#.to_owned())
         );
+    }
+
+    /// `GET /v1/models` in the Anthropic dialect pages the ordered catalog with
+    /// `after_id`/`before_id`/`limit`, reports `has_more` in the page direction, and
+    /// rejects an unknown cursor or an out-of-range limit.
+    #[test]
+    fn anthropic_pages_follow_the_catalog_order() {
+        let specs: Vec<Spec> = ["a", "b", "c"]
+            .into_iter()
+            .map(|n| Spec {
+                id: format!("m-{n}"),
+                display_name: n.to_ascii_uppercase(),
+                ..Spec::default()
+            })
+            .collect();
+        let ids = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        for (query, want) in [
+            // Default limit 20 covers the whole catalog.
+            ("", Ok((ids(&["m-a", "m-b", "m-c"]), Some("m-a"), Some("m-c"), false))),
+            (
+                "limit=1000",
+                Ok((ids(&["m-a", "m-b", "m-c"]), Some("m-a"), Some("m-c"), false)),
+            ),
+            (
+                "limit=3",
+                Ok((ids(&["m-a", "m-b", "m-c"]), Some("m-a"), Some("m-c"), false)),
+            ),
+            ("limit=2", Ok((ids(&["m-a", "m-b"]), Some("m-a"), Some("m-b"), true))),
+            ("limit=1", Ok((ids(&["m-a"]), Some("m-a"), Some("m-a"), true))),
+            // Forward pages start just after `after_id`.
+            (
+                "after_id=m-a&limit=1",
+                Ok((ids(&["m-b"]), Some("m-b"), Some("m-b"), true)),
+            ),
+            ("after_id=m-c&limit=1", Ok((ids(&[]), None, None, false))),
+            // Backward pages end just before `before_id`.
+            (
+                "before_id=m-c&limit=1",
+                Ok((ids(&["m-b"]), Some("m-b"), Some("m-b"), true)),
+            ),
+            ("before_id=m-a&limit=1", Ok((ids(&[]), None, None, false))),
+            ("before_id=m-a&limit=2", Ok((ids(&[]), None, None, false))),
+            // Both cursors bound one page: only what lies between them, whatever the limit.
+            (
+                "after_id=m-a&before_id=m-c&limit=1",
+                Ok((ids(&["m-b"]), Some("m-b"), Some("m-b"), false)),
+            ),
+            (
+                "after_id=m-a&before_id=m-c&limit=10",
+                Ok((ids(&["m-b"]), Some("m-b"), Some("m-b"), false)),
+            ),
+            ("after_id=m-c&before_id=m-a&limit=10", Ok((ids(&[]), None, None, false))),
+            // An unknown cursor or limit is an invalid_request_error message.
+            (
+                "after_id=m-x",
+                Err("after_id: Value not found for `after_id`: m-x. Input was 'm-x'."),
+            ),
+            (
+                "before_id=m-x",
+                Err("before_id: Value not found for `before_id`: m-x. Input was 'm-x'."),
+            ),
+            (
+                "before_id=m-c&after_id=m-x&limit=2",
+                Err("after_id: Value not found for `after_id`: m-x. Input was 'm-x'."),
+            ),
+            (
+                "after_id=m-x&before_id=m-y",
+                Err("after_id: Value not found for `after_id`: m-x. Input was 'm-x'."),
+            ),
+            (
+                "limit=0",
+                Err("limit: Input should be between 1 and 1000, e.g. `20`. Input was '0'."),
+            ),
+            (
+                "limit=1001",
+                Err("limit: Input should be between 1 and 1000, e.g. `20`. Input was '1001'."),
+            ),
+            (
+                "limit=abc",
+                Err("limit: Input should be a valid integer, e.g. `20`. Input was 'abc'."),
+            ),
+        ] {
+            let uri: axum::http::Uri = format!("http://local/v1/models?{query}").parse().unwrap();
+            let got = ClaudePage::parse(&uri).and_then(|page| {
+                claude_list(specs.iter(), true, Some(&page)).map(|body| {
+                    let v: Value = serde_json::from_str(&body).unwrap();
+                    (
+                        v["data"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|e| e["id"].as_str().unwrap().to_owned())
+                            .collect::<Vec<_>>(),
+                        v["first_id"].as_str().map(str::to_owned),
+                        v["last_id"].as_str().map(str::to_owned),
+                        v["has_more"].as_bool().unwrap(),
+                    )
+                })
+            });
+            let want =
+                want.map(|(ids, first, last, more)| (ids, first.map(str::to_owned), last.map(str::to_owned), more));
+            assert_eq!(got, want.map_err(str::to_owned), "{query}");
+        }
     }
 
     /// A detail lookup answers the entry, a 404 for a missing model and a 502 for a

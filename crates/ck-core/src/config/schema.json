@@ -132,11 +132,9 @@
         "proxy-url": "string",
         "tls-handshake-timeout-seconds": "int",
         "passthrough-headers": "bool",
-        "nonstream-keepalive-interval": "int",
         "streaming": {
           "fields": {
             "keepalive-seconds": "int",
-            "bootstrap-retries": "int",
             "send-keepalive-before-ft": "bool"
           }
         },
@@ -328,6 +326,13 @@
               }
             }
           }
+        },
+        "upstream-timeouts": {
+          "fields": {
+            "header-seconds": "int",
+            "idle-seconds": "int",
+            "total-seconds": "int"
+          }
         }
       }
     },
@@ -383,7 +388,9 @@
           "fields": {
             "aistudio": {
               "fields": {
-                "ws-auth": "bool"
+                "relay-keys": {
+                  "list": "string"
+                }
               }
             },
             "codex": {
@@ -1541,6 +1548,20 @@
         "cache-file": "string"
       }
     },
+    "model-catalog": {
+      "list": {
+        "fields": {
+          "match": "string",
+          "overrides": {
+            "fields": {
+              "default-max-tokens": {
+                "optional": "int"
+              }
+            }
+          }
+        }
+      }
+    },
     "model-routers": {
       "list": {
         "fields": {
@@ -1562,6 +1583,14 @@
             }
           }
         }
+      }
+    },
+    "realtime": {
+      "fields": {
+        "ping-interval-seconds": "int",
+        "read-timeout-seconds": "int",
+        "write-timeout-seconds": "int",
+        "max-sockets-per-key": "int"
       }
     }
   }

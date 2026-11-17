@@ -15,6 +15,8 @@ use ck_core::format::Format;
 use ck_wire::gostr::GoStr;
 use ck_wire::json::{self as gj, Kind, Res};
 
+use super::usage_snapshot::{self, CanonicalUsage, Dimension, ResponseFacts, Unit};
+
 /// Go `usage.TokenAccountingQuality`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Quality {
@@ -46,9 +48,96 @@ pub struct Detail {
     pub cache_creation: i64,
     pub cache_creation_5m: Option<i64>,
     pub cache_creation_1h: Option<i64>,
+    pub cache_creation_30m: Option<i64>,
+    pub cache_creation_12h: Option<i64>,
     pub total: i64,
     pub breakdown: Option<Breakdown>,
     pub response_service_tier: String,
+    pub unreported: Unreported,
+    /// Billing dimensions besides the token counts (`usage_snapshot::DIMENSIONS`).
+    pub dimensions: Vec<(&'static str, Dimension)>,
+    /// The usage members holding dimensions that the parsed usage reported, present and not
+    /// null, so a streamed update replaces exactly those ([`merge_dimensions`]).
+    pub dimension_members: Vec<&'static str>,
+}
+
+/// Counts an attempt's canonical usage did not report (`docs/EXECUTION-CONTRACT.md` §8):
+/// the queued record omits them instead of writing zero. The legacy per-protocol parsers
+/// report every count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Unreported {
+    pub input: bool,
+    pub output: bool,
+    pub reasoning: bool,
+    pub cache_read: bool,
+    pub cache_creation: bool,
+    pub total: bool,
+}
+
+impl Unreported {
+    pub const ALL: Self = Self {
+        input: true,
+        output: true,
+        reasoning: true,
+        cache_read: true,
+        cache_creation: true,
+        total: true,
+    };
+}
+
+impl Detail {
+    /// The record of an attempt's canonical usage. Canonical counts are inclusive, cache
+    /// reads and writes inside input and reasoning inside output, so the breakdown is Go's
+    /// subset one whatever the provider.
+    pub fn canonical(usage: &CanonicalUsage, facts: &ResponseFacts) -> Self {
+        let count = |n: Option<u64>| n.map_or(0, |n| i64::try_from(n).unwrap_or(i64::MAX));
+        let (input, output, total) = (
+            count(usage.input_tokens),
+            count(usage.output_tokens),
+            count(usage.total_tokens),
+        );
+        let (cache_read, cache_write, reasoning) = (
+            count(usage.cache_read_tokens),
+            count(usage.cache_write_tokens),
+            count(usage.reasoning_tokens),
+        );
+        // ponytail: an unreported cache or reasoning count enters the breakdown as none, as
+        // Go's accounting did; the stored counts keep it absent.
+        let breakdown = if usage.input_tokens.is_some() && usage.output_tokens.is_some() {
+            subset(input, cache_read, cache_write, output, reasoning, total)
+        } else {
+            unclassified(total)
+        };
+        Self {
+            input,
+            output,
+            reasoning,
+            cached: cache_read,
+            cache_read,
+            cache_creation: cache_write,
+            cache_creation_5m: usage.cache_write_5m_tokens.map(|n| count(Some(n))),
+            cache_creation_1h: usage.cache_write_1h_tokens.map(|n| count(Some(n))),
+            cache_creation_30m: usage.cache_write_30m_tokens.map(|n| count(Some(n))),
+            cache_creation_12h: usage.cache_write_12h_tokens.map(|n| count(Some(n))),
+            total,
+            breakdown: Some(breakdown),
+            response_service_tier: facts
+                .service_tier
+                .clone()
+                .or_else(|| usage.service_tier.clone())
+                .unwrap_or_default(),
+            unreported: Unreported {
+                input: usage.input_tokens.is_none(),
+                output: usage.output_tokens.is_none(),
+                reasoning: usage.reasoning_tokens.is_none(),
+                cache_read: usage.cache_read_tokens.is_none(),
+                cache_creation: usage.cache_write_tokens.is_none(),
+                total: usage.total_tokens.is_none(),
+            },
+            dimensions: usage.dimensions.clone(),
+            dimension_members: Vec::new(),
+        }
+    }
 }
 
 /// Go `nonNegativeSum`.
@@ -354,6 +443,12 @@ pub fn ensure_breakdown(mut d: Detail, provider: &str, executor_type: &str) -> D
 }
 
 /// Go `hasNonZeroTokenUsage`.
+/// The detail reports billing evidence besides token counts. Only the tier reaches the parsers
+/// that drop tokenless updates: Gemini and Interactions have no dimension rows.
+fn has_billing(d: &Detail) -> bool {
+    !d.response_service_tier.trim().is_empty()
+}
+
 fn has_tokens(d: &Detail) -> bool {
     d.input != 0
         || d.output != 0
@@ -424,6 +519,57 @@ fn has_openai_token_fields(node: &Res<'_>) -> bool {
     node.exists() && node.is_object() && (node.get("total_tokens").exists() || has_openai_bucket_fields(node))
 }
 
+/// The unsigned integer at `path`. Absent, null, a string, a negative or fractional number and
+/// one beyond `u64` are unknown: their raw text does not parse as `u64`.
+fn uint_at(node: &Res<'_>, path: &str) -> Option<u64> {
+    std::str::from_utf8(node.get(path).raw()).ok()?.parse().ok()
+}
+
+/// The `usage_snapshot::dimension_rows` of `protocol` read from an upstream usage object, as the
+/// canonical reader reads them from a snapshot's native value.
+fn native_dimensions(protocol: &str, node: &Res<'_>) -> Vec<(&'static str, Dimension)> {
+    usage_snapshot::dimension_rows(protocol)
+        .filter_map(|(path, name, unit)| {
+            let path = path.join(".");
+            let value = match unit {
+                Unit::Count => uint_at(node, &path).map(Dimension::Count),
+                Unit::Decimal => {
+                    let value = node.get(path.as_str());
+                    let raw = std::str::from_utf8(value.raw()).ok();
+                    raw.filter(|_| value.kind == Kind::Number)
+                        .map(|raw| Dimension::Decimal(raw.to_owned()))
+                }
+                Unit::Text => {
+                    let value = node.get(path.as_str());
+                    (value.kind == Kind::String).then(|| Dimension::Text(value.str().into_owned()))
+                }
+            };
+            value.map(|value| (name, value))
+        })
+        .collect()
+}
+
+/// The usage members of `protocol`'s dimension rows that `node` reports, present and not null.
+fn reported_members(protocol: &str, node: &Res<'_>) -> Vec<&'static str> {
+    let mut members = Vec::new();
+    for (path, _, _) in usage_snapshot::dimension_rows(protocol) {
+        let reported = node.get(path[0]);
+        if reported.exists() && reported.kind != Kind::Null && !members.contains(&path[0]) {
+            members.push(path[0]);
+        }
+    }
+    members
+}
+
+/// The service tier inside an upstream usage object of `protocol`, or empty.
+fn native_tier(protocol: &str, node: &Res<'_>) -> String {
+    usage_snapshot::tier_member(protocol)
+        .map(|member| node.get(member))
+        .filter(|tier| tier.kind == Kind::String)
+        .map(|tier| tier.str().trim().to_owned())
+        .unwrap_or_default()
+}
+
 /// Go `parseOpenAIStyleUsageNode`.
 fn parse_openai_node(node: &Res<'_>) -> Detail {
     let input = first(node, &["prompt_tokens", "input_tokens"]);
@@ -457,6 +603,14 @@ fn parse_openai_node(node: &Res<'_>) -> Detail {
     if creation.exists() {
         d.cache_creation = creation.int();
     }
+    let ttl = |name: &str| {
+        uint_at(node, &format!("input_tokens_details.cache_write_tokens_details.{name}"))
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+    };
+    d.cache_creation_30m = ttl("ttl_30m_tokens");
+    d.cache_creation_12h = ttl("ttl_12h_tokens");
+    d.dimensions = native_dimensions("chat", node);
+    d.dimension_members = reported_members("chat", node);
     let reasoning = first(
         node,
         &[
@@ -490,6 +644,103 @@ fn parse_openai_node(node: &Res<'_>) -> Detail {
 
 /// Go `ParseOpenAIUsage`.
 pub fn parse_openai(body: &[u8]) -> Detail {
+    parse_usage(body, parse_openai_node)
+}
+
+/// The paths each token count is read from, first present wins, as `parse_openai_node` reads them.
+const INPUT: &[&str] = &["prompt_tokens", "input_tokens"];
+const OUTPUT: &[&str] = &["completion_tokens", "output_tokens"];
+const REASONING: &[&str] = &[
+    "completion_tokens_details.reasoning_tokens",
+    "output_tokens_details.reasoning_tokens",
+];
+const CACHED: &[&str] = &[
+    "prompt_tokens_details.cached_tokens",
+    "input_tokens_details.cached_tokens",
+];
+const CACHE_CREATION: &[&str] = &[
+    "input_tokens_details.cache_creation_tokens",
+    "input_tokens_details.cache_write_tokens",
+    "prompt_tokens_details.cache_creation_tokens",
+    "prompt_tokens_details.cache_write_tokens",
+];
+
+/// A Responses usage object's token counts and billed units. A count exists only when the usage
+/// gives it as an integer number; any other count is unreported rather than zero, and never
+/// enters a derived total or the breakdown. A total the usage omits is the sum of its input and
+/// output, as the canonical reader derives it. Without both, the breakdown classifies nothing.
+/// `None` when the usage has no token member and no billed unit.
+fn responses_usage(node: &Res<'_>, tier: String) -> Option<Detail> {
+    if !node.is_object() {
+        return None;
+    }
+    let count = |paths: &[&str]| {
+        let value = first(node, paths);
+        (value.kind == Kind::Number)
+            .then(|| std::str::from_utf8(value.raw()).ok()?.parse::<i64>().ok())
+            .flatten()
+    };
+    let mut dimensions = native_dimensions("chat", node);
+    dimensions.extend(native_dimensions("responses", node));
+    if !has_openai_token_fields(node) && dimensions.is_empty() {
+        return None;
+    }
+    let (input, output, total) = (count(INPUT), count(OUTPUT), count(&["total_tokens"]));
+    let (reasoning, cached, creation) = (count(REASONING), count(CACHED), count(CACHE_CREATION));
+    let breakdown = match (input, output) {
+        (Some(input), Some(output)) => subset(
+            input,
+            cached.unwrap_or(0),
+            creation.unwrap_or(0),
+            output,
+            reasoning.unwrap_or(0),
+            total.unwrap_or(0),
+        ),
+        _ => unclassified(total.unwrap_or(0)),
+    };
+    let ttl = |name: &str| {
+        uint_at(node, &format!("input_tokens_details.cache_write_tokens_details.{name}"))
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+    };
+    Some(Detail {
+        input: input.unwrap_or(0),
+        output: output.unwrap_or(0),
+        reasoning: reasoning.unwrap_or(0),
+        cached: cached.unwrap_or(0),
+        cache_read: cached.unwrap_or(0),
+        cache_creation: creation.unwrap_or(0),
+        cache_creation_30m: ttl("ttl_30m_tokens"),
+        cache_creation_12h: ttl("ttl_12h_tokens"),
+        total: total.unwrap_or(breakdown.total),
+        breakdown: Some(breakdown),
+        response_service_tier: tier,
+        unreported: Unreported {
+            input: input.is_none(),
+            output: output.is_none(),
+            reasoning: reasoning.is_none(),
+            cache_read: cached.is_none(),
+            cache_creation: creation.is_none(),
+            total: total.is_none() && (input.is_none() || output.is_none()),
+        },
+        dimensions,
+        // A Responses stream accounts its first terminal usage alone: no later update merges.
+        dimension_members: reported_members("chat", node),
+        ..Detail::default()
+    })
+}
+
+/// A buffered Responses body's usage through [`responses_usage`]. A body without a usage that
+/// reports a count or unit, such as a pending video job's, records no count.
+fn parse_responses(body: &[u8]) -> Detail {
+    let tier = service_tier(body);
+    responses_usage(&gj::parse(body).get("usage"), tier.clone()).unwrap_or(Detail {
+        response_service_tier: tier,
+        unreported: Unreported::ALL,
+        ..Detail::default()
+    })
+}
+
+fn parse_usage(body: &[u8], parse: fn(&Res<'_>) -> Detail) -> Detail {
     let tier = service_tier(body);
     let node = gj::parse(body).get("usage");
     if !has_openai_token_fields(&node) {
@@ -498,32 +749,59 @@ pub fn parse_openai(body: &[u8]) -> Detail {
             ..Detail::default()
         };
     }
-    let mut d = parse_openai_node(&node);
+    let mut d = parse(&node);
     d.response_service_tier = tier;
     d
 }
 
-/// Go `ParseCodexUsage`.
+/// Go `ParseCodexUsage`, through [`responses_usage`].
 pub fn parse_codex(data: &[u8]) -> Option<Detail> {
     let tier = service_tier(data);
     let node = gj::parse(data).get("response.usage");
-    if !has_openai_token_fields(&node) {
-        return (!tier.is_empty()).then(|| Detail {
+    responses_usage(&node, tier.clone()).or_else(|| {
+        (!tier.is_empty()).then(|| Detail {
             response_service_tier: tier,
             ..Detail::default()
-        });
-    }
-    let mut d = parse_openai_node(&node);
-    d.response_service_tier = tier;
-    Some(d)
+        })
+    })
 }
 
 /// Go `parseClaudeUsageNode`: cache buckets are separate from `input_tokens`;
-/// thinking is part of `output_tokens`.
+/// thinking is part of `output_tokens`. A usage listing `iterations` bills their sum, as the
+/// canonical Anthropic reader does: an on-demand compaction reports its tokens only there and
+/// leaves the top level at 0, and server-side compaction leaves its iteration out of the top level.
 fn parse_claude_node(node: &Res<'_>) -> Detail {
-    let cache_read = node.get("cache_read_input_tokens").int();
-    let cache_creation = node.get("cache_creation_input_tokens").int();
-    let output = node.get("output_tokens").int();
+    let iterations = node.get("iterations");
+    let iterations = if iterations.is_array() {
+        iterations.array()
+    } else {
+        Vec::new()
+    };
+    let billed = |key: &str| match iterations.as_slice() {
+        [] => node.get(key).int(),
+        entries => entries
+            .iter()
+            .map(|entry| entry.get(key).int())
+            .fold(0i64, i64::wrapping_add),
+    };
+    // A cache-write TTL bucket comes from the usage objects its write count comes from; absent
+    // when none of them splits its writes.
+    let ttl = |path: &str| {
+        let objects = if iterations.is_empty() {
+            std::slice::from_ref(node)
+        } else {
+            iterations.as_slice()
+        };
+        objects
+            .iter()
+            .map(|object| object.get(path))
+            .filter(Res::exists)
+            .map(|count| count.int())
+            .reduce(i64::wrapping_add)
+    };
+    let cache_read = billed("cache_read_input_tokens");
+    let cache_creation = billed("cache_creation_input_tokens");
+    let output = billed("output_tokens");
     let reasoning = first(
         node,
         &[
@@ -542,20 +820,17 @@ fn parse_claude_node(node: &Res<'_>) -> Detail {
         output
     };
     let mut d = Detail {
-        input: node.get("input_tokens").int(),
+        input: billed("input_tokens"),
         output,
         reasoning,
         cached: cache_read,
         cache_read,
         cache_creation,
-        cache_creation_5m: node
-            .get("cache_creation.ephemeral_5m_input_tokens")
-            .exists()
-            .then(|| node.get("cache_creation.ephemeral_5m_input_tokens").int()),
-        cache_creation_1h: node
-            .get("cache_creation.ephemeral_1h_input_tokens")
-            .exists()
-            .then(|| node.get("cache_creation.ephemeral_1h_input_tokens").int()),
+        cache_creation_5m: ttl("cache_creation.ephemeral_5m_input_tokens"),
+        cache_creation_1h: ttl("cache_creation.ephemeral_1h_input_tokens"),
+        response_service_tier: native_tier("anthropic", node),
+        dimensions: native_dimensions("anthropic", node),
+        dimension_members: reported_members("anthropic", node),
         ..Detail::default()
     };
     if d.cached == 0 {
@@ -610,6 +885,7 @@ fn parse_gemini_node(node: &Res<'_>) -> Detail {
         total: node.get("totalTokenCount").int(),
         cached,
         cache_read: cached,
+        response_service_tier: native_tier("gemini", node),
         ..Detail::default()
     };
     if input.is_none() {
@@ -656,7 +932,7 @@ fn parse_gemini_stream(line: &[u8]) -> Option<Detail> {
         return None;
     }
     let d = parse_gemini_node(&node);
-    has_tokens(&d).then_some(d)
+    (has_tokens(&d) || has_billing(&d)).then_some(d)
 }
 
 /// Go `ParseAntigravityStreamUsage`: the wrapped `response.usageMetadata` first, and
@@ -778,16 +1054,21 @@ fn parse_interactions_stream(line: &[u8]) -> Option<Detail> {
         return None;
     }
     let d = parse_interactions(payload);
-    has_tokens(&d).then_some(d)
+    (has_tokens(&d) || has_billing(&d)).then_some(d)
 }
 
 /// The buffered-response parser for a format (Go's executor for that format).
+// Q1 (temporary): the per-protocol parsers and `StreamUsage` serve executors that still
+// report through `UsageSink::response_*` and dispatch's `Tracker::body`/`event`. Each
+// provider unit (P1–P9) removes its executor's calls and D2 removes dispatch's; the last
+// of them deletes these parsers.
 pub fn parse_body(format: Format, body: &[u8]) -> Detail {
     match format {
         Format::Claude => parse_claude(body),
+        Format::OpenAI => parse_openai(body),
         // A buffered Responses body is the completed response object: usage and
         // service_tier are top-level, as `ParseOpenAIUsage` reads them.
-        Format::OpenAI | Format::OpenAIResponse | Format::Codex => parse_openai(body),
+        Format::OpenAIResponse | Format::Codex => parse_responses(body),
         Format::Gemini => parse_gemini(body),
         Format::Antigravity => {
             let node = first(
@@ -804,18 +1085,35 @@ pub fn parse_body(format: Format, body: &[u8]) -> Detail {
     }
 }
 
+/// Keeps the earlier dimensions of every usage member `update` did not report, so the tier,
+/// speed and region of `message_start` survive `message_delta`. A reported member replaces all
+/// its earlier dimensions, even with none the record can name, as the Anthropic SDK replaces a
+/// non-null `server_tool_use` whole.
+fn merge_dimensions(update: &mut Detail, existing: &Detail) {
+    for (name, value) in &existing.dimensions {
+        if usage_snapshot::dimension_member(name).is_none_or(|member| !update.dimension_members.contains(&member)) {
+            update.dimensions.push((name, value.clone()));
+        }
+    }
+}
+
 /// Go `StreamUsageBuffer`, fed line by line in one format the way that format's Go
 /// executor feeds it.
 #[derive(Debug, Default)]
 pub struct StreamUsage {
     detail: Detail,
     ok: bool,
+    /// Each choice's latest choice-local usage, by choice index ([`Self::choice_usage`]).
+    choices: Vec<(i64, Detail)>,
 }
 
 impl StreamUsage {
-    /// Go `StreamUsageBuffer.Observe`: the latest usage wins; a tier-only update keeps
-    /// the usage and replaces the tier.
-    fn observe(&mut self, detail: Detail) {
+    /// Every stream observation lands here. Token counts follow Go's
+    /// `StreamUsageBuffer.Observe`: the latest usage wins, and a tier-only update keeps the
+    /// counts and replaces the tier. Billing dimensions are kept apart from that rule: they merge
+    /// ([`merge_dimensions`]) whether or not the update carries tokens.
+    fn observe(&mut self, mut detail: Detail) {
+        merge_dimensions(&mut detail, &self.detail);
         let tier = detail.response_service_tier.trim().to_owned();
         if tier.is_empty() || has_tokens(&detail) {
             let preserved = std::mem::take(&mut self.detail.response_service_tier);
@@ -825,6 +1123,12 @@ impl StreamUsage {
             }
         } else {
             self.detail.response_service_tier = tier;
+            self.detail.dimensions = detail.dimensions;
+            // No earlier counts to keep: the update's unreported counts stay unreported, so a
+            // tiered billed-only terminal writes no zero tokens.
+            if !self.ok {
+                self.detail.unreported = detail.unreported;
+            }
         }
         self.ok = true;
     }
@@ -891,6 +1195,9 @@ impl StreamUsage {
             if has_openai_token_fields(&node) {
                 detail = parse_openai_node(&node);
                 usage_ok = true;
+            } else if let Some(choices) = self.choice_usage(payload) {
+                detail = choices;
+                usage_ok = true;
             }
         }
         if tier_candidate {
@@ -899,6 +1206,40 @@ impl StreamUsage {
         if usage_ok || !detail.response_service_tier.is_empty() {
             self.observe(detail);
         }
+    }
+
+    /// Kimi's usage in `choices[i].usage` of each choice's last chunk, a stream without an
+    /// aggregate: every choice reports the same prompt and its own completion. The usage is the
+    /// prompt once and the completions summed, each choice's latest report replacing its earlier
+    /// one. A later top-level usage replaces the whole detail ([`Self::observe`]).
+    fn choice_usage(&mut self, payload: &[u8]) -> Option<Detail> {
+        let mut last = None;
+        for choice in gj::get(payload, "choices").array() {
+            let node = choice.get("usage");
+            if !has_openai_token_fields(&node) {
+                continue;
+            }
+            let detail = parse_openai_node(&node);
+            let index = choice.get("index").int();
+            match self.choices.iter_mut().find(|(i, _)| *i == index) {
+                Some((_, slot)) => *slot = detail.clone(),
+                None => self.choices.push((index, detail.clone())),
+            }
+            last = Some(detail);
+        }
+        let mut d = last?;
+        d.output = self.choices.iter().map(|(_, c)| c.output).fold(0, i64::wrapping_add);
+        d.reasoning = self.choices.iter().map(|(_, c)| c.reasoning).fold(0, i64::wrapping_add);
+        d.total = d.input.wrapping_add(d.output);
+        d.breakdown = Some(subset(
+            d.input,
+            d.cache_read,
+            d.cache_creation,
+            d.output,
+            d.reasoning,
+            d.total,
+        ));
+        Some(d)
     }
 
     /// One client-visible stream line of `format`.
@@ -1295,6 +1636,9 @@ pub struct Record {
     /// [`prompt_prefix`] of the client request; empty when it has none. Not in Go.
     pub prompt_prefix_hash: String,
     pub claude_cache: Option<ck_core::exec::ClaudeCacheTelemetry>,
+    /// The usage scope of a record that is not the attempt's own (`tool:<model>`, `job:<id>`,
+    /// an upstream response); empty for the attempt's. Not in Go.
+    pub usage_scope: String,
     /// Present only for additional telemetry-only records that Go omits.
     pub usage_observed: Option<bool>,
     pub timings: Timings,
@@ -1401,6 +1745,11 @@ impl Writer {
         // Straight into the record: no string per number.
         let _ = write!(self.0, "{v}");
     }
+    /// `v` is a JSON number literal both usage readers validated.
+    fn number(&mut self, k: &str, v: &str) {
+        self.key(k);
+        self.0.extend_from_slice(v.as_bytes());
+    }
     fn bool(&mut self, k: &str, v: bool) {
         self.key(k);
         self.0.extend_from_slice(if v { b"true" } else { b"false" });
@@ -1431,6 +1780,22 @@ pub(crate) fn is_native_access_provider(provider: &str) -> bool {
     use ck_wire::gostr::GoStr;
     let provider = provider.trim();
     provider.go_eq_fold("config-inline") || provider.go_eq_fold("config-api-key")
+}
+
+/// The record's `dimensions` object, left out when the usage reported none.
+fn write_dimensions(w: &mut Writer, dimensions: &[(&'static str, Dimension)]) {
+    if dimensions.is_empty() {
+        return;
+    }
+    w.object("dimensions", |d| {
+        for (name, value) in dimensions {
+            match value {
+                Dimension::Count(n) => d.int(name, i64::try_from(*n).unwrap_or(i64::MAX)),
+                Dimension::Decimal(number) => d.number(name, number),
+                Dimension::Text(text) => d.str(name, text),
+            }
+        }
+    });
 }
 
 pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
@@ -1476,22 +1841,38 @@ pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
     w.str("resolved_client_ip", &client.resolved_client_ip);
     w.str("x_forwarded_for", &client.x_forwarded_for);
     w.str("user_agent", &client.user_agent);
+    let unreported = detail.unreported;
     w.object("tokens", |t| {
-        t.int("input_tokens", detail.input);
-        t.int("output_tokens", detail.output);
-        t.int("reasoning_tokens", detail.reasoning);
-        t.int("cached_tokens", detail.cached);
-        t.int("cache_read_tokens", detail.cache_read);
-        t.bool("cache_read_tokens_present", true);
-        t.int("cache_creation_tokens", detail.cache_creation);
-        if let Some(n) = detail.cache_creation_5m {
-            t.int("cache_creation_5m_tokens", n);
+        for (name, value, absent) in [
+            ("input_tokens", detail.input, unreported.input),
+            ("output_tokens", detail.output, unreported.output),
+            ("reasoning_tokens", detail.reasoning, unreported.reasoning),
+            ("cached_tokens", detail.cached, unreported.cache_read),
+            ("cache_read_tokens", detail.cache_read, unreported.cache_read),
+        ] {
+            if !absent {
+                t.int(name, value);
+            }
         }
-        if let Some(n) = detail.cache_creation_1h {
-            t.int("cache_creation_1h_tokens", n);
+        t.bool("cache_read_tokens_present", !unreported.cache_read);
+        if !unreported.cache_creation {
+            t.int("cache_creation_tokens", detail.cache_creation);
         }
-        t.int("total_tokens", detail.total);
+        for (name, value) in [
+            ("cache_creation_5m_tokens", detail.cache_creation_5m),
+            ("cache_creation_1h_tokens", detail.cache_creation_1h),
+            ("cache_creation_30m_tokens", detail.cache_creation_30m),
+            ("cache_creation_12h_tokens", detail.cache_creation_12h),
+        ] {
+            if let Some(n) = value {
+                t.int(name, n);
+            }
+        }
+        if !unreported.total {
+            t.int("total_tokens", detail.total);
+        }
     });
+    write_dimensions(&mut w, &detail.dimensions);
     w.bool("failed", record.failed);
     if let Some(observed) = record.usage_observed {
         w.bool("usage_observed", observed);
@@ -1572,6 +1953,7 @@ pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
     // Not in Go's record (docs/DIFFERENCES-FROM-GO.md).
     w.opt_str("session_source", client.session_source);
     w.opt_str("prompt_prefix_hash", &record.prompt_prefix_hash);
+    w.opt_str("usage_scope", &record.usage_scope);
     if let Some(cache) = &record.claude_cache {
         w.key("claude_cache");
         serde_json::to_writer(&mut w.0, cache).expect("cache telemetry contains only JSON primitives");
@@ -1646,6 +2028,8 @@ impl Facts {
 // ponytail: Chat Completions, Antigravity and Interactions bodies get none (their system
 // prompt is a message or sits in an envelope); add a lookup when a client of theirs
 // needs one.
+// Q1 (temporary): D2 switches dispatch to `usage_snapshot::prompt_prefix` over the request
+// view and deletes this.
 pub(crate) fn prompt_prefix(format: Format, body: &[u8]) -> String {
     use sha2::Digest;
     let system: &[&[u8]] = match format {
@@ -1833,12 +2217,60 @@ struct Reported {
     claude_cache: Option<ck_core::exec::ClaudeCacheTelemetry>,
     /// The executor type and model of the built-in executor the attempt was handed to.
     delegated: Option<(String, String)>,
+    /// Kimi's cache-write TTL: the Chat request's, or the one a Responses response says it applied.
+    kimi_cache_ttl: Option<KimiCacheTtl>,
+}
+
+/// A Kimi `prompt_cache_options.ttl`. Kimi bills a cache write by the TTL it was written with and
+/// reports no TTL in the usage; an omitted option writes at 5m.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KimiCacheTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+impl KimiCacheTtl {
+    /// The TTL of a request or response's `prompt_cache_options` at `path`, if it names one.
+    fn at(payload: &[u8], path: &str) -> Option<Self> {
+        match gj::get(payload, path).str().as_ref() {
+            "5m" => Some(Self::FiveMinutes),
+            "1h" => Some(Self::OneHour),
+            _ => None,
+        }
+    }
 }
 
 impl Reported {
-    /// The usage reported so far: a body, else the stream's last usage.
+    /// The usage reported so far: a body, else the stream's last usage. A Kimi Chat or Responses
+    /// cache write lands in the bucket of the TTL it was written with; the input still counts it
+    /// once.
     fn usage(&self) -> Option<Detail> {
-        self.body.clone().or_else(|| self.stream.detail().cloned())
+        let mut d = self.body.clone().or_else(|| self.stream.detail().cloned())?;
+        if let Some(ttl) = self.kimi_cache_ttl
+            && d.cache_creation > 0
+        {
+            let bucket = match ttl {
+                KimiCacheTtl::FiveMinutes => &mut d.cache_creation_5m,
+                KimiCacheTtl::OneHour => &mut d.cache_creation_1h,
+            };
+            *bucket = Some(d.cache_creation);
+        }
+        Some(d)
+    }
+
+    /// A Kimi Responses response's applied `prompt_cache_options`, from the buffered response
+    /// object or a stream event's `response`. Chat responses echo none.
+    fn kimi_applied_ttl(&mut self, payload: &[u8]) {
+        const MEMBER: &[u8] = b"\"prompt_cache_options\"";
+        let payload = json_payload(payload).unwrap_or(payload);
+        if !payload.windows(MEMBER.len()).any(|w| w == MEMBER) {
+            return;
+        }
+        if let Some(ttl) = KimiCacheTtl::at(payload, "response.prompt_cache_options.ttl")
+            .or_else(|| KimiCacheTtl::at(payload, "prompt_cache_options.ttl"))
+        {
+            self.kimi_cache_ttl = Some(ttl);
+        }
     }
 }
 
@@ -1851,6 +2283,11 @@ struct Observer {
 }
 
 impl Observer {
+    /// The attempt runs on the Kimi executor, under any provider name it serves.
+    fn kimi(&self) -> bool {
+        ck_exec::kimi::PROVIDERS.contains(&self.provider.as_str())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Reported> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1892,6 +2329,9 @@ impl ck_core::exec::UsageObserver for Observer {
         r.seen = true;
         r.body = Some(parse_body(format, body));
         r.model.observe(body, &self.provider);
+        if self.kimi() {
+            r.kimi_applied_ttl(body);
+        }
     }
 
     fn response_line(&self, format: Format, line: &[u8]) {
@@ -1899,6 +2339,9 @@ impl ck_core::exec::UsageObserver for Observer {
         r.seen = true;
         r.stream.line(format, line);
         r.model.observe(line, &self.provider);
+        if self.kimi() {
+            r.kimi_applied_ttl(line);
+        }
     }
 
     fn response_usage_line(&self, format: Format, line: &[u8]) {
@@ -1916,9 +2359,17 @@ impl ck_core::exec::UsageObserver for Observer {
     }
 
     fn request_for(&self, identifier: &str, payload: &[u8]) {
-        self.lock().effort = Some(ck_wire::thinking::extract_translated_reasoning_effort(
+        let mut r = self.lock();
+        r.effort = Some(ck_wire::thinking::extract_translated_reasoning_effort(
             payload, identifier,
         ));
+        // Kimi's Chat and Responses requests (identifier `kimi`) carry `prompt_cache_options`; a
+        // Messages request delegated to Claude reports its own buckets, never inferred from the
+        // requested TTL.
+        if self.kimi() && identifier == "kimi" {
+            r.kimi_cache_ttl =
+                Some(KimiCacheTtl::at(payload, "prompt_cache_options.ttl").unwrap_or(KimiCacheTtl::FiveMinutes));
+        }
     }
 
     fn upstream_model(&self, model: &str) {
@@ -1990,6 +2441,11 @@ pub struct Tracker {
     observer: std::sync::Arc<Observer>,
     stream: StreamUsage,
     body: Option<Detail>,
+    /// The attempt's canonical usage ([`Tracker::canonical`]). It is the record's usage on
+    /// success and on failure alike, whatever the provider.
+    canonical: Option<Detail>,
+    /// The last usage of each named scope ([`Tracker::usage`]), each its own record.
+    scoped: Vec<(String, Detail)>,
     model: ResponseModel,
     first: Option<std::time::Duration>,
     published: bool,
@@ -2064,6 +2520,8 @@ impl Tracker {
             }),
             stream: StreamUsage::default(),
             body: None,
+            canonical: None,
+            scoped: Vec::new(),
             model: ResponseModel::default(),
             first: None,
             published: false,
@@ -2089,6 +2547,7 @@ impl Tracker {
 
     /// The buffered client-format body (or the joined events of a stream the client
     /// did not ask to stream).
+    // Q1 (temporary): D2 removes `body` and `event` with dispatch's byte-level accounting.
     pub fn body(&mut self, body: &[u8]) {
         if body.trim_ascii_start().first() == Some(&b'{') {
             self.body = Some(parse_body(self.facts.format, body));
@@ -2116,6 +2575,25 @@ impl Tracker {
         self.model.observe(line, &self.observer.provider);
     }
 
+    /// The attempt's canonical usage and response facts (`usage_snapshot::read`); they
+    /// replace what the legacy parsers saw. Without a snapshot every count is unreported.
+    pub fn canonical(&mut self, usage: Option<&CanonicalUsage>, facts: &ResponseFacts) {
+        self.canonical = Some(Detail::canonical(usage.unwrap_or(&CanonicalUsage::default()), facts));
+        if let Some(model) = &facts.model {
+            self.model.set(model);
+        }
+    }
+
+    /// The attempt's usage by scope (`usage_snapshot::read`): the attempt's own is its record's
+    /// ([`Tracker::canonical`]), and each named scope's is a record of its own.
+    pub fn usage(&mut self, usage: &usage_snapshot::Usage, facts: &ResponseFacts) {
+        self.canonical(usage.attempt(), facts);
+        self.scoped = usage
+            .scoped()
+            .map(|(scope, usage)| (scope.to_owned(), Detail::canonical(usage, facts)))
+            .collect();
+    }
+
     pub fn succeed(mut self) {
         self.publish(Ending::Done);
     }
@@ -2131,11 +2609,12 @@ impl Tracker {
         if std::mem::replace(&mut self.published, true) {
             return;
         }
-        let queue = self.queue.usage_queue();
+        let rt = self.queue.clone();
+        let queue = rt.usage_queue();
         if !queue.accepts() {
             return;
         }
-        let reported = std::mem::take(&mut *self.observer.lock());
+        let mut reported = std::mem::take(&mut *self.observer.lock());
         if reported.discarded {
             return;
         }
@@ -2146,100 +2625,141 @@ impl Tracker {
         if let Some((executor_type, model)) = reported.delegated.clone() {
             (record.executor_type, record.model) = (executor_type, model);
         }
-        let (latency, ttft);
-        if let Some(outcome) = reported.outcome {
-            record.failed = outcome.failed;
-            record.fail_status = outcome.status;
-            record.fail_body = outcome.body;
-            record.detail = outcome.detail;
-            record.response_model = outcome.model;
-            (latency, ttft) = (outcome.latency, outcome.ttft);
-        } else {
-            let usage = if reported.seen {
-                reported.usage()
-            } else {
-                self.body.take().or_else(|| self.stream.detail().cloned())
-            };
-            let detail = match ending {
-                Ending::Done if reported.usage_required && usage.is_none() => {
-                    if reported.claude_cache.is_none() {
-                        return;
-                    }
-                    // Keep activity and timestamps even when a Claude stream never
-                    // returns usage.
-                    record.usage_observed = Some(false);
-                    Detail::default()
-                }
-                Ending::Done => usage.unwrap_or_default(),
-                Ending::Failed(error) => {
-                    record.failed = true;
-                    record.fail_status = i64::from(crate::scheduling::classify::go_status(error));
-                    record.fail_body = crate::scheduling::classify::error_text(error);
-                    if record.response_headers.is_empty() {
-                        record.response_headers = go_headers(&error.headers);
-                    }
-                    if self.observer.provider == "claude" {
-                        usage.unwrap_or_default()
-                    } else {
-                        Detail::default()
-                    }
-                }
-            };
-            record.detail = detail;
-            record.response_model = if reported.seen || !reported.model.get().is_empty() {
-                reported.model.get().to_owned()
-            } else {
-                self.model.get().to_owned()
-            };
-            latency = self.started.elapsed();
-            ttft = if reported.ttft.tracked {
-                reported.ttft.get()
-            } else {
-                self.first.unwrap_or_default()
-            };
-        }
+        let (latency, ttft) = match reported.outcome.take() {
+            Some(outcome) => {
+                record.failed = outcome.failed;
+                record.fail_status = outcome.status;
+                record.fail_body = outcome.body;
+                record.detail = outcome.detail;
+                record.response_model = outcome.model;
+                (outcome.latency, outcome.ttft)
+            }
+            None => match self.observed(&reported, ending, &mut record) {
+                Some(times) => times,
+                None => return,
+            },
+        };
         record.latency_ms = latency.as_millis() as i64;
         record.ttft_ms = ttft.as_millis() as i64;
         if let Some((five, hour)) = returned_cache {
             record.detail.cache_creation_5m = five;
             record.detail.cache_creation_1h = hour;
         }
+        // Canonical usage, once recorded, is the attempt's usage over every executor outcome
+        // and legacy observation; failure still sets the status and body above.
+        if let Some(canonical) = self.canonical.take() {
+            record.detail = canonical;
+        }
         record.timings = self.timings(&reported.exchange);
         record.prompt_prefix_hash = self.facts.prompt_prefix_hash.clone();
-        if let Some(mut cache) = reported.claude_cache {
-            let at = |instant: Option<std::time::Instant>| {
-                instant.map(|instant| {
-                    let offset = instant.saturating_duration_since(self.started).as_millis() as i64;
-                    self.requested_at.timestamp_millis().saturating_add(offset)
-                })
-            };
-            cache.request_start_unix_ms = at(reported.exchange.started);
-            cache.first_response_byte_unix_ms = at(reported.exchange.first_byte);
-            // Completion of this upstream attempt, not the downstream socket flush.
-            cache.end_unix_ms = Some(self.requested_at.timestamp_millis().saturating_add(record.latency_ms));
-            cache.attempt = self.attempt;
-            if self.client.as_ref().unwrap_or(&self.facts.client).is_compaction {
-                cache.base_request_type = "compaction".into();
-                if cache.request_type != "retry" {
-                    cache.request_type = "compaction".into();
-                }
-            }
-            if self.attempt > 0 {
-                cache.request_type = "retry".into();
-            }
-            record.claude_cache = Some(cache);
-        }
+        record.claude_cache = reported
+            .claude_cache
+            .map(|cache| self.claude_cache(cache, &reported.exchange, record.latency_ms));
         if let Some(effort) = reported.effort {
             record.reasoning_effort = effort;
         }
+        let client = self.client.as_ref().unwrap_or(&self.facts.client);
         if queue.accepts() {
-            queue.enqueue(queued(&record, self.client.as_ref().unwrap_or(&self.facts.client)));
+            queue.enqueue(queued(&record, client));
+        }
+        // One record per named scope beside the attempt's (E-Q13). A video job's scope is published
+        // only by the poll its job table charged (`ck_exec` `VideoJobs`), so it is recorded as is.
+        for (scope, detail) in std::mem::take(&mut self.scoped) {
+            let scoped = Record {
+                detail,
+                usage_scope: scope,
+                claude_cache: None,
+                ..record.clone()
+            };
+            if queue.accepts() {
+                queue.enqueue(queued(&scoped, client));
+            }
         }
         warn_model_substitution(&record, &reported.upstream_model, &self.auth_id);
     }
 }
 
 impl Tracker {
+    /// The record's usage, failure and model from what the attempt observed, when the
+    /// executor published no outcome of its own; its latency and TTFT. `None` publishes
+    /// nothing: a stream that had to report usage ended without it.
+    fn observed(
+        &mut self,
+        reported: &Reported,
+        ending: Ending<'_>,
+        record: &mut Record,
+    ) -> Option<(std::time::Duration, std::time::Duration)> {
+        let usage = if reported.seen {
+            reported.usage()
+        } else {
+            self.body.take().or_else(|| self.stream.detail().cloned())
+        };
+        record.detail = match ending {
+            Ending::Done if reported.usage_required && usage.is_none() && self.canonical.is_none() => {
+                reported.claude_cache.as_ref()?;
+                // Keep activity and timestamps even when a Claude stream never
+                // returns usage.
+                record.usage_observed = Some(false);
+                Detail::default()
+            }
+            Ending::Done => usage.unwrap_or_default(),
+            Ending::Failed(error) => {
+                record.failed = true;
+                record.fail_status = i64::from(crate::scheduling::classify::go_status(error));
+                record.fail_body = crate::scheduling::classify::error_text(error);
+                if record.response_headers.is_empty() {
+                    record.response_headers = go_headers(&error.headers);
+                }
+                if self.observer.provider == "claude" {
+                    usage.unwrap_or_default()
+                } else {
+                    Detail::default()
+                }
+            }
+        };
+        record.response_model = if reported.seen || !reported.model.get().is_empty() {
+            reported.model.get().to_owned()
+        } else {
+            self.model.get().to_owned()
+        };
+        let ttft = if reported.ttft.tracked {
+            reported.ttft.get()
+        } else {
+            self.first.unwrap_or_default()
+        };
+        Some((self.started.elapsed(), ttft))
+    }
+
+    /// Claude cache telemetry with this attempt's wall-clock marks, number and request type.
+    fn claude_cache(
+        &self,
+        mut cache: ck_core::exec::ClaudeCacheTelemetry,
+        exchange: &Exchange,
+        latency_ms: i64,
+    ) -> ck_core::exec::ClaudeCacheTelemetry {
+        let at = |instant: Option<std::time::Instant>| {
+            instant.map(|instant| {
+                let offset = instant.saturating_duration_since(self.started).as_millis() as i64;
+                self.requested_at.timestamp_millis().saturating_add(offset)
+            })
+        };
+        cache.request_start_unix_ms = at(exchange.started);
+        cache.first_response_byte_unix_ms = at(exchange.first_byte);
+        // Completion of this upstream attempt, not the downstream socket flush.
+        cache.end_unix_ms = Some(self.requested_at.timestamp_millis().saturating_add(latency_ms));
+        cache.attempt = self.attempt;
+        if self.client.as_ref().unwrap_or(&self.facts.client).is_compaction {
+            cache.base_request_type = "compaction".into();
+            if cache.request_type != "retry" {
+                cache.request_type = "compaction".into();
+            }
+        }
+        if self.attempt > 0 {
+            cache.request_type = "retry".into();
+        }
+        cache
+    }
+
     /// The record's [`Timings`]: each mark as an offset from the request's arrival.
     fn timings(&self, exchange: &Exchange) -> Timings {
         let clock = &self.facts.clock;
@@ -2393,6 +2913,616 @@ mod tests {
     /// tokens, response model kept, and the later failure the server sees changes
     /// nothing); `discard` is Go returning before it created a reporter (no record).
     #[test]
+    fn canonical_usage_is_the_last_snapshot_and_keeps_absent_counts_absent() {
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAI,
+            Format::OpenAI,
+            "m",
+            b"{}",
+            true,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("openai-compatibility"), "m");
+        let response = ResponseFacts {
+            model: Some("m-served".into()),
+            service_tier: Some("flex".into()),
+        };
+        let early = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(4),
+            ..CanonicalUsage::default()
+        };
+        tracker.canonical(Some(&early), &response);
+        let last = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            final_snapshot: true,
+            ..CanonicalUsage::default()
+        };
+        tracker.canonical(Some(&last), &response);
+        tracker.succeed();
+        let raw = rt.usage_queue().pop_oldest(10);
+        assert_eq!(raw.len(), 1, "one record per attempt");
+        let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+        // The last snapshot replaces the first; nothing is summed, and its absent counts
+        // (cache, reasoning, total) are not written as zero.
+        assert_eq!(
+            record["tokens"],
+            serde_json::json!({"input_tokens": 10, "output_tokens": 20, "cache_read_tokens_present": false})
+        );
+        assert_eq!(record["token_breakdown"]["total_tokens"], 30);
+        assert_eq!(record["response_model"], "m-served");
+        assert_eq!(record["response_service_tier"], "flex");
+    }
+
+    #[test]
+    fn canonical_usage_survives_failure_and_a_missing_snapshot_is_unreported() {
+        use ck_core::exec::{ExecError, FailureScope};
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAI,
+            Format::OpenAI,
+            "m",
+            b"{}",
+            true,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let error = ExecError::local(502, FailureScope::Transport, "upstream");
+        let usage = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            total_tokens: Some(30),
+            ..CanonicalUsage::default()
+        };
+        let response = ResponseFacts::default();
+        // Not a Claude credential: the legacy failure path would drop the counts.
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("openai-compatibility"), "m");
+        tracker.canonical(Some(&usage), &response);
+        tracker.fail(&error);
+        let mut none = Tracker::start(&rt, &facts, &credential_for("openai-compatibility"), "m");
+        none.canonical(None, &response);
+        none.succeed();
+        let raw = rt.usage_queue().pop_oldest(10);
+        let records: Vec<Value> = raw.iter().map(|r| serde_json::from_slice(r).unwrap()).collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["failed"], true);
+        assert_eq!(
+            records[0]["tokens"],
+            serde_json::json!({
+                "input_tokens": 10, "output_tokens": 20, "total_tokens": 30,
+                "cache_read_tokens_present": false,
+            })
+        );
+        assert_eq!(
+            records[1]["tokens"],
+            serde_json::json!({"cache_read_tokens_present": false}),
+            "no snapshot is unknown usage, not zero"
+        );
+    }
+
+    #[test]
+    fn canonical_usage_wins_over_executor_outcomes_and_legacy_cache_buckets() {
+        use ck_core::exec::{ExecError, FailureScope};
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::Claude,
+            Format::Claude,
+            "m",
+            b"{}",
+            true,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let error = ExecError::local(502, FailureScope::Transport, "upstream");
+        let response = ResponseFacts::default();
+        let usage = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            total_tokens: Some(30),
+            ..CanonicalUsage::default()
+        };
+        // An executor-published failure carries its own zero usage.
+        for provider in ["openai-compatibility", "claude", "gemini", "codex"] {
+            let mut tracker = Tracker::start(&rt, &facts, &credential_for(provider), "m");
+            tracker.sink().publish_failure(502, "upstream");
+            tracker.canonical(Some(&usage), &response);
+            tracker.fail(&error);
+            let raw = rt.usage_queue().pop_oldest(10);
+            let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+            assert_eq!(record["failed"], true);
+            assert_eq!(
+                record["tokens"],
+                serde_json::json!({
+                    "input_tokens": 10, "output_tokens": 20, "total_tokens": 30,
+                    "cache_read_tokens_present": false,
+                }),
+                "{provider}"
+            );
+        }
+        // An executor that requires usage and saw none still gets the canonical record.
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("claude"), "m");
+        tracker.sink().usage_required();
+        tracker.canonical(Some(&usage), &response);
+        tracker.succeed();
+        let raw = rt.usage_queue().pop_oldest(10);
+        let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+        assert_eq!(record["tokens"]["total_tokens"], 30);
+        // The Claude observer saw 5m/1h buckets 7/5; the canonical snapshot reports 4 and no 1h.
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("claude"), "m");
+        tracker.sink().response_line(
+            Format::Claude,
+            br#"data: {"type":"message_start","message":{"model":"m","usage":{"input_tokens":9,"output_tokens":1,"cache_creation_input_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":7,"ephemeral_1h_input_tokens":5}}}}"#,
+        );
+        let cached = CanonicalUsage {
+            cache_write_tokens: Some(4),
+            cache_write_5m_tokens: Some(4),
+            ..usage
+        };
+        tracker.canonical(Some(&cached), &response);
+        tracker.fail(&error);
+        let raw = rt.usage_queue().pop_oldest(10);
+        let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+        assert_eq!(record["tokens"]["cache_creation_tokens"], 4);
+        assert_eq!(record["tokens"]["cache_creation_5m_tokens"], 4);
+        assert_eq!(record["tokens"].get("cache_creation_1h_tokens"), None);
+    }
+
+    /// The record carries the snapshot's 30-minute and 12-hour writes, its other billing
+    /// dimensions and the tier its usage reported; a snapshot without them writes none.
+    #[test]
+    fn canonical_billing_dimensions_reach_the_record() {
+        use super::super::usage_snapshot::Dimension;
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAI,
+            Format::OpenAI,
+            "m",
+            b"{}",
+            true,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let usage = CanonicalUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            cache_write_tokens: Some(7),
+            cache_write_30m_tokens: Some(3),
+            cache_write_12h_tokens: Some(4),
+            service_tier: Some("priority".into()),
+            dimensions: vec![
+                ("speed", Dimension::Text("fast".into())),
+                ("web_search_requests", Dimension::Count(2)),
+                ("web_fetch_requests", Dimension::Count(0)),
+            ],
+            ..CanonicalUsage::default()
+        };
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("claude"), "m");
+        tracker.canonical(Some(&usage), &ResponseFacts::default());
+        tracker.succeed();
+        let mut bare = Tracker::start(&rt, &facts, &credential_for("claude"), "m");
+        bare.canonical(Some(&CanonicalUsage::default()), &ResponseFacts::default());
+        bare.succeed();
+        // A chunk's `service_tier` is the response tier ahead of the one in usage.
+        let mut chunk = Tracker::start(&rt, &facts, &credential_for("claude"), "m");
+        let tiered = ResponseFacts {
+            model: None,
+            service_tier: Some("flex".into()),
+        };
+        chunk.canonical(Some(&usage), &tiered);
+        chunk.succeed();
+        let raw = rt.usage_queue().pop_oldest(10);
+        let records: Vec<Value> = raw.iter().map(|r| serde_json::from_slice(r).unwrap()).collect();
+        assert_eq!(records[0]["tokens"]["cache_creation_30m_tokens"], 3);
+        assert_eq!(records[0]["tokens"]["cache_creation_12h_tokens"], 4);
+        assert_eq!(records[0]["tokens"].get("cache_creation_5m_tokens"), None);
+        assert_eq!(
+            records[0]["dimensions"],
+            serde_json::json!({"speed": "fast", "web_search_requests": 2, "web_fetch_requests": 0})
+        );
+        assert_eq!(records[0]["response_service_tier"], "priority");
+        assert_eq!(records[1].get("dimensions"), None);
+        assert_eq!(records[1].get("response_service_tier"), None);
+        assert_eq!(records[1]["tokens"].get("cache_creation_30m_tokens"), None);
+        assert_eq!(records[2]["response_service_tier"], "flex");
+    }
+
+    /// One record per usage scope (E-Q13): the attempt's, and one per tool model, upstream
+    /// response or video job beside it. A snapshot replaces only its own scope's, and every
+    /// published scope is recorded: whether a job's report is its charge is the executor's job
+    /// table's decision, made before the scope is published.
+    #[test]
+    fn usage_is_recorded_once_per_scope() {
+        // (label, each attempt's snapshots in stream order as (scope, input tokens), expected
+        // records as (usage_scope, input tokens)).
+        type Case = (
+            &'static str,
+            Vec<Vec<(Option<&'static str>, u64)>>,
+            Vec<(&'static str, Option<u64>)>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "a single scope is one record",
+                vec![vec![(None, 10)]],
+                vec![("", Some(10))],
+            ),
+            (
+                "two scopes give two records",
+                vec![vec![(None, 10), (Some("tool:gpt-image-2"), 50)]],
+                vec![("", Some(10)), ("tool:gpt-image-2", Some(50))],
+            ),
+            (
+                "a snapshot replaces only its own scope",
+                vec![vec![(None, 1), (Some("tool:a"), 2), (None, 3), (Some("tool:a"), 4)]],
+                vec![("", Some(3)), ("tool:a", Some(4))],
+            ),
+            (
+                "a published job scope is its own record and the poll's has no usage",
+                vec![vec![(Some("job:vid_1"), 7)], vec![]],
+                vec![("", None), ("job:vid_1", Some(7)), ("", None)],
+            ),
+            (
+                "65 response scopes and the attempt's are all recorded",
+                vec![
+                    (0..=64)
+                        .map(|n| (Some(&*format!("response:{n}").leak()), n + 1))
+                        .chain(std::iter::once((None, 1000)))
+                        .collect(),
+                ],
+                std::iter::once(("", Some(1000)))
+                    .chain((0..=64).map(|n| (&*format!("response:{n}").leak(), Some(n + 1))))
+                    .collect(),
+            ),
+        ];
+        for (label, attempts, expected) in cases {
+            let rt = usage_runtime();
+            let facts = std::sync::Arc::new(Facts::new(
+                Client::default(),
+                Format::OpenAI,
+                Format::OpenAI,
+                "m",
+                b"{}",
+                true,
+                &crate::inference::dispatch::Trace::default(),
+            ));
+            for snapshots in attempts {
+                let mut usage = usage_snapshot::Usage::default();
+                for (scope, input) in snapshots {
+                    let snapshot = CanonicalUsage {
+                        input_tokens: Some(input),
+                        ..CanonicalUsage::default()
+                    };
+                    usage.replace(scope.map(str::to_owned), snapshot);
+                }
+                let mut tracker = Tracker::start(&rt, &facts, &credential_for("xai"), "m");
+                tracker.usage(&usage, &ResponseFacts::default());
+                tracker.succeed();
+            }
+            let records: Vec<(String, Option<u64>)> = rt
+                .usage_queue()
+                .pop_oldest(100)
+                .iter()
+                .map(|raw| {
+                    let record: Value = serde_json::from_slice(raw).unwrap();
+                    (
+                        record["usage_scope"].as_str().unwrap_or_default().to_owned(),
+                        record["tokens"]["input_tokens"].as_u64(),
+                    )
+                })
+                .collect();
+            let expected: Vec<(String, Option<u64>)> = expected.into_iter().map(|(s, n)| (s.to_owned(), n)).collect();
+            assert_eq!(records, expected, "{label}");
+        }
+    }
+
+    /// A malformed legacy dimension or tier is unknown; the token counts still count.
+    #[test]
+    fn legacy_malformed_dimensions_stay_absent() {
+        let detail = parse_claude(
+            br#"{"usage":{"input_tokens":5,"output_tokens":2,"service_tier":7,"speed":42,"server_tool_use":{"web_search_requests":-1,"web_fetch_requests":"3"}}}"#,
+        );
+        assert_eq!((detail.input, detail.output), (5, 2));
+        assert_eq!(detail.response_service_tier, "");
+        assert_eq!(detail.dimensions, Vec::new());
+        let detail = parse_openai(
+            br#"{"usage":{"input_tokens":5,"output_tokens":2,"input_tokens_details":{"cache_write_tokens_details":{"ttl_30m_tokens":1.5,"ttl_12h_tokens":null}}}}"#,
+        );
+        assert_eq!((detail.cache_creation_30m, detail.cache_creation_12h), (None, None));
+    }
+
+    /// Each provider's rows read only that provider's usage: Anthropic fields in an OpenAI usage
+    /// object are not Anthropic dimensions.
+    #[test]
+    fn provider_fields_stay_with_their_provider() {
+        let detail = parse_openai(
+            br#"{"usage":{"prompt_tokens":5,"completion_tokens":2,"speed":"fast","server_tool_use":{"web_search_requests":1}}}"#,
+        );
+        assert_eq!(detail.dimensions, Vec::new());
+        let detail = parse_claude(
+            br#"{"usage":{"input_tokens":5,"output_tokens":2,"prompt_tokens_details":{"audio_tokens":2}}}"#,
+        );
+        assert_eq!(detail.dimensions, Vec::new());
+        // Meta's segmentation counts are Responses usage members, in a buffered body too.
+        let segmentation = br#"{"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7,"images_processed":2,"video_frames_processed":0}}"#;
+        assert_eq!(parse_body(Format::OpenAI, segmentation).dimensions, Vec::new());
+        assert_eq!(
+            parse_body(Format::Codex, segmentation).dimensions,
+            vec![
+                ("images_processed", Dimension::Count(2)),
+                ("video_frames_processed", Dimension::Count(0)),
+            ]
+        );
+    }
+
+    /// The billed units of a Responses usage an executor reports, streamed or as a buffered
+    /// body, reach the record as their own dimensions in their own units: xAI ticks, nano-USD
+    /// and tool counts as integers, Codex rollout budget units as the number the upstream wrote.
+    /// A token count is recorded only when the usage reports it as a number: an absent, null or
+    /// non-numeric count is left out and never enters a derived total or the breakdown, and
+    /// without both input and output the breakdown classifies nothing. A body without usage, or
+    /// with an empty one, records no count.
+    #[test]
+    fn responses_billed_units_reach_the_record() {
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAI,
+            Format::OpenAI,
+            "m",
+            b"{}",
+            false,
+            &crate::inference::dispatch::Trace::default(),
+        ));
+        let terminal = |usage: &str| format!(r#"data: {{"type":"response.completed","response":{{"usage":{usage}}}}}"#);
+        let body = |usage: &str| format!(r#"{{"data":[{{"b64_json":"AAAA"}}],"usage":{usage}}}"#);
+        let ticks = serde_json::json!({"cost_in_usd_ticks":200000000});
+        let none = serde_json::json!({});
+        for (provider, streamed, upstream, dimensions, tokens, literal) in [
+            (
+                "xai",
+                true,
+                terminal(
+                    r#"{"input_tokens":5,"output_tokens":2,"total_tokens":7,"cost_in_usd_ticks":158100000,"cost_in_nano_usd":15810000,"num_server_side_tools_used":1,"server_side_tool_usage_details":{"x_posts_fetched":7}}"#,
+                ),
+                serde_json::json!({"cost_in_usd_ticks":158100000,"cost_in_nano_usd":15810000,"num_server_side_tools_used":1,"x_posts_fetched":7}),
+                serde_json::json!({"input_tokens":5,"output_tokens":2,"total_tokens":7}),
+                "",
+            ),
+            (
+                "codex",
+                true,
+                terminal(r#"{"input_tokens":100,"input_tokens_details":{"cached_tokens":40},"output_tokens":10,"output_tokens_details":{"reasoning_tokens":4},"total_tokens":110,"codex_rollout_budget_units":2.50}"#),
+                serde_json::json!({"codex_rollout_budget_units":2.5}),
+                serde_json::json!({"input_tokens":100,"output_tokens":10,"reasoning_tokens":4,"cached_tokens":40,"cache_read_tokens":40,"total_tokens":110}),
+                r#""codex_rollout_budget_units":2.50"#,
+            ),
+            (
+                "xai",
+                false,
+                body(r#"{"input_tokens":3,"output_tokens":0,"total_tokens":3,"cost_in_usd_ticks":200000000}"#),
+                ticks.clone(),
+                serde_json::json!({"input_tokens":3,"output_tokens":0,"total_tokens":3}),
+                "",
+            ),
+            (
+                "xai",
+                false,
+                r#"{"status":"done","video":{"url":"https://v.example/out.mp4"},"usage":{"cost_in_usd_ticks":5000000000}}"#.to_owned(),
+                serde_json::json!({"cost_in_usd_ticks":5000000000_u64}),
+                none.clone(),
+                "",
+            ),
+            ("xai", false, r#"{"status":"pending"}"#.to_owned(), Value::Null, none.clone(), ""),
+            ("xai", false, r#"{"status":"pending","usage":{}}"#.to_owned(), Value::Null, none.clone(), ""),
+            (
+                "codex",
+                true,
+                terminal(r#"{"codex_rollout_budget_units":2.50}"#),
+                serde_json::json!({"codex_rollout_budget_units":2.5}),
+                none.clone(),
+                r#""codex_rollout_budget_units":2.50"#,
+            ),
+            (
+                "xai",
+                true,
+                terminal(r#"{"cost_in_usd_ticks":5000000000}"#),
+                serde_json::json!({"cost_in_usd_ticks":5000000000_u64}),
+                none.clone(),
+                "",
+            ),
+            (
+                "xai",
+                true,
+                r#"data: {"type":"response.completed","response":{"service_tier":"priority","usage":{"cost_in_usd_ticks":5000000000}}}"#.to_owned(),
+                serde_json::json!({"cost_in_usd_ticks":5000000000_u64}),
+                none.clone(),
+                r#""response_service_tier":"priority""#,
+            ),
+            // A total the usage omits is its input and output's sum, as the canonical reader
+            // derives it.
+            (
+                "xai",
+                false,
+                body(r#"{"cost_in_usd_ticks":200000000,"input_tokens":4,"output_tokens":1}"#),
+                ticks.clone(),
+                serde_json::json!({"input_tokens":4,"output_tokens":1,"total_tokens":5}),
+                "",
+            ),
+            // A cache count without input, output or total is still a reported count.
+            (
+                "xai",
+                false,
+                body(r#"{"input_tokens_details":{"cached_tokens":3}}"#),
+                Value::Null,
+                serde_json::json!({"cached_tokens":3,"cache_read_tokens":3}),
+                "",
+            ),
+            // Partial, null and non-numeric token counts: only the numbers are recorded, and only
+            // they enter a derived total or the breakdown.
+            (
+                "xai",
+                false,
+                body(r#"{"input_tokens":3,"output_tokens":2,"total_tokens":"999","cost_in_usd_ticks":100}"#),
+                serde_json::json!({"cost_in_usd_ticks":100}),
+                serde_json::json!({"input_tokens":3,"output_tokens":2,"total_tokens":5}),
+                "",
+            ),
+            (
+                "xai",
+                false,
+                body(r#"{"input_tokens":3,"output_tokens":2,"input_tokens_details":{"cached_tokens":"2"},"cost_in_usd_ticks":100}"#),
+                serde_json::json!({"cost_in_usd_ticks":100}),
+                serde_json::json!({"input_tokens":3,"output_tokens":2,"total_tokens":5}),
+                "",
+            ),
+            (
+                "xai",
+                false,
+                body(r#"{"cost_in_usd_ticks":200000000,"input_tokens":3}"#),
+                ticks.clone(),
+                serde_json::json!({"input_tokens":3}),
+                "",
+            ),
+            (
+                "xai",
+                false,
+                body(r#"{"cost_in_usd_ticks":200000000,"input_tokens":null}"#),
+                ticks.clone(),
+                none.clone(),
+                "",
+            ),
+            (
+                "xai",
+                false,
+                body(r#"{"cost_in_usd_ticks":200000000,"input_tokens":"3","output_tokens":2,"total_tokens":null,"input_tokens_details":{"cached_tokens":null}}"#),
+                ticks.clone(),
+                serde_json::json!({"output_tokens":2}),
+                "",
+            ),
+            (
+                "xai",
+                true,
+                terminal(r#"{"input_tokens":3,"output_tokens":null,"cost_in_usd_ticks":200000000}"#),
+                ticks.clone(),
+                serde_json::json!({"input_tokens":3}),
+                "",
+            ),
+        ] {
+            let tracker = Tracker::start(&rt, &facts, &credential_for(provider), "m");
+            if streamed {
+                tracker.sink().response_line(Format::Codex, upstream.as_bytes());
+            } else {
+                tracker.sink().response_body(Format::Codex, upstream.as_bytes());
+            }
+            tracker.succeed();
+            let raw = rt.usage_queue().pop_oldest(10);
+            let record: Value = serde_json::from_slice(&raw[0]).unwrap();
+            let got = record.get("dimensions").cloned().unwrap_or(Value::Null);
+            assert_eq!(got, dimensions, "{upstream}");
+            let counts: serde_json::Map<String, Value> = record["tokens"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(name, value)| value.is_number() && !name.contains("_tokens_") && !name.contains("_5m") && !name.contains("_1h"))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            assert_eq!(Value::Object(counts), tokens, "{upstream}");
+            // The breakdown holds only recorded counts: its total is the record's, or zero when
+            // unreported, and with both input and output so are its cache reads.
+            let breakdown = &record["token_breakdown"];
+            let recorded = |name: &str| tokens.get(name).cloned().unwrap_or(Value::from(0));
+            assert_eq!(breakdown["total_tokens"], recorded("total_tokens"), "{upstream}");
+            if tokens.get("input_tokens").is_some() && tokens.get("output_tokens").is_some() {
+                assert_eq!(
+                    breakdown["input"]["cache_read_tokens"],
+                    recorded("cache_read_tokens"),
+                    "{upstream}"
+                );
+            }
+            // Without both input and output the breakdown classifies nothing.
+            if tokens.get("input_tokens").is_none() || tokens.get("output_tokens").is_none() {
+                let breakdown = &record["token_breakdown"];
+                assert_eq!(
+                    (&breakdown["input"]["total_tokens"], &breakdown["output"]["total_tokens"]),
+                    (&Value::from(0), &Value::from(0)),
+                    "{upstream}"
+                );
+            }
+            assert!(String::from_utf8_lossy(&raw[0]).contains(literal), "{upstream}");
+        }
+    }
+
+    /// Gemini reports its tier inside `usageMetadata`, on the buffered and streamed paths.
+    #[test]
+    fn gemini_usage_tier_is_the_response_tier() {
+        let body = br#"{"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4,"serviceTier":"priority"}}"#;
+        assert_eq!(parse_gemini(body).response_service_tier, "priority");
+        let mut stream = StreamUsage::default();
+        stream.line(Format::Gemini, &[b"data: ".as_slice(), body].concat());
+        assert_eq!(stream.detail().unwrap().response_service_tier, "priority");
+    }
+
+    /// Billing evidence in a stream is kept whatever the token counts: a chunk with a tier but
+    /// no tokens keeps its tier for the later counts, and each usage member's latest dimensions
+    /// replace its earlier ones while an unreported member keeps them.
+    #[test]
+    fn streamed_billing_evidence_is_independent_of_token_counts() {
+        use super::super::usage_snapshot::Dimension::Count;
+        let gemini_counts = r#"{"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}}"#;
+        let chat = |details: &str| format!(r#"{{"usage":{{"prompt_tokens":3,"completion_tokens":1{details}}}}}"#);
+        for (format, lines, tier, dimensions) in [
+            (
+                Format::Gemini,
+                vec![
+                    r#"{"usageMetadata":{"serviceTier":"priority"}}"#.to_owned(),
+                    gemini_counts.to_owned(),
+                ],
+                "priority",
+                vec![],
+            ),
+            (
+                Format::Interactions,
+                vec![
+                    r#"{"interaction":{"service_tier":"priority","usage":{}}}"#.to_owned(),
+                    gemini_counts.to_owned(),
+                ],
+                "priority",
+                vec![],
+            ),
+            (
+                Format::OpenAI,
+                vec![
+                    chat(r#","prompt_tokens_details":{"audio_tokens":2}"#),
+                    chat(r#","prompt_tokens_details":{"audio_tokens":5}"#),
+                ],
+                "",
+                vec![("input_audio_tokens", Count(5))],
+            ),
+            (
+                Format::OpenAI,
+                vec![chat(r#","prompt_tokens_details":{"audio_tokens":2}"#), chat("")],
+                "",
+                vec![("input_audio_tokens", Count(2))],
+            ),
+        ] {
+            let mut stream = StreamUsage::default();
+            for line in &lines {
+                stream.line(format, format!("data: {line}").as_bytes());
+            }
+            let detail = stream.detail().unwrap();
+            assert!(has_tokens(detail), "{lines:?}");
+            assert_eq!(
+                (detail.response_service_tier.as_str(), &detail.dimensions),
+                (tier, &dimensions),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[test]
     fn claude_executor_outcomes_reach_the_queue() {
         use ck_core::exec::{ExecError, FailureScope};
         let rt = usage_runtime();
@@ -2505,6 +3635,256 @@ mod tests {
         }
     }
 
+    /// What an executor reports reaches the queued record's token counts: one record whose counts
+    /// are the upstream's, whatever shape the provider reports them in.
+    #[test]
+    fn provider_reported_usage_reaches_the_record() {
+        // Anthropic on-demand compaction bills only in `iterations` and leaves the top level at 0;
+        // server-side compaction leaves its iteration out of the top level.
+        const COMPACTED: &str = r#"{"input_tokens":0,"output_tokens":0,"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217}]}"#;
+        const ITERATION_WRITES: &str = r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217,"cache_read_input_tokens":0,"cache_creation_input_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":15}}]}"#;
+        const ITERATION_WRITES_UNSPLIT: &str = r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":0},"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217,"cache_read_input_tokens":0,"cache_creation_input_tokens":20}]}"#;
+        const SERVER_COMPACTED: &str = r#"{"input_tokens":30,"output_tokens":5,"iterations":[{"type":"compaction","input_tokens":119,"output_tokens":217},{"type":"message","input_tokens":30,"output_tokens":5}]}"#;
+        // Kimi reports each choice's usage in that choice's last chunk: the same prompt, its own
+        // completion.
+        let choice = |index: u8, completion: u8| {
+            format!(
+                r#"data: {{"id":"c","model":"kimi-k3","choices":[{{"index":{index},"delta":{{}},"finish_reason":"stop","usage":{{"prompt_tokens":10,"completion_tokens":{completion},"total_tokens":{}}}}}]}}"#,
+                10 + u16::from(completion)
+            )
+        };
+        let aggregate = r#"data: {"id":"c","model":"kimi-k3","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":13,"total_tokens":23}}"#;
+        // Kimi bills a cache write by the TTL it was written with; the usage reports no TTL.
+        let chat_request = |options: &str| format!(r#"{{"model":"kimi-k3","messages":[]{options}}}"#);
+        let chat_write = r#"data: {"id":"c","model":"kimi-k3","choices":[],"usage":{"prompt_tokens":300,"completion_tokens":5,"total_tokens":305,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":256}}}"#;
+        let responses_write = |ttl: &str| {
+            format!(
+                r#"{{"id":"r","object":"response","prompt_cache_options":{{"mode":"implicit","ttl":"{ttl}"}},"usage":{{"input_tokens":300,"output_tokens":5,"total_tokens":305,"input_tokens_details":{{"cached_tokens":0,"cache_write_tokens":256}}}}}}"#
+            )
+        };
+        enum Report {
+            Body(Format, String),
+            Lines(Format, Vec<String>),
+            /// The lines, then an upstream failure that keeps the usage seen so far.
+            Cut(Format, Vec<String>),
+        }
+        let claude_lines = |usage: &str| {
+            vec![
+                r#"data: {"type":"message_start","message":{"model":"claude-haiku-5-5","usage":{"input_tokens":0,"output_tokens":0}}}"#.to_owned(),
+                format!(r#"data: {{"type":"message_delta","delta":{{"stop_reason":"compaction"}},"usage":{usage}}}"#),
+            ]
+        };
+        // (label, provider, request as (identifier, body), report, expected tokens).
+        type Row = (
+            &'static str,
+            &'static str,
+            Option<(&'static str, String)>,
+            Report,
+            Value,
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "buffered compaction bills its iterations",
+                "claude",
+                None,
+                Report::Body(Format::Claude, format!(r#"{{"usage":{COMPACTED}}}"#)),
+                serde_json::json!({"input_tokens": 119, "output_tokens": 217, "total_tokens": 336}),
+            ),
+            (
+                "streamed compaction bills its iterations",
+                "claude",
+                None,
+                Report::Lines(Format::Claude, claude_lines(COMPACTED)),
+                serde_json::json!({"input_tokens": 119, "output_tokens": 217, "total_tokens": 336}),
+            ),
+            (
+                "server-side compaction bills every iteration",
+                "claude",
+                None,
+                Report::Body(Format::Claude, format!(r#"{{"usage":{SERVER_COMPACTED}}}"#)),
+                serde_json::json!({"input_tokens": 149, "output_tokens": 222, "total_tokens": 371}),
+            ),
+            (
+                "compaction iteration cache writes keep their TTL split",
+                "claude",
+                None,
+                Report::Lines(Format::Claude, claude_lines(ITERATION_WRITES)),
+                serde_json::json!({"input_tokens": 119, "cache_creation_tokens": 20, "cache_creation_5m_tokens": 5, "cache_creation_1h_tokens": 15}),
+            ),
+            (
+                "a top-level TTL split does not cover compaction iteration writes",
+                "claude",
+                None,
+                Report::Lines(Format::Claude, claude_lines(ITERATION_WRITES_UNSPLIT)),
+                serde_json::json!({"input_tokens": 119, "cache_creation_tokens": 20}),
+            ),
+            (
+                "choice usage counts the prompt once and each completion",
+                "kimi",
+                None,
+                Report::Lines(Format::OpenAI, vec![choice(0, 5), choice(1, 7)]),
+                serde_json::json!({"input_tokens": 10, "output_tokens": 12, "total_tokens": 22}),
+            ),
+            (
+                "a later choice report replaces that choice's",
+                "kimi",
+                None,
+                Report::Lines(Format::OpenAI, vec![choice(0, 5), choice(1, 7), choice(1, 9)]),
+                serde_json::json!({"input_tokens": 10, "output_tokens": 14, "total_tokens": 24}),
+            ),
+            (
+                "an aggregate after choice usage replaces it",
+                "kimi",
+                None,
+                Report::Lines(Format::OpenAI, vec![choice(0, 5), choice(1, 7), aggregate.to_owned()]),
+                serde_json::json!({"input_tokens": 10, "output_tokens": 13, "total_tokens": 23}),
+            ),
+            (
+                "a disconnect keeps the choice usage already reported",
+                "kimi",
+                None,
+                Report::Cut(Format::OpenAI, vec![choice(0, 5)]),
+                serde_json::json!({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}),
+            ),
+            (
+                "a Chat cache write is billed at the requested 1h TTL",
+                "kimi",
+                Some(("kimi", chat_request(
+                    r#","prompt_cache_options":{"mode":"implicit","ttl":"1h"}"#,
+                ))),
+                Report::Lines(Format::OpenAI, vec![chat_write.to_owned()]),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_1h_tokens": 256}),
+            ),
+            (
+                "a Kimi.ai Chat cache write is billed at the requested 1h TTL",
+                "kimi-ai",
+                Some((
+                    "kimi",
+                    chat_request(r#","prompt_cache_options":{"mode":"implicit","ttl":"1h"}"#),
+                )),
+                Report::Lines(Format::OpenAI, vec![chat_write.to_owned()]),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_1h_tokens": 256}),
+            ),
+            (
+                "a Chat cache write is billed at the requested 5m TTL",
+                "kimi",
+                Some(("kimi", chat_request(
+                    r#","prompt_cache_options":{"mode":"implicit","ttl":"5m"}"#,
+                ))),
+                Report::Lines(Format::OpenAI, vec![chat_write.to_owned()]),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_5m_tokens": 256}),
+            ),
+            (
+                "a Chat cache write without options is billed at the default 5m TTL",
+                "kimi",
+                Some(("kimi", chat_request(""))),
+                Report::Lines(Format::OpenAI, vec![chat_write.to_owned()]),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_5m_tokens": 256}),
+            ),
+            (
+                "a delegated Messages response keeps the TTL buckets it reports",
+                "kimi",
+                Some((
+                    "claude",
+                    r#"{"model":"kimi-k3.1-pro","max_tokens":16,"messages":[],"cache_control":{"type":"ephemeral","ttl":"1h"}}"#.to_owned(),
+                )),
+                Report::Body(
+                    Format::Claude,
+                    r#"{"usage":{"input_tokens":9,"output_tokens":1,"cache_creation_input_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":7,"ephemeral_1h_input_tokens":5}}}"#.to_owned(),
+                ),
+                serde_json::json!({"cache_creation_tokens": 12, "cache_creation_5m_tokens": 7, "cache_creation_1h_tokens": 5}),
+            ),
+            (
+                "a Kimi Messages write without a TTL split fills no bucket",
+                "kimi",
+                Some((
+                    "claude",
+                    r#"{"model":"kimi-k3.1-pro","max_tokens":16,"messages":[],"cache_control":{"type":"ephemeral","ttl":"1h"}}"#.to_owned(),
+                )),
+                Report::Lines(
+                    Format::Claude,
+                    vec![
+                        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#.to_owned(),
+                        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":12}}"#.to_owned(),
+                    ],
+                ),
+                serde_json::json!({"cache_creation_tokens": 12}),
+            ),
+            (
+                "a response without a cache write fills no TTL bucket",
+                "kimi",
+                Some(("kimi", chat_request(
+                    r#","prompt_cache_options":{"mode":"implicit","ttl":"1h"}"#,
+                ))),
+                Report::Lines(Format::OpenAI, vec![choice(0, 5)]),
+                serde_json::json!({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}),
+            ),
+            (
+                "a Responses cache write is billed at the applied TTL, not the requested one",
+                "kimi",
+                Some(("kimi", r#"{"model":"kimi-k3","input":"hi","prompt_cache_options":{"ttl":"5m"}}"#.to_owned())),
+                Report::Body(Format::Codex, responses_write("1h")),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_1h_tokens": 256}),
+            ),
+            (
+                "a streamed Responses cache write is billed at the applied TTL",
+                "kimi",
+                Some(("kimi", r#"{"model":"kimi-k3","input":"hi","prompt_cache_options":{"ttl":"1h"}}"#.to_owned())),
+                // What the Kimi executor's stream tap reports: each event live without its usage,
+                // then the held usage once the stream succeeded.
+                Report::Lines(
+                    Format::Codex,
+                    vec![
+                        r#"data: {"type":"response.completed","response":{"prompt_cache_options":{"mode":"implicit","ttl":"5m"}}}"#.to_owned(),
+                        r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":300,"output_tokens":5,"total_tokens":305,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":256}}}}"#.to_owned(),
+                    ],
+                ),
+                serde_json::json!({"input_tokens": 300, "output_tokens": 5, "total_tokens": 305, "cache_creation_tokens": 256, "cache_creation_5m_tokens": 256}),
+            ),
+        ];
+        let rt = usage_runtime();
+        for (label, provider, request, report, expected) in rows {
+            let facts = std::sync::Arc::new(Facts::new(
+                Client::default(),
+                Format::OpenAI,
+                Format::OpenAI,
+                "m",
+                b"{}",
+                true,
+                &crate::inference::dispatch::Trace::default(),
+            ));
+            let tracker = Tracker::start(&rt, &facts, &credential_for(provider), "m");
+            let sink = tracker.sink();
+            if let Some((identifier, request)) = request {
+                sink.request_for(identifier, request.as_bytes());
+            }
+            match report {
+                Report::Body(format, body) => sink.response_body(format, body.as_bytes()),
+                Report::Lines(format, lines) => lines.iter().for_each(|l| sink.response_line(format, l.as_bytes())),
+                Report::Cut(format, lines) => {
+                    lines.iter().for_each(|l| sink.response_line(format, l.as_bytes()));
+                    sink.publish_failure_with_usage(0, "upstream stream ended");
+                }
+            }
+            tracker.succeed();
+            let raw = rt.usage_queue().pop_oldest(10);
+            assert_eq!(raw.len(), 1, "{label}: one record");
+            let tokens = &serde_json::from_slice::<Value>(&raw[0]).unwrap()["tokens"];
+            let got: serde_json::Map<String, Value> = expected
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| (k.clone(), tokens[k].clone()))
+                .collect();
+            assert_eq!(Value::Object(got), expected, "{label}: {tokens}");
+            for bucket in ["cache_creation_5m_tokens", "cache_creation_1h_tokens"] {
+                if expected.get(bucket).is_none() {
+                    assert!(tokens.get(bucket).is_none(), "{label}: {tokens}");
+                }
+            }
+        }
+    }
+
     /// Records from Go's real parsers, `UsageReporter` and `usageQueuePlugin`
     /// (tests/reference/server/main.go `usageRecords`), byte for byte.
     #[test]
@@ -2599,9 +3979,10 @@ mod tests {
                             .collect()
                     })
                     .unwrap_or_default(),
-                // Go's record has neither: none are written.
+                // Go's record has none of these: none are written.
                 prompt_prefix_hash: String::new(),
                 claude_cache: None,
+                usage_scope: String::new(),
                 usage_observed: None,
                 timings: Timings::default(),
             };

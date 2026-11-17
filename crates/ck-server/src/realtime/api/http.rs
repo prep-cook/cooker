@@ -1,5 +1,9 @@
 //! Call negotiation (`Handler.Handle`), hangup (`HandleHangup`) and the capability
 //! stubs (capabilities.go).
+//!
+//! A WebRTC call terminates on the media relay; without one it answers 501. A stored call's
+//! `oai-events` data channel runs as a live session ([`super::session::run_call`]), whose end
+//! closes the call and both media peers.
 
 use std::sync::Arc;
 
@@ -15,6 +19,7 @@ use ck_exec::codex_live::{self as live, BodyError, LiveTarget, ShapeError};
 use futures_util::StreamExt;
 
 use super::calls::Call;
+use super::session::{self, Opened};
 use super::{
     Live, Principal, header_session, live_error, panic_response, realtime_error, select_oauth, trace, with_trace,
 };
@@ -249,15 +254,19 @@ pub(super) async fn call(
         .unwrap_or_default();
     let shaped = live::prepare(&body, &header_text(&headers, header::CONTENT_TYPE))
         .and_then(|call| live::apply_client_secret(call, secret_session))
-        .and_then(live::rewrite_model);
-    let call = match shaped {
-        Ok(call) => call,
+        .and_then(|call| {
+            let requested = call.model.clone();
+            live::rewrite_model(call).map(|call| (requested, call))
+        });
+    let (requested, call) = match shaped {
+        Ok(shaped) => shaped,
         Err(ShapeError::Invalid(message)) => return fail(400, &message),
         Err(ShapeError::NilMap) => return panic_response(),
     };
     let (cfg, relay) = live_state.relays.snapshot(|| rt.config());
     let relay = match relay {
-        Ok(relay) => relay,
+        Ok(Some(relay)) => relay,
+        Ok(None) => return no_relay(realtime),
         Err(message) => return fail(503, &message),
     };
     let selection_headers = principal.selection_headers(&headers);
@@ -273,36 +282,34 @@ pub(super) async fn call(
     };
     let trace = trace(&credential);
     let traced = |response| with_trace(response, &trace);
-    let (mut upstream_body, mut upstream_content_type) = (call.body, call.content_type);
-    if let Some(relay) = relay {
-        let offer = match live::request_sdp(&upstream_body, &upstream_content_type) {
-            Ok(offer) => offer,
-            Err(message) => return traced(fail(400, &message)),
-        };
-        let route = super::relay::Route {
-            proxy_url: ck_exec::proxy::Proxy::effective_url(&credential, &cfg),
-            credential: media_credential_name(&credential),
-            auth_index: ck_core::config::credentials::auth_index(&credential),
-        };
-        // Setup shares the lease: if this request goes away mid-setup, the relay keeps it
-        // until the half-built session finished closing.
-        let shared_lease = Arc::new(std::sync::Mutex::new(held.lease.take()));
-        let created = relay.new_session(offer, route, Box::new(shared_lease.clone())).await;
-        held.lease = shared_lease
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let (session, upstream_offer) = match created {
-            Ok(created) => created,
-            Err(e) => return traced(fail(e.status, &e.message)),
-        };
-        held.media = Some(session);
-        match live::replace_sdp(&upstream_body, &upstream_content_type, &upstream_offer) {
-            Ok((body, content_type)) => (upstream_body, upstream_content_type) = (body, content_type),
+    let offer = match live::request_sdp(&call.body, &call.content_type) {
+        Ok(offer) => offer,
+        Err(message) => return traced(fail(400, &message)),
+    };
+    let route = super::relay::Route {
+        proxy_url: ck_exec::proxy::Proxy::effective_url(&credential, &cfg),
+        credential: media_credential_name(&credential),
+        auth_index: ck_core::config::credentials::auth_index(&credential),
+    };
+    // Setup shares the lease: if this request goes away mid-setup, the relay keeps it
+    // until the half-built session finished closing.
+    let shared_lease = Arc::new(std::sync::Mutex::new(held.lease.take()));
+    let created = relay.new_session(offer, route, Box::new(shared_lease.clone())).await;
+    held.lease = shared_lease
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let (media, upstream_offer) = match created {
+        Ok(created) => created,
+        Err(e) => return traced(fail(e.status, &e.message)),
+    };
+    held.media = Some(media.clone());
+    let (upstream_body, upstream_content_type) =
+        match live::replace_sdp(&call.body, &call.content_type, &upstream_offer) {
+            Ok(replaced) => replaced,
             Err(ShapeError::Invalid(message)) => return traced(fail(400, &message)),
             Err(ShapeError::NilMap) => return traced(panic_response()),
-        }
-    }
+        };
     let session_id = super::session_id(&selection_headers, &body);
     let mut upstream_headers = live::protocol_headers(&headers);
     upstream_headers.push(("Content-Type".into(), upstream_content_type));
@@ -343,36 +350,25 @@ pub(super) async fn call(
         return traced(fail(502, message));
     }
     let success = (200..300).contains(&status);
-    let mut call_id = String::new();
+    let mut on_failure: Option<Box<dyn FnOnce() + Send>> = None;
     if success {
-        call_id = live::call_id_from_location(&location);
-        if call_id.is_empty() && held.media.is_some() {
+        let call_id = live::call_id_from_location(&location);
+        if call_id.is_empty() {
             return traced(fail(502, "Codex live response is missing a valid call ID"));
         }
-        if let Some(session) = &held.media {
-            session.set_call_id(&call_id);
-        }
-        if !call_id.is_empty()
-            && realtime
-            && let Ok(value) = HeaderValue::from_str(&format!("/v1/realtime/calls/{call_id}"))
-        {
+        media.set_call_id(&call_id);
+        if realtime && let Ok(value) = HeaderValue::from_str(&format!("/v1/realtime/calls/{call_id}")) {
             response_headers.insert(header::LOCATION, value);
         }
-    }
-    if success && let Some(session) = &held.media {
         let answer = match live::response_sdp(&data, &upstream_content_type) {
             Ok(answer) => answer,
             Err(message) => return traced(fail(502, &message)),
         };
-        match session.accept_upstream_answer(answer).await {
+        match media.accept_upstream_answer(answer).await {
             Ok(downstream) => data = downstream.into_bytes(),
             Err(e) => return traced(fail(e.status, &e.message)),
         }
         response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/sdp"));
-    }
-    let mut on_failure: Option<Box<dyn FnOnce() + Send>> = None;
-    if success && !call_id.is_empty() {
-        let media = held.media.take();
         let stored = live_state.calls.put(
             &call_id,
             Call {
@@ -385,22 +381,36 @@ pub(super) async fn call(
                     .as_ref()
                     .map(|g| g.principal.clone())
                     .unwrap_or_default(),
-                media: media.clone(),
+                media: Some(media.clone()),
                 ..Call::default()
             },
         );
         if let Some(stored) = stored {
-            // The media ending on its own, or the answer never reaching the client, ends
+            held.media = None;
+            // The data channel session ending, or the answer never reaching the client, ends
             // the call; weak, so the call can drop.
             let calls = Arc::downgrade(&live_state.calls);
             let (id, token) = (stored.call_id.clone(), stored.token);
-            if let Some(media) = media {
+            if let Some(events) = media.events() {
+                let opened = Opened {
+                    rt: rt.clone(),
+                    settings: live_state.settings,
+                    owner: principal.owner(),
+                    events: ck_translate::realtime::Events::Realtime,
+                    model: Some(requested.clone()),
+                    upstream_model: call.model.clone(),
+                    credential: credential.clone(),
+                    call_id: Some(id.clone()),
+                    facts: principal.facts(&cfg, &headers, &format!("POST {}", uri.path()), &requested),
+                    hangup: stored.ended.clone(),
+                };
                 let (calls, id) = (calls.clone(), id.clone());
-                media.set_close_handler(Box::new(move |reason| {
+                tokio::spawn(async move {
+                    let cause = session::run_call(opened, events, &*media).await;
                     if let Some(calls) = calls.upgrade() {
-                        calls.complete_token(&id, token, &reason);
+                        calls.complete_token(&id, token, cause);
                     }
-                }));
+                });
             }
             on_failure = Some(Box::new(move || {
                 if let Some(calls) = calls.upgrade() {
@@ -614,6 +624,16 @@ pub(super) async fn hangup(
     traced(written(status, response_headers, data))
 }
 
+/// A WebRTC call without the media relay: nothing may carry its media past this host.
+fn no_relay(realtime: bool) -> Response {
+    const MESSAGE: &str = "WebRTC calls are not available on this server; connect over the Realtime WebSocket instead";
+    if realtime {
+        realtime_error(501, MESSAGE, "not_supported_error", "realtime_capability_not_supported")
+    } else {
+        live_error(false, 501, MESSAGE)
+    }
+}
+
 /// `writeCapabilityNotSupported`.
 fn not_supported(capability: &str) -> Response {
     realtime_error(
@@ -701,15 +721,18 @@ mod tests {
 }
 
 /// Go live_test.go's relay cases (`TestHandlerRelaysWebRTCMediaSDP`,
-/// `TestHandlerClosesUnretainedMediaSession`) with a fake relay.
+/// `TestHandlerClosesUnretainedMediaSession`) with a fake relay, and the call's data channel
+/// as a live session.
 #[cfg(test)]
 mod relay_tests {
     use std::sync::Mutex;
 
     use axum::extract::State as AxumState;
+    use ck_exec::session::Frame;
     use futures_util::future::BoxFuture;
+    use tokio::sync::mpsc;
 
-    use super::super::relay::{Hold, MediaRelay, MediaSession, NewSession, RelayError, Route};
+    use super::super::relay::{Events, Hold, MediaRelay, MediaSession, NewSession, RelayError, Route, Rtp};
     use super::*;
 
     #[derive(Default)]
@@ -720,7 +743,36 @@ mod relay_tests {
         call_id: Mutex<String>,
         call_id_at_accept: Mutex<String>,
         closed: Mutex<Option<String>>,
-        handler: Mutex<Option<super::super::relay::CloseHandler>>,
+        events: Mutex<Option<Events>>,
+    }
+
+    /// The far ends of a fake call's data channel: what each peer sends, and what reaches it.
+    struct Peers {
+        client: mpsc::Sender<Frame>,
+        to_client: mpsc::Receiver<Frame>,
+        upstream: mpsc::Sender<Frame>,
+        to_upstream: mpsc::Receiver<Frame>,
+    }
+
+    impl FakeSession {
+        fn with_events(&self) -> Peers {
+            let (client, from_client) = mpsc::channel(8);
+            let (to_client_tx, to_client) = mpsc::channel(8);
+            let (upstream, from_upstream) = mpsc::channel(8);
+            let (to_upstream_tx, to_upstream) = mpsc::channel(8);
+            *self.events.lock().unwrap() = Some(Events {
+                from_client,
+                to_client: to_client_tx,
+                from_upstream,
+                to_upstream: to_upstream_tx,
+            });
+            Peers {
+                client,
+                to_client,
+                upstream,
+                to_upstream,
+            }
+        }
     }
 
     impl MediaSession for FakeSession {
@@ -737,8 +789,14 @@ mod relay_tests {
         fn set_call_id(&self, call_id: &str) {
             *self.call_id.lock().unwrap() = call_id.into();
         }
-        fn set_close_handler(&self, handler: super::super::relay::CloseHandler) {
-            *self.handler.lock().unwrap() = Some(handler);
+        fn events(&self) -> Option<Events> {
+            self.events.lock().unwrap().take()
+        }
+        fn rtp(&self) -> Rtp {
+            Rtp {
+                client: [3, 30],
+                upstream: [4, 40],
+            }
         }
         fn close(&self, reason: &str) {
             self.closed.lock().unwrap().get_or_insert_with(|| reason.into());
@@ -782,6 +840,17 @@ mod relay_tests {
         location: Option<&'static str>,
         yaml: &str,
     ) -> (String, Arc<Live>, Seen) {
+        let (proxy, live, seen, _) = start_runtime(relay, status, location, yaml).await;
+        (proxy, live, seen)
+    }
+
+    /// [`start`] and its runtime.
+    async fn start_runtime(
+        relay: Option<Arc<FakeRelay>>,
+        status: u16,
+        location: Option<&'static str>,
+        yaml: &str,
+    ) -> (String, Arc<Live>, Seen, Arc<Runtime>) {
         let seen = Seen::default();
         let upstream = axum::Router::new()
             .fallback(move |AxumState(seen): AxumState<Seen>, body: Bytes| async move {
@@ -833,18 +902,22 @@ mod relay_tests {
         let live = Arc::new(live);
         let app = axum::Router::new()
             .merge(super::super::routes_with(&rt, live.clone()))
-            .with_state(rt);
-        (serve(app).await, live, seen)
+            .with_state(rt.clone());
+        (serve(app).await, live, seen, rt)
     }
 
     const BOUNDARY: &str = "media-relay-boundary";
 
     async fn post(proxy: &str) -> wreq::Response {
+        post_to(proxy, "/v1/live").await
+    }
+
+    async fn post_to(proxy: &str, path: &str) -> wreq::Response {
         let body = format!(
             "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"sdp\"\r\n\r\nv=0\r\no=desktop-offer\r\n\r\n--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"session\"\r\n\r\n{{\"model\":\"gpt-live-1-codex\"}}\r\n--{BOUNDARY}--\r\n"
         );
         wreq::Client::new()
-            .post(format!("{proxy}/v1/live"))
+            .post(format!("{proxy}{path}"))
             .header("content-type", format!("multipart/form-data; boundary={BOUNDARY}"))
             .body(body)
             .send()
@@ -902,10 +975,224 @@ mod relay_tests {
         );
         assert!(session.closed.lock().unwrap().is_none(), "retained session stays open");
         assert!(live.calls.peek("call-123").unwrap().media.is_some());
-        let handler = session.handler.lock().unwrap().take().expect("close handler installed");
-        handler("test_closed".into());
-        assert!(live.calls.peek("call-123").is_none(), "media closing ends the call");
-        assert_eq!(session.closed.lock().unwrap().as_deref(), Some("test_closed"));
+    }
+
+    /// No media goes straight to the upstream: without a relay, in a default build or with
+    /// `codex.live-media-relay` disabled, every call answers 501 before the upstream is asked.
+    #[tokio::test]
+    async fn calls_without_the_relay_answer_501() {
+        let (proxy, live, seen) = start(None, 201, Some("/v1/live/call-1"), "{}").await;
+        let message = "WebRTC calls are not available on this server; connect over the Realtime WebSocket instead";
+        // (route, response body)
+        let rows = [
+            ("/v1/live", format!(r#"{{"error":"{message}"}}"#)),
+            (
+                "/v1/realtime/calls",
+                format!(
+                    r#"{{"error":{{"message":"{message}","type":"not_supported_error","param":null,"code":"realtime_capability_not_supported"}}}}"#
+                ),
+            ),
+        ];
+        for (path, body) in rows {
+            let response = post_to(&proxy, path).await;
+            assert_eq!(response.status().as_u16(), 501, "{path}");
+            let text = response.text().await.unwrap();
+            let got: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let want: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(got, want, "{path}: {text}");
+        }
+        assert!(seen.lock().unwrap().is_empty(), "the upstream was never asked");
+        assert!(live.calls.peek("call-1").is_none());
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn ends(&self) -> Vec<String> {
+            let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+            text.lines()
+                .filter(|line| line.contains("live_session_end"))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    async fn next(rx: &mut mpsc::Receiver<Frame>) -> Option<Frame> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a message within 5 s")
+    }
+
+    fn text(json: &str) -> Frame {
+        Frame::Text(Bytes::from(json.to_owned()))
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Ending {
+        ClientClose,
+        ClientGone,
+        UpstreamClose,
+        UpstreamGone,
+        Hangup,
+    }
+
+    /// A stored call's `oai-events` data channel is a live session: admitted client messages
+    /// and upstream messages reach the other peer unchanged and in order, a refused one gets
+    /// the `error` event and never reaches the upstream, `response.done` usage is recorded per
+    /// response, and every end logs one `live_session_end`, forgets the call and closes both
+    /// media peers.
+    #[tokio::test]
+    async fn data_channel_runs_as_a_live_session() {
+        let capture = LogCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let append = r#"{ "type" :"input_audio_buffer.append","audio":"AAAA"}"#;
+        let create = r#"{"type":"response.create"}"#;
+        let created = r#"{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#;
+        let done = r#"{"type":"response.done","response":{"id":"resp_1","status":"completed","usage":{"total_tokens":15,"input_tokens":10,"output_tokens":5}}}"#;
+        // (how it ends, cause, initiator, the reason the media closed with)
+        let rows = [
+            (Ending::ClientClose, "client_close", "client", "client_close"),
+            (Ending::ClientGone, "client_gone", "client", "client_gone"),
+            (Ending::UpstreamClose, "upstream_close", "upstream", "upstream_close"),
+            (Ending::UpstreamGone, "upstream_gone", "upstream", "upstream_gone"),
+            (Ending::Hangup, "hangup", "client", "client_hangup"),
+        ];
+        for (ending, cause, initiator, closed) in rows {
+            capture.0.lock().unwrap().clear();
+            tracing::callsite::rebuild_interest_cache();
+            let relay = fake(None, None);
+            let peers = relay.session.with_events();
+            let (proxy, live, _, rt) = start_runtime(Some(relay.clone()), 201, Some("/v1/live/call-123"), "{}").await;
+            rt.usage_queue().configure(
+                true,
+                &ck_core::config::Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let response = post(&proxy).await;
+            assert_eq!(response.status().as_u16(), 201, "{}", response.text().await.unwrap());
+            let Peers {
+                client,
+                mut to_client,
+                upstream,
+                mut to_upstream,
+            } = peers;
+
+            client.send(text(append)).await.unwrap();
+            // Refused: an unknown event, and a model the call was not made for.
+            client.send(text(r#"{"type":"bogus.event"}"#)).await.unwrap();
+            client
+                .send(text(
+                    r#"{"type":"session.update","session":{"type":"realtime","model":"gpt-other"}}"#,
+                ))
+                .await
+                .unwrap();
+            client.send(text(create)).await.unwrap();
+            assert_eq!(next(&mut to_upstream).await, Some(text(append)), "{ending:?}");
+            for code in ["unknown_event_type", "invalid_value"] {
+                let Some(Frame::Text(refused)) = next(&mut to_client).await else {
+                    panic!("{ending:?}: no error event");
+                };
+                let refused: serde_json::Value = serde_json::from_slice(&refused).unwrap();
+                assert_eq!(refused["type"], "error", "{ending:?}");
+                assert_eq!(refused["error"]["code"], code, "{ending:?}: {refused}");
+            }
+            assert_eq!(
+                next(&mut to_upstream).await,
+                Some(text(create)),
+                "{ending:?}: the refused events never went upstream"
+            );
+            upstream.send(text(created)).await.unwrap();
+            upstream.send(text(done)).await.unwrap();
+            assert_eq!(next(&mut to_client).await, Some(text(created)), "{ending:?}");
+            assert_eq!(next(&mut to_client).await, Some(text(done)), "{ending:?}");
+
+            let mut kept = Vec::new();
+            match ending {
+                Ending::ClientClose => client.send(Frame::Close(None)).await.unwrap(),
+                Ending::ClientGone => drop(client),
+                Ending::UpstreamClose => upstream.send(Frame::Close(None)).await.unwrap(),
+                Ending::UpstreamGone => drop(upstream),
+                // What an accepted hangup does.
+                Ending::Hangup => {
+                    let call = live.calls.peek("call-123").unwrap();
+                    live.calls.complete(&call, "client_hangup");
+                }
+            }
+            for _ in 0..500 {
+                if !capture.ends().is_empty() && live.calls.peek("call-123").is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(live.calls.peek("call-123").is_none(), "{ending:?}: the call ended");
+            assert_eq!(
+                relay.session.closed.lock().unwrap().as_deref(),
+                Some(closed),
+                "{ending:?}: both media peers closed"
+            );
+            let ends = capture.ends();
+            assert_eq!(ends.len(), 1, "{ending:?}: {ends:?}");
+            let end = &ends[0];
+            for field in [
+                format!("cause=\"{cause}\""),
+                format!("initiator=\"{initiator}\""),
+                "call_id=\"call-123\"".to_owned(),
+                "client_rtp_packets=3".to_owned(),
+                "upstream_rtp_bytes=40".to_owned(),
+            ] {
+                assert!(end.contains(&field), "{ending:?}: {field} missing in {end}");
+            }
+            for absent in ["ping_interval_s", "input_audio_buffer", "AAAA"] {
+                assert!(!end.contains(absent), "{ending:?}: {absent} in {end}");
+            }
+
+            for _ in 0..500 {
+                kept.extend(rt.usage_queue().pop_oldest(10));
+                if kept.len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let mut usage: Vec<(String, Option<u64>, Option<u64>, String)> = kept
+                .iter()
+                .map(|record| {
+                    let record: serde_json::Value = serde_json::from_slice(record).unwrap();
+                    (
+                        record["usage_scope"].as_str().unwrap_or_default().to_owned(),
+                        record["tokens"]["input_tokens"].as_u64(),
+                        record["tokens"]["output_tokens"].as_u64(),
+                        record["endpoint"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect();
+            usage.sort();
+            let endpoint = "POST /v1/live".to_owned();
+            assert_eq!(
+                usage,
+                [
+                    (String::new(), None, None, endpoint.clone()),
+                    ("response:resp_1".into(), Some(10), Some(5), endpoint),
+                ],
+                "{ending:?}"
+            );
+        }
     }
 
     #[tokio::test]

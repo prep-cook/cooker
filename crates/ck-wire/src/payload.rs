@@ -23,6 +23,7 @@ use serde_yaml_ng::Value as Yaml;
 
 use crate::gostr::GoStr;
 use crate::json::{self, GoValue, Kind, Res};
+mod baseline;
 
 /// One request's context for payload rules (Go's parameters to
 /// `ApplyPayloadConfigWithTrackedPathsForExecutor`).
@@ -198,6 +199,11 @@ impl Rules {
     /// given.
     pub fn of(cfg: &Config) -> std::sync::Arc<Rules> {
         cfg.derived(Rules::from_config)
+    }
+
+    /// Whether any default rule is configured: only defaults read the request's baseline.
+    pub fn has_defaults(&self) -> bool {
+        !(self.default.is_empty() && self.default_raw.is_empty())
     }
 
     pub fn from_config(cfg: &Config) -> Self {
@@ -454,9 +460,8 @@ pub fn apply_tracked(
 fn edit(rules: &Rules, req: &Request<'_>, mut out: Vec<u8>, mark: &mut dyn FnMut(&str)) -> Vec<u8> {
     // Go: defaults check the original request, else the body as it entered (after the
     // Codex normalization, before image-generation stripping).
-    let needs_source = !(rules.default.is_empty() && rules.default_raw.is_empty());
-    let entered = (needs_source && req.original.is_empty()).then(|| out.clone());
-    let source: &[u8] = entered.as_deref().unwrap_or(req.original);
+    let entered = req.original.is_empty().then(|| rules.baseline(req.root, &out));
+    let source: &[u8] = entered.as_ref().and_then(Option::as_deref).unwrap_or(req.original);
     if strip_image_generation(rules.image_generation, req.request_path) {
         out = remove_tool_type(&out, &build_path(req.root, "tools"), "image_generation");
         out = remove_tool_choice(&out, &build_path(req.root, "tool_choice"), "image_generation");

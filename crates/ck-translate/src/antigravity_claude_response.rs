@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use base64::Engine;
 use ck_wire::json::{self as gj, GoValue, Res};
 use ck_wire::signature::{self as sig, Provider};
 use sha2::{Digest, Sha256};
@@ -40,38 +39,15 @@ fn model_name(translated: &[u8]) -> String {
     String::from_utf8_lossy(&gj::get(translated, "model").bytes()).into_owned()
 }
 
-/// decodeSignature: an `R` (double base64) signature decoded once; undecodable ones
-/// become empty.
-fn decode_signature(signature: &[u8]) -> Vec<u8> {
-    if signature.starts_with(b"R") {
-        return crate::gemini_responses::go_base64(true)
-            .decode(
-                signature
-                    .iter()
-                    .copied()
-                    .filter(|&c| c != b'\r' && c != b'\n')
-                    .collect::<Vec<u8>>(),
-            )
-            .unwrap_or_default();
-    }
-    signature.to_vec()
-}
-
-/// formatClaudeSignatureValue: Claude-group models get the provider-native `E` form.
-fn claude_signature_value(model: &str, signature: &[u8]) -> Vec<u8> {
-    if model_group(model) == "claude" {
-        decode_signature(signature)
-    } else {
-        signature.to_vec()
-    }
-}
-
-/// formatGeminiClaudeCarrierValue: Gemini targets wrap the signature in a carrier.
+/// formatGeminiClaudeCarrierValue: Gemini targets wrap the signature in a carrier; others get
+/// it unchanged.
 fn carrier_value(model: &str, signature: &[u8], direction: &str, target: &str) -> Vec<u8> {
     if sig::provider_from_model_name(model) == Provider::Gemini {
         encode_carrier(signature, direction, target)
     } else {
-        claude_signature_value(model, signature)
+        // Owner ruling 68: a Claude client gets the upstream's signature as sent;
+        // CLIProxyAPI's `formatClaudeSignatureValue` decodes the double-layer form here.
+        signature.to_vec()
     }
 }
 
@@ -436,12 +412,78 @@ pub(crate) fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
     })
 }
 
+/// The latest value the upstream sent for each usage count, zero included; `None` until a
+/// usage object carries that count.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct Sent {
+    prompt: Option<i64>,
+    cached: Option<i64>,
+    candidates: Option<i64>,
+    thoughts: Option<i64>,
+    total: Option<i64>,
+}
+
+impl Sent {
+    /// Takes each count the line's usage object carries, terminal (`usageMetadata`) or
+    /// non-terminal (`cpaUsageMetadata`); a count the object leaves out keeps its last value.
+    fn merge(&mut self, raw: &[u8]) {
+        let Some(usage) = ["response.usageMetadata", "response.cpaUsageMetadata"]
+            .into_iter()
+            .map(|path| gj::get(raw, path))
+            .find(|usage| usage.exists())
+        else {
+            return;
+        };
+        for (field, key) in [
+            (&mut self.prompt, "promptTokenCount"),
+            (&mut self.cached, "cachedContentTokenCount"),
+            (&mut self.candidates, "candidatesTokenCount"),
+            (&mut self.thoughts, "thoughtsTokenCount"),
+            (&mut self.total, "totalTokenCount"),
+        ] {
+            let value = usage.get(key);
+            if value.exists() {
+                *field = Some(value.int());
+            }
+        }
+    }
+
+    /// The Anthropic usage object of these counts: input leaves the cache out (Go 912a038b)
+    /// and output is candidates plus thoughts. The total, which Anthropic usage has no member
+    /// for, goes to the gateway's `x_ck.total_tokens`. A count the upstream did not send stays
+    /// out, and nothing is derived from the total.
+    fn usage(&self) -> Vec<u8> {
+        let mut usage = b"{}".to_vec();
+        if let Some(prompt) = self.prompt {
+            let input = prompt.wrapping_sub(self.cached.unwrap_or(0)).max(0);
+            gj::set_int(&mut usage, "input_tokens", input);
+        }
+        if let Some(cached) = self.cached {
+            gj::set_int(&mut usage, "cache_read_input_tokens", cached);
+        }
+        if self.candidates.is_some() || self.thoughts.is_some() {
+            let output = self.candidates.unwrap_or(0).wrapping_add(self.thoughts.unwrap_or(0));
+            gj::set_int(&mut usage, "output_tokens", output);
+        }
+        if let Some(total) = self.total {
+            gj::set_int(&mut usage, "x_ck.total_tokens", total);
+        }
+        usage
+    }
+}
+
 /// Params of ConvertAntigravityResponseToClaude.
 #[derive(Default)]
 struct Stream {
     model: String,
     names: HashMap<Vec<u8>, Vec<u8>>,
     web_search_mode: bool,
+    /// Usage events hold only the counts the upstream sent (`report_usage_only`).
+    reported_usage: bool,
+    /// The latest count of each usage field the upstream sent, in reported-only mode.
+    sent: Sent,
+    /// What the last usage event carried, in reported-only mode.
+    emitted: Option<Sent>,
     out: Vec<u8>,
     has_first_response: bool,
     response_type: u8,
@@ -655,11 +697,7 @@ impl Stream {
         );
         gj::set_str(&mut data, "content_block.name", &name);
         if model_group(&self.model) == "claude" && !signature_bytes.is_empty() {
-            gj::set_str(
-                &mut data,
-                "content_block.signature",
-                claude_signature_value(&self.model, &signature_bytes),
-            );
+            gj::set_str(&mut data, "content_block.signature", &signature_bytes);
         }
         self.event("content_block_start", &data);
         let args = call.get("args");
@@ -715,8 +753,30 @@ impl Stream {
         if self.cached_tokens > 0 {
             gj::set_int(&mut delta, "usage.cache_read_input_tokens", self.cached_tokens);
         }
+        if self.reported_usage {
+            // Only the counts the upstream sent, whether the stream completes or is cut
+            // (owner ruling P7-4-1, 2026-11-16).
+            let mut usage = self.sent.usage();
+            if self.web_search_requests > 0 {
+                gj::set_int(
+                    &mut usage,
+                    "server_tool_use.web_search_requests",
+                    self.web_search_requests,
+                );
+            }
+            gj::set_raw(&mut delta, "usage", &usage);
+            self.emitted = Some(self.sent);
+        }
         self.event("message_delta", &delta);
         self.sent_final = true;
+    }
+
+    /// A usage-only `message_delta`: `stop_reason` stays null, so the message goes on or
+    /// keeps the reason it ended with.
+    fn usage_delta(&mut self, usage: &[u8]) {
+        let mut delta = br#"{"type":"message_delta","delta":{"stop_reason":null,"stop_sequence":null}}"#.to_vec();
+        gj::set_raw(&mut delta, "usage", usage);
+        self.event("message_delta", &delta);
     }
 
     fn translate(&mut self, raw: &[u8]) -> Vec<Vec<u8>> {
@@ -734,15 +794,23 @@ impl Stream {
             return vec![std::mem::take(&mut self.out)];
         }
         let root = gj::parse(raw);
+        if self.reported_usage {
+            self.sent.merge(raw);
+        }
         if !self.has_first_response {
             let mut start = br#"{"type": "message_start", "message": {"id": "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY", "type": "message", "role": "assistant", "content": [], "model": "claude-3-5-sonnet-20241022", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}"#.to_vec();
-            let prompt = gj::get(raw, "response.cpaUsageMetadata.promptTokenCount");
-            if prompt.exists() {
-                gj::set_int(&mut start, "message.usage.input_tokens", prompt.int());
-            }
-            let candidates = gj::get(raw, "response.cpaUsageMetadata.candidatesTokenCount");
-            if candidates.exists() && !self.web_search_mode {
-                gj::set_int(&mut start, "message.usage.output_tokens", candidates.int());
+            if self.reported_usage {
+                gj::set_raw(&mut start, "message.usage", self.sent.usage());
+                self.emitted = Some(self.sent);
+            } else {
+                let prompt = gj::get(raw, "response.cpaUsageMetadata.promptTokenCount");
+                if prompt.exists() {
+                    gj::set_int(&mut start, "message.usage.input_tokens", prompt.int());
+                }
+                let candidates = gj::get(raw, "response.cpaUsageMetadata.candidatesTokenCount");
+                if candidates.exists() && !self.web_search_mode {
+                    gj::set_int(&mut start, "message.usage.output_tokens", candidates.int());
+                }
             }
             let version = gj::get(raw, "response.modelVersion");
             if version.exists() {
@@ -830,6 +898,20 @@ impl Stream {
 }
 
 impl GoStream for Stream {
+    fn report_usage_only(&mut self) {
+        self.reported_usage = true;
+    }
+
+    /// Usage the upstream reported since the last usage event, so a cut stream accounts it.
+    fn flush_before_error(&mut self) -> Vec<Vec<u8>> {
+        if !self.reported_usage || !self.has_first_response || self.emitted == Some(self.sent) {
+            return vec![];
+        }
+        self.emitted = Some(self.sent);
+        self.usage_delta(&self.sent.usage());
+        vec![std::mem::take(&mut self.out)]
+    }
+
     fn line(&mut self, line: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         Ok(self.translate(line))
     }
@@ -925,7 +1007,7 @@ pub(crate) fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, 
                 );
                 gj::set_str(&mut block, "name", &name);
                 if claude_target && !signature.is_empty() {
-                    gj::set_str(&mut block, "signature", claude_signature_value(&model, &signature));
+                    gj::set_str(&mut block, "signature", &signature);
                 }
                 let args = call.get("args");
                 if args.exists() && !args.raw.is_empty() && gj::valid(&args.raw) && args.is_object() {

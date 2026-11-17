@@ -308,6 +308,9 @@ async fn auth_matches_go() {
                         Some(error) => {
                             let e = got.err().unwrap_or_else(|| panic!("{name}: no error"));
                             assert_eq!(String::from_utf8_lossy(&e.body), error, "{name}: error");
+                            // Every failure to prepare a credential is the credential's, whatever
+                            // the status: routes that hide local detail hide this text.
+                            assert_eq!(e.scope, ck_core::exec::FailureScope::Credential, "{name}: scope");
                             if let Some(status) = case["status"].as_u64() {
                                 assert_eq!(u64::from(e.status), status, "{name}: status");
                             }

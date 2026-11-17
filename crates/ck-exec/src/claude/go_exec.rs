@@ -59,6 +59,36 @@ struct Script {
     seen: Vec<Seen>,
 }
 
+/// Owner ruling Q-H: Go's Chat and Gemini to Claude translators send a guessed `max_tokens`
+/// (32000, 64000 or the pinned model's) when the `client` body sets no limit; Rust sends the
+/// `model-catalog` default, the registered limit or a payload default rule's, else none.
+pub(crate) fn guesses_max_tokens(source: Format, client: &[u8]) -> bool {
+    let set = |path: &str| {
+        let value = ck_wire::json::get(client, path);
+        value.exists() && value.kind != ck_wire::json::Kind::Null
+    };
+    match source {
+        Format::OpenAI => !set("max_tokens") && !set("max_completion_tokens"),
+        Format::Gemini => !ck_wire::json::get(client, "generationConfig.maxOutputTokens").exists(),
+        _ => false,
+    }
+}
+
+/// A recorded Go upstream body without Go's guessed `max_tokens` ([`guesses_max_tokens`]).
+pub(crate) fn without_guessed_max_tokens(source: Format, client: &[u8], go_body: &str) -> String {
+    let mut body = go_body.as_bytes().to_vec();
+    if guesses_max_tokens(source, client) {
+        ck_wire::json::delete(&mut body, "max_tokens");
+    }
+    String::from_utf8(body).expect("a recorded body is UTF-8")
+}
+
+/// Go tests whose calls with a payload default rule set `max_tokens: 16384`. Go's guess left
+/// the rule nothing to fill; without the guess (Q-H) and with no configured or registered
+/// limit, the rule applies, so Rust must send its value.
+const PAYLOAD_DEFAULT_MAX_TOKENS: &[&str] =
+    &["TestClaudeExecutor_ChatCompletionsDefaultMaxTokensAndPayloadDefaultRule"];
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
@@ -653,6 +683,26 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         count_upstream: kind == "count_tokens_upstream",
         ..Default::default()
     };
+    let api_key_identity = {
+        let scoped = cfg.for_api_key();
+        let config = if ck_core::registry::dynamic::auth_kind(&credential) == Some("apikey") {
+            &scoped
+        } else {
+            &cfg
+        };
+        let ctx = super::Ctx::new(
+            &executor,
+            &credential,
+            (
+                &req.model,
+                req.resolved_model.as_ref(),
+                req.execution_session.as_deref(),
+            ),
+            config,
+            delegation,
+        );
+        super::tests::api_key_identity(&ctx, &req, kind.starts_with("count_tokens"))
+    };
     let result = executor.execute_delegated(&credential, req, &cfg, delegation).await;
     drop(pins);
     let recorded = &record["result"];
@@ -736,6 +786,9 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         for (k, v) in header_pairs(&go["headers"]) {
             want.entry(k.go_lower()).or_default().push(value(&v));
         }
+        if api_key_identity {
+            want.insert("user-agent".into(), vec!["cooker".into()]);
+        }
         let mut got = Headers::new();
         for (k, v) in &rust.headers {
             let k = k.go_lower();
@@ -749,11 +802,28 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
             want.remove(random);
             got.remove(random);
         }
-        let mut go_body = text(&bytes(&go["body"]));
+        let mut go_body = without_guessed_max_tokens(source, &bytes(&request["payload"]), &text(&bytes(&go["body"])));
         if RELOCATES_API_KEY_SYSTEM.contains(&test) {
             go_body = super::tests::with_relocated_system(&go_body);
         }
-        sent.push((got, want, text(&rust.body), go_body));
+        let mut rust_body = text(&rust.body);
+        let ruled = record["config"]
+            .as_str()
+            .is_some_and(|c| c.contains("max_tokens: 16384"));
+        if PAYLOAD_DEFAULT_MAX_TOKENS.contains(&test)
+            && ruled
+            && guesses_max_tokens(source, &bytes(&request["payload"]))
+        {
+            let mut body = rust_body.into_bytes();
+            if ck_wire::json::get(&body, "max_tokens").int() != 16384 {
+                diffs.push(format!(
+                    "exchange {i}: the payload default rule's max_tokens is missing"
+                ));
+            }
+            ck_wire::json::delete(&mut body, "max_tokens");
+            rust_body = String::from_utf8(body).expect("a sent body is UTF-8");
+        }
+        sent.push((got, want, rust_body, go_body));
     }
     // Identifiers to keep verbatim: the recorded inputs (config, credential, request,
     // upstream replies) and whatever both implementations produced.

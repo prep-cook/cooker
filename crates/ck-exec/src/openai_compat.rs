@@ -13,22 +13,27 @@ use ck_core::format::Format;
 use ck_translate::{RequestCtx, ResponseCtx, StreamTranslator};
 use futures_util::StreamExt;
 
-use ck_wire::gostr::GoStr;
 use ck_wire::json as gj;
 use ck_wire::thinking::{self, ModelCaps, RequestThinking, parse_suffix};
 
 use crate::gemini_stream::ClaudeInputTokens;
+use crate::multipart;
 use crate::openai_compat_go as go;
+use crate::openai_compat_headers::base_headers;
 use crate::openai_compat_http::{self as wire, Clients, GoHeaders};
-use crate::openai_compat_multipart as multipart;
 use crate::openai_compat_payload as payload;
 
-pub const USER_AGENT: &str = "cli-proxy-openai-compat";
+#[path = "openai_compat_chat.rs"]
+mod chat;
+#[path = "openai_compat_stream.rs"]
+mod stream;
+pub(crate) use chat::chat_with;
+use stream::frames;
+
+pub const USER_AGENT: &str = "cooker";
 const COMPACT_ALT: &str = "responses/compact";
-const IMAGES_GENERATIONS: &str = "/images/generations";
-const IMAGES_EDITS: &str = "/images/edits";
 /// `scanner.Buffer(nil, 52_428_800)`.
-const MAX_LINE: usize = 52_428_800;
+pub(crate) const MAX_LINE: usize = 52_428_800;
 /// helps.ApplyPatchUpstreamErrorMessage: Go's error for an empty or rejected translation.
 const EMPTY_TRANSLATION: &str = ck_translate::APPLY_PATCH_UPSTREAM_ERROR;
 
@@ -76,32 +81,28 @@ pub(crate) fn status_err(status: u16, message: impl Into<String>) -> ExecError {
 async fn upstream_error(upstream: wire::Upstream, capture: &wire::Capture) -> ExecError {
     let (status, headers, body) = wire::read_error_body(upstream).await;
     capture.chunk(&body);
-    status_error(status, headers, &body, true)
+    status_error(status, headers, body, true)
 }
 
-/// An images non-2xx response: the whole body is read first and a read error is
-/// captured and returned instead, then `newOpenAICompatStatusError`, or the plain
-/// `statusErr` the image stream path uses.
-async fn images_error(upstream: wire::Upstream, with_retry: bool, capture: &wire::Capture) -> ExecError {
-    let (status, headers) = (upstream.status, upstream.headers.clone());
-    let body = wire::read_all(upstream).await;
-    capture.read(&body);
-    match body {
-        Ok(body) => status_error(status, headers, &body, with_retry),
-        Err(error) => error,
+/// `newOpenAICompatStatusError`: the upstream's status and its body as received, an empty or
+/// non-UTF-8 one included; the retry hint is read from the headers and body, never rewritten.
+pub(crate) fn status_error(status: u16, headers: http::HeaderMap, body: Bytes, with_retry: bool) -> ExecError {
+    let retry_after = with_retry
+        .then(|| payload::retry_after(status, &headers, &body, SystemTime::now()))
+        .flatten();
+    ExecError {
+        status,
+        scope: scope_for(status),
+        body,
+        headers: Box::new(headers),
+        retry_after,
+        direct: false,
+        addon: None,
+        upstream: true,
     }
 }
 
-fn status_error(status: u16, headers: http::HeaderMap, body: &[u8], with_retry: bool) -> ExecError {
-    let mut error = status_err(status, String::from_utf8_lossy(body));
-    if with_retry {
-        error.retry_after = payload::retry_after(status, &headers, body, SystemTime::now());
-    }
-    error.headers = Box::new(headers);
-    error
-}
-
-fn credentials(credential: &Credential) -> (String, String) {
+pub(crate) fn credentials(credential: &Credential) -> (String, String) {
     let attr = |k: &str| {
         credential
             .attributes
@@ -112,12 +113,12 @@ fn credentials(credential: &Credential) -> (String, String) {
     (attr("base_url"), attr("api_key"))
 }
 
-fn missing_base_url() -> ExecError {
+pub(crate) fn missing_base_url() -> ExecError {
     ExecError::local(401, FailureScope::Credential, "missing provider baseURL")
 }
 
 /// `strings.TrimSuffix(baseURL, "/") + path`: one slash only, like Go.
-fn endpoint(base_url: &str, path: &str) -> String {
+pub(crate) fn endpoint(base_url: &str, path: &str) -> String {
     format!("{}{path}", base_url.strip_suffix('/').unwrap_or(base_url))
 }
 
@@ -208,29 +209,21 @@ fn apply_thinking(
     provider: &str,
     resolved: Option<&ModelCaps>,
 ) -> Result<Vec<u8>, ExecError> {
-    thinking::apply_request_thinking(&RequestThinking {
-        body: &body,
-        payload: &req.body,
-        original: &req.original_body,
-        model: &req.model,
-        from: req.source_format.as_str(),
-        to: target.as_str(),
-        provider,
-        resolved: resolved.map(Some),
-        has_request_transformer: ck_translate::pair(req.source_format, target).is_some(),
-        updates_changed: false,
-    })
+    thinking::apply_request_thinking(
+        &RequestThinking {
+            payload: Some(&req.body[..]),
+            original: Some(&req.original_body[..]),
+            model: &req.model,
+            from: req.source_format.as_str(),
+            to: target.as_str(),
+            provider,
+            resolved: resolved.map(Some),
+            has_request_transformer: ck_translate::pair(req.source_format, target).is_some(),
+            updates_changed: false,
+        },
+        body,
+    )
     .map_err(|e| ExecError::local(400, FailureScope::Request, e.message))
-}
-
-fn base_headers(api_key: &str, content_type: &str) -> GoHeaders {
-    let mut headers = GoHeaders::new();
-    headers.set("Content-Type", content_type);
-    if !api_key.is_empty() {
-        headers.set("Authorization", format!("Bearer {api_key}"));
-    }
-    headers.set("User-Agent", USER_AGENT);
-    headers
 }
 
 /// `util.ApplyCustomHeadersFromAttrs` with the client headers and the canonical session.
@@ -247,6 +240,11 @@ impl OpenAICompatExecutor {
         Self {
             clients: Clients::new(client),
         }
+    }
+
+    /// The HTTP client of `credential`'s effective proxy.
+    pub(crate) fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
+        self.clients.for_credential(credential, cfg)
     }
 
     pub async fn execute(
@@ -266,307 +264,16 @@ impl OpenAICompatExecutor {
         let (base_url, api_key) = credentials(credential);
         let compat = payload::resolve_compat(credential, cfg);
         let client = self.clients.for_credential(credential, cfg);
-        chat_with(&client, credential, req, cfg, &base_url, &api_key, compat.as_ref()).await
-    }
-
-    /// `executeImages` / `executeImagesStream`: the body (JSON or multipart) goes to
-    /// `/images/edits` or `/images/generations` with the model replaced. `request_path` is
-    /// the inbound route; `req.stream` selects raw SSE passthrough.
-    pub async fn images(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        request_path: &str,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        let base_model = parse_suffix(&req.model).model_name.trim().to_owned();
-        let (base_url, api_key) = credentials(credential);
-        if base_url.is_empty() {
-            return Err(missing_base_url());
-        }
-        let client_content_type = req
-            .headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        let (body, content_type) = prepare_images_payload(&req.body, &base_model, &client_content_type, req.stream)?;
-        let content_type = if content_type.is_empty() {
-            "application/json".to_owned()
-        } else {
-            content_type
-        };
-        let (body, content_type) = media_barrier(
+        chat_with(
+            &client,
             credential,
-            &req,
+            req,
             cfg,
-            &base_model,
-            &body,
-            &content_type,
-            &client_content_type,
-        )?;
-        let path = if request_path.trim().ends_with(IMAGES_EDITS) {
-            IMAGES_EDITS
-        } else {
-            IMAGES_GENERATIONS
-        };
-        // SetTranslatedReasoningEffort(payload, "openai").
-        if req.usage.enabled() {
-            req.usage.request(Format::OpenAI, &body);
-        }
-        let mut headers = base_headers(&api_key, &content_type);
-        if req.stream {
-            headers.set("Accept", "text/event-stream");
-            headers.set("Cache-Control", "no-cache");
-        }
-        apply_custom(&mut headers, credential, &req);
-        let client = self.clients.for_credential(credential, cfg);
-        let url = endpoint(&base_url, path);
-        let capture = wire::Capture::request(
-            &req,
-            credential,
-            &credential.provider,
-            &url,
-            "POST",
-            headers.pairs(),
-            &body,
-        );
-        let upstream = wire::send(&client, &url, headers, body).await;
-        capture.sent(&upstream);
-        let upstream = upstream?;
-        if !(200..300).contains(&upstream.status) {
-            return Err(images_error(upstream, !req.stream, &capture).await);
-        }
-        let headers = upstream.headers.clone();
-        if req.stream {
-            // Each raw read is logged; a read error is logged and published as a failure
-            // before the client gets it.
-            let usage = req.usage.clone();
-            let stream = capture
-                .stream(upstream.body)
-                .inspect(move |item| {
-                    if let Err(error) = item {
-                        wire::publish_failure(&usage, error);
-                    }
-                })
-                .boxed();
-            return Ok(ExecResponse {
-                status: 200,
-                headers,
-                body: ResponseBody::Stream(stream),
-            });
-        }
-        let data = wire::read_all(upstream).await;
-        capture.read(&data);
-        let data = data?;
-        if req.usage.enabled() {
-            req.usage.response_body(Format::OpenAI, &data);
-        }
-        Ok(ExecResponse {
-            status: 200,
-            headers,
-            body: ResponseBody::Buffered(data),
-        })
+            (&base_url, &api_key, true),
+            compat.as_ref(),
+        )
+        .await
     }
-}
-
-/// `executeWithCredentials` / `executeStreamWithCredentials` (Go d9451cb6): the chat
-/// request at `base_url` with `api_key`, for this executor's credentials and for
-/// Vertex's endpoints/openapi route (which passes no compatibility config).
-pub(crate) async fn chat_with(
-    client: &wreq::Client,
-    credential: &Credential,
-    req: ExecRequest,
-    cfg: &Config,
-    base_url: &str,
-    api_key: &str,
-    compat: Option<&payload::Compat>,
-) -> Result<ExecResponse, ExecError> {
-    let base_model = parse_suffix(&req.model).model_name;
-    if base_url.is_empty() {
-        return Err(missing_base_url());
-    }
-    let compact = req.alt.as_deref() == Some(COMPACT_ALT);
-    // ExecuteStream always targets chat completions, even with the compact alt.
-    let (target, path) = if compact && !req.stream {
-        (Format::OpenAIResponse, "/responses/compact")
-    } else {
-        (Format::OpenAI, "/chat/completions")
-    };
-    let response_pair = ck_translate::pair(req.response_format, target);
-    if response_pair.is_none() && req.response_format != target {
-        return Err(not_registered("response", req.response_format, target));
-    }
-    let caps = req.resolved_model.as_ref().map(|r| ModelCaps::from(&r.info));
-    let is_compat = req.resolved_model.as_ref().is_some_and(|r| r.is_compat());
-    let original = translate_body(
-        &req,
-        cfg,
-        target,
-        &base_model,
-        req.stream,
-        original_payload(&req),
-        is_compat,
-    );
-    let mut body = translate_body(&req, cfg, target, &base_model, req.stream, &req.body, is_compat)?;
-    let original = crate::translate::baseline_or_working(original, &body);
-    body = apply_thinking(body, &req, target, &credential.provider, caps.as_ref())?;
-    let requested = route_model(&req);
-    if payload::excludes_images(compat, &base_model, requested) {
-        body = payload::normalize_tool_results_text_only(body);
-    }
-    if !compact {
-        let mct = payload::uses_max_completion_tokens(compat, &base_model, requested);
-        body = payload::normalize_max_tokens(body, mct);
-        body = prompt_cache_key(compat, &credential.provider, &req, &base_model, body);
-    }
-    if compact && !req.stream {
-        gj::delete(&mut body, "stream");
-        body = payload::sanitize_reasoning_encrypted_content(body);
-    }
-    if req.stream {
-        payload::set_bool_if_different(&mut body, "stream_options.include_usage", true);
-    }
-    if req.usage.enabled() {
-        req.usage.request(target, &body);
-    }
-    // The payload rules are the last change to the body (868e137).
-    body = apply_payload_rules(cfg, &req, &base_model, target, &original, body);
-    let mut headers = base_headers(api_key, "application/json");
-    apply_custom(&mut headers, credential, &req);
-    if req.stream {
-        headers.set("Accept", "text/event-stream");
-        headers.set("Cache-Control", "no-cache");
-    }
-    let url = endpoint(base_url, path);
-    // Go's `http.NewRequestWithContext` refuses a URL its parser rejects (an escaped
-    // host such as `%61iplatform.googleapis.com`) and its transport one without a host
-    // (`https:relay.example`), before anything is sent; the url crate would read a host
-    // from both and send the key there.
-    crate::xai_url::new_request(&url)?;
-    let capture = wire::Capture::request(
-        &req,
-        credential,
-        &credential.provider,
-        &url,
-        "POST",
-        headers.pairs(),
-        &body,
-    );
-    let upstream = match crate::xai_url::transport_refusal(&url) {
-        Some(error) => Err(error),
-        None => wire::send(client, &url, headers, Bytes::from(body.clone())).await,
-    };
-    capture.sent(&upstream);
-    let upstream = upstream?;
-    if !(200..300).contains(&upstream.status) {
-        return Err(upstream_error(upstream, &capture).await);
-    }
-    let response_headers = upstream.headers.clone();
-    let original = if req.original_body.is_empty() {
-        req.body.clone()
-    } else {
-        req.original_body.clone()
-    };
-    if req.stream {
-        let translator: Box<dyn StreamTranslator> = match response_pair {
-            Some(pair) => (pair.stream)(&ResponseCtx {
-                model: &req.model,
-                original_request: &original,
-                translated_request: &body,
-                tool_search: false,
-            }),
-            None => Box::new(Identity),
-        };
-        let mut lines = wire::lines(upstream, MAX_LINE);
-        if req.usage.enabled() {
-            // StreamUsageBuffer.ObserveOpenAIStream per line; the served model is observed
-            // per accepted frame (Frames::frame).
-            let usage = req.usage.clone();
-            lines = lines
-                .inspect(move |line| {
-                    if let Ok(line) = line {
-                        usage.response_usage_line(Format::OpenAI, line);
-                    }
-                })
-                .boxed();
-        }
-        let claude = ClaudeInputTokens::new(req.source_format, Format::OpenAI, req.response_format, original.clone());
-        let stream = frames(
-            lines,
-            translator,
-            claude,
-            req.response_format,
-            capture,
-            req.usage.clone(),
-        );
-        return Ok(ExecResponse {
-            status: 200,
-            headers: response_headers,
-            body: ResponseBody::Stream(stream),
-        });
-    }
-    let raw = wire::read_all(upstream).await;
-    capture.read(&raw);
-    let raw = raw?;
-    // ObserveResponseModel(body) and Publish(ParseOpenAIUsage(body)).
-    if req.usage.enabled() {
-        req.usage.response_body(target, &raw);
-    }
-    let ctx = ResponseCtx {
-        model: &req.model,
-        original_request: &original,
-        translated_request: &body,
-        tool_search: false,
-    };
-    let mut out = match response_pair {
-        Some(pair) => (pair.non_stream)(&ctx, &raw)
-            .map_err(|_| ExecError::local(502, FailureScope::Request, EMPTY_TRANSLATION))?,
-        None => raw.to_vec(),
-    };
-    if out.is_empty() {
-        return Err(ExecError::local(502, FailureScope::Request, EMPTY_TRANSLATION));
-    }
-    if req.response_format == Format::OpenAIResponse {
-        out = payload::ensure_responses_usage_details(&out);
-    }
-    Ok(ExecResponse {
-        status: 200,
-        headers: response_headers,
-        body: ResponseBody::Buffered(Bytes::from(out)),
-    })
-}
-
-/// `ApplyMediaPayloadConfig` on a prepared images request (868e137): the payload rules
-/// run last, on the body's JSON view, against the client's original request.
-fn media_barrier(
-    credential: &Credential,
-    req: &ExecRequest,
-    cfg: &Config,
-    model: &str,
-    body: &[u8],
-    content_type: &str,
-    client_content_type: &str,
-) -> Result<(Bytes, String), ExecError> {
-    let original = if req.original_body.is_empty() {
-        &req.body
-    } else {
-        &req.original_body
-    };
-    let (body, content_type) =
-        crate::payload_media::apply(body, content_type, original, client_content_type, |view, original| {
-            crate::payload_barrier::Barrier {
-                executor: &credential.provider,
-                model,
-                protocol: Format::OpenAI.as_str(),
-                root: "",
-                original,
-            }
-            .apply(cfg, req, view)
-        })
-        .map_err(plain_err)?;
-    Ok((Bytes::from(body), content_type))
 }
 
 /// `prepareOpenAICompatImagesPayload`.
@@ -635,34 +342,13 @@ fn prompt_cache_key(
         payload::set_str_if_different(&mut body, "prompt_cache_key", &key);
         return body;
     }
-    let Some(session) = provider_session_uuid(provider, req) else {
-        return body;
-    };
-    let provider = provider.trim().go_lower();
-    let identity = format!(
-        "cli-proxy-api:openai-compat:prompt-cache\0{provider}\0{}\0{}\0{session}",
-        model.go_lower(),
-        req.source_format.as_str().trim().go_lower()
-    );
-    let key = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.as_bytes()).to_string();
-    payload::set_str_if_different(&mut body, "prompt_cache_key", &key);
-    body
-}
-
-/// `helps.ProviderSessionUUID`: the execution session, else the derived session identity,
-/// as a provider-scoped stable UUID.
-fn provider_session_uuid(provider: &str, req: &ExecRequest) -> Option<String> {
-    let nonempty = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
-    let (kind, value) = match nonempty(&req.execution_session) {
-        Some(execution) => ("execution-session", execution),
-        None => ("derived-session", nonempty(&req.derived_session)?),
-    };
-    let provider = provider.trim().go_lower();
-    if provider.is_empty() {
-        return None;
+    let sessions = (req.execution_session.as_deref(), req.derived_session.as_deref());
+    if let Some(key) =
+        crate::openai_compat_exec::session_cache_key(provider, &model, req.source_format.as_str(), sessions)
+    {
+        payload::set_str_if_different(&mut body, "prompt_cache_key", &key);
     }
-    let identity = format!("cli-proxy-api\0{provider}\0{kind}\0{value}");
-    Some(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.as_bytes()).to_string())
+    body
 }
 
 /// `CountTokens`: a local tiktoken estimate of the translated chat request.
@@ -734,278 +420,6 @@ impl StreamTranslator for Identity {
 
 fn trim(bytes: &[u8]) -> &[u8] {
     go::trim_space(bytes)
-}
-
-/// The ExecuteStream scan loop: SSE lines grouped into frames, Go's error detection on
-/// every frame, and the terminal rules for `[DONE]` and EOF.
-struct Frames {
-    translator: Box<dyn StreamTranslator>,
-    /// `TranslateStreamWithClaudeInputTokens` (Go f3e36f19): a Claude client's
-    /// `message_start` gets the estimate of its request when the upstream reports none.
-    claude: ClaudeInputTokens,
-    responses: bool,
-    claude_client: bool,
-    event: String,
-    data: Vec<Vec<u8>>,
-    ready: VecDeque<Result<Bytes, ExecError>>,
-    seen_done: bool,
-    /// A data frame carried a finish_reason (Go 4f2e5270 `openAICompatChunkHasFinishReason`).
-    saw_finish_reason: bool,
-    failed: bool,
-    capture: wire::Capture,
-    usage: ck_core::exec::UsageSink,
-}
-
-impl Frames {
-    /// `publishStreamError(err, false)`: the error is logged and published as a failure
-    /// before the client gets it.
-    fn fail(&mut self, status: u16, message: impl Into<String>) -> bool {
-        let error = status_err(status, message);
-        self.capture.error(&error);
-        wire::publish_failure(&self.usage, &error);
-        self.terminal(error);
-        true
-    }
-
-    /// `publishStreamError(err, true)`: the upstream's error payload is neither logged nor
-    /// published; a fixed text stands in for it.
-    fn fail_payload(&mut self, status: u16, message: impl Into<String>) -> bool {
-        let logged = status_err(status, "upstream stream returned an error payload");
-        self.capture.error(&logged);
-        wire::publish_failure(&self.usage, &logged);
-        self.terminal(status_err(status, message));
-        true
-    }
-
-    /// A terminal error: a Responses client first gets the frame its Go framer would
-    /// flush (`responsesSSEFramer.Flush`), then the error.
-    fn terminal(&mut self, error: ExecError) {
-        let mut flushed = self.translator.flush_frames();
-        self.usage_details(&mut flushed);
-        self.ready.extend(flushed.into_iter().map(Ok));
-        self.ready.push_back(Err(error));
-        self.failed = true;
-    }
-
-    /// TranslateStreamWithClaudeInputTokens: Responses usage gets its detail fields
-    /// unless the apply_patch bridge failed. Go patches before the SSE framer, so frames
-    /// the framer flushes later get them too.
-    fn usage_details(&self, out: &mut [Bytes]) {
-        if self.responses && !self.translator.tool_input_failed() {
-            for chunk in out {
-                *chunk = Bytes::from(payload::ensure_responses_usage_details(chunk));
-            }
-        }
-    }
-
-    /// One Go `TranslateStream` call per frame's joined `data:` line; no blank line
-    /// follows it.
-    fn translate(&mut self, line: &[u8]) -> bool {
-        match self.translator.event(line) {
-            Ok(mut out) => {
-                self.usage_details(&mut out);
-                self.claude.apply(&mut out);
-                self.ready.extend(out.into_iter().map(Ok));
-                false
-            }
-            Err(e) => self.fail(502, e.to_string()),
-        }
-    }
-
-    /// `processFrame`; true ends the scan.
-    fn frame(&mut self) -> bool {
-        let event = std::mem::take(&mut self.event);
-        let data = std::mem::take(&mut self.data);
-        if data.is_empty() {
-            return payload::error_event(&event) && self.fail(502, "upstream error event ended without data");
-        }
-        if data.len() > 1 && data.iter().any(|d| trim(d) == b"[DONE]") {
-            return self.fail(502, "upstream stream ended with incomplete data before [DONE]");
-        }
-        let joined = data.join(&b"\n"[..]);
-        let payload_bytes = trim(&joined);
-        let done = payload_bytes == b"[DONE]";
-        if done && payload::error_event(&event) {
-            return self.fail(502, "upstream error event ended before [DONE]");
-        }
-        if !done && !go::json_valid(payload_bytes) {
-            return self.fail(502, "upstream stream ended with incomplete SSE data frame");
-        }
-        if !done && let Some(status) = payload::stream_data_error(payload_bytes, &event) {
-            return self.fail_payload(status, String::from_utf8_lossy(payload_bytes));
-        }
-        if !done && !self.saw_finish_reason {
-            self.saw_finish_reason = has_finish_reason(payload_bytes);
-        }
-        // ObserveChatTokenEvent (Go f8e4a840): the served model comes from frames that
-        // passed these checks, not from every line.
-        self.usage.response_model_line(payload_bytes);
-        let mut line = b"data: ".to_vec();
-        line.extend_from_slice(payload_bytes);
-        if self.translate(&line) {
-            return true;
-        }
-        // helps.ApplyPatchTranslationError: the frame's chunks go out, then the 502.
-        if self.translator.tool_input_failed() {
-            return self.fail(502, EMPTY_TRANSLATION);
-        }
-        if done {
-            self.seen_done = true;
-        }
-        done
-    }
-
-    /// One scanned line; true ends the scan.
-    fn line(&mut self, line: &[u8]) -> bool {
-        let line = trim(line);
-        if line.is_empty() {
-            return self.frame();
-        }
-        if let Some(rest) = line.strip_prefix(b"data:") {
-            self.data.push(trim(rest).to_vec());
-        } else if let Some(rest) = line.strip_prefix(b"event:") {
-            self.event = String::from_utf8_lossy(trim(rest)).into_owned();
-        } else if line.starts_with(b":") || line.starts_with(b"id:") || line.starts_with(b"retry:") {
-        } else if line.starts_with(b"{") || line.starts_with(b"[") {
-            return self.fail_payload(502, String::from_utf8_lossy(line));
-        }
-        false
-    }
-
-    /// `helps.EndApplyPatchStream` when the transport ends: the translator's closing
-    /// apply_patch frames, then the 502 when its tool input failed. True ends the stream.
-    fn end_tool_input(&mut self) -> bool {
-        let out = self.translator.finalize_tool_input();
-        self.ready.extend(out.into_iter().map(Ok));
-        if self.translator.tool_input_failed() {
-            // RecordApplyPatchStreamFailure publishes; nothing is logged.
-            let error = status_err(502, EMPTY_TRANSLATION);
-            wire::publish_failure(&self.usage, &error);
-            self.terminal(error);
-            return true;
-        }
-        false
-    }
-
-    /// Clean EOF: flush a pending frame, then Go's terminal rule per client format.
-    fn eof(&mut self) {
-        if !self.seen_done && !self.failed && !self.data.is_empty() {
-            self.frame();
-        }
-        if self.failed || self.end_tool_input() {
-            return;
-        }
-        if !self.seen_done {
-            // 0ea4e1dc: a finish reason that left every item done completes the stream.
-            if self.responses && self.translator.can_finalize_response_stream() {
-                if self.translate(b"data: [DONE]") {
-                    return;
-                }
-                self.seen_done = !self.translator.can_finalize_response_stream();
-            }
-        }
-        if !self.seen_done {
-            // 4f2e5270: a Claude client's EOF fails too unless a chunk carried a finish
-            // reason; both failures publish the usage seen so far.
-            if self.responses || (self.claude_client && !self.saw_finish_reason) {
-                let error = status_err(502, "upstream stream closed before [DONE]");
-                self.capture.error(&error);
-                self.usage
-                    .publish_failure_with_usage(error.status, &String::from_utf8_lossy(&error.body));
-                self.terminal(error);
-                return;
-            }
-            if self.translate(b"data: [DONE]") {
-                return;
-            }
-        }
-        self.finish();
-    }
-
-    fn finish(&mut self) {
-        match self.translator.finish() {
-            Ok(mut out) => {
-                self.usage_details(&mut out);
-                self.ready.extend(out.into_iter().map(Ok));
-            }
-            Err(e) => {
-                self.fail(502, e.to_string());
-            }
-        }
-    }
-}
-
-/// Go `openAICompatChunkHasFinishReason`: a choice whose `finish_reason` is not null and
-/// not blank after `strings.TrimSpace`.
-fn has_finish_reason(payload: &[u8]) -> bool {
-    gj::get(payload, "choices").array().iter().any(|choice| {
-        let reason = choice.get("finish_reason");
-        reason.kind != gj::Kind::Null && !go::trim_space(&reason.bytes()).is_empty()
-    })
-}
-
-fn frames(
-    lines: ExecStream,
-    translator: Box<dyn StreamTranslator>,
-    claude: ClaudeInputTokens,
-    client: Format,
-    capture: wire::Capture,
-    usage: ck_core::exec::UsageSink,
-) -> ExecStream {
-    let state = Frames {
-        translator,
-        claude,
-        responses: client == Format::OpenAIResponse,
-        claude_client: client == Format::Claude,
-        event: String::new(),
-        data: Vec::new(),
-        ready: VecDeque::new(),
-        seen_done: false,
-        saw_finish_reason: false,
-        failed: false,
-        capture,
-        usage,
-    };
-    futures_util::stream::unfold((lines, state, false), |(mut lines, mut state, mut ended)| async move {
-        loop {
-            if let Some(item) = state.ready.pop_front() {
-                if item.is_err() {
-                    state.ready.clear();
-                    ended = true;
-                }
-                return Some((item, (lines, state, ended)));
-            }
-            if ended {
-                return None;
-            }
-            match lines.next().await {
-                Some(Ok(line)) => {
-                    // AppendAPIResponseChunk per scanned line.
-                    state.capture.chunk(&line);
-                    if state.line(&line) {
-                        if !state.failed && !state.end_tool_input() {
-                            state.finish();
-                        }
-                        ended = true;
-                    }
-                }
-                Some(Err(error)) => {
-                    // Go ends apply_patch input before reporting the scan error.
-                    if !state.end_tool_input() {
-                        state.capture.error(&error);
-                        wire::publish_failure(&state.usage, &error);
-                        state.terminal(error);
-                    }
-                    ended = true;
-                }
-                None => {
-                    state.eof();
-                    ended = true;
-                }
-            }
-        }
-    })
-    .boxed()
 }
 
 #[cfg(test)]

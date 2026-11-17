@@ -364,8 +364,6 @@ pub(crate) enum Logged {
     Whole,
     /// One chunk per `bufio.Scanner` line.
     Lines,
-    /// One chunk per raw read.
-    Reads,
 }
 
 /// Headers the Go transport adds after the executor logs `httpReq.Header`.
@@ -473,35 +471,22 @@ pub(crate) fn http_capture_problems(events: &[Captured], a: &HttpAttempt<'_>) ->
         }
         return problems;
     }
-    if a.logged == Logged::Reads {
-        let joined: String = rest
-            .iter()
-            .map(|e| match e {
-                Captured::Chunk(c) => c.as_str(),
-                _ => "<not a chunk>",
-            })
-            .collect();
-        if joined != a.body {
-            problems.push(format!("capture reads: {rest:?}"));
-        }
-        return problems;
-    }
-    // bufio.ScanLines: lines without their newline or a trailing CR; the scan stops at
-    // Go's terminal frame, so the chunks are a prefix of the lines, then at most one
-    // error.
-    let lines: Vec<&str> = a
+    // bufio.ScanLines: lines without their newline or a trailing CR, each recorded with a
+    // newline; the scan stops at Go's terminal frame, so the chunks are a prefix of the
+    // lines, then at most one error.
+    let lines: Vec<String> = a
         .body
         .strip_suffix('\n')
         .unwrap_or(a.body)
         .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .map(|l| format!("{}\n", l.strip_suffix('\r').unwrap_or(l)))
         .collect();
     let (chunks, tail) = match rest.iter().position(|e| !matches!(e, Captured::Chunk(_))) {
         Some(i) => rest.split_at(i),
         None => (rest, &[][..]),
     };
     for (i, chunk) in chunks.iter().enumerate() {
-        if *chunk != Captured::Chunk(lines.get(i).copied().unwrap_or("<none>").to_owned()) {
+        if *chunk != Captured::Chunk(lines.get(i).map_or("<none>", String::as_str).to_owned()) {
             problems.push(format!("capture line {i}: {chunk:?} != {:?}", lines.get(i)));
             break;
         }
@@ -510,4 +495,33 @@ pub(crate) fn http_capture_problems(events: &[Captured], a: &HttpAttempt<'_>) ->
         problems.push(format!("capture stream tail: {tail:?}"));
     }
     problems
+}
+
+/// Applies Q13 to a historical API-key request; body bytes and other headers stay exact.
+pub(crate) fn api_key_request(raw: &[u8]) -> Vec<u8> {
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("HTTP header boundary");
+    let head = std::str::from_utf8(&raw[..end]).unwrap();
+    let mut out = Vec::with_capacity(raw.len());
+    for line in head.split("\r\n") {
+        if line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            continue;
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        if line.starts_with("Host:") {
+            out.extend_from_slice(b"User-Agent: cooker\r\n");
+        }
+    }
+    out.extend_from_slice(&raw[end + 2..]);
+    out
+}
+
+pub(crate) fn api_key_wire(raw: &str) -> String {
+    String::from_utf8(api_key_request(raw.as_bytes())).unwrap()
 }

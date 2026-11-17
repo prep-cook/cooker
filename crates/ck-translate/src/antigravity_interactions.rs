@@ -10,7 +10,7 @@ use crate::antigravity_gemini::rewrite_function_names;
 use crate::common::{
     format_rfc3339_utc, go_lower, now_nanos, now_unix, restore_sanitized_tool_name, sse_event, trim_space,
 };
-use crate::gemini::attach_default_safety_settings;
+use crate::gemini_gemini::attach_default_safety_settings;
 use crate::gemini_interactions::{
     copy_generation_config, copy_response_modalities, copy_system_instruction, first_existing, input_contents,
 };

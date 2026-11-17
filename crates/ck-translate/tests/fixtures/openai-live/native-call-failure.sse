@@ -1,0 +1,4 @@
+data: {"responseId": "r", "modelVersion": "m", "candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": "first"}]}}]}
+
+data: {"responseId": "r", "modelVersion": "m", "candidates": [{"index": 1, "content": {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {}}}]}}]}
+

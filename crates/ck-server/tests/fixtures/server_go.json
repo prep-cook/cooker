@@ -5274,11 +5274,11 @@
     },
     {
       "in": "request to https://user:pass@api.example.com/v1?key=abc123\u0026x=1 failed",
-      "out": "request to https://[REDACTED_AUTH]@api.example.com/v1?key=[REDACTED]"
+      "out": "request to https://api.example.com/v1?key=[REDACTED]"
     },
     {
       "in": "Post \"https://api.example.com/v1/messages?beta=true\": dial tcp 10.0.0.1:443: i/o timeout",
-      "out": "Post \"https://api.example.com/v1/messages?beta=true\": dial tcp 10.0.0.1:443: i/o timeout"
+      "out": "Post \"https://api.example.com/v1/messages?beta=***\": dial tcp 10.0.0.1:443: i/o timeout"
     },
     {
       "in": "Authorization: Bearer sk-ant-api03-abcdefghijkl",
@@ -7353,7 +7353,6 @@
           "cached_tokens": 50,
           "cache_read_tokens": 50,
           "cache_read_tokens_present": true,
-          "cache_creation_tokens": 0,
           "total_tokens": 280
         },
         "failed": false,
@@ -7454,11 +7453,7 @@
         "tokens": {
           "input_tokens": 9,
           "output_tokens": 4,
-          "reasoning_tokens": 0,
-          "cached_tokens": 0,
-          "cache_read_tokens": 0,
-          "cache_read_tokens_present": true,
-          "cache_creation_tokens": 0,
+          "cache_read_tokens_present": false,
           "total_tokens": 13
         },
         "failed": false,

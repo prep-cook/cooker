@@ -7,3 +7,4 @@ pub mod pprof;
 pub mod request_logging;
 pub mod usage;
 pub(crate) mod usage_record;
+pub mod usage_snapshot;

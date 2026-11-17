@@ -20,10 +20,13 @@
 //! Go sends it and recovers on 401.
 
 pub mod aistudio;
+#[cfg(test)]
+mod alloc_count;
 pub mod antigravity;
 pub mod antigravity_auth;
 mod antigravity_compaction;
 pub mod antigravity_credits;
+mod antigravity_exec;
 mod antigravity_models;
 mod antigravity_replay;
 mod antigravity_request;
@@ -31,17 +34,22 @@ pub mod antigravity_version;
 pub mod claude;
 pub mod claude_login;
 pub mod codex;
+mod codex_alpha;
 mod codex_capture;
 mod codex_client;
+mod codex_events;
+pub mod codex_exec;
 mod codex_images;
 mod codex_json;
 pub mod codex_live;
+mod codex_media;
 pub mod codex_oauth;
 pub mod codex_quota;
 pub mod codex_refresh;
 mod codex_replay;
 mod codex_request;
 mod codex_response;
+mod codex_shape;
 pub mod codex_siwc;
 pub mod codex_siwc_bind;
 mod codex_sse;
@@ -49,6 +57,7 @@ mod codex_sse;
 mod codex_testkit;
 mod codex_tls;
 mod codex_tokens;
+mod codex_upload;
 mod codex_ws;
 pub mod devin;
 pub mod devin_auth;
@@ -57,58 +66,109 @@ mod devin_payload;
 mod devin_request;
 mod devin_wire;
 pub mod gemini;
+mod gemini_exec;
 mod gemini_payload;
 mod gemini_stream;
+mod google_wire;
 pub mod kimi;
 pub mod kimi_auth;
+mod kimi_edit;
+mod kimi_exec;
 #[cfg(test)]
 mod kimi_fixture;
 mod kimi_http;
 mod kimi_replay;
+mod kimi_sse;
 pub mod login_store;
+pub mod media_exec;
 pub mod meta;
 pub mod meta_auth;
 mod meta_codex;
+pub mod meta_exec;
 mod meta_wire;
+pub mod multipart;
 pub mod oauth;
 pub mod openai_compat;
+pub mod openai_compat_exec;
 mod openai_compat_go;
+mod openai_compat_headers;
 mod openai_compat_http;
-pub mod openai_compat_multipart;
+mod openai_compat_media;
 mod openai_compat_payload;
 #[cfg(test)]
 mod openai_compat_usage;
 mod payload_barrier;
 mod payload_media;
+pub mod pipeline;
 pub mod proxy;
 mod quota;
 mod rawjson;
 mod replay;
+pub mod session;
 #[cfg(test)]
 mod test_tls;
 mod tls;
 mod tokenizer;
 mod tokens;
 mod translate;
+pub mod types;
 mod upstream;
 pub mod vertex;
 pub mod vertex_auth;
+mod vertex_exec;
 mod vertex_openapi;
 mod wire;
 pub mod wsrelay;
 pub mod xai;
 pub mod xai_auth;
+mod xai_deferred;
+mod xai_events;
+pub mod xai_exec;
+mod xai_media;
 mod xai_replay;
+mod xai_replay_items;
+mod xai_replay_key;
+mod xai_replay_store;
 mod xai_request;
 mod xai_response;
+mod xai_shape;
 pub mod xai_url;
 mod xai_ws;
 
 use ck_core::config::Config;
 use ck_core::credential::{Credential, MetadataPatch};
-use ck_core::exec::{ExecError, ExecRequest, ExecResponse, ExecSession, FailureScope};
+use ck_core::exec::{ExecError, ExecRequest, ExecResponse, FailureScope};
 
+pub use xai_media::{JobBinding, JobKind};
 pub use xai_ws::websockets_enabled;
+
+/// The `alt` marker the deferred Chat route puts on a poll (X11).
+pub const DEFERRED_CHAT_POLL: &str = "chat/deferred-completion";
+
+/// The upstream-socket half of one Responses WebSocket turn ([`Executors::start_turn`]).
+pub enum TurnCancel {
+    Codex(codex::TurnControl),
+    Xai(xai_ws::Cancel),
+}
+
+impl TurnCancel {
+    /// The client went away with the turn in flight ([`session::CancelTurn`]).
+    pub async fn cancel(self) {
+        use session::CancelTurn;
+        match self {
+            Self::Codex(control) => control.cancel().await,
+            Self::Xai(cancel) => cancel.cancel().await,
+        }
+    }
+
+    /// The control a client's `response.interrupt` goes to; xAI's WebSocket mode has none.
+    pub fn control(&self) -> Option<codex::TurnControl> {
+        match self {
+            Self::Codex(control) => Some(control.clone()),
+            Self::Xai(_) => None,
+        }
+    }
+}
 
 /// What a credential needs before or around use. See the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +221,111 @@ pub struct DeviceExecutors {
     pub devin: devin::DevinExecutor,
 }
 
+/// The execution contract's selector (`docs/EXECUTION-CONTRACT.md` §3–4). Each provider unit
+/// adds its arm to all four methods, calling `pipeline` with its `Execute` implementation,
+/// and deletes its arm from the old methods below. A provider without an arm here is not
+/// converted: `destination` answers `None`, and the server takes the old path before fencing.
 impl Executors {
+    pub fn destination(&self, attempt: &types::Attempt<'_>) -> Option<&'static str> {
+        match attempt.credential.provider.as_str() {
+            "codex" => Some(pipeline::destination(&self.codex, attempt)),
+            // Whether a Claude request keeps the old arm is known only at the fence (C2).
+            "claude" => Some(pipeline::destination(&self.claude, attempt)),
+            p if openai_compat::handles(p) => Some(pipeline::destination(&self.openai.compat, attempt)),
+            gemini_exec::PROVIDER => Some(pipeline::destination(&self.google.gemini, attempt)),
+            xai::PROVIDER => Some(pipeline::destination(&self.openai.xai, attempt)),
+            meta::PROVIDER => Some(pipeline::destination(&self.devices.meta, attempt)),
+            p if vertex::handles(p) => vertex_exec::destination(&self.google.vertex, attempt),
+            p if kimi::PROVIDERS.contains(&p) => Some(pipeline::destination(&self.devices.kimi, attempt)),
+            antigravity::PROVIDER => Some(pipeline::destination(&self.google.antigravity, attempt)),
+            _ => None,
+        }
+    }
+
+    /// Re-fences the client view for this attempt's destination (contract §4 step 2; the
+    /// server closes the client fence against `ClientCapability` first).
+    pub fn refence<'a>(
+        &self,
+        attempt: &types::Attempt<'_>,
+        view: ck_translate::codec::RequestView<'a>,
+    ) -> ck_translate::codec::Result<ck_translate::codec::ValidatedRequest<'a>> {
+        match attempt.credential.provider.as_str() {
+            "codex" => pipeline::refence(&self.codex, attempt, view),
+            "claude" if self.claude.contract_path(attempt, view) => pipeline::refence(&self.claude, attempt, view),
+            p if openai_compat::handles(p) => pipeline::refence(&self.openai.compat, attempt, view),
+            gemini_exec::PROVIDER => pipeline::refence(&self.google.gemini, attempt, view),
+            xai::PROVIDER => pipeline::refence(&self.openai.xai, attempt, view),
+            meta::PROVIDER => pipeline::refence(&self.devices.meta, attempt, view),
+            p if vertex::handles(p) => pipeline::refence(&self.google.vertex, attempt, view),
+            p if kimi::PROVIDERS.contains(&p) => pipeline::refence(&self.devices.kimi, attempt, view),
+            antigravity::PROVIDER => pipeline::refence(&self.google.antigravity, attempt, view),
+            _ => Err(ck_translate::codec::Error::Destination),
+        }
+    }
+
+    /// Runs the operation in the request view and starts the producer on `response`, a
+    /// stream created with `Store::create_dependent(upload)`.
+    pub async fn start(
+        &self,
+        attempt: &types::Attempt<'_>,
+        request: &mut types::Request<'_>,
+        upload: &mut ck_stream::Writer,
+        mut response: ck_stream::Writer,
+    ) -> Result<pipeline::Started, ExecError> {
+        match attempt.credential.provider.as_str() {
+            "codex" => pipeline::start(&self.codex, attempt, request, upload, response).await,
+            "claude" if self.claude.contract_path(attempt, request.validated().view()) => {
+                pipeline::start(&self.claude, attempt, request, upload, response).await
+            }
+            p if openai_compat::handles(p) => {
+                pipeline::start(&self.openai.compat, attempt, request, upload, response).await
+            }
+            gemini_exec::PROVIDER => pipeline::start(&self.google.gemini, attempt, request, upload, response).await,
+            xai::PROVIDER => pipeline::start(&self.openai.xai, attempt, request, upload, response).await,
+            meta::PROVIDER => pipeline::start(&self.devices.meta, attempt, request, upload, response).await,
+            p if vertex::handles(p) => pipeline::start(&self.google.vertex, attempt, request, upload, response).await,
+            p if kimi::PROVIDERS.contains(&p) => {
+                pipeline::start(&self.devices.kimi, attempt, request, upload, response).await
+            }
+            antigravity::PROVIDER => {
+                pipeline::start(&self.google.antigravity, attempt, request, upload, response).await
+            }
+            provider => {
+                response.finish(ck_stream::Terminal::Gone);
+                Err(no_executor(provider))
+            }
+        }
+    }
+}
+
+impl Executors {
+    /// [`Executors::start`] for one Responses WebSocket turn whose execution session is its
+    /// connection. A Codex or xAI credential with `websockets` runs it on its upstream socket
+    /// ([`session::Turns`]) and returns that transport's cancel; any other, or a Codex turn whose
+    /// upgrade the upstream refused with 426, runs it as an ordinary attempt, which its response
+    /// stream's cancel stops.
+    pub async fn start_turn(
+        &self,
+        attempt: &types::Attempt<'_>,
+        request: &mut types::Request<'_>,
+        upload: &mut ck_stream::Writer,
+        response: ck_stream::Writer,
+    ) -> Result<(pipeline::Started, Option<TurnCancel>), ExecError> {
+        let credential = attempt.credential;
+        match credential.provider.as_str() {
+            "codex" if codex::CodexExecutor::upstream_websocket(credential) => {
+                let (started, cancel) = pipeline::start_turn(&self.codex, attempt, request, upload, response).await?;
+                Ok((started, cancel.map(TurnCancel::Codex)))
+            }
+            xai::PROVIDER if xai_ws::websockets_enabled(credential) => {
+                let (started, cancel) =
+                    pipeline::start_turn(&self.openai.xai, attempt, request, upload, response).await?;
+                Ok((started, cancel.map(TurnCancel::Xai)))
+            }
+            _ => Ok((self.start(attempt, request, upload, response).await?, None)),
+        }
+    }
+
     pub async fn execute(
         &self,
         credential: &Credential,
@@ -169,6 +333,7 @@ impl Executors {
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         match credential.provider.as_str() {
+            // The old route until D2 switches the server to `start` (Q1).
             "claude" => self.claude.execute(credential, req, cfg).await,
             "codex" => self.codex.execute(credential, req, cfg).await,
             p if kimi::PROVIDERS.contains(&p) => self.devices.kimi.execute(&self.claude, credential, req, cfg).await,
@@ -184,99 +349,34 @@ impl Executors {
         }
     }
 
-    /// The Images API (`/v1/images/generations`, `/v1/images/edits`) for providers that
-    /// serve it directly. `request_path` is the inbound route; `req.stream` asks for the
-    /// upstream event stream passed through raw.
-    pub async fn images(
+    /// Where `caller`'s video job `job` is polled: the credential and model it was created on
+    /// (E-Q5). `None` when the job is another caller's, expired or unknown.
+    pub fn video_binding(&self, caller: &ck_core::exec::Caller, job: &str) -> Option<JobBinding> {
+        self.openai.xai.jobs.binding(caller, JobKind::Video, job)
+    }
+
+    /// Where `caller`'s deferred image job `job` is polled, as [`Executors::video_binding`] finds
+    /// a video job's.
+    pub fn image_binding(&self, caller: &ck_core::exec::Caller, job: &str) -> Option<JobBinding> {
+        self.openai.xai.jobs.binding(caller, JobKind::Image, job)
+    }
+
+    /// Where `caller`'s deferred Chat job `job` is polled, as [`Executors::video_binding`]
+    /// finds a video job's.
+    pub fn chat_binding(&self, caller: &ck_core::exec::Caller, job: &str) -> Option<JobBinding> {
+        self.openai.xai.jobs.binding(caller, JobKind::Chat, job)
+    }
+
+    /// A deferred xAI Chat create or poll (X11); only xAI serves it.
+    pub async fn deferred_chat(
         &self,
         credential: &Credential,
         req: ExecRequest,
-        request_path: &str,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         match credential.provider.as_str() {
-            "codex" => self.codex.images(credential, req, request_path, cfg).await,
-            p if openai_compat::handles(p) => self.openai.compat.images(credential, req, request_path, cfg).await,
-            xai::PROVIDER => self.openai.xai.images(credential, req, request_path, cfg).await,
+            xai::PROVIDER => self.openai.xai.deferred_chat(credential, req, cfg).await,
             other => Err(no_executor(other)),
-        }
-    }
-
-    /// The Videos API (`/v1/videos*`, `/openai/v1/videos*`) for providers that serve it.
-    /// `request_path` is the inbound route; a route other than generations, edits or
-    /// extensions polls the job named by the body's `request_id`.
-    pub async fn videos(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        request_path: &str,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        match credential.provider.as_str() {
-            xai::PROVIDER => self.openai.xai.videos(credential, req, request_path, cfg).await,
-            other => Err(no_executor(other)),
-        }
-    }
-
-    /// The OpenAI speech routes (`/v1/audio/speech`, `/v1/tts`): Go's `openai-speech`
-    /// source, which only the xAI executor serves.
-    pub async fn speech(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        cfg: &Config,
-    ) -> Result<ExecResponse, ExecError> {
-        match credential.provider.as_str() {
-            xai::PROVIDER => self.openai.xai.speech(credential, req, cfg).await,
-            other => Err(no_executor(other)),
-        }
-    }
-
-    /// One turn of a downstream Responses WebSocket session. Codex and xAI credentials
-    /// with `websockets` keep a pooled upstream socket per session; every other credential
-    /// runs an ordinary execution and cannot continue upstream state, so a continuation
-    /// turn fails with [`ExecError::replay_required`].
-    pub async fn execute_in_session(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        cfg: &Config,
-        session: &ExecSession,
-    ) -> Result<ExecResponse, ExecError> {
-        match credential.provider.as_str() {
-            "codex" => self.codex.execute_in_session(credential, req, cfg, session).await,
-            xai::PROVIDER => self.openai.xai.execute_in_session(credential, req, cfg, session).await,
-            _ if session.continuation => Err(ExecError::replay_required()),
-            _ => self.execute(credential, req, cfg).await,
-        }
-    }
-
-    /// Whether `credential` keeps upstream conversation state on a session socket, so
-    /// the next turn may be sent as an incremental continuation.
-    pub fn session_upstream(&self, credential: &Credential) -> bool {
-        match credential.provider.as_str() {
-            "codex" => codex::CodexExecutor::upstream_websocket(credential),
-            xai::PROVIDER => xai::XaiExecutor::session_upstream(credential),
-            _ => false,
-        }
-    }
-
-    /// Starts another downstream session attempt without retaining its predecessor's loss.
-    pub fn clear_session_loss(&self, id: &str) {
-        self.codex.ws.clear_loss(id);
-        self.openai.xai.ws.clear_loss(id);
-    }
-
-    /// Resolves when an upstream socket held for session `id` is lost; pending forever
-    /// when no executor holds one.
-    pub fn session_closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        let codex = self.codex.session_closed(id);
-        let xai = self.openai.xai.session_closed(id);
-        async move {
-            tokio::select! {
-                error = codex => error,
-                error = xai => error,
-            }
         }
     }
 
@@ -441,7 +541,8 @@ impl Executors {
     }
 }
 
-fn no_executor(provider: &str) -> ExecError {
+/// The failure of a call no executor of `provider` serves; it fails over to another credential.
+pub fn no_executor(provider: &str) -> ExecError {
     ExecError::local(
         500,
         FailureScope::Credential,
@@ -450,223 +551,4 @@ fn no_executor(provider: &str) -> ExecError {
 }
 
 #[cfg(test)]
-mod readiness_tests {
-    use super::{Executors, Readiness, claude};
-    use ck_core::config::Config;
-    use ck_core::credential::Credential;
-    use std::path::Path;
-
-    fn credential(metadata: serde_json::Value) -> Credential {
-        Credential::from_file(
-            Path::new("/auth"),
-            Path::new("/auth/a.json"),
-            metadata.as_object().unwrap().clone(),
-        )
-        .unwrap()
-    }
-
-    fn rfc3339(offset: chrono::Duration) -> String {
-        (chrono::Utc::now() + offset).to_rfc3339()
-    }
-
-    /// Requests block only on Go `ShouldPrepareRequestAuth` (Claude: an OAuth token
-    /// without a canonical device pool or account UUID). Expiry, even past expiry, is a
-    /// background refresh.
-    #[test]
-    fn only_missing_identity_blocks_requests() {
-        let executors = Executors {
-            claude: claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
-            codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
-        };
-        let cfg = Config::default();
-        let pool = serde_json::json!(["a".repeat(64)]);
-        let identified = |expired: String| {
-            credential(serde_json::json!({
-                "type": "claude",
-                "access_token": "sk-ant-oat01-fake",
-                "refresh_token": "fake-refresh",
-                "claude_device_ids": pool,
-                "account_uuid": "fake-account",
-                "expired": expired,
-            }))
-        };
-        let cases = [
-            (identified(rfc3339(chrono::Duration::days(2))), Readiness::Ready),
-            (identified(rfc3339(chrono::Duration::hours(1))), Readiness::RefreshSoon),
-            (identified(rfc3339(-chrono::Duration::hours(1))), Readiness::RefreshSoon),
-            (
-                credential(serde_json::json!({
-                    "type": "claude",
-                    "access_token": "sk-ant-oat01-fake",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(-chrono::Duration::hours(1)),
-                })),
-                Readiness::PrepareNow,
-            ),
-            (
-                credential(serde_json::json!({"type": "claude", "access_token": "sk-ant-api03-fake"})),
-                Readiness::Ready,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "kimi",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(-chrono::Duration::hours(1)),
-                })),
-                Readiness::RefreshSoon,
-            ),
-            // Antigravity: requests wait for the project ID and for a token valid five
-            // more minutes (Go's inline refresh); otherwise the token refreshes 30
-            // minutes ahead in the background.
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::hours(5)),
-                })),
-                Readiness::PrepareNow,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::minutes(20)),
-                })),
-                Readiness::RefreshSoon,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::minutes(6)),
-                })),
-                Readiness::RefreshSoon,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::minutes(4)),
-                })),
-                Readiness::PrepareNow,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::minutes(40)),
-                })),
-                Readiness::PrepareNow,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "access_token": "fake-access",
-                })),
-                Readiness::PrepareNow,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::minutes(40)),
-                })),
-                Readiness::Ready,
-            ),
-        ];
-        for (i, (c, expected)) in cases.iter().enumerate() {
-            assert_eq!(executors.readiness(c, &cfg), *expected, "case {i}");
-        }
-    }
-
-    /// The refresh loop sleeps until `prepare_due`: each provider's own lead before
-    /// expiry (Claude 4 h, Kimi 5 min), to the second, `now` once due, and nothing past
-    /// the horizon.
-    #[test]
-    fn prepare_due_finds_each_providers_deadline() {
-        let executors = Executors {
-            claude: claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
-            codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
-        };
-        let cfg = Config::default();
-        let now = chrono::Utc::now();
-        let horizon = chrono::Duration::hours(1);
-        let with_expiry = |provider: &str, expiry: chrono::DateTime<chrono::Utc>| {
-            credential(serde_json::json!({
-                "type": provider,
-                "access_token": "fake-access",
-                "refresh_token": "fake-refresh",
-                "expired": expiry.to_rfc3339(),
-            }))
-        };
-        let near = |got: Option<chrono::DateTime<chrono::Utc>>, want: chrono::DateTime<chrono::Utc>| {
-            let got = got.expect("due inside the horizon");
-            assert!((got - want).num_milliseconds().abs() <= 1000, "{got} vs {want}");
-        };
-        let offset = chrono::Duration::seconds(1337);
-        let claude = with_expiry("claude", now + chrono::Duration::hours(4) + offset);
-        near(executors.prepare_due(&claude, &cfg, now, horizon), now + offset);
-        let kimi = with_expiry("kimi", now + chrono::Duration::minutes(5) + offset);
-        near(executors.prepare_due(&kimi, &cfg, now, horizon), now + offset);
-        let due = with_expiry("claude", now - chrono::Duration::hours(1));
-        assert_eq!(executors.prepare_due(&due, &cfg, now, horizon), Some(now));
-        let later = with_expiry("claude", now + chrono::Duration::hours(6));
-        assert_eq!(executors.prepare_due(&later, &cfg, now, horizon), None);
-        let api_key = credential(serde_json::json!({"type": "claude", "access_token": "sk-ant-api03-fake"}));
-        assert_eq!(executors.prepare_due(&api_key, &cfg, now, horizon), None);
-    }
-
-    /// Go `authHasRefreshCredential`.
-    #[test]
-    fn refresh_credentials_follow_go() {
-        let executors = Executors {
-            claude: claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
-            codex: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
-            devices: Default::default(),
-        };
-        let has = |m: serde_json::Value| executors.has_refresh_credential(&credential(m));
-        assert!(has(serde_json::json!({"type": "claude", "refresh_token": "fake"})));
-        assert!(has(serde_json::json!({"type": "kimi", "refreshToken": "fake"})));
-        assert!(!has(serde_json::json!({"type": "claude", "refresh_token": "  "})));
-        // A Sign in with ChatGPT partition needs its refresh token and client ID.
-        assert!(has(
-            serde_json::json!({"type": "codex", "siwc": {"refresh_token": "fake", "client_id": "c"}})
-        ));
-        assert!(!has(
-            serde_json::json!({"type": "codex", "siwc": {"refresh_token": "fake"}})
-        ));
-        assert!(
-            !has(serde_json::json!({"type": "claude", "siwc": {"refresh_token": "fake", "client_id": "c"}})),
-            "SIWC is Codex's"
-        );
-        assert!(has(serde_json::json!({"type": "meta", "dca_token": "fake"})));
-        assert!(
-            !has(serde_json::json!({"type": "claude", "dca_token": "fake"})),
-            "dca_token is Meta's"
-        );
-        let mut meta = credential(serde_json::json!({"type": "meta"}));
-        assert!(!executors.has_refresh_credential(&meta));
-        meta.attributes.insert("dca_token".into(), "fake".into());
-        assert!(executors.has_refresh_credential(&meta));
-    }
-}
+mod readiness_tests;

@@ -354,6 +354,18 @@ const response = await client.models.generateContent({
 console.log(response.text);
 ```
 
+## Deferred xAI Chat
+
+Send `POST /v1/chat/completions` with an xAI model, `deferred: true`, and no streaming. The response is xAI's `request_id`, not a completion. Poll `GET /v1/chat/deferred-completion/{request_id}` with the same client key:
+
+- `202` with an empty body: pending; poll again later.
+- `200` with a Chat completion: completed.
+- An error status: the poll failed; no synchronous generation replaces it.
+
+The job stays bound to its creating client key and upstream credential for 3 hours after the last poll. Unknown, expired and other callers' IDs return `404` without an upstream request. Bindings live in process memory, so restarting cooker loses them. OAuth Chat proxy credentials and `stream: true` are rejected.
+
+xAI keeps a completed result for 24 hours and releases it once. Cooker never retries a sent create or poll, because a lost response may already have created or consumed the job. See xAI's [deferred Chat guide](https://docs.x.ai/developers/advanced-api-usage/deferred-chat-completions) and [REST reference](https://docs.x.ai/developers/rest-api-reference/inference/chat-completions).
+
 ## Check it works
 
 ```bash

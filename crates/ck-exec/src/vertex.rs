@@ -58,7 +58,7 @@ impl Default for VertexExecutor {
 }
 
 /// How one request authenticates.
-enum Auth {
+pub(crate) enum Auth {
     /// `x-goog-api-key` at `base` (empty: the global endpoint).
     ApiKey { key: String, base: String },
     ServiceAccount {
@@ -75,7 +75,7 @@ fn plain_error(message: impl Into<String>) -> ExecError {
 
 /// `vertexAPICreds`: the `api_key` and `base_url` attributes as stored, else the file's
 /// `access_token`.
-fn api_creds(credential: &Credential) -> (String, String) {
+pub(crate) fn api_creds(credential: &Credential) -> (String, String) {
     let attr = |k: &str| credential.attributes.get(k).cloned().unwrap_or_default();
     let mut key = attr("api_key");
     if key.is_empty() {
@@ -111,7 +111,7 @@ fn service_account(credential: &Credential) -> Result<Auth, ExecError> {
     })
 }
 
-fn auth_for(credential: &Credential) -> Result<Auth, ExecError> {
+pub(crate) fn auth_for(credential: &Credential) -> Result<Auth, ExecError> {
     let (key, base) = api_creds(credential);
     if key.is_empty() {
         return service_account(credential);
@@ -177,6 +177,11 @@ fn regional_base(location: &str) -> String {
 }
 
 fn endpoint(auth: &Auth, model: &str, action: &str) -> String {
+    format!("{}/{model}:{action}", models_url(auth))
+}
+
+/// The Google publisher's model collection URL, without a trailing slash.
+pub(crate) fn models_url(auth: &Auth) -> String {
     match auth {
         // `vertexAPIKeyModelsURL` (Go 2d7f5377): a base holding `/publishers/` is the
         // full models prefix; otherwise `/v1` is added unless the base ends in a
@@ -185,17 +190,17 @@ fn endpoint(auth: &Auth, model: &str, action: &str) -> String {
             let base = base.trim().trim_end_matches('/');
             let base = if base.is_empty() { DEFAULT_API_KEY_BASE } else { base };
             if base.contains("/publishers/") {
-                return format!("{base}/{model}:{action}");
+                return base.to_owned();
             }
             let version = if ends_in_version(base) {
                 String::new()
             } else {
                 format!("/{API_VERSION}")
             };
-            format!("{base}{version}/publishers/google/models/{model}:{action}")
+            format!("{base}{version}/publishers/google/models")
         }
         Auth::ServiceAccount { project, location, .. } => format!(
-            "{}/{API_VERSION}/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}",
+            "{}/{API_VERSION}/projects/{project}/locations/{location}/publishers/google/models",
             regional_base(location)
         ),
     }
@@ -218,7 +223,7 @@ fn ends_in_version(base: &str) -> bool {
 /// exchange, so a URL it rejects fails without contacting the token endpoint. A URL
 /// its transport refuses (no host, or a scheme other than http and https) passes here
 /// and fails at the send ([`g::send_captured`]).
-fn check_url(url: &str) -> Result<(), ExecError> {
+pub(crate) fn check_url(url: &str) -> Result<(), ExecError> {
     crate::xai_url::new_request(url)?;
     if crate::xai_url::transport_refusal(url).is_some() {
         return Ok(());
@@ -241,7 +246,7 @@ fn go_string(value: &gj::Res<'_>) -> String {
 }
 
 /// `isImagenModel`.
-fn is_imagen(model: &str) -> bool {
+pub(crate) fn is_imagen(model: &str) -> bool {
     model.go_lower().contains("imagen")
 }
 
@@ -355,6 +360,12 @@ fn strip_tool_call_ids(body: Vec<u8>, source: Format) -> Vec<u8> {
     if source != Format::OpenAIResponse {
         return body;
     }
+    strip_call_ids(body)
+}
+
+/// Deletes `id` from every `functionCall` and `functionResponse` part of `contents`, which
+/// Vertex refuses; calls and responses still pair by order and name.
+pub(crate) fn strip_call_ids(body: Vec<u8>) -> Vec<u8> {
     let contents = gj::get(&body, "contents");
     if !contents.is_array() {
         return body;
@@ -444,8 +455,19 @@ impl VertexExecutor {
         }
     }
 
-    fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
+    pub(crate) fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
         self.clients.get(&Proxy::effective(credential, cfg))
+    }
+
+    /// A fresh access token for `account`, which may be empty. The token exchange uses the
+    /// credential's proxy, like the model request; a failure is logged without any token.
+    pub(crate) async fn mint(&self, client: &wreq::Client, account: &Map<String, Value>) -> Result<String, ExecError> {
+        vertex_auth::access_token(client, account, (self.now)())
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "vertex executor: access token error");
+                g::status_err(500, "internal server error")
+            })
     }
 
     pub async fn execute(
@@ -495,57 +517,34 @@ impl VertexExecutor {
         };
         req.usage
             .delegated_executor(executor, &parse_suffix(&req.model).model_name);
-        let (base_url, token) = credentials?;
-        crate::openai_compat::chat_with(&client, credential, req, cfg, &base_url, &token, None).await
+        let (base_url, token, api_auth) = credentials?;
+        crate::openai_compat::chat_with(&client, credential, req, cfg, (&base_url, &token, api_auth), None).await
     }
 
-    /// `resolveOpenAPICredentials`: a service account (also when the file carries an
-    /// access token beside it) sends a fresh token to its project's route; an API key
-    /// only to a third-party relay, since Google's hosts need OAuth.
+    /// `resolveOpenAPICredentials`: the route's base URL, then the bearer credential.
     async fn openapi_credentials(
         &self,
         client: &wreq::Client,
         credential: &Credential,
-    ) -> Result<(String, String), ExecError> {
-        let (key, base) = api_creds(credential);
-        let has_account = matches!(credential.metadata.get("service_account"), Some(Value::Object(a)) if !a.is_empty());
-        if key.is_empty() || has_account {
-            let Auth::ServiceAccount {
-                project,
-                location,
-                account,
-            } = service_account(credential)?
-            else {
-                unreachable!("service_account answers a service account")
-            };
-            let token = vertex_auth::access_token(client, &account, (self.now)())
-                .await
-                .map_err(|error| {
-                    tracing::error!(%error, "vertex executor: access token error");
-                    g::status_err(500, "internal server error")
-                })?;
-            if token.trim().is_empty() {
-                return Err(g::status_err(401, "missing access token"));
+    ) -> Result<(String, String, bool), ExecError> {
+        let (base, key) = openapi_route(credential)?;
+        let api_auth = matches!(key, OpenApiKey::Key(_));
+        Ok((base, self.openapi_key(client, key).await?, api_auth))
+    }
+
+    /// The bearer credential of the `endpoints/openapi` route: the API key, or a fresh access
+    /// token, which must not be empty.
+    pub(crate) async fn openapi_key(&self, client: &wreq::Client, key: OpenApiKey) -> Result<String, ExecError> {
+        match key {
+            OpenApiKey::Key(key) => Ok(key),
+            OpenApiKey::Account(account) => {
+                let token = self.mint(client, &account).await?;
+                if token.trim().is_empty() {
+                    return Err(g::status_err(401, "missing access token"));
+                }
+                Ok(token)
             }
-            let location = vertex_openapi::location(credential, &location);
-            let base = vertex_openapi::auth_base_url(credential);
-            return Ok((
-                vertex_openapi::service_account_base_url(&base, API_VERSION, &project, &location),
-                token,
-            ));
         }
-        if vertex_openapi::is_google_host(&base) {
-            return Err(g::status_err(
-                400,
-                "vertex endpoints/openapi on aiplatform.googleapis.com requires service account credentials",
-            ));
-        }
-        let location = vertex_openapi::location(credential, "");
-        let project = vertex_openapi::auth_project_id(credential);
-        Ok((
-            vertex_openapi::api_key_base_url(&base, API_VERSION, &project, &location),
-            key,
-        ))
     }
 
     /// Go 2d5351b3 `executeInteractions` / `executeInteractionsStream`: the Interactions
@@ -590,9 +589,12 @@ impl VertexExecutor {
                 }
                 headers.set("Authorization", format!("Bearer {token}"));
             }
-            None => headers.set("x-goog-api-key", key),
+            None => headers.set("x-goog-api-key", &key),
         }
         g::set_custom_headers(&mut headers, credential, req);
+        if !key.is_empty() {
+            headers.set("User-Agent", "cooker");
+        }
         g::interactions_revision(&mut headers, req);
         g::interactions_exchange(req, credential, PROVIDER, &client, &url, headers, body).await
     }
@@ -611,19 +613,16 @@ impl VertexExecutor {
         match auth {
             Auth::ApiKey { key, .. } => headers.set("x-goog-api-key", key.clone()),
             Auth::ServiceAccount { account, .. } => {
-                // Token exchange uses the credential's proxy, like the model request.
-                let token = vertex_auth::access_token(&self.client(credential, cfg), account, (self.now)())
-                    .await
-                    .map_err(|error| {
-                        tracing::error!(%error, "vertex executor: access token error");
-                        g::status_err(500, "internal server error")
-                    })?;
+                let token = self.mint(&self.client(credential, cfg), account).await?;
                 if !token.is_empty() {
                     headers.set("Authorization", format!("Bearer {token}"));
                 }
             }
         }
         g::set_custom_headers(&mut headers, credential, req);
+        if matches!(auth, Auth::ApiKey { .. }) {
+            headers.set("User-Agent", "cooker");
+        }
         Ok(headers)
     }
 
@@ -814,6 +813,49 @@ impl VertexExecutor {
             body: ResponseBody::Buffered(Bytes::from(out)),
         })
     }
+}
+
+/// What the `endpoints/openapi` route authenticates with.
+pub(crate) enum OpenApiKey {
+    /// A service account, whose token is minted per request.
+    Account(Map<String, Value>),
+    Key(String),
+}
+
+/// The `endpoints/openapi` base URL and its credential, without contacting anyone: a service
+/// account (also when the file carries an access token beside it) goes to its project's route;
+/// an API key only to a third-party relay, since Google's hosts need OAuth.
+pub(crate) fn openapi_route(credential: &Credential) -> Result<(String, OpenApiKey), ExecError> {
+    let (key, base) = api_creds(credential);
+    let has_account = matches!(credential.metadata.get("service_account"), Some(Value::Object(a)) if !a.is_empty());
+    if key.is_empty() || has_account {
+        let Auth::ServiceAccount {
+            project,
+            location,
+            account,
+        } = service_account(credential)?
+        else {
+            unreachable!("service_account answers a service account")
+        };
+        let location = vertex_openapi::location(credential, &location);
+        let base = vertex_openapi::auth_base_url(credential);
+        return Ok((
+            vertex_openapi::service_account_base_url(&base, API_VERSION, &project, &location),
+            OpenApiKey::Account(account),
+        ));
+    }
+    if vertex_openapi::is_google_host(&base) {
+        return Err(g::status_err(
+            400,
+            "vertex endpoints/openapi on aiplatform.googleapis.com requires service account credentials",
+        ));
+    }
+    let location = vertex_openapi::location(credential, "");
+    let project = vertex_openapi::auth_project_id(credential);
+    Ok((
+        vertex_openapi::api_key_base_url(&base, API_VERSION, &project, &location),
+        OpenApiKey::Key(key),
+    ))
 }
 
 /// `type` values the import flag writes and the executor serves.

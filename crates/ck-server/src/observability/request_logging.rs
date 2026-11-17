@@ -1,10 +1,16 @@
 //! Go request_logging.go / response_writer.go and request_logger_writer.go.
-//! Request bodies in these files are intentionally unredacted, as in Go. Headers
-//! and URL queries are masked before writing; management routes are never captured.
+//! Request bodies in these files are intentionally unredacted, as in Go, except for
+//! URLs: each section of a log is redacted word by word with `ck_wire::redact` when the
+//! log is written (owner ruling Settled 60), as a whole, or as the messages of a WebSocket
+//! timeline that fail closed at each message end. A URL that a protocol splits across
+//! separate JSON values (stream deltas) is redacted value by value (owner ruling R-6). Spools hold the captured bytes until then,
+//! with no name in the log directory. Headers and URL queries
+//! are masked before writing; management routes are never captured.
 
 use ck_core::gostr::GoStr;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,10 +24,16 @@ use axum::middleware::Next;
 use axum::response::Response;
 use bytes::Bytes;
 use chrono::{DateTime, Local, SecondsFormat};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+#[path = "request_logging_spool.rs"]
+mod spool;
+#[cfg(test)]
+use spool::SECTION_MEMORY;
+use spool::{Section, Spool};
 
 use crate::management::api::Management;
-use crate::observability::api::{RequestId, hide_key, mask_query};
+use crate::observability::api::{RequestId, hide_key};
 use crate::{Runtime, http::body_limit};
 
 const SMALL_BODY: u64 = 1 << 20;
@@ -180,7 +192,8 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             deferred: deferred.clone(),
         });
     }
-    let query = mask_query(request.uri().query().unwrap_or_default());
+    // The record keeps this URL, so its query is masked as it enters.
+    let query = ck_wire::redact::query(request.uri().query().unwrap_or_default());
     let url = if query.is_empty() {
         path
     } else {
@@ -213,8 +226,8 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             detached: false,
             metadata_ready: false,
             websocket_done: false,
-            timeline: None,
-            api_timeline: Section::new("api-websocket-timeline"),
+            timeline: Section::framed("websocket-timeline"),
+            api_timeline: Section::framed("api-websocket-timeline"),
             api_request: Section::new("api-request"),
             deferred_api_request: Vec::new(),
             api_response: Section::new("api-response"),
@@ -289,17 +302,14 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
                             .any(|window| window == *needle)
                     })));
     let chunks = if record.streaming && !head {
-        match Spool::new(&record.state.dir, "response-body") {
-            Ok(spool) => match spool.file.try_clone() {
-                Ok(file) => {
-                    record.response_spool = Some(spool);
-                    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(100);
-                    record.state.work.spawn(spool_response(file, rx, sink.clone()));
-                    guard.0 = None;
-                    Some(tx)
-                }
-                Err(_) => None,
-            },
+        match Spool::new(&record.state.dir, "response-body").and_then(|spool| Ok((spool.file.try_clone()?, spool))) {
+            Ok((file, spool)) => {
+                record.response_spool = Some(spool);
+                let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(100);
+                record.state.work.spawn(spool_response(file, rx, sink.clone()));
+                guard.0 = None;
+                Some(tx)
+            }
             Err(_) => None,
         }
     } else {
@@ -389,12 +399,6 @@ impl RequestLog {
         }
     }
 
-    pub fn api_websocket_timeline(&self, bytes: &[u8]) {
-        if let Some(record) = self.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-            record.api_timeline.append(&record.state.dir, bytes);
-        }
-    }
-
     /// Go API_RESPONSE_ERROR: actionable upstream failures can force an error
     /// log even when the downstream HTTP response started with 200.
     pub fn api_error(&self, status: u16, message: String) {
@@ -453,7 +457,6 @@ struct UpstreamCapture {
     status: bool,
     headers: bool,
     body: bool,
-    event: bool,
     error: bool,
 }
 
@@ -554,7 +557,7 @@ impl RequestLog {
                     if info.url.is_empty() {
                         String::from("<unknown>")
                     } else {
-                        logged_url(info.url)
+                        info.url.to_owned()
                     }
                 )
                 .unwrap();
@@ -622,7 +625,6 @@ impl RequestLog {
                 record.upstream.error = true;
             }
             ResponseChunk(chunk) => {
-                let chunk = trim(chunk);
                 if chunk.is_empty() {
                     return;
                 }
@@ -634,31 +636,26 @@ impl RequestLog {
                 }
                 if !record.upstream.body {
                     record.api_response.append(dir, b"Body:\n");
-                } else {
-                    record.api_response.append(
-                        dir,
-                        if record.upstream.event && chunk.starts_with(b"data:") {
-                            b"\n"
-                        } else {
-                            b"\n\n"
-                        },
-                    );
+                    record.upstream.body = true;
                 }
+                // Chunks join exactly as they arrived, with nothing inserted or trimmed
+                // between them (decision 2026-11-15): a separator would cut a URL split
+                // across two chunks, and the section's redaction would miss its tail.
                 record.api_response.append(dir, chunk);
-                record.upstream.body = true;
-                record.upstream.event = chunk.starts_with(b"event:");
             }
             WebsocketRequest(info) => {
                 let mut part = websocket_event("api.websocket.request");
                 if !info.url.is_empty() {
-                    writeln!(part, "Upstream URL: {}", logged_url(info.url)).unwrap();
+                    writeln!(part, "Upstream URL: {}", info.url).unwrap();
                 }
                 upstream_auth(&mut part, &info);
                 part.extend_from_slice(b"Headers:\n");
                 upstream_headers(&mut part, info.headers);
                 part.extend_from_slice(b"\nBody:\n");
-                part.extend_from_slice(if info.body.is_empty() { b"<empty>" } else { info.body });
-                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
+                if info.body.is_empty() {
+                    part.extend_from_slice(b"<empty>");
+                }
+                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part, info.body);
             }
             WebsocketHandshake(status, headers) => {
                 let mut part = websocket_event("api.websocket.handshake");
@@ -667,7 +664,7 @@ impl RequestLog {
                 }
                 part.extend_from_slice(b"Headers:\n");
                 upstream_headers(&mut part, headers);
-                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
+                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part, b"");
             }
             WebsocketResponse(payload) => {
                 let payload = trim(payload);
@@ -675,9 +672,8 @@ impl RequestLog {
                     return;
                 }
                 record.api_timestamp.get_or_insert_with(Local::now);
-                let mut part = websocket_event("api.websocket.response");
-                part.extend_from_slice(payload);
-                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
+                let part = websocket_event("api.websocket.response");
+                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part, payload);
             }
             WebsocketError { stage, error } => {
                 record.api_timestamp.get_or_insert_with(Local::now);
@@ -687,7 +683,7 @@ impl RequestLog {
                     writeln!(part, "Stage: {stage}").unwrap();
                 }
                 writeln!(part, "Error: {error}").unwrap();
-                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
+                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part, b"");
             }
         }
     }
@@ -767,11 +763,28 @@ fn websocket_event(event: &str) -> Vec<u8> {
     format!("Timestamp: {}\nEvent: {event}\n", timestamp(Local::now())).into_bytes()
 }
 
-fn upstream_timeline(out: &mut Section, dir: &Path, part: &[u8]) {
+/// One event of the upstream timeline: the log's `text` and the captured `payload` after
+/// it, trimmed as one part.
+fn upstream_timeline(out: &mut Section, dir: &Path, text: &[u8], payload: &[u8]) {
     if !out.is_empty() {
-        out.append(dir, b"\n\n");
+        out.insert(dir, b"\n\n");
     }
-    out.append(dir, trim(part));
+    let part = [text, payload].concat();
+    let trimmed = trim(&part);
+    let start = trimmed.as_ptr() as usize - part.as_ptr() as usize;
+    let (text, payload) = trimmed.split_at(text.len().saturating_sub(start).min(trimmed.len()));
+    out.insert(dir, text);
+    out.piece(dir, payload);
+}
+
+/// One event of the downstream timeline: the log's `header` lines, then the payload.
+fn downstream_timeline(out: &mut Section, dir: &Path, header: &[u8], payload: &[u8]) {
+    if !out.is_empty() {
+        out.insert(dir, b"\n");
+    }
+    out.insert(dir, header);
+    out.piece(dir, payload);
+    out.insert(dir, b"\n");
 }
 
 /// Connection-owned timeline sink. Explicit `close().await` waits for the durable
@@ -779,24 +792,15 @@ fn upstream_timeline(out: &mut Section, dir: &Path, part: &[u8]) {
 pub struct WebsocketLog(Option<RequestLog>);
 
 impl WebsocketLog {
-    pub fn append_part(&self, part: &[u8]) -> io::Result<()> {
-        if trim(part).is_empty() {
+    /// One event: the log's `header` lines and the client's or upstream's `payload`.
+    pub fn append_part(&self, header: &[u8], payload: &[u8]) -> io::Result<()> {
+        if trim(header).is_empty() && trim(payload).is_empty() {
             return Ok(());
         }
         if let Some(sink) = &self.0 {
             let mut record = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(record) = record.as_mut() {
-                if record.timeline.is_none() {
-                    record.timeline = Some(Spool::new(&record.state.dir, "websocket-timeline")?);
-                }
-                let spool = record.timeline.as_mut().unwrap();
-                if spool.file.metadata()?.len() > 0 {
-                    spool.file.write_all(b"\n")?;
-                }
-                spool.file.write_all(part)?;
-                if !part.ends_with(b"\n") {
-                    spool.file.write_all(b"\n")?;
-                }
+                downstream_timeline(&mut record.timeline, &record.state.dir, header, payload);
             } else {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "request log finalized"));
             }
@@ -833,15 +837,14 @@ fn schedule(sink: RequestLog, websocket: bool) {
 
 /// Drain even after a sticky disk error. Only EOF/drop ends capture; never
 /// finalize a live HTTP stream merely because its log file could not be written.
-async fn spool_response(file: File, mut rx: tokio::sync::mpsc::Receiver<Bytes>, sink: RequestLog) {
-    let mut file = tokio::fs::File::from_std(file);
+/// Writes are synchronous, like a section's spill.
+async fn spool_response(mut file: File, mut rx: tokio::sync::mpsc::Receiver<Bytes>, sink: RequestLog) {
     let mut failed = false;
     while let Some(bytes) = rx.recv().await {
-        if !failed && file.write_all(&bytes).await.is_err() {
+        if !failed && file.write_all(&bytes).is_err() {
             failed = true;
         }
     }
-    failed |= file.flush().await.is_err();
     drop(file);
     if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
         record.streaming_failed = failed;
@@ -956,6 +959,7 @@ impl HttpBody for RequestBody {
 }
 
 struct Deferred {
+    /// The body as read, still encoded: it is decoded before it is logged.
     spool: Spool,
     length: Option<u64>,
     read: u64,
@@ -965,7 +969,7 @@ struct Deferred {
     failed: bool,
 }
 impl Deferred {
-    fn bytes(&self) -> io::Result<(Vec<u8>, String)> {
+    fn bytes(&mut self) -> io::Result<(Vec<u8>, String)> {
         if self.failed {
             return Err(io::Error::other("request body capture failed"));
         }
@@ -985,146 +989,7 @@ impl Deferred {
                 ),
             });
         }
-        Ok((std::fs::read(&self.spool.path)?, markers.join("\n")))
-    }
-}
-
-struct Spool {
-    file: File,
-    path: PathBuf,
-}
-impl Spool {
-    fn new(dir: &Path, prefix: &str) -> io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!("{prefix}-{}.tmp", uuid::Uuid::new_v4()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        // Go's os.OpenFile modes; Windows ignores them.
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let file = options.open(&path)?;
-        Ok(Self { file, path })
-    }
-}
-impl Drop for Spool {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// In-memory bytes an upstream section keeps before it moves to its spool file.
-const SECTION_MEMORY: usize = 64 << 10;
-/// Long enough for every section header that `section` looks for.
-const SECTION_HEAD: usize = 32;
-
-/// An append-only upstream section of the log (API REQUEST, API RESPONSE or
-/// API WEBSOCKET TIMELINE). Go appends these to file-backed sources
-/// (request_logging.go attachRequestLogSources), so a long stream or WebSocket
-/// session does not grow in memory. Here a section stays in memory until it
-/// passes SECTION_MEMORY bytes, then the buffered bytes and everything after
-/// them go to a spool file in the log directory. If the spool cannot be
-/// written, the section keeps the rest in memory, as Go's writeAttemptResponse
-/// falls back to a strings.Builder.
-struct Section {
-    prefix: &'static str,
-    memory: Vec<u8>,
-    spool: Option<Spool>,
-    /// Bytes at the start of the spool file that belong to the section; a
-    /// failed write can leave more after them, which are never read.
-    spilled: u64,
-    spill_failed: bool,
-    /// The first SECTION_HEAD bytes of the section.
-    head: Vec<u8>,
-    /// Newlines at the end of the section.
-    trailing: usize,
-    /// Every byte so far is whitespace (the section trims to nothing).
-    blank: bool,
-}
-
-impl Section {
-    fn new(prefix: &'static str) -> Self {
-        Self {
-            prefix,
-            memory: Vec::new(),
-            spool: None,
-            spilled: 0,
-            spill_failed: false,
-            head: Vec::new(),
-            trailing: 0,
-            blank: true,
-        }
-    }
-
-    /// A section that holds `bytes` in memory, for a buffer that is already
-    /// in memory as a whole.
-    fn from_vec(prefix: &'static str, bytes: Vec<u8>) -> Self {
-        let mut section = Self::new(prefix);
-        section.track(&bytes);
-        section.memory = bytes;
-        section
-    }
-
-    fn is_empty(&self) -> bool {
-        self.spilled == 0 && self.memory.is_empty()
-    }
-
-    fn track(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let room = SECTION_HEAD.saturating_sub(self.head.len());
-        self.head.extend_from_slice(&bytes[..room.min(bytes.len())]);
-        let newlines = bytes.iter().rev().take_while(|&&b| b == b'\n').count();
-        self.trailing = if newlines == bytes.len() {
-            self.trailing + newlines
-        } else {
-            newlines
-        };
-        self.blank &= trim(bytes).is_empty();
-    }
-
-    fn append(&mut self, dir: &Path, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        self.track(bytes);
-        if !self.spill_failed && self.memory.len() + bytes.len() > SECTION_MEMORY {
-            if self.spill(dir, bytes).is_ok() {
-                return;
-            }
-            self.spill_failed = true;
-        }
-        self.memory.extend_from_slice(bytes);
-    }
-
-    /// Moves the buffered bytes and then `bytes` to the spool file. On error,
-    /// whatever did not reach the file is still in memory or in `bytes`.
-    fn spill(&mut self, dir: &Path, bytes: &[u8]) -> io::Result<()> {
-        if self.spool.is_none() {
-            self.spool = Some(Spool::new(dir, self.prefix)?);
-        }
-        let file = &mut self.spool.as_mut().unwrap().file;
-        file.write_all(&self.memory)?;
-        self.spilled += self.memory.len() as u64;
-        // Appends only reach memory while it stays within SECTION_MEMORY, so
-        // the kept allocation is bounded too.
-        self.memory.clear();
-        file.write_all(bytes)?;
-        self.spilled += bytes.len() as u64;
-        Ok(())
-    }
-
-    fn write_to(&self, out: &mut dyn Write) -> io::Result<()> {
-        if let Some(spool) = self.spool.as_ref().filter(|_| self.spilled > 0) {
-            let copied = io::copy(&mut File::open(&spool.path)?.take(self.spilled), out)?;
-            if copied != self.spilled {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("{} spool is shorter than written", self.prefix),
-                ));
-            }
-        }
-        out.write_all(&self.memory)
+        Ok((self.spool.contents()?, markers.join("\n")))
     }
 }
 
@@ -1149,7 +1014,7 @@ struct Record {
     detached: bool,
     metadata_ready: bool,
     websocket_done: bool,
-    timeline: Option<Spool>,
+    timeline: Section,
     api_timeline: Section,
     api_request: Section,
     deferred_api_request: Vec<Bytes>,
@@ -1237,11 +1102,10 @@ impl Record {
         Ok(())
     }
 
+    /// Writes the log, each section redacted ([`write_redacted`], [`Section::write_to`]);
+    /// the bytes sent to the client and upstream are not touched.
     fn format(&self, out: &mut dyn Write, decompress_error: Option<String>) -> io::Result<()> {
-        let websocket = self
-            .timeline
-            .as_ref()
-            .is_some_and(|s| s.file.metadata().is_ok_and(|m| m.len() > 0));
+        let websocket = !self.timeline.is_empty();
         let downstream = if websocket
             || self
                 .headers
@@ -1260,47 +1124,33 @@ impl Record {
             (false, true) => "websocket",
             _ => "",
         };
+        let mut block = Vec::new();
         write!(
-            out,
+            block,
             "=== REQUEST INFO ===\nVersion: {}\nURL: {}\nMethod: {}\nDownstream Transport: {downstream}\n",
             concat!("cooker-", env!("CARGO_PKG_VERSION")),
             self.url,
             self.method
         )?;
         if !upstream.is_empty() {
-            writeln!(out, "Upstream Transport: {upstream}")?;
+            writeln!(block, "Upstream Transport: {upstream}")?;
         }
-        write!(out, "Timestamp: {}\n\n\n=== HEADERS ===\n", timestamp(self.timestamp))?;
-        headers(out, &self.headers, true)?;
-        out.write_all(b"\n\n")?;
+        write!(block, "Timestamp: {}\n\n\n=== HEADERS ===\n", timestamp(self.timestamp))?;
+        headers(&mut block, &self.headers, true)?;
+        block.extend_from_slice(b"\n\n");
+        write_redacted(out, &block)?;
         if !websocket {
             out.write_all(b"=== REQUEST BODY ===\n")?;
-            out.write_all(&self.request_body)?;
+            write_redacted(out, &self.request_body)?;
             spacing(out, &self.request_body)?;
         }
-        if let Some(spool) = &self.timeline {
-            out.write_all(b"=== WEBSOCKET TIMELINE ===\n")?;
-            let mut input = File::open(&spool.path)?;
-            let mut buffer = [0; 8192];
-            let mut trailing = 0;
-            loop {
-                let n = input.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                out.write_all(&buffer[..n])?;
-                let count = buffer[..n].iter().rev().take_while(|&&b| b == b'\n').count();
-                trailing = if count == n { trailing + count } else { count };
-            }
-            for _ in trailing..3 {
-                out.write_all(b"\n")?;
-            }
-        }
+        section(out, "WEBSOCKET TIMELINE", &self.timeline, None)?;
         section(out, "API WEBSOCKET TIMELINE", &self.api_timeline, None)?;
         section(out, "API REQUEST", &self.api_request, None)?;
         if !self.streaming {
             for (status, error) in &self.api_errors {
-                write!(out, "=== API ERROR RESPONSE ===\nHTTP Status: {status}\n{error}")?;
+                write!(out, "=== API ERROR RESPONSE ===\nHTTP Status: {status}\n")?;
+                write_redacted(out, error.as_bytes())?;
                 spacing(out, error.as_bytes())?;
             }
         }
@@ -1308,42 +1158,53 @@ impl Record {
         if websocket {
             return Ok(());
         }
-        write!(out, "=== RESPONSE ===\nStatus: {}\n", self.status)?;
-        headers(out, &self.response_headers, false)?;
-        if let Some(spool) = &self.response_spool
-            && self.redact_sdp
-        {
-            // A live call's response is at most `live::MAX_BODY`; redacting it whole
-            // also covers a marker split across written chunks.
-            let body = std::fs::read(&spool.path)?;
-            let body = ck_exec::codex_live::redact_sdp(&body);
-            if !(body.starts_with(b"\n") || body.starts_with(b"\r\n")) {
-                out.write_all(b"\n")?;
+        block.clear();
+        writeln!(block, "=== RESPONSE ===\nStatus: {}", self.status)?;
+        headers(&mut block, &self.response_headers, false)?;
+        write_redacted(out, &block)?;
+        match &self.response_spool {
+            // A live call's response is at most `live::MAX_BODY`; redacting it whole also
+            // covers a marker split across written chunks.
+            Some(spool) if self.redact_sdp => {
+                let body = spool.contents()?;
+                write_body(out, &ck_exec::codex_live::redact_sdp(&body))?;
             }
-            out.write_all(&body)?;
-        } else if let Some(spool) = &self.response_spool {
-            let mut input = File::open(&spool.path)?;
-            let mut first = [0; 2];
-            let n = input.read(&mut first)?;
-            if !(first[..n].starts_with(b"\n") || first[..n].starts_with(b"\r\n")) {
-                out.write_all(b"\n")?;
+            // A streamed response is copied into the log, not read into memory whole.
+            Some(spool) => {
+                let mut first = [0; 2];
+                let n = spool.file.read_at(&mut first, 0)?;
+                if !(first[..n].starts_with(b"\n") || first[..n].starts_with(b"\r\n")) {
+                    out.write_all(b"\n")?;
+                }
+                spool.copy_redacted(&[], out)?;
             }
-            out.write_all(&first[..n])?;
-            io::copy(&mut input, out)?;
-        } else {
-            if !(self.response.starts_with(b"\n") || self.response.starts_with(b"\r\n")) {
-                out.write_all(b"\n")?;
-            }
-            out.write_all(&self.response)?;
-            if let Some(error) = decompress_error {
-                write!(out, "\n[DECOMPRESSION ERROR: {error}]")?;
-            }
+            None => write_body(out, &self.response)?,
+        }
+        if let Some(error) = decompress_error {
+            write!(out, "\n[DECOMPRESSION ERROR: ")?;
+            write_redacted(out, error.as_bytes())?;
+            out.write_all(b"]")?;
         }
         if !self.streaming {
             out.write_all(b"\n")?;
         }
         Ok(())
     }
+}
+
+/// Writes a response body, after a line break unless it starts with one, with every URL
+/// in it redacted.
+fn write_body(out: &mut dyn Write, body: &[u8]) -> io::Result<()> {
+    if !(body.starts_with(b"\n") || body.starts_with(b"\r\n")) {
+        out.write_all(b"\n")?;
+    }
+    write_redacted(out, body)
+}
+
+/// Writes one section of a log with every URL in it redacted. The section is redacted as
+/// a whole, so a URL anywhere in it is seen whole.
+fn write_redacted(out: &mut dyn Write, section: &[u8]) -> io::Result<()> {
+    ck_wire::redact::write(section, out)
 }
 
 fn trim(bytes: &[u8]) -> &[u8] {
@@ -1380,50 +1241,14 @@ const REDACTED: &str = "<redacted>";
 /// (util.MaskSensitiveHeaderValue). A session cookie is a credential, so the
 /// whole value of any header whose lowercase name contains "cookie" is
 /// replaced, on both the masked and the unmasked header sections.
-fn cookie(name: &str) -> bool {
-    name.contains("cookie")
-}
-
-/// Deliberate difference: Go prints upstream URLs unchanged, and a configured
-/// base-url can carry credentials. The logged copy replaces any userinfo and
-/// masks sensitive query values the way the downstream URL is masked; the
-/// request itself still goes to the URL as configured.
-fn logged_url(url: &str) -> String {
-    let mut out = String::new();
-    let mut rest = url;
-    if let Some(i) = url.find("://")
-        && i > 0
-        && url[..i]
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
-    {
-        out.push_str(&url[..i + 3]);
-        rest = &url[i + 3..];
-        // Look for '@' up to the first '/', even past a '?' or '#': a
-        // password with those characters unescaped still counts as userinfo,
-        // and dropping too much is safer than printing a secret.
-        let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
-        if let Some(at) = authority.rfind('@') {
-            out.push_str(REDACTED);
-            out.push('@');
-            rest = &rest[at + 1..];
-        }
-    }
-    let (rest, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
-    match rest.split_once('?') {
-        Some((base, query)) => {
-            out.push_str(base);
-            out.push('?');
-            out.push_str(&mask_query(query));
-        }
-        None => out.push_str(rest),
-    }
-    out.push_str(fragment);
-    out
+/// Headers whose values never reach a log: cookies, and the stream resume identity and
+/// cursor (`docs/INTERNAL-STREAM.md` §6.7). Names arrive lowercase.
+fn redacted(name: &str) -> bool {
+    name.contains("cookie") || name == crate::inference::streams::STREAM_ID_HEADER || name == "last-event-id"
 }
 
 fn masked_header(name: &str, value: &[u8]) -> Vec<u8> {
-    if cookie(name) {
+    if redacted(name) {
         return REDACTED.as_bytes().to_vec();
     }
     if name.contains("authorization") {
@@ -1448,7 +1273,7 @@ fn headers(out: &mut dyn Write, headers: &HeaderMap, mask: bool) -> io::Result<(
         write!(out, "{}: ", header_name(name.as_str()))?;
         if mask {
             out.write_all(&masked_header(name.as_str(), value.as_bytes()))?;
-        } else if cookie(name.as_str()) {
+        } else if redacted(name.as_str()) {
             out.write_all(REDACTED.as_bytes())?;
         } else {
             out.write_all(value.as_bytes())?;
@@ -1480,14 +1305,14 @@ fn section(out: &mut dyn Write, name: &str, bytes: &Section, at: Option<DateTime
     if bytes.is_empty() {
         return Ok(());
     }
-    if !bytes.head.starts_with(format!("=== {name}").as_bytes()) {
+    if bytes.dropped() || !bytes.head.starts_with(format!("=== {name}").as_bytes()) {
         writeln!(out, "=== {name} ===")?;
         if let Some(at) = at {
             writeln!(out, "Timestamp: {}", timestamp(at))?;
         }
     }
     bytes.write_to(out)?;
-    pad(out, bytes.trailing)
+    pad(out, if bytes.dropped() { 0 } else { bytes.trailing })
 }
 
 fn filename(url: &str, id: &str, at: DateTime<Local>, error: bool) -> String {
@@ -1663,6 +1488,10 @@ async fn held_delivery(dir: &Path) {
 }
 
 #[cfg(test)]
+#[path = "request_logging_url_tests.rs"]
+mod url_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::{Request as HttpRequest, StatusCode};
@@ -1673,7 +1502,7 @@ mod tests {
     /// `cliproxy-rs-0.1.0` (tests/reference/capture/main.go). The version of this build
     /// replaces it, so a release bump needs no re-recording.
     /// A file every write to fails, on any OS (Linux-only `/dev/full` is not needed).
-    fn unwritable(dir: &Path) -> File {
+    pub(super) fn unwritable(dir: &Path) -> File {
         let path = dir.join("unwritable");
         File::create(&path).unwrap();
         File::options().read(true).open(path).unwrap()
@@ -1685,7 +1514,7 @@ mod tests {
         serde_json::from_str(&text).unwrap()
     }
 
-    fn management(dir: &Path, enabled: bool, commercial: bool) -> Arc<Management> {
+    pub(super) fn management(dir: &Path, enabled: bool, commercial: bool) -> Arc<Management> {
         let config = ck_core::config::Config::parse(&format!(
             "observability: {{logs: {{request-log: {enabled}}}}}\nserver: {{commercial-mode: {commercial}}}\n"
         ))
@@ -1714,7 +1543,7 @@ mod tests {
         )
     }
 
-    fn scratch() -> PathBuf {
+    pub(super) fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cooker-request-log-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1746,7 +1575,7 @@ mod tests {
         out
     }
 
-    fn logs(dir: &Path) -> Vec<PathBuf> {
+    pub(super) fn logs(dir: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(dir)
             .unwrap()
             .flatten()
@@ -1838,9 +1667,25 @@ mod tests {
                         ("response", contents(&record.api_response)),
                         ("timeline", contents(&record.api_timeline)),
                     ] {
+                        // Go prints URLs as written; cooker redacts the words that may
+                        // hold a credential (owner ruling Settled 60) when the log is
+                        // written, so a deferred request is still raw. In a timeline, the
+                        // last word of a message followed by another prints as the
+                        // placeholder, and the next message loses the rest of its line.
+                        let raw = case[name].as_str().unwrap();
+                        let mut want = if kind == "disabled" {
+                            raw.to_owned()
+                        } else {
+                            ck_wire::redact::urls_in(raw).into_owned()
+                        };
+                        if name == "timeline" {
+                            want = want
+                                .replace("\nrequest body\n", "\nrequest <redacted url>\n")
+                                .replace("\n{\"type\":\"response.created\"}\n", "\n\n");
+                        }
                         assert_eq!(
                             canonical(std::str::from_utf8(&bytes).unwrap()).trim_end_matches('\n'),
-                            case[name].as_str().unwrap().trim_end_matches('\n'),
+                            want.trim_end_matches('\n'),
                             "{kind} {name}"
                         );
                         assert!(!String::from_utf8_lossy(&bytes).contains("never-print-oauth"));
@@ -1942,7 +1787,7 @@ mod tests {
         drop(response);
         let (log, socket) = rx.recv().await.unwrap();
         socket
-            .append_part(b"Timestamp: fixture\nEvent: websocket.disconnect\nbye\n")
+            .append_part(b"Timestamp: fixture\nEvent: websocket.disconnect\n", b"bye")
             .unwrap();
         // The first poll hands the delivery to the work pool; dropping the caller then
         // cancels only the wait for it.
@@ -2015,7 +1860,7 @@ mod tests {
             assert_eq!(response.status(), status);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             assert_eq!(body, if case["method"] == "HEAD" { "" } else { "outbound\n" });
-            let expected = case["content"].as_str().unwrap();
+            let expected = &*ck_wire::redact::urls_in(case["content"].as_str().unwrap());
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 let files = logs(&dir);
@@ -2078,20 +1923,43 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(logs(&dir).is_empty(), "HTTP 101 must not flush the transcript");
         for part in fixture["websocket"]["parts"].as_array().unwrap() {
-            sink.append_part(
-                &base64::engine::general_purpose::STANDARD
-                    .decode(part.as_str().unwrap())
-                    .unwrap(),
-            )
-            .unwrap();
+            let part = base64::engine::general_purpose::STANDARD
+                .decode(part.as_str().unwrap())
+                .unwrap();
+            // A Go part is its `Timestamp:` and `Event:` lines, the payload and a newline.
+            let header = part.iter().enumerate().filter(|(_, b)| **b == b'\n').nth(1).unwrap().0 + 1;
+            let payload = &part[header..];
+            sink.append_part(&part[..header], payload.strip_suffix(b"\n").unwrap_or(payload))
+                .unwrap();
         }
         sink.close().await;
         let files = logs(&dir);
         assert_eq!(files.len(), 1);
         let content = std::fs::read_to_string(&files[0]).unwrap();
-        assert_eq!(canonical(&content), fixture["websocket"]["content"]);
+        // The last word of a message followed by another prints as the placeholder, and
+        // the next message loses the rest of its line.
+        let expected = ck_wire::redact::urls_in(fixture["websocket"]["content"].as_str().unwrap())
+            .replace("request-payload\n", "<redacted url>\n")
+            .replace("response-payload\n", "\n")
+            .replace("disconnect-payload\n", "\n");
+        assert_eq!(canonical(&content), expected);
         assert!(!content.contains("REQUEST BODY") && !content.contains("=== RESPONSE ==="));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stream_resume_headers_are_redacted_in_every_capture() {
+        for name in ["x-ck-stream-id", "last-event-id"] {
+            assert_eq!(masked_header(name, b"0123456789abcdef"), REDACTED.as_bytes());
+            let mut out = Vec::new();
+            let mut map = HeaderMap::new();
+            map.insert(name, axum::http::HeaderValue::from_static("0123456789abcdef"));
+            for mask in [true, false] {
+                headers(&mut out, &map, mask).unwrap();
+            }
+            upstream_headers(&mut out, &[(name.to_ascii_uppercase(), "0123456789abcdef".into())]);
+            assert!(!String::from_utf8(out).unwrap().contains("0123"));
+        }
     }
 
     #[test]
@@ -2106,7 +1974,7 @@ mod tests {
                 want = "...".into();
             }
             // Deliberate difference: Go logs cookie values unchanged.
-            if cookie(&name) {
+            if redacted(&name) {
                 want = REDACTED.into();
             }
             assert_eq!(String::from_utf8(masked_header(&name, value.as_bytes())).unwrap(), want);
@@ -2571,62 +2439,72 @@ mod tests {
     /// Serves one request (sending a Cookie) whose handler feeds `events` to the
     /// capture sink and answers `status` with a Set-Cookie, then returns the
     /// persisted log file.
-    async fn persisted(
+    pub(super) async fn persisted(
         enabled: bool,
         status: StatusCode,
         events: impl Fn(&RequestLog) + Clone + Send + Sync + 'static,
     ) -> Vec<u8> {
+        persisted_request(enabled, status, "/fixture", &[], events).await.0
+    }
+
+    /// [`persisted`] for a request to `uri`, with `headers` on both the request and the
+    /// response; also returns the headers the client received.
+    pub(super) async fn persisted_request(
+        enabled: bool,
+        status: StatusCode,
+        uri: &str,
+        headers: &'static [(&'static str, &'static str)],
+        events: impl Fn(&RequestLog) + Clone + Send + Sync + 'static,
+    ) -> (Vec<u8>, HeaderMap) {
         let dir = scratch();
         let state = management(&dir, enabled, false);
         let app = axum::Router::new().fallback(move |axum::Extension(log): axum::Extension<RequestLog>| {
             let events = events.clone();
             async move {
                 events(&log);
-                (status, [("set-cookie", "down=c00kie-down-set")], "done")
+                let mut response = (status, [("set-cookie", "down=c00kie-down-set")], "done").into_response();
+                for (name, value) in headers {
+                    response
+                        .headers_mut()
+                        .insert(*name, axum::http::HeaderValue::from_static(value));
+                }
+                response
             }
         });
         let mut app = router(&state, app);
-        let request = HttpRequest::builder()
+        let mut request = HttpRequest::builder()
             .method("POST")
-            .uri("/fixture")
-            .header("cookie", "client=c00kie-client")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.call(request).await.unwrap();
-        axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let mut content = Vec::new();
-        for _ in 0..500 {
-            if let [log] = &logs(&dir)[..] {
-                content = std::fs::read(log).unwrap();
-                if content.trim_ascii_end().ends_with(b"\ndone") {
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            .uri(uri)
+            .header("cookie", "client=c00kie-client");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
         }
-        assert!(content.trim_ascii_end().ends_with(b"\ndone"), "no complete log");
+        let response = app.call(request.body(Body::empty()).unwrap()).await.unwrap();
+        let received = response.headers().clone();
+        axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        // Shutdown joins the finalization task, which writes the log and then drops the
+        // record, so the spool files are gone when it returns; no timer decides how long
+        // a slow disk may take.
+        state.shutdown().await;
+        let [log] = &logs(&dir)[..] else {
+            panic!("no complete log");
+        };
+        let content = std::fs::read(log).unwrap();
+        assert!(content.trim_ascii_end().ends_with(b"\ndone"), "incomplete log");
         drop(app);
         drop(state);
-        // A spool removes its file when dropped, after its section was copied into the
-        // log, so the log can be complete a moment before the file is gone.
-        let mut leftovers = Vec::new();
-        for _ in 0..500 {
-            leftovers = std::fs::read_dir(&dir)
-                .unwrap()
-                .flatten()
-                .filter(|e| e.path().extension().is_some_and(|e| e == "tmp"))
-                .collect();
-            if leftovers.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        // Spools have no name in the log directory.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|e| e == "tmp"))
+            .collect();
         assert!(leftovers.is_empty(), "spool files left behind: {leftovers:?}");
         std::fs::remove_dir_all(dir).unwrap();
-        content
+        (content, received)
     }
 
-    fn upstream_request<'a>(
+    pub(super) fn upstream_request<'a>(
         url: &'a str,
         headers: &'a [(String, String)],
         body: &'a [u8],
@@ -2678,59 +2556,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_url_credentials_are_redacted_in_logs() {
-        use ck_core::exec::CaptureEvent::*;
-        let content = persisted(true, StatusCode::OK, |log| {
-            let sink = log.capture_sink();
-            sink.record(Request(upstream_request(
-                "https://alice:pw-h1dden@proxy.example/v1/models?alt=sse&key=AIza-h1dden-query-123&access_token=tok-x-h1dden-x-456#frag",
-                &[],
-                b"",
-            )));
-            sink.record(WebsocketRequest(upstream_request(
-                "wss://bob:pw2-h1dden@ws.example/realtime?client_secret=cs-xx-h1dden-xx-789&model=gpt",
-                &[],
-                b"",
-            )));
-        })
-        .await;
-        let content = String::from_utf8(content).unwrap();
-        assert!(!content.contains("h1dden"), "{content}");
-        assert!(!content.contains("alice") && !content.contains("bob:"), "{content}");
-        let line = |prefix: &str| {
-            content
-                .lines()
-                .find(|l| l.starts_with(prefix))
-                .unwrap_or_else(|| panic!("no {prefix} in {content}"))
-                .to_owned()
-        };
-        let http = line("Upstream URL: https://<redacted>@proxy.example/v1/models?alt=sse&key=");
-        assert!(http.contains("&access_token=") && http.ends_with("#frag"), "{http}");
-        let ws = line("Upstream URL: wss://<redacted>@ws.example/realtime?client_secret=");
-        assert!(ws.ends_with("&model=gpt"), "{ws}");
-
-        for url in [
-            "https://host.example/v1/users/a@b.example?alt=sse",
-            "http://127.0.0.1:8080/v1#a@b",
-            "https://host.example/v1?model=gpt",
-        ] {
-            assert_eq!(logged_url(url), url);
-        }
-        assert_eq!(
-            logged_url("https://u:p@host.example"),
-            "https://<redacted>@host.example"
-        );
-        assert_eq!(
-            logged_url("https://user@host.example/x"),
-            "https://<redacted>@host.example/x"
-        );
-    }
-
-    #[tokio::test]
     async fn large_upstream_sections_stay_bounded_in_memory() {
         use ck_core::exec::CaptureEvent::*;
-        let body = vec![b'q'; 20 << 20];
-        let chunk: Vec<u8> = (0..64 << 10).map(|i| b'a' + (i % 26) as u8).collect();
+        // Lines, since a word longer than the redaction hold limit prints as a placeholder.
+        let line = |i: usize, letter: u8| if i % 64 == 32 { b'\n' } else { letter };
+        let body: Vec<u8> = (0..20 << 20).map(|i| line(i, b'q')).collect();
+        let chunk: Vec<u8> = (0..64 << 10).map(|i| line(i, b'a' + (i % 26) as u8)).collect();
         const CHUNKS: usize = 640;
         let events = {
             let body = body.clone();
@@ -2769,7 +2600,8 @@ mod tests {
         expect(start, &[&body[..], b"\n\n\n=== API RESPONSE 1 ===\n"].concat());
         let response = find(start + body.len(), b"=== API RESPONSE 1 ===\n");
         let start = find(response, b"\nBody:\n") + b"\nBody:\n".len();
-        let mut stream = vec![chunk.clone(); CHUNKS].join(&b"\n\n"[..]);
+        // Chunks join as they arrived, with nothing between them.
+        let mut stream = vec![chunk.clone(); CHUNKS].concat();
         stream.extend_from_slice(b"\n\n\n=== RESPONSE ===\nStatus: 200\n");
         expect(start, &stream);
     }

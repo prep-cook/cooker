@@ -17,3 +17,5 @@ The `validate` vectors were re-run with Go 1.26.4 against v8.0.35 (`ae3ee3be`): 
 
 Regenerate like the OpenAI-compatible goldens (see ../openai_compat/README.md), with
 this directory's `main.go` and output `xai_auth_go.json`.
+
+URL redaction (owner ruling Q18): error messages that name a URL hold cooker's redacted form, not Go's text. After re-recording, rewrite each URL in a `Post "…"`, `parse "…"` or `must use https: "…"` message as `ck_wire::redact::url` renders it.

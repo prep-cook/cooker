@@ -285,9 +285,40 @@ async fn a_split_payload_reports_its_served_model() {
     );
 }
 
+/// Settled 68 (docs/OPEN-QUESTIONS.md): in these scenarios a Claude client receives the Claude
+/// model's signature as the upstream sent it (`RULED_SIGNATURE.1`), where Go hands it the
+/// single-layer decoding (`.0`). They expect Go's client bytes with that value restored; every
+/// other byte still comes from Go.
+const RULED: &[&str] = &[
+    "claude_model_execute",
+    "claude_client_claude_model_empty_signature",
+    "claude_stream_claude_model",
+    "credits_claude_execute",
+];
+const RULED_SIGNATURE: (&str, &str) = (
+    "EqsCkwIBGAIiQHfake-claude-signature-for-antigravity-tests",
+    "RXFzQ2t3SUJHQUlpUUhmYWtlLWNsYXVkZS1zaWduYXR1cmUtZm9yLWFudGlncmF2aXR5LXRlc3Rz",
+);
+
+/// Go's client bytes for scenario `name`, with Settled 68 applied.
+fn ruled(name: &str, go: &str) -> String {
+    if !RULED.contains(&name) || go == "<none>" || go.is_empty() {
+        return go.to_owned();
+    }
+    assert!(
+        go.contains(RULED_SIGNATURE.0),
+        "{name}: no longer differs from Go; remove it from RULED"
+    );
+    go.replace(RULED_SIGNATURE.0, RULED_SIGNATURE.1)
+}
+
 /// Replays `scenarios` in order on one executor; returns how many ran.
 async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
-    let executor = AntigravityExecutor::default();
+    // Keep the shared cooldown fixed while unrelated fixture requests run.
+    let executor = AntigravityExecutor {
+        cooldown_now: Some(Instant::now()),
+        ..Default::default()
+    };
     let mut ran = 0;
     for s in scenarios {
         let name = s["name"].as_str().unwrap();
@@ -354,14 +385,14 @@ async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
                 };
                 (status, normalize(message))
             }),
-            want_error.map(|e| (go_status(e), normalize(e["message"].as_str().unwrap()))),
+            want_error.map(|e| { (go_status(e), normalize(e["message"].as_str().unwrap())) }),
             "{name}: error"
         );
         if let Some(want) = want_error.and_then(|e| e.get("retry_after_ms")).and_then(Value::as_u64) {
             let got = error.as_ref().and_then(|e| e.2).map(|d| d.as_millis() as u64);
             if error.as_ref().is_some_and(|e| e.1.contains("short cooldown")) {
-                // The cooldown left when the second request arrived: within a second.
-                assert!(got.is_some_and(|g| g <= 30_000 && g + 1_000 >= want), "{name}: {got:?}");
+                // The fixture opens a 30 s cooldown; no manual time has elapsed.
+                assert_eq!(got, Some(30_000), "{name}: cooldown remaining");
             } else {
                 assert_eq!(got, Some(want), "{name}: retry after");
             }
@@ -370,14 +401,14 @@ async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
             name,
             "output",
             &normalize(output.as_deref().unwrap_or("<none>")),
-            &normalize(s["output"].as_str().unwrap_or("<none>")),
+            &normalize(&ruled(name, s["output"].as_str().unwrap_or("<none>"))),
         );
         let want_stream = client_bytes(client, alt, s["chunks"].as_array().map_or(&[][..], Vec::as_slice));
         assert_same(
             name,
             "stream",
             &normalize(&String::from_utf8_lossy(&streamed)),
-            &normalize(&String::from_utf8_lossy(&want_stream)),
+            &normalize(&ruled(name, &String::from_utf8_lossy(&want_stream))),
         );
         let summary =
             compaction::summary_text(s["upstream"]["body"].as_str().unwrap_or_default().as_bytes()).unwrap_or_default();

@@ -4,6 +4,211 @@
 
 Binary size, memory and throughput of cook-router and CLIProxyAPI on the same configuration, with a local fake upstream. The numbers come from one small machine and a synthetic load, so use them to compare the two servers with each other. They say little about how much traffic either one can carry on bigger hardware.
 
+## S1 acceptance drivers
+
+These drivers implement the codec, flow and container interfaces in
+`docs/INTERNAL-STREAM.md` §9. They do not replace the storage gate or the existing
+size, idle, request-heap and end-to-end pipeline measurements. Missing S1 server
+features fail their scenarios; an old gateway is not expected to pass resume or
+upstream-independence checks.
+
+Run from the repository root on Linux. Use separate old/new release executables
+and a new external output directory on a no-snapshot filesystem. The flow driver
+uses Python 3's standard library; container checks also need rootless Docker,
+`nsenter` and `iptables` for an outbound firewall confined to each test container.
+Do not run benchmarks concurrently with other benchmarks. On the maintainer's
+workstation:
+
+```sh
+flock /tmp/cooker-bench.lock taskset -c 0-7,16-23 \
+  bench/codec-gate.sh "$OLD_CODEC" "$NEW_CODEC" "$OUT/codecs"
+flock /tmp/cooker-bench.lock taskset -c 0-7,16-23 \
+  bench/flow-gate.sh "$NEW" "$OUT/flow"
+flock /tmp/cooker-bench.lock taskset -c 0-7,16-23 \
+  bench/container-start.sh cooker:ci "$OUT/container-start"
+```
+
+Build separately on CPUs `8-15,24-31`, with `CARGO_BUILD_JOBS=4` and
+`CARGO_TARGET_DIR=/scratch/ssd/bench-target`. The wrapper's affinity is inherited
+by the gateway, mocks and clients; these drivers do not reset it to CPUs 0 and 1.
+
+### Codec comparison
+
+`codec-gate.sh` drives the same external fixtures through two standalone codec
+harnesses. See the [harness contract](../bench/codec/CONTRACT.md) for the CLI,
+driver-owned workloads, instrumentation and diagnostic resource components.
+The captured old gateway and latency binary are not codec harnesses. Keep the
+baseline harness separate from the new implementation; do not benchmark an
+adapter between their internal APIs.
+
+Build the old harness from a fresh detached checkout at
+`b518060ea1e43ef4b266591986ca92321e6289b5`, not from either captured executable:
+
+```sh
+bench/codec/build-baseline.sh "$BASELINE_SOURCE" "$OUT/baseline-build"
+OLD_CODEC="$OUT/baseline-build/baseline-harness"
+```
+
+The builder accepts `BUILD_CPUS`, `CARGO_TARGET_DIR` and `CARGO_BUILD_JOBS`
+overrides. Their defaults are `8-15,24-31`, `/scratch/ssd/bench-target` and `4`;
+the build provenance records the effective values.
+Running that harness requires private cgroup v2 memory accounting and
+passwordless `sudo` for its own disposable groups. It refuses unavailable
+accounting instead of substituting host-wide charges or invented zeros.
+
+The gate retains three old/new rounds and compares matching per-workload metric
+medians, never an average across protocols. It applies the specification's
+§9.2 tolerance table, which records the 2026-11-14 owner ruling (option B):
+CPU, allocations and latency may rise by at most 5%; throughput may fall by at
+most 5%. Allocated bytes/event and heap metrics allow no regression. RSS, PSS
+and the cgroup charges may exceed old only by a noise band calibrated from
+old-against-old baseline runs (owner ruling 2026-11-14); beyond it the 0% rule
+holds. Each workload's band comes from its own differences between medians of
+three warm old rounds, recomputed by the gate from the raw samples in the band
+file, with a one-page floor. Calibrate with `bench/codec-gate.sh --calibrate "$OLD_CODEC" "$BAND_OUT"`
+and pass `CODEC_NOISE_BAND="$BAND_OUT/noise-band.json"`; the gate refuses a
+missing, stale or mismatched band. Backend-specific splits are diagnostics; mapped/tmpfs costs still
+contribute to the charged totals. A zero old cost requires a zero new cost;
+throughput retains its higher-is-better rule. Encoded bytes and output chunks are
+not byte-exact goldens, but a new harness must produce output wherever the old
+one did, and its completions without output may not increase. Decoded media and
+opaque signatures remain exact. The storage gate's separate seven/101-run rules
+are unchanged.
+
+### Flow semantics and backpressure
+
+`flow-gate.sh` starts a fresh actual gateway and a private loopback HTTP/WS upstream
+for each scenario. Each run uses a new config database and private runtime
+directory. Provider URLs point only at the local mock; remote model downloads
+are disabled and proxy variables point non-loopback traffic at a closed port.
+Realtime credentials explicitly use the fixture as their proxy because the
+ChatGPT transport ignores environment proxies. The fixture accepts only its own
+loopback HTTP/WS target and rejects CONNECT; it never forwards or tunnels traffic.
+This is not a network-namespace isolation claim.
+
+The driver checks interleaved choices, logprobs-only events, incremental tool
+arguments, fragmented opaque signatures, redacted/encrypted thinking, terminal
+Responses snapshots and an exact 8 MiB binary audio body. The slow-reader case
+reads one SSE record, stops reading, and requires the upstream to finish an
+80 MiB response during the stall. It rejects a workload that fits the host's
+TCP-buffer bound; delaying the upstream does not count as throttling downstream.
+After the stall, every content byte and the single usage snapshot must survive.
+The capacity case sends about 288 MB and requires a visible
+`stream.storage_exhausted` error, no successful terminal, no upstream retry and a
+surviving gateway. The content before the error must be a gap-free prefix of
+whole records. Within 3 s of the error the upstream write must fail with a
+broken pipe or reset before the whole body is sent; an upstream that completes
+normally fails the case. The error must also fire exactly when the exchange
+holds all 5,368 frames that its request, response, scratch and replay share
+(§6.4). Client bytes cannot show that to one frame: each stored record adds
+§3.1 framing and an implementation-defined `x_ck` object, and 1 KiB of
+uncertainty per 41 KB record adds up to about 99 frames. No gateway interface reports the frames charged
+to the failed exchange, so the case fails as "position unverified" until one
+does. Raw
+media records the delay until the first byte reaches the client; an external
+HTTP clock does not directly prove the internal 100 ms collection bound.
+
+Live and completed SSE resume use only the `X-Ck-Stream-Id` header and positional
+`v1.e.*` cursors. They check content without gaps/repeats, consecutive cursors,
+terminal EOF, invalid attachments' 400, foreign/unknown identities' 410 before
+cursor validation, and exactly one upstream request. Invalid attachments include
+missing positions, missing/duplicate identity headers, malformed/overflowing
+cursors, wrong cursor kinds and future positions. SSE checks `Last-Event-ID`
+replacement and agreement with `after`, and rejects disagreement. Initial
+responses must advertise `v1.e.0` or `v1.b.0`. Binary resume checks the exact byte
+suffix, accepted byte cursor, retained identity/content type, `no-store` and
+identity encoding. A missing header, cursor, route or retained response fails.
+No resume performance baseline is invented for the old server.
+
+Native `/v1/realtime` and call-sideband WS scenarios each transfer more than
+8 MiB over 80 ordered media/control messages, with a producer lasting at least two seconds.
+They check session control, JSON/base64 and arbitrary binary media, numbered
+request units, both cursor directions, duplicate-input acknowledgment, explicit
+`response.cancel` and the close code/reason. They drop a response between its
+payload and cursor marker, reattach without another upstream session or turn,
+and require the exact replay/live suffix. Reattaching at the terminal cursor must
+produce normal EOF without repeating the terminal outcome. JSON text is compared
+semantically and media bytes after base64 decoding, not by whitespace or escaping.
+Results include media bytes, unit counts, upstream sessions and session duration.
+
+These scenarios import only a fake OAuth credential into their private database
+through the local management API. Provider base URLs point to the loopback mock.
+A binary that ignores the local base URL for native realtime fails with a
+reachability diagnostic; closed non-loopback proxies remain in effect. The
+preserved baseline has hard-coded realtime TLS endpoints. Successful native
+realtime acceptance is unverified until an executable reaches the local fixture
+and passes every assertion; synthetic controls are not production acceptance.
+Expiry/eviction with a test clock, authoritative usage settlement, internal
+publication/leases and WebRTC peer/packet acceptance remain the production
+semantic test suites' responsibility.
+
+`results.jsonl`, `summary.json`, per-scenario `server.log`, `upstream.json` and
+`response-*.body` retain the observations. Resume identity headers are not
+recorded. Set `FLOW_BUILD_PROVENANCE` to the gateway's revision, compiler,
+profile, features and build flags.
+
+`summary.json` records the §9.2 flow-limit metrics. The driver measures consumer
+lag (upstream minus client bytes during the slow-reader stall), blocked-read
+duration (the longest upstream write interval during that stall), resume
+attaches, `410 Gone` responses and cancelled-stream cleanup (seconds from the
+storage error to the upstream's end). The gateway exposes no cache bytes, time
+since last read, evictions, expiries, allocation failures or outstanding leases,
+so those stay `null`.
+
+`bench/flow-gate.sh NEW OUT` is the acceptance run and fails closed: it exits
+nonzero when any scenario fails, any flow metric is missing,
+`FLOW_BUILD_PROVENANCE` is unset or the storage error's frame position is
+unverified. It cannot pass until the gateway reports the internal counters and
+that frame count. Add `--diagnostic` to see the remaining checks: the summary is
+marked "diagnostic, not acceptance", lists those gaps under `unverified`, never
+sets `"pass": true`, and its exit status covers only the scenarios' own checks.
+
+### Container startup
+
+`container-start.sh` starts the actual image with its default configuration, a
+private `/data` volume, an isolated network, a loopback port mapping and:
+
+```text
+--tmpfs /run/cooker-runtime:rw,noexec,nosuid,size=512m,mode=0700,uid=10001,gid=10001
+```
+
+The image must provide `XDG_RUNTIME_DIR=/run/cooker-runtime` and run as uid/gid
+10001. Health means `/healthz` returned `{"status":"ok"}`, not merely that a
+container was created or `--version` worked. The gate checks the private pool
+directory and the pool inode, including an unlinked inode, before shutdown.
+It also exercises missing XDG, unsafe-directory refusal, explicit-directory
+startup without XDG, and capped-pool configuration. The capped pool's backing
+inode size must equal `stream.pool_bytes`, and its virtual mapping must cover
+exactly that capacity rounded up to whole pages. Docker and `nsenter` commands
+have 35-second default deadlines. Early exit and timeout are failures, and a
+started server must still be running when the gate stops it: one that exits on
+its own after the health check fails with its exit code. Graceful SIGTERM
+shutdown also exits 0, so the gate reads the logs before `docker stop` and
+requires no `shutdown signal received:` line yet, then requires exactly one
+`shutdown signal received: SIGTERM` line after it. A server that exited 0
+before the signal arrived never logs it, and a line logged before the stop
+belongs to another signal that was already draining the server. Cleanup
+removes only resources created by that invocation.
+Docker's internal bridge blocks initial outbound traffic. Because rootless
+Docker 29 does not publish internal-bridge ports, the driver pauses its own
+container, installs a namespace-local outbound `DROP` policy with established
+response allowance, attaches its private IPv4 port bridge, then resumes it.
+It does not change the host firewall or another container's namespace.
+
+Driver controls, from the repository root:
+
+The WS controls exchange HTTP upgrade bytes and encoded frames through in-memory
+duplex pipes, including cursor/ack interleaving. They require no socket privileges;
+the executable scenarios use actual loopback sockets.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 flock /tmp/cooker-bench.lock taskset -c 0-7,16-23 \
+  python3 -B -I bench/flow/test_driver.py
+PYTHONDONTWRITEBYTECODE=1 flock /tmp/cooker-bench.lock taskset -c 0-7,16-23 \
+  python3 -B -I bench/container-test.py "$OUT/container-controls"
+```
+
+
 ## Field memory
 
 On 2026-10-05, a personal install in daily use ran at 75 to 101 MB RSS. That reading was unscripted; sample timing, workload and the exact build were not recorded.

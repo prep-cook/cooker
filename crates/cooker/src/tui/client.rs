@@ -94,8 +94,8 @@ impl Client {
     /// Go `doRequest`: the status and the whole body, with `http.Client`'s rules: at
     /// most ten requests across redirects, 301-303 turn into a body-less GET, the
     /// Bearer key follows only to the same host or a subdomain, and the ten-second
-    /// timeout covers the whole exchange. Errors read like Go's `url.Error`, with a
-    /// password in the URL shown as `***`. Atomic owner writes and privileged
+    /// timeout covers the whole exchange. Errors read like Go's `url.Error`, with the
+    /// URL redacted (`ck_wire::redact::url`). Atomic owner writes and privileged
     /// snapshot reads instead require the final management URL without redirects.
     // ponytail: the transport cause is the OS error text ("Connection refused (os error
     // 111)") where Go prints its dialer's ("dial tcp ...: connect: connection refused").
@@ -125,8 +125,10 @@ impl Client {
                 );
         let mut op = method.as_str().go_lower();
         op[..1].make_ascii_uppercase();
-        // Go's url.Error names the request that failed (its password shown as ***).
-        let fail_at = |at: &str, cause: &str| format!("{op} {}: {cause}", ck_wire::gostr::quote(at));
+        // Go's url.Error names the request that failed; here its URL is redacted
+        // (owner ruling Q18).
+        let fail_at =
+            |at: &str, cause: &str| format!("{op} {}: {cause}", ck_wire::gostr::quote(ck_wire::redact::url(at)));
         let secret = self
             .secret
             .lock()
@@ -134,9 +136,9 @@ impl Client {
             .clone();
         let headers_seen = std::sync::atomic::AtomicBool::new(false);
         // The request in flight, for a timeout's message (Go names the current hop).
-        let in_flight = std::sync::Mutex::new(redact_url(&url));
+        let in_flight = std::sync::Mutex::new(url.clone());
         let exchange = async {
-            let initial = url::Url::parse(&url).map_err(|e| fail_at(&redact_url(&url), &e.to_string()))?;
+            let initial = url::Url::parse(&url).map_err(|e| fail_at(&url, &e.to_string()))?;
             let (mut current, mut method, mut body) = (initial.clone(), method.clone(), body);
             let (mut with_auth, mut referer) = (!secret.is_empty(), None::<String>);
             let mut sent = 0;
@@ -164,7 +166,7 @@ impl Client {
                 if let Some(referer) = &referer {
                     req = req.header("Referer", referer.clone());
                 }
-                let shown = redact_url(current.as_str());
+                let shown = current.to_string();
                 *in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = shown.clone();
                 let res = req.send().await.map_err(|e| fail_at(&shown, &cause(&e)))?;
                 sent += 1;
@@ -185,7 +187,7 @@ impl Client {
                     break res;
                 }
                 let next = current.join(&location).map_err(|e| {
-                    let quoted = ck_wire::gostr::quote(&location);
+                    let quoted = ck_wire::gostr::quote(ck_wire::redact::url(&location));
                     fail_at(&shown, &format!("failed to parse Location header {quoted}: {e}"))
                 })?;
                 if sent >= 10 {
@@ -194,7 +196,7 @@ impl Client {
                 }
                 // Go builds the next request before draining, so a timeout from here on
                 // names it.
-                *in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = redact_url(next.as_str());
+                *in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next.to_string();
                 // Go drains a small or unsized redirect body (2 KiB at most) before
                 // following it.
                 if res.content_length().is_none_or(|n| n <= 2048) {
@@ -254,8 +256,7 @@ impl Client {
         let owner_commit = method == wreq::Method::POST && path == "/admin/v1/apply";
         let (code, data) = self.request(method, path, body).await?;
         if code >= 400 || (owner_commit && code != 200) {
-            let text = String::from_utf8_lossy(ck_wire::gostr::trim_space(&data)).into_owned();
-            return Err(format!("HTTP {code}: {text}"));
+            return Err(http_error(code, &data));
         }
         if owner_commit {
             let receipt: Value =
@@ -492,8 +493,7 @@ impl Client {
             return Ok(None);
         }
         if code >= 400 {
-            let text = String::from_utf8_lossy(ck_wire::gostr::trim_space(&data)).into_owned();
-            return Err(format!("HTTP {code}: {text}"));
+            return Err(http_error(code, &data));
         }
         body.and_then(|mut b| b.get_mut("spec").map(Value::take))
             .ok_or_else(|| "invalid owner setting response".to_owned())
@@ -693,6 +693,13 @@ pub fn value_at<'a>(cfg: &'a Object, path: &str) -> Option<&'a Value> {
     Some(value)
 }
 
+/// Go's `HTTP <code>: <body>`, with every URL in the body redacted (owner ruling Q18):
+/// the body is an upstream error the TUI displays.
+fn http_error(code: u16, data: &[u8]) -> String {
+    let text = String::from_utf8_lossy(ck_wire::gostr::trim_space(data));
+    format!("HTTP {code}: {}", ck_wire::redact::urls_in(&text))
+}
+
 /// The innermost cause of a request error.
 fn cause(e: &wreq::Error) -> String {
     let mut cause: &dyn std::error::Error = e;
@@ -700,17 +707,6 @@ fn cause(e: &wreq::Error) -> String {
         cause = next;
     }
     cause.to_string()
-}
-
-/// Go `stripPassword`: a password in the URL's userinfo becomes `***`.
-fn redact_url(raw: &str) -> String {
-    match url::Url::parse(raw) {
-        Ok(mut u) if u.password().is_some() => {
-            let _ = u.set_password(Some("***"));
-            u.to_string()
-        }
-        _ => raw.to_owned(),
-    }
 }
 
 /// Go `shouldCopyHeaderOnRedirect`: the same host name, or a subdomain of it.
@@ -873,21 +869,30 @@ mod tests {
         );
     }
 
-    /// A refused connection reads like Go's url.Error, and a URL password never shows.
+    /// A refused connection reads like Go's url.Error, with the URL redacted: neither a
+    /// password nor a query value such as the OAuth `state` shows (review of #127,
+    /// finding 6).
     #[tokio::test]
-    async fn request_errors_hide_url_passwords() {
+    async fn request_errors_hide_url_credentials() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let client = Client::new(&format!("http://user:fake-url-password@127.0.0.1:{port}"), "k");
         let err = client.get_config().await.unwrap_err();
         assert!(
+            err.starts_with(&format!("Get \"http://127.0.0.1:{port}/admin/v1/effective/config\": ")),
+            "{err}"
+        );
+        assert!(!err.contains("fake-url-password") && !err.contains("user"), "{err}");
+        let client = Client::new(&format!("http://127.0.0.1:{port}"), "");
+        let err = client.get_auth_status("sk-review-secret").await.unwrap_err();
+        assert!(
             err.starts_with(&format!(
-                "Get \"http://user:***@127.0.0.1:{port}/admin/v1/effective/config\": "
+                "Get \"http://127.0.0.1:{port}/v0/management/get-auth-status?state=***\": "
             )),
             "{err}"
         );
-        assert!(!err.contains("fake-url-password"));
+        assert!(!err.contains("sk-review-secret"), "{err}");
     }
 
     #[tokio::test]
@@ -1247,6 +1252,48 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, "Get \"/loop\": stopped after 10 redirects");
         assert_eq!(seen.lock().unwrap().len(), 10);
+        // Every URL a redirect error names is redacted (review of #127, finding 6).
+        for (location, want) in [
+            (
+                format!("http://127.0.0.1:{dead}/gone?code=sk-review-secret"),
+                format!("Get \"http://127.0.0.1:{dead}/gone?code=***\": "),
+            ),
+            (
+                "/loop?code=sk-review-secret".to_owned(),
+                "Get \"/loop?code=***\": stopped after 10 redirects".to_owned(),
+            ),
+            (
+                "http://[::1/?code=sk-review-secret".to_owned(),
+                "Get \"http://127.0.0.1:PORT/admin/v1/effective/config\": failed to parse Location header \"<redacted url>\": ".to_owned(),
+            ),
+        ] {
+            let (port, _) = record(format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            let err = Client::new(&format!("http://127.0.0.1:{port}"), "k")
+                .get_config()
+                .await
+                .unwrap_err();
+            assert!(err.starts_with(&want.replace("PORT", &port.to_string())), "{err}");
+            assert!(!err.contains("sk-review-secret"), "{err}");
+        }
+    }
+
+    /// Round 3, finding 6: an HTTP error shows its body with every URL redacted.
+    #[tokio::test]
+    async fn http_errors_hide_url_credentials_in_the_body() {
+        let body = "request failed for http://user:sk-review-secret@127.0.0.1/?code=sk-review-secret#sk-review-secret";
+        let (port, _) = record(format!(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let err = Client::new(&format!("http://127.0.0.1:{port}"), "k")
+            .get_config()
+            .await
+            .unwrap_err();
+        assert_eq!(err, "HTTP 502: request failed for <redacted url>");
     }
 
     #[tokio::test]
@@ -1469,10 +1516,6 @@ mod tests {
             assert_eq!(normalize_base_url(input), want, "{input:?}");
         }
         assert_eq!(query_escape("a b/ü~.json"), "a+b%2F%C3%BC~.json");
-        assert_eq!(
-            redact_url("http://user:fake-url-password@127.0.0.1:1/admin/v1/effective/config"),
-            "http://user:***@127.0.0.1:1/admin/v1/effective/config"
-        );
         let host = |s: &str| url::Url::parse(s).unwrap();
         assert!(same_site(&host("http://a.example:1/x"), &host("http://a.example:2/y")));
         assert!(same_site(

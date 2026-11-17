@@ -178,6 +178,18 @@ fn endpoint_validation_matches_go_net_url() {
     }
 }
 
+/// A refused discovery endpoint names neither its password nor its query key.
+#[test]
+fn refused_endpoints_never_print_url_credentials() {
+    assert_eq!(
+        validate_endpoint(
+            "http://u:sk-review-secret@auth.x.ai/t?k=sk-review-secret",
+            "token_endpoint"
+        ),
+        Err(r#"xai discovery token_endpoint must use https: "http://auth.x.ai/t?k=***""#.to_owned())
+    );
+}
+
 #[test]
 fn credential_file_names_match_go() {
     for case in fixture()["file_names"].as_array().unwrap() {

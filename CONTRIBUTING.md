@@ -67,7 +67,7 @@ A pull request that touches shipped code needs a new fragment. The shipped paths
 
 Pull requests are squash-merged, so the pull request title becomes the commit subject on `master` and GitHub appends the number, as in `fix(ui): keep Overview tiles whole on a phone (#41)`. The description stays on the pull request; write the reason there.
 
-- Write the title as `type(scope): subject`. Types: `feat`, `fix`, `refactor`, `test`, `style`, `chore`, `docs`, `deps`, `ci` and `release`. Scopes: `cli` (crates/cooker), `server`, `exec`, `translate`, `core` (ck-core and ck-wire), `ui`, `docker`, `ci`, `docs`, `deps`, `bench`, `tools` and `release`.
+- Write the title as `type(scope): subject`. Types: `feat`, `fix`, `refactor`, `test`, `style`, `chore`, `docs`, `deps`, `ci` and `release`. Scopes: `cli` (crates/cooker), `server`, `exec`, `stream`, `translate`, `core` (ck-core and ck-wire), `ui`, `docker`, `ci`, `docs`, `deps`, `bench`, `tools` and `release`.
 - The subject is an English imperative phrase that starts in lower case, such as `retry a reset Claude stream once`, with no full stop. A first word such as `OAuth` keeps its case.
 - The whole title fits in 72 characters.
 - Commit subjects follow the same grammar. Each commit stands alone; squash fixups before pushing rather than pushing `fixup!` commits.

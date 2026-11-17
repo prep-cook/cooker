@@ -124,6 +124,8 @@ pub struct AntigravityExecutor {
     plain: GoClients,
     /// Short quota cooldowns by `auth|model|sc` (`antigravityShortCooldownByAuth`).
     cooldowns: Mutex<HashMap<String, Instant>>,
+    #[cfg(test)]
+    cooldown_now: Option<Instant>,
     /// The sensitive-word matcher for the configured word list.
     matcher: Mutex<Option<(String, Option<Arc<SensitiveWords>>)>>,
     /// Capability probes of registered credentials (`asyncProbeAntigravityCapabilities`).
@@ -196,7 +198,7 @@ fn cooldown_key(credential: &Credential, model: &str) -> Option<String> {
 /// (`newAntigravityStatusErr`).
 pub(crate) fn upstream_error(status: u16, body: Bytes) -> ExecError {
     let retry = (status == 429).then(|| auth::parse_retry_delay(&body)).flatten();
-    let mut error = gemini::status_err(status, body);
+    let mut error = gemini::status_err(status, body).from_upstream();
     error.retry_after = retry;
     error
 }
@@ -232,6 +234,8 @@ impl AntigravityExecutor {
             plain: GoClients::new(hooks.clone()),
             hooks,
             cooldowns: Mutex::default(),
+            #[cfg(test)]
+            cooldown_now: None,
             matcher: Mutex::default(),
             probes: Arc::default(),
         }
@@ -395,13 +399,23 @@ impl AntigravityExecutor {
         built
     }
 
+    fn cooldown_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.cooldown_now {
+            return now;
+        }
+        Instant::now()
+    }
+
     /// `antigravityIsInShortCooldownRequired`: the cooldown left for this credential and
     /// model; an expired entry is removed.
     fn cooldown_remaining(&self, credential: &Credential, model: &str) -> Option<Duration> {
         let key = cooldown_key(credential, model)?;
         let mut cooldowns = self.cooldowns.lock().unwrap_or_else(PoisonError::into_inner);
         let until = *cooldowns.get(&key)?;
-        let remaining = until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
+        let remaining = until
+            .checked_duration_since(self.cooldown_now())
+            .filter(|d| !d.is_zero());
         if remaining.is_none() {
             cooldowns.remove(&key);
         }
@@ -457,7 +471,7 @@ impl AntigravityExecutor {
             self.cooldowns
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(key, Instant::now() + retry);
+                .insert(key, self.cooldown_now() + retry);
         }
     }
 
@@ -466,6 +480,31 @@ impl AntigravityExecutor {
         credential: &Credential,
         req: ExecRequest,
         cfg: &Config,
+    ) -> Result<ExecResponse, ExecError> {
+        self.execute_with(credential, req, cfg, false).await
+    }
+
+    /// `execute` for the execution contract: the canonical stream accounts the usage in the
+    /// answer, so the answer carries only counts the upstream sent, with no Claude
+    /// input-token estimate and no zero default.
+    pub(crate) async fn execute_reported(
+        &self,
+        credential: &Credential,
+        req: ExecRequest,
+        cfg: &Config,
+    ) -> Result<ExecResponse, ExecError> {
+        self.execute_with(credential, req, cfg, true).await
+    }
+
+    /// `reported_usage`: the answer's usage holds only counts the upstream sent. Otherwise a
+    /// Claude client's answer is presented as Go does: zero defaults and the O200kBase
+    /// estimate of the request's input.
+    async fn execute_with(
+        &self,
+        credential: &Credential,
+        req: ExecRequest,
+        cfg: &Config,
+        reported_usage: bool,
     ) -> Result<ExecResponse, ExecError> {
         if req.operation == Operation::CountTokens {
             return self.count_tokens(credential, req, cfg).await;
@@ -500,7 +539,7 @@ impl AntigravityExecutor {
         let model = parse_suffix(&req.model).model_name;
         self.check_cooldown(credential, cfg, &model)?;
         if req.stream {
-            self.stream(credential, req, cfg, &model).await
+            self.stream(credential, req, cfg, &model, reported_usage).await
         } else if ag::merges_stream(&model) {
             self.merged(credential, req, cfg, &model).await
         } else {
@@ -610,7 +649,9 @@ impl AntigravityExecutor {
         }
         let project = auth::project_id(credential);
         if project.is_empty() {
-            return Err(gemini::status_err(400, "antigravity auth missing project_id"));
+            let mut error = gemini::status_err(400, "antigravity auth missing project_id");
+            error.scope = ck_core::exec::FailureScope::Credential;
+            return Err(error);
         }
         let derived = ag::derived_session_id(req.derived_session.as_deref());
         let body = ag::gemini_to_antigravity(model, body, project, &derived);
@@ -756,6 +797,7 @@ impl AntigravityExecutor {
         mut req: ExecRequest,
         cfg: &Config,
         model: &str,
+        reported_usage: bool,
     ) -> Result<ExecResponse, ExecError> {
         let prepared = self.prepare_request(credential, &mut req, cfg, model, true)?;
         let accumulator = replay::Accumulator::new(&prepared.replay, &prepared.body);
@@ -803,6 +845,7 @@ impl AntigravityExecutor {
         // split over lines before translating it.
         let options = ck_translate::stream::StreamOptions {
             whole_events: true,
+            reported_usage,
             ..Default::default()
         };
         let mut output = Output::with_options(&req, Format::Antigravity, &prepared.translated, options)

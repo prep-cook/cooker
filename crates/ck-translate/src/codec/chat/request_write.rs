@@ -1,0 +1,328 @@
+use super::super::request_content::write_part;
+use super::*;
+
+pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    let root = doc.root();
+    let x = doc.required(root, "x_ck")?;
+    e.bytes(b"{")?;
+    let mut first = true;
+    for child in doc.children(root)? {
+        let name = doc.node(child)?.name.ok_or(Error::Schema)?;
+        if doc.name_is(name, "x_ck")? || doc.name_is(name, "stream")? {
+            continue;
+        }
+        if !first {
+            e.bytes(b",")?;
+        }
+        first = false;
+        if doc.name_is(name, "tools")? && doc.member(x, "chat_legacy_functions")?.is_some() {
+            e.bytes(b"\"functions\":[")?;
+            for (i, tool) in doc.children(child)?.enumerate() {
+                if i != 0 {
+                    e.bytes(b",")?;
+                }
+                super::super::request_controls::write(doc, doc.required(tool, "function")?, e)?;
+            }
+            e.bytes(b"]")?;
+        } else if doc.name_is(name, "tool_choice")? && doc.member(x, "chat_legacy_choice")?.is_some() {
+            e.bytes(b"\"function_call\":")?;
+            if matches!(doc.node(child)?.value, Value::Object) {
+                super::super::request_controls::write(doc, doc.required(child, "function")?, e)?;
+            } else {
+                super::super::request_controls::write(doc, child, e)?;
+            }
+        } else {
+            doc.write_name(name, e)?;
+            e.bytes(b":")?;
+            if doc.name_is(name, "messages")? {
+                e.bytes(b"[")?;
+                let mut first = true;
+                for (i, message) in doc.children(child)?.enumerate() {
+                    if !write_tool_results(doc, message, &mut first, e)? {
+                        continue;
+                    }
+                    if !first {
+                        e.bytes(b",")?;
+                    }
+                    first = false;
+                    write_message(view, message, i as u64, e)?;
+                }
+                e.bytes(b"]")?;
+            } else if doc.name_is(name, "tools")? && super::json_schema::from_gemini(doc)? {
+                write_gemini_tools(doc, child, e)?;
+            } else if doc.name_is(name, "response_format")? && super::json_schema::from_gemini(doc)? {
+                write_gemini_format(doc, child, e)?;
+            } else if doc.name_is(name, "tool_choice")? && flat_allowed(doc, child)? {
+                write_allowed(doc, child, e)?;
+            } else {
+                super::super::request_controls::write(doc, child, e)?;
+            }
+        }
+    }
+    e.bytes(if first { b"" } else { b"," })?;
+    e.bytes(b"\"stream\":")?;
+    e.bytes(if streaming { b"true" } else { b"false" })?;
+    if let Some(thinking) = doc.member(x, "thinking")? {
+        // Another protocol's native thinking config has no Chat field (orchestrator ruling
+        // 2026-11-15); only its effort maps.
+        let native = super::super::request_controls::from_chat(doc)?;
+        for (from, to) in [("effort", "reasoning_effort"), ("native", "reasoning")] {
+            if from == "native" && !native {
+                continue;
+            }
+            if let Some(value) = doc.member(thinking, from)? {
+                e.bytes(b",")?;
+                e.string(to)?;
+                e.bytes(b":")?;
+                doc.write(value, e)?;
+            }
+        }
+    }
+    super::super::provenance::request_members(doc, root, None, &[], &["x_ck"], e)?;
+    e.bytes(b"}")
+}
+
+/// Whether `choice` is a Responses request's flat allowed-tools choice, which the fence admitted
+/// only with function and custom tools named flat.
+fn flat_allowed(doc: &Document, choice: usize) -> Result<bool> {
+    if !matches!(doc.node(choice)?.value, Value::Object) || doc.member(choice, "allowed_tools")?.is_some() {
+        return Ok(false);
+    }
+    doc.string_is(doc.required(choice, "type")?, "allowed_tools")
+}
+/// Writes a flat allowed-tools choice in Chat's nested form, each tool's name under its type.
+fn write_allowed(doc: &Document, choice: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"{\"type\":\"allowed_tools\",\"allowed_tools\":{\"mode\":")?;
+    doc.write(doc.required(choice, "mode")?, e)?;
+    e.bytes(b",\"tools\":[")?;
+    for (i, tool) in doc.children(doc.required(choice, "tools")?)?.enumerate() {
+        let kind = doc.required(tool, "type")?;
+        e.bytes(if i == 0 { b"{\"type\":" } else { b",{\"type\":" })?;
+        doc.write(kind, e)?;
+        e.bytes(b",")?;
+        doc.write(kind, e)?;
+        e.bytes(b":{\"name\":")?;
+        doc.write(doc.required(tool, "name")?, e)?;
+        e.bytes(b"}}")?;
+    }
+    e.bytes(b"]}}")
+}
+/// Writes Gemini JSON mode as a `json_schema` format with a fixed name, or `json_object` when it
+/// has no schema.
+fn write_gemini_format(doc: &Document, format: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let Some(schema) = gemini::json_mode(doc, format)? else {
+        return e.bytes(b"{\"type\":\"json_object\"}");
+    };
+    e.bytes(b"{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"response\",\"schema\":")?;
+    gemini::write_schema(doc, schema, e)?;
+    e.bytes(b"}}")
+}
+/// Writes a Gemini source's tools with each declaration as a JSON Schema tool definition.
+fn write_gemini_tools(doc: &Document, tools: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"[")?;
+    for (i, tool) in doc.children(tools)?.enumerate() {
+        e.bytes(if i == 0 { b"{" } else { b",{" })?;
+        for (j, field) in doc.children(tool)?.enumerate() {
+            e.bytes(if j == 0 { b"" } else { b"," })?;
+            let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+            doc.write_name(name, e)?;
+            e.bytes(b":")?;
+            if !doc.name_is(name, "function")? {
+                doc.write(field, e)?;
+                continue;
+            }
+            e.bytes(b"{")?;
+            super::json_schema::write_function(doc, field, ("parameters", None), e)?;
+            e.bytes(b"}")?;
+        }
+        e.bytes(b"}")?;
+    }
+    e.bytes(b"]")
+}
+/// Writes each tool result of `message` as a `tool` message with its text parts joined, or a
+/// Gemini `result` as its JSON text, ahead of the rest of the turn; returns whether parts other
+/// than tool results remain. Chat has no field for `is_error`.
+fn write_tool_results(doc: &Document, message: usize, first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<bool> {
+    let Some(content) = doc.member(message, "content")? else {
+        return Ok(true);
+    };
+    if !matches!(doc.node(content)?.value, Value::Array) {
+        return Ok(true);
+    }
+    let mut rest = doc.node(content)?.first.is_none();
+    for part in doc.children(content)? {
+        if !doc.string_is(doc.required(part, "type")?, "tool_result")? {
+            rest = true;
+            continue;
+        }
+        e.bytes(if *first { b"" } else { b"," })?;
+        *first = false;
+        e.bytes(b"{\"role\":\"tool\",\"tool_call_id\":")?;
+        doc.write(doc.required(part, "tool_call_id")?, e)?;
+        if !gemini::write_outcome(doc, part, "content", e)? {
+            e.bytes(b",\"content\":\"")?;
+            if let Some(texts) = doc.member(part, "content")? {
+                for text in doc.children(texts)? {
+                    doc.write_contents(doc.required(text, "text")?, e)?;
+                }
+            }
+            e.bytes(b"\"")?;
+        }
+        e.bytes(b"}")?;
+    }
+    Ok(rest)
+}
+fn write_message(view: RequestView<'_>, message: usize, _message_index: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    let claude = super::super::request_controls::from_claude(doc)?;
+    let mut reasoning = None;
+    e.bytes(b"{")?;
+    for (i, field) in doc.children(message)?.enumerate() {
+        if i != 0 {
+            e.bytes(b",")?;
+        }
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        if doc.name_is(name, "tool_calls")? {
+            let x = doc.required(doc.root(), "x_ck")?;
+            let mut legacy = false;
+            if let Some(calls) = doc.member(x, "chat_legacy_calls")? {
+                for call in doc.children(calls)? {
+                    legacy |= doc.origin(call)?.is_some_and(|(parent, _)| parent == message);
+                }
+            }
+            if legacy {
+                e.bytes(b"\"function_call\":")?;
+                let call = doc.node(field)?.first.ok_or(Error::Schema)?;
+                let verbatim = doc.string_is(doc.required(call, "arguments_format")?, "invalid_json")?;
+                write_function(doc, doc.required(call, "function")?, (false, verbatim), e)?;
+            } else {
+                e.bytes(b"\"tool_calls\":[")?;
+                for (j, call) in doc.children(field)?.enumerate() {
+                    if j != 0 {
+                        e.bytes(b",")?;
+                    }
+                    let format = doc.required(call, "arguments_format")?;
+                    let custom = doc.string_is(format, "text")?;
+                    let verbatim = custom || doc.string_is(format, "invalid_json")?;
+                    e.bytes(b"{")?;
+                    let mut first = true;
+                    for member in doc.children(call)? {
+                        let name = doc.node(member)?.name.ok_or(Error::Schema)?;
+                        if doc.name_is(name, "arguments_format")? {
+                            continue;
+                        }
+                        if !first {
+                            e.bytes(b",")?;
+                        }
+                        first = false;
+                        if doc.name_is(name, "function")? {
+                            e.string(if custom { "custom" } else { "function" })?;
+                            e.bytes(b":")?;
+                            write_function(doc, member, (custom, verbatim), e)?;
+                        } else {
+                            doc.write_name(name, e)?;
+                            e.bytes(b":")?;
+                            super::super::request_controls::write(doc, member, e)?;
+                        }
+                    }
+                    super::super::request_controls::members(doc, call, &mut first, e)?;
+                    super::super::provenance::request_members(doc, call, None, &[], &[], e)?;
+                    e.bytes(b"}")?;
+                }
+                e.bytes(b"]")?;
+            }
+        } else {
+            doc.write_name(name, e)?;
+            e.bytes(b":")?;
+            if doc.name_is(name, "content")? && matches!(doc.node(field)?.value, Value::Array) {
+                write_content(view, field, claude, e)?;
+                reasoning = claude.then_some(field);
+            } else {
+                super::super::request_controls::write(doc, field, e)?;
+            }
+        }
+    }
+    if let Some(content) = reasoning {
+        write_reasoning(doc, content, e)?;
+    }
+    super::super::request_controls::members(doc, message, &mut false, e)?;
+    super::super::provenance::request_members(doc, message, None, &[], &[], e)?;
+    e.bytes(b"}")
+}
+/// Writes a content array; for Claude history it leaves out thinking, which
+/// [`write_reasoning`] carries, and redacted blocks, which Chat cannot replay. Chat requires at
+/// least one part in a content array.
+fn write_content(view: RequestView<'_>, content: usize, claude: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    let mut first = true;
+    for part in doc.children(content)? {
+        let kind = doc.required(part, "type")?;
+        if (claude && (doc.string_is(kind, "reasoning")? || doc.string_is(kind, "redacted")?))
+            || doc.string_is(kind, "tool_result")?
+        {
+            continue;
+        }
+        e.bytes(if first { b"[" } else { b"," })?;
+        first = false;
+        write_part(view, part, e)?;
+    }
+    // Another protocol's turn left with no part, such as a Gemini model turn holding only calls,
+    // is empty text, as Claude history is; a Chat client's own `[]` returns as it came.
+    let native = super::super::request_controls::from_chat(doc)?;
+    e.bytes(match (first, native) {
+        (false, _) => b"]".as_slice(),
+        (true, false) => b"\"\"",
+        (true, true) => b"[]",
+    })
+}
+/// Writes the visible thinking of Claude history as `reasoning_content`, blocks joined by a
+/// newline; signatures stay behind (owner ruling 2026-11-15).
+fn write_reasoning(doc: &Document, content: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let mut first = true;
+    for part in doc.children(content)? {
+        if !doc.string_is(doc.required(part, "type")?, "reasoning")? {
+            continue;
+        }
+        e.bytes(if first {
+            b",\"reasoning_content\":\"".as_slice()
+        } else {
+            b"\\n"
+        })?;
+        first = false;
+        doc.write_contents(doc.required(part, "text")?, e)?;
+    }
+    if first { Ok(()) } else { e.bytes(b"\"") }
+}
+/// `verbatim` arguments are a string written as it is: custom input, or function arguments
+/// that were not JSON.
+fn write_function(
+    doc: &Document,
+    function: usize,
+    (custom, verbatim): (bool, bool),
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
+    e.bytes(b"{")?;
+    for (i, field) in doc.children(function)?.enumerate() {
+        if i != 0 {
+            e.bytes(b",")?;
+        }
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        if doc.name_is(name, "arguments")? {
+            e.string(if custom { "input" } else { "arguments" })?;
+            e.bytes(b":")?;
+            if verbatim {
+                doc.write(field, e)?;
+            } else {
+                e.quoted_json(|e| doc.write(field, e))?;
+            }
+        } else {
+            doc.write_name(name, e)?;
+            e.bytes(b":")?;
+            super::super::request_controls::write(doc, field, e)?;
+        }
+    }
+    super::super::request_controls::members(doc, function, &mut false, e)?;
+    super::super::provenance::request_members(doc, function, None, &[], &[], e)?;
+    e.bytes(b"}")
+}

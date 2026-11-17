@@ -4,9 +4,10 @@
 use crate::{
     Error, Registered, RequestCtx,
     common::{self, UserTurnDrops, gemini_part_is_sendable, go_lower, sanitize_function_name, trim_space},
-    gemini::{self, attach_default_safety_settings},
     gemini_chat_request::content_node,
-    gemini_claude_response as response, openai_claude,
+    gemini_claude_response as response,
+    gemini_gemini::{self, attach_default_safety_settings},
+    openai_claude,
 };
 use ck_wire::json::{self as gj, Kind, Res};
 use std::collections::HashMap;
@@ -105,7 +106,7 @@ fn convert(model: &str, raw: &[u8], preserve_thinking: bool) -> Result<Vec<u8>, 
                 contents.pop();
             }
         }
-        gj::set_items(&mut out, "contents", &gemini::merge_adjacent_contents(contents));
+        gj::set_items(&mut out, "contents", &gemini_gemini::merge_adjacent_contents(contents));
     }
 
     let mut declarations = vec![];
@@ -336,12 +337,16 @@ fn message_contents(
                 if name.is_empty() {
                     name = id.clone();
                 }
-                let result = gemini::claude_tool_result(&block.get("content"));
+                let result = gemini_gemini::claude_tool_result(&block.get("content"));
                 let mut part = br#"{"functionResponse":{"name":"","response":{"result":""}}}"#.to_vec();
                 gj::set_str(&mut part, "functionResponse.id", &id);
                 gj::set_str(&mut part, "functionResponse.name", sanitize_function_name(&name));
                 if result.raw {
-                    gemini::set_function_response_raw(&mut part, "functionResponse.response.result", &result.result);
+                    gemini_gemini::set_function_response_raw(
+                        &mut part,
+                        "functionResponse.response.result",
+                        &result.result,
+                    );
                 } else {
                     gj::set_str(&mut part, "functionResponse.response.result", &result.result);
                 }
@@ -365,7 +370,7 @@ fn message_contents(
         }
     }
     if role == b"user" {
-        parts = gemini::reorder_user_parts(parts);
+        parts = gemini_gemini::reorder_user_parts(parts);
     }
     if original == b"user" {
         drops.end_turn(parts.iter().filter(|p| gemini_part_is_sendable(p)).count());

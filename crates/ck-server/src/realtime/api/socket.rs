@@ -1,33 +1,32 @@
 //! The call sideband (sideband.go `HandleSideband`) and the standard Realtime WebSocket
 //! (websocket.go `HandleDirectWebsocket`): both dial an upstream socket with a Codex
-//! OAuth credential, then relay text and binary messages both ways until either side
-//! closes. Pings are answered locally, never relayed (gorilla's default handlers).
+//! OAuth credential, then run a live session over both sockets ([`super::session`]) until
+//! either side closes. The credential is chosen before the upstream session opens and stays
+//! pinned to it; a sideband reuses the call's own.
 //!
 //! A sideband claims its call while it runs: a second join gets 409, the call does not
-//! expire meanwhile, a hangup tears the relay down, and the call is forgotten when the
-//! relay ends.
+//! expire meanwhile, a hangup ends the session, and the call is forgotten when it ends.
+//! With `realtime.max-sockets-per-key` set, a key's socket past it is refused before dialling.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::Extension;
 use axum::extract::rejection::PathRejection;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::ws::{self, WebSocket, WebSocketUpgrade};
 use axum::extract::{OriginalUri, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ck_exec::codex_live::{self as live, DialError, LiveSocket, LiveTarget, Sideband};
-use futures_util::{SinkExt, StreamExt};
+use ck_translate::realtime::Events;
+use tokio_util::sync::CancellationToken;
 use wreq::ws::message as up;
 
 use super::calls::{Claim, ClaimGuard};
 use super::http::{HANDSHAKE_HEADERS, copy_headers, header_text};
+use super::session::{self, Opened};
 use super::{Live, Principal, header_session, live_error, realtime_error, select_oauth, trace, with_trace};
 use crate::runtime::state::Runtime;
-
-/// Bound on the closing frames written after a relay ends.
-const CLOSE_WRITE: Duration = Duration::from_secs(1);
 
 /// gorilla `tokenListContainsValue`: `token` is one of the comma-separated values.
 fn has_token(headers: &HeaderMap, name: header::HeaderName, token: &str) -> bool {
@@ -226,6 +225,9 @@ async fn sideband(inbound: Inbound, realtime: bool, style: Sideband, call_id: St
             "realtime_call_scope_mismatch",
         );
     }
+    let Some(slot) = live.sockets.take(&principal.key) else {
+        return socket_limit(&live, Some(&call_id));
+    };
     let cfg = rt.config();
     let selection_headers = principal.selection_headers(&headers);
     // Go: a pick pinned to the call's credential that lasts as long as this relay.
@@ -259,37 +261,59 @@ async fn sideband(inbound: Inbound, realtime: bool, style: Sideband, call_id: St
     let Some(ws) = ws.ok().filter(|_| acceptable_handshake(&headers)) else {
         return with_trace(bad_handshake(), &trace);
     };
-    upgrade(ws, upstream, owner, move |relay| {
+    let opened = Opened {
+        rt: rt.clone(),
+        settings: live.settings,
+        owner: principal.owner(),
+        events: Events::Sideband,
+        model: None,
+        upstream_model: String::new(),
+        credential: credential.clone(),
+        call_id: Some(call_id.clone()),
+        facts: principal.facts(&cfg, &headers, "GET /v1/realtime", ""),
+        hangup: call.ended.clone(),
+    };
+    upgrade(ws, upstream, owner, opened, move || {
         let mut guard = guard;
         guard.consume = true;
-        guard.call.resources.add(relay.abort_handle());
-        async move {
-            finish(relay).await;
-            // Ending the call closes its media; the pick ends once that close finished.
-            let media = guard.call.media.clone();
-            drop(guard);
-            match media {
-                Some(media) => media.after_close(Box::new(move || drop(lease))),
-                None => drop(lease),
-            }
+        drop(slot);
+        // Ending the call closes its media; the pick ends once that close finished.
+        let media = guard.call.media.clone();
+        drop(guard);
+        match media {
+            Some(media) => media.after_close(Box::new(move || drop(lease))),
+            None => drop(lease),
         }
     })
 }
 
-/// Waits for `relay`, aborting it when the wait is dropped first.
-async fn finish(relay: tokio::task::JoinHandle<()>) {
-    let _ = tokio_util::task::AbortOnDropHandle::new(relay).await;
+/// Refuses a socket past `realtime.max-sockets-per-key` and logs its end.
+fn socket_limit(live: &Live, call_id: Option<&str>) -> Response {
+    tracing::warn!(
+        request_id = crate::observability::api::current_request_id().as_deref(),
+        call_id,
+        cause = "socket_limit",
+        initiator = "gateway",
+        max_sockets_per_key = live.settings.max_sockets_per_key,
+        "live_session_end"
+    );
+    realtime_error(
+        429,
+        "Too many Realtime sockets are open for this key. Close one and connect again.",
+        "rate_limit_error",
+        "realtime_socket_limit",
+    )
 }
 
 /// `HandleDirectWebsocket`.
 async fn direct(inbound: Inbound, model: String) -> Response {
     let Inbound {
         rt,
+        live,
         principal,
         headers,
         ws,
         owner,
-        ..
     } = inbound;
     if !is_upgrade(&headers) {
         return upgrade_required(realtime_error(
@@ -314,6 +338,9 @@ async fn direct(inbound: Inbound, model: String) -> Response {
             "realtime_client_secret_scope_mismatch",
         );
     }
+    let Some(slot) = live.sockets.take(&principal.key) else {
+        return socket_limit(&live, None);
+    };
     let cfg = rt.config();
     let selection_headers = principal.selection_headers(&headers);
     let lease = match select_oauth(&rt, &cfg, None, &selection_headers, &[], None).await {
@@ -388,9 +415,21 @@ async fn direct(inbound: Inbound, model: String) -> Response {
     let Some(ws) = ws.ok().filter(|_| acceptable_handshake(&headers)) else {
         return traced(bad_handshake());
     };
+    let opened = Opened {
+        rt: rt.clone(),
+        settings: live.settings,
+        owner: principal.owner(),
+        events: Events::Realtime,
+        model: Some(requested.clone()),
+        upstream_model: selection_model.clone(),
+        credential: credential.clone(),
+        call_id: None,
+        facts: principal.facts(&cfg, &headers, "GET /v1/realtime", &requested),
+        hangup: CancellationToken::new(),
+    };
     // Go `selection.Retain()` until the session closes.
-    upgrade(ws, upstream, owner, move |relay| async move {
-        finish(relay).await;
+    upgrade(ws, upstream, owner, opened, move || {
+        drop(slot);
         drop(lease);
     })
 }
@@ -416,155 +455,25 @@ fn dial_failed(error: DialError, other: impl FnOnce(u16) -> Response) -> Respons
     response
 }
 
-/// Completes the downstream upgrade with the upstream's subprotocol, then runs the
-/// relay as its own task (so a hangup can abort it) inside `run`.
-fn upgrade<F, Fut>(
+/// Completes the downstream upgrade with the upstream's subprotocol, then runs the live
+/// session and `ended` once it is over.
+fn upgrade(
     ws: WebSocketUpgrade,
     upstream: LiveSocket,
     owner: Option<Extension<crate::net::listener::ConnectionWork>>,
-    run: F,
-) -> Response
-where
-    F: FnOnce(tokio::task::JoinHandle<()>) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
+    opened: Opened,
+    ended: impl FnOnce() + Send + 'static,
+) -> Response {
     let mut ws = ws
         .max_message_size(live::MAX_WS_MESSAGE)
         .max_frame_size(live::MAX_WS_MESSAGE);
     if let Some(protocol) = upstream.protocol.as_deref().and_then(|p| HeaderValue::from_str(p).ok()) {
         ws.set_selected_protocol(protocol);
     }
-    let upstream = upstream.socket;
-    let work = owner.as_ref().map(|Extension(owner)| owner.work.clone());
     crate::net::listener::websocket(ws, owner, move |downstream| async move {
-        let relay = relay(downstream, upstream);
-        let task = match work {
-            Some(work) => work.spawn(relay),
-            None => tokio::spawn(relay),
-        };
-        run(task).await;
+        session::run(opened, downstream, upstream).await;
+        ended();
     })
-}
-
-/// How one relay direction ended.
-#[derive(Debug)]
-enum End {
-    /// A close frame: its code and reason, if any.
-    Closed(Option<(u16, String)>),
-    /// The peer went away: the stream ended, or the connection closed without a close
-    /// frame (gorilla's 1006, `io.EOF`, `net.ErrClosed`).
-    Gone,
-    /// Reading failed for another reason: a protocol violation or a socket error.
-    Failed,
-    /// Writing to the other side failed.
-    WriteFailed,
-}
-
-/// A read error as gorilla reports it: an abnormal closure (connection closed without a
-/// close frame) counts as the peer going away; anything else is a relay failure.
-fn read_end(error: &(dyn std::error::Error + 'static)) -> End {
-    let mut current = Some(error);
-    while let Some(e) = current {
-        // tungstenite's `ResetWithoutClosingHandshake`, `ConnectionClosed`, `AlreadyClosed`;
-        // the crate is not a direct dependency, so they are recognised by their text.
-        let text = e.to_string();
-        if text.contains("Connection reset without closing handshake")
-            || text.contains("Connection closed normally")
-            || text.contains("Trying to work with closed connection")
-        {
-            return End::Gone;
-        }
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            return if io.kind() == std::io::ErrorKind::UnexpectedEof {
-                End::Gone
-            } else {
-                End::Failed
-            };
-        }
-        current = e.source();
-    }
-    End::Failed
-}
-
-/// `websocketCloseDetails`: what both sides are told when one direction stops.
-fn close_details(end: End) -> (u16, String) {
-    match end {
-        End::Closed(Some((code, reason))) if !matches!(code, 1005 | 1006 | 1015) => (code, reason),
-        End::Closed(_) | End::Gone => (1000, String::new()),
-        End::Failed | End::WriteFailed => (1011, "relay closed".into()),
-    }
-}
-
-/// `relayWebsockets`.
-async fn relay(downstream: WebSocket, upstream: wreq::ws::WebSocket) {
-    let (mut down_tx, mut down_rx) = downstream.split();
-    let (mut up_tx, mut up_rx) = upstream.split();
-    let end = {
-        let to_upstream = async {
-            loop {
-                let message = match down_rx.next().await {
-                    Some(Ok(message)) => message,
-                    Some(Err(e)) => return read_end(&e),
-                    None => return End::Gone,
-                };
-                let message = match message {
-                    ws::Message::Text(text) => up::Message::text(text.as_str()),
-                    ws::Message::Binary(data) => up::Message::binary(data),
-                    ws::Message::Ping(_) | ws::Message::Pong(_) => continue,
-                    ws::Message::Close(frame) => {
-                        return End::Closed(frame.map(|f| (f.code, f.reason.as_str().to_owned())));
-                    }
-                };
-                if up_tx.send(message).await.is_err() {
-                    return End::WriteFailed;
-                }
-            }
-        };
-        let to_downstream = async {
-            loop {
-                let message = match up_rx.next().await {
-                    Some(Ok(message)) => message,
-                    Some(Err(e)) => return read_end(&e),
-                    None => return End::Gone,
-                };
-                let message = match message {
-                    up::Message::Text(text) => ws::Message::Text(text.as_str().into()),
-                    up::Message::Binary(data) => ws::Message::Binary(data),
-                    up::Message::Ping(_) | up::Message::Pong(_) => continue,
-                    up::Message::Close(frame) => {
-                        return End::Closed(frame.map(|f| (u16::from(f.code), f.reason.as_str().to_owned())));
-                    }
-                };
-                if down_tx.send(message).await.is_err() {
-                    return End::WriteFailed;
-                }
-            }
-        };
-        tokio::select! {
-            end = to_upstream => end,
-            end = to_downstream => end,
-        }
-    };
-    let (code, reason) = close_details(end);
-    let down_close = ws::Message::Close(Some(ws::CloseFrame {
-        code,
-        reason: reason.as_str().into(),
-    }));
-    let up_close = up::Message::Close(Some(up::CloseFrame {
-        code: code.into(),
-        reason: reason.as_str().into(),
-    }));
-    // Both sides get the close; a side that closed first gets its close echoed instead.
-    // Closing the sinks flushes those frames before the sockets drop.
-    let close_down = async {
-        let _ = down_tx.send(down_close).await;
-        let _ = down_tx.close().await;
-    };
-    let close_up = async {
-        let _ = up_tx.send(up_close).await;
-        let _ = up_tx.close().await;
-    };
-    let _ = tokio::time::timeout(CLOSE_WRITE, futures_util::future::join(close_down, close_up)).await;
 }
 
 #[cfg(test)]
@@ -585,35 +494,5 @@ mod tests {
         );
         headers.append(header::SEC_WEBSOCKET_PROTOCOL, "ignored".parse().unwrap());
         assert_eq!(subprotocols(&headers), ["realtime", "openai-insecure-api-key.x"]);
-    }
-
-    #[test]
-    fn close_codes_follow_go() {
-        assert_eq!(
-            close_details(End::Closed(Some((4001, "bye".into())))),
-            (4001, "bye".into())
-        );
-        assert_eq!(
-            close_details(End::Closed(Some((1006, "x".into())))),
-            (1000, String::new())
-        );
-        assert_eq!(close_details(End::Closed(None)), (1000, String::new()));
-        assert_eq!(close_details(End::Gone), (1000, String::new()));
-        assert_eq!(close_details(End::WriteFailed), (1011, "relay closed".into()));
-        assert_eq!(close_details(End::Failed), (1011, "relay closed".into()));
-    }
-
-    #[test]
-    fn read_errors_classify_like_gorilla() {
-        let io = |kind| std::io::Error::new(kind, "x");
-        assert!(matches!(read_end(&io(std::io::ErrorKind::UnexpectedEof)), End::Gone));
-        assert!(matches!(
-            read_end(&io(std::io::ErrorKind::ConnectionReset)),
-            End::Failed
-        ));
-        let abrupt = std::io::Error::other("WebSocket protocol error: Connection reset without closing handshake");
-        assert!(matches!(read_end(&abrupt), End::Gone));
-        let rsv = std::io::Error::other("WebSocket protocol error: Reserved bits are non-zero");
-        assert!(matches!(read_end(&rsv), End::Failed));
     }
 }

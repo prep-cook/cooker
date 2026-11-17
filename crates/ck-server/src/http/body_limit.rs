@@ -21,7 +21,7 @@ use crate::Runtime;
 pub(crate) const MESSAGE: &str = "http: request body too large";
 
 /// A body read stopped at the configured limit.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TooLarge;
 
 impl std::fmt::Display for TooLarge {
@@ -60,7 +60,9 @@ pub(crate) fn is_too_large(error: &(dyn std::error::Error + 'static)) -> bool {
 
 /// The middleware's own answer, and request capture's.
 pub(crate) fn too_large() -> Response {
-    crate::http::respond::gin_json(413, format!(r#"{{"error":"{MESSAGE}"}}"#))
+    let mut response = crate::http::respond::gin_json(413, format!(r#"{{"error":"{MESSAGE}"}}"#));
+    response.extensions_mut().insert(TooLarge);
+    response
 }
 
 /// Applies the limit to `app`, outside request capture (Go registers it before the
@@ -70,22 +72,43 @@ pub fn layer(rt: &Arc<Runtime>, app: axum::Router) -> axum::Router {
 }
 
 async fn limit(State(rt): State<Arc<Runtime>>, mut request: Request, next: Next) -> Response {
-    let Some(max) = rt.config().max_request_body_bytes() else {
+    let configured = rt.config().max_request_body_bytes();
+    let max = if super::errors::anthropic_body_path(request.uri().path()) {
+        Some(
+            configured
+                .unwrap_or(u64::MAX)
+                .min(super::errors::ANTHROPIC_MAX_REQUEST_BYTES as u64),
+        )
+    } else {
+        configured
+    };
+    let Some(max) = max else {
         return next.run(request).await;
     };
-    // hyper reports a declared Content-Length as the body's exact size.
-    if request.body().size_hint().lower() > max {
-        return too_large();
+    let render = crate::observability::api::is_ai_path(request.uri().path())
+        .then(|| super::errors::renderer(request.uri().path(), request.headers()));
+    // Capture and handlers share this bound; a reload cannot change an in-flight read.
+    let response = if request.body().size_hint().lower() > max {
+        too_large()
+    } else {
+        request.extensions_mut().insert(Limit(Some(max)));
+        next.run(request.map(|body| {
+            Body::new(Capped {
+                body,
+                left: max,
+                over: false,
+            })
+        }))
+        .await
+    };
+    // Capture can reject before routing. Only its local limit marker is rewritten,
+    // never an upstream 413 or a management response.
+    if response.extensions().get::<TooLarge>().is_some()
+        && let Some(render) = render
+    {
+        return render(413, MESSAGE);
     }
-    request.extensions_mut().insert(Limit(Some(max)));
-    next.run(request.map(|body| {
-        Body::new(Capped {
-            body,
-            left: max,
-            over: false,
-        })
-    }))
-    .await
+    response
 }
 
 /// Go `http.MaxBytesReader`: passes frames through until more than `left` bytes have

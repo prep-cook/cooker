@@ -57,6 +57,7 @@ macro_rules! registered {
     };
 }
 
+pub mod anthropic;
 mod antigravity_chat;
 mod antigravity_claude;
 mod antigravity_claude_response;
@@ -65,6 +66,8 @@ mod antigravity_interactions;
 mod antigravity_responses;
 mod apply_patch;
 pub mod apply_patch_responses;
+pub mod audio;
+mod boundary;
 mod claude_chat_request;
 mod claude_chat_response;
 mod claude_gemini;
@@ -72,6 +75,7 @@ mod claude_interactions;
 mod claude_responses;
 mod claude_responses_response;
 mod claude_tool_args;
+pub mod codec;
 mod codex_chat_request;
 mod codex_chat_response;
 mod codex_claude;
@@ -80,17 +84,23 @@ mod codex_gemini;
 mod codex_interactions;
 mod codex_responses;
 mod common;
-mod gemini;
+#[path = "gemini/boundary.rs"]
+pub mod gemini;
 mod gemini_chat_request;
 mod gemini_chat_response;
 mod gemini_claude;
 mod gemini_claude_response;
+mod gemini_gemini;
 mod gemini_interactions;
 mod gemini_interactions_response;
 mod gemini_responses;
 mod gemini_responses_response;
 mod gemini_web_search;
+#[cfg(test)]
+mod history_tests;
+pub mod images;
 mod interactions_claude;
+pub mod meta;
 mod mime;
 mod openai;
 mod openai_claude;
@@ -100,13 +110,18 @@ mod openai_interactions;
 mod openai_interactions_response;
 mod openai_responses;
 mod openai_responses_response;
+pub mod realtime;
 mod replay_cache;
+pub mod responses;
 mod responses_interactions;
 mod responses_interactions_response;
+mod responses_policy;
 mod responses_tools;
+pub mod search;
 pub mod sse;
 pub mod stream;
 mod thinking;
+pub mod video;
 
 #[doc(hidden)]
 pub use codex_responses::go_stream_with_bridge as codex_responses_go_stream_with_bridge;
@@ -144,15 +159,6 @@ pub fn strip_invalid_gemini_signature_thinking_blocks(payload: &[u8]) -> Vec<u8>
 // compatibility endpoints; deeply nested bodies run on a sized stack as registered
 // requests do.
 
-/// ConvertOpenAIResponsesRequestToOpenAIChatCompletions as Go's Chat Completions handler
-/// calls it: the converted body, even when the conversion would refuse an emptied turn.
-/// The only error left is a failed stack reservation for a deeply nested body.
-pub fn responses_to_chat_completions_body(model: &str, body: &[u8], stream: bool) -> Result<Vec<u8>, Error> {
-    deep_stack(levels(&[body]), || {
-        Ok(openai_responses::convert_with_refusal(model, body, stream).0)
-    })
-}
-
 /// ConvertOpenAIRequestToClaudeWithCompat.
 pub fn openai_to_claude_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
     deep_stack(levels(&[body]), || claude_chat_request::request_with_compat(ctx, body))
@@ -166,6 +172,14 @@ pub fn claude_to_codex_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<
 /// ConvertClaudeRequestToGeminiWithCompat.
 pub fn claude_to_gemini_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
     deep_stack(levels(&[body]), || gemini_claude::request_with_compat(ctx, body))
+}
+
+/// Normalize native Gemini contents for AI Studio without changing schema dialects
+/// or replacing the API's omitted safety settings with gateway defaults.
+pub fn gemini_to_aistudio(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
+    translate_registered(Format::Gemini, Format::Gemini, ctx, body, |body| {
+        Ok(gemini_gemini::convert_aistudio(body))
+    })
 }
 
 /// ConvertClaudeRequestToInteractionsWithCompat.
@@ -287,7 +301,7 @@ fn registered(client: Format, upstream: Format) -> Option<&'static Registered> {
         (Format::OpenAIResponse, Format::Codex) => Some(&codex_responses::PAIR),
         (Format::OpenAIResponse, Format::Claude) => Some(&claude_responses_response::PAIR),
         (Format::Claude, Format::OpenAI) => Some(&openai_claude::PAIR),
-        (Format::Gemini, Format::Gemini) => Some(&gemini::PAIR),
+        (Format::Gemini, Format::Gemini) => Some(&gemini_gemini::PAIR),
         (Format::OpenAI, Format::Gemini) => Some(&gemini_chat_request::PAIR),
         (Format::Claude, Format::Gemini) => Some(&gemini_claude::PAIR),
         (Format::OpenAI, Format::Codex) => Some(&codex_chat_request::PAIR),
@@ -337,10 +351,14 @@ pub fn stream_with(
     options: stream::StreamOptions,
 ) -> Option<Box<dyn StreamTranslator>> {
     registered(client, upstream).map(|r| {
+        let mut inner = (r.go_stream)(ctx);
+        if options.reported_usage {
+            inner.report_usage_only();
+        }
         stream::framed_with(
             client,
             upstream,
-            (r.go_stream)(ctx),
+            inner,
             levels(&[ctx.original_request, ctx.translated_request]),
             options,
         )

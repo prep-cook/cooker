@@ -1,0 +1,8 @@
+data: {"id": "r", "object": "chat.completion.chunk", "created": 1, "model": "m", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call-0", "type": "function", "function": {"name": "f", "arguments": "{\"x\":"}}]}, "finish_reason": null}]}
+
+data: {"id": "r", "object": "chat.completion.chunk", "created": 1, "model": "m", "choices": [{"index": 1, "delta": {"tool_calls": [{"index": 0, "id": "call-1", "type": "function", "function": {"name": "f", "arguments": "{\"x\":"}}]}, "finish_reason": null}]}
+
+data: {"id": "r", "object": "chat.completion.chunk", "created": 1, "model": "m", "choices": [{"index": 1, "delta": {"content": "one-first"}, "finish_reason": null}]}
+
+data: {"id": "r", "object": "chat.completion.chunk", "created": 1, "model": "m", "choices": [{"index": 0, "delta": {"content": "zero-second"}, "finish_reason": null}]}
+

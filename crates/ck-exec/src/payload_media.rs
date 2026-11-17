@@ -5,8 +5,9 @@
 use std::collections::BTreeMap;
 
 use ck_wire::json as gj;
+use ck_wire::mime::{self, MediaType};
 
-use crate::openai_compat_multipart::{self as multipart, MediaType};
+use crate::multipart;
 
 /// `ApplyMediaPayloadConfig`: the body and content type to send. `finalize` applies the
 /// rules to the view, given the client's original request in the same view. A form is
@@ -38,7 +39,7 @@ pub(crate) fn apply(
                     .map_err(|e| format!("multipart payload {}: {e}", String::from_utf8_lossy(&key)))?;
                 let filename = item.get("filename").bytes();
                 let params = BTreeMap::from([("filename", &filename[..]), ("name", &key[..])]);
-                let disposition = multipart::format_media_type("form-data", &params).unwrap_or_default();
+                let disposition = mime::format_media_type("form-data", &params).unwrap_or_default();
                 let headers = [
                     ("Content-Disposition".to_owned(), disposition.into_bytes()),
                     ("Content-Type".to_owned(), item.get("content_type").bytes().into_owned()),
@@ -58,7 +59,7 @@ fn form_view(body: &[u8], content_type: &str) -> Result<(Vec<u8>, bool), String>
     if gj::std_valid(body) {
         return Ok((body.to_vec(), false));
     }
-    let MediaType::Ok(media, params) = multipart::parse_media_type(content_type) else {
+    let MediaType::Ok(media, params) = mime::parse_media_type(content_type) else {
         return Ok((body.to_vec(), false));
     };
     if media != "multipart/form-data" {
@@ -113,7 +114,7 @@ mod tests {
     /// A form as Go's recorder lists it: each part's headers sorted, then its body in
     /// base64, the parts sorted (Go writes them in random order).
     fn parts(body: &[u8], content_type: &str) -> Vec<String> {
-        let MediaType::Ok(media, params) = multipart::parse_media_type(content_type) else {
+        let MediaType::Ok(media, params) = mime::parse_media_type(content_type) else {
             panic!("{content_type}");
         };
         assert_eq!(media, "multipart/form-data");
@@ -136,7 +137,7 @@ mod tests {
 
     /// Each repeated name's part bodies (base64) in the order they were written.
     fn order(body: &[u8], content_type: &str) -> BTreeMap<String, Vec<String>> {
-        let MediaType::Ok(_, params) = multipart::parse_media_type(content_type) else {
+        let MediaType::Ok(_, params) = mime::parse_media_type(content_type) else {
             panic!("{content_type}");
         };
         let mut order: BTreeMap<String, Vec<String>> = BTreeMap::new();

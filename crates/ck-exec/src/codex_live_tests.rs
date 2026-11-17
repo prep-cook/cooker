@@ -344,3 +344,44 @@ fn redact_sdp_recognises_an_escaped_equals_sign() {
         br#"{"sdp":"a\u003dice-pwd:[REDACTED]\r\na\u003Dice-ufrag:[REDACTED]\r\na\u003dmid:0","note":"a\u003dice"}"#
     );
 }
+
+/// A failed live dial names the socket URL without its query key.
+#[tokio::test]
+async fn a_failed_dial_never_names_the_query_key() {
+    const SECRET: &str = "sk-review-secret";
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = closed.local_addr().unwrap();
+    drop(closed);
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("type".into(), "codex".into());
+    metadata.insert("access_token".into(), "codex-token".into());
+    let credential = Credential::from_file(
+        std::path::Path::new("/fixture"),
+        std::path::Path::new("/fixture/codex.json"),
+        metadata,
+    )
+    .unwrap();
+    let (cfg, client) = (Config::default(), HeaderMap::new());
+    let target = LiveTarget {
+        credential: &credential,
+        cfg: &cfg,
+        client: &client,
+        session: None,
+        capture: Default::default(),
+    };
+    let url = format!("ws://{addr}/v1/realtime?api_key={SECRET}");
+    let Err(error) = CodexExecutor::default()
+        .live_websocket(&target, &url, vec![], vec![])
+        .await
+    else {
+        panic!("a dial to a closed port succeeded");
+    };
+    assert!(!error.message.contains(SECRET), "{}", error.message);
+    assert!(
+        error.message.starts_with(&format!(
+            "error sending request for uri (http://{addr}/v1/realtime?api_key=***)"
+        )),
+        "{}",
+        error.message
+    );
+}

@@ -10,8 +10,10 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use ck_core::exec::{Caller, ExecError, Operation};
 use ck_core::format::Format;
+use ck_translate::codec;
 use serde_json::Value;
 
+use crate::http::egress::{Framing, Output, Protocol};
 use crate::http::respond::{self, Writer};
 use crate::inference::dispatch::{self, Call, Done};
 use crate::{Runtime, http::gojson, inference::errors};
@@ -125,7 +127,9 @@ pub fn read_failed(rejection: &BytesRejection) -> Response {
 /// The status and text for a failed body read: Go's `HTTPStatusFromErrorOr(err, 400)`
 /// and `err.Error()`, which is 413 for the configured body limit.
 pub(crate) fn read_error(rejection: &BytesRejection) -> (u16, String) {
-    if crate::http::body_limit::is_too_large(rejection) {
+    if crate::http::body_limit::is_too_large(rejection)
+        || rejection.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE
+    {
         (413, crate::http::body_limit::MESSAGE.to_owned())
     } else {
         (400, rejection.body_text())
@@ -147,7 +151,10 @@ async fn handle(
     tracing::trace!(target: "cpa_latency", stage = "handler");
     let mut body = match body {
         Ok(body) => body,
-        Err(rejection) => return read_failed(&rejection),
+        Err(rejection) => {
+            let (status, reason) = read_error(&rejection);
+            return crate::http::errors::anthropic(status, &format!("Invalid request: {reason}"));
+        }
     };
     let fields = peek(&body);
     let raw_model = gojson::gjson_string(fields.get("model"));
@@ -179,16 +186,23 @@ async fn handle(
         execution_session: None,
         request_path: dispatch::route_path(matched, uri),
         peer,
-        turn: None,
+        socket: None,
         media: None,
     };
-    let keepalive = respond::keepalive(&rt.config());
-    dispatch::serve(&rt, call, move |result| async move {
+    let output = Output {
+        protocol: Protocol::Anthropic,
+        operation: match operation {
+            Operation::CountTokens => codec::Operation::CountTokens,
+            _ => codec::Operation::Generate,
+        },
+        framing: if stream { Framing::Sse } else { Framing::Json },
+    };
+    dispatch::exchange::serve(&rt, call, output, |result| async move {
         match result {
             Err(failure) => errors::claude(&failure),
             Ok(Done::Buffered { body, .. }) => respond::json(200, "application/json", body),
             Ok(Done::Stream { first, rest, .. }) => {
-                respond::sse(respond::stream(first, rest, ClaudeSse::default(), keepalive))
+                respond::sse(respond::stream(first, rest, ClaudeSse::default(), None))
             }
         }
     })

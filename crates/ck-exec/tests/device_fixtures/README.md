@@ -1,10 +1,14 @@
 # Device-provider fixtures (Kimi, Meta, Devin)
 
-Every JSON file here was produced by the unmodified Go executors and auth code of
-CLIProxyAPI at `6fecc6e`, run against a local raw HTTP/1.1 capture server. The Rust
-tests (`src/kimi_tests.rs` and siblings) replay the same scripted upstream responses and
+These fixtures originate from the unmodified Go executors and auth code of
+CLIProxyAPI at `6fecc6e`, run against a local raw HTTP/1.1 capture server.
+The Rust tests (`src/kimi_tests.rs` and siblings) replay the same scripted upstream responses and
 compare what the Rust executors send and return. Expected values are never derived from
 the Rust code.
+
+Q13 (2026-11-16) changes the expected upstream and captured `User-Agent` to `cooker`
+in `meta/config-apikey-headers.json` and `devin/chat-custom-headers-attrs.json`.
+Reapply these API-key header changes after regenerating; OAuth recordings stay unchanged.
 
 Each executor fixture records:
 

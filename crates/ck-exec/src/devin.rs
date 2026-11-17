@@ -190,6 +190,7 @@ fn upstream_error(status: u16, headers: http::HeaderMap, body: Bytes) -> ExecErr
         retry_after,
         direct: false,
         addon: None,
+        upstream: true,
     }
 }
 
@@ -634,6 +635,9 @@ fn headers(credential: &Credential, req: &ExecRequest, key: &str) -> GoHeaders {
     h.set("User-Agent", "");
     for (name, value) in crate::kimi_http::credential_headers(credential, req, original(req)) {
         h.set(&name, value);
+    }
+    if ck_core::registry::dynamic::is_api_key(credential) {
+        h.set("User-Agent", "cooker");
     }
     h
 }

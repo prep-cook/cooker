@@ -285,6 +285,11 @@ impl UsageSink {
         self
     }
 
+    /// The attached request capture (upstream request and response logs).
+    pub fn capture(&self) -> &CaptureSink {
+        &self.1
+    }
+
     /// Whether anyone listens; executors can skip the work otherwise.
     pub fn enabled(&self) -> bool {
         self.0.is_some()
@@ -423,7 +428,7 @@ impl ExecRequest {
     /// Optional per-call wire capture, independent of usage accounting. Capture
     /// the handle before spawning a stream task; clones retain the same observer.
     pub fn capture(&self) -> &CaptureSink {
-        &self.usage.1
+        self.usage.capture()
     }
 }
 
@@ -601,6 +606,9 @@ pub struct ExecError {
     /// WebSocket error frames and stream bootstrap failures). `headers` stays the
     /// classification copy and is never sent, except as a `direct` response's headers.
     pub addon: Option<Box<HeaderMap>>,
+    /// `body` is an upstream response's message rather than text this process wrote. Routes
+    /// that hide local detail from clients (Anthropic) show upstream messages only.
+    pub upstream: bool,
 }
 
 impl ExecError {
@@ -613,7 +621,14 @@ impl ExecError {
             retry_after: None,
             direct: false,
             addon: None,
+            upstream: false,
         }
+    }
+
+    /// Marks an error built from an upstream response.
+    pub fn from_upstream(mut self) -> Self {
+        self.upstream = true;
+        self
     }
 }
 
@@ -630,36 +645,3 @@ impl fmt::Display for ExecError {
 }
 
 impl std::error::Error for ExecError {}
-
-/// A long-lived downstream connection (the Responses WebSocket, `GET /v1/responses`)
-/// whose turns can share upstream state. It travels next to an [`ExecRequest`] in
-/// `ck_exec::Executors::execute_in_session`. Executors that pool upstream sockets key
-/// them by `id` and release them in `Executors::close_session` when the downstream
-/// connection ends (Go: execution session id and `CloseExecutionSession`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecSession {
-    /// Stable for the whole downstream connection.
-    pub id: String,
-    /// This turn continues upstream state (`previous_response_id` or `response.append`
-    /// passed through unchanged), so it must run on the session's current upstream socket.
-    /// An executor that cannot honour that fails with [`ExecError::replay_required`]
-    /// instead of opening a fresh connection (Go: `RequiredUpstreamWebsocket`).
-    pub continuation: bool,
-}
-
-impl ExecError {
-    /// Body of the replay signal (Go `UpstreamWebsocketReplayRequiredError`).
-    pub const REPLAY_REQUIRED: &'static str = r#"{"error":{"message":"upstream transport requires full HTTP replay","type":"server_error","code":"upstream_http_replay_required","status":426}}"#;
-
-    /// A continuation turn lost its upstream socket: the client must resend the full
-    /// conversation. Request-scoped: no credential is at fault.
-    pub fn replay_required() -> Self {
-        Self::local(426, FailureScope::Request, Self::REPLAY_REQUIRED)
-    }
-
-    pub fn is_replay_required(&self) -> bool {
-        self.status == 426
-            && self.scope == FailureScope::Request
-            && self.body.as_ref() == Self::REPLAY_REQUIRED.as_bytes()
-    }
-}

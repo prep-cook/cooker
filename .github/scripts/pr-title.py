@@ -18,6 +18,7 @@ SCOPES = {
     "cli": "the cooker binary: command line, TUI, discovery (crates/cooker)",
     "server": "HTTP routes, client auth, credential selection, management API (crates/ck-server)",
     "exec": "upstream provider executors (crates/ck-exec)",
+    "stream": "shared mmap stream storage and publication (crates/ck-stream)",
     "translate": "request and response translation (crates/ck-translate)",
     "core": "config, credentials, formats, shared helpers (crates/ck-core, crates/ck-wire)",
     "ui": "the dashboard (ui/)",

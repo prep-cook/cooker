@@ -119,7 +119,9 @@ fn no_truncate(s: &str) -> String {
     if s.is_empty() {
         return String::new();
     }
-    let mut s = SCHEME_AUTH.replace_all(s, "${1}[REDACTED_AUTH]@").into_owned();
+    // Every URL drops its userinfo and query values first (owner ruling Q18).
+    let s = ck_wire::redact::urls_in(s);
+    let mut s = SCHEME_AUTH.replace_all(&s, "${1}[REDACTED_AUTH]@").into_owned();
     s = QUERY_PARAM.replace_all(&s, "${1}[REDACTED]").into_owned();
     s = DOUBLE_QUOTED_PATH.replace_all(&s, r#""[REDACTED_PATH]""#).into_owned();
     s = SINGLE_QUOTED_PATH.replace_all(&s, "'[REDACTED_PATH]'").into_owned();
@@ -225,7 +227,31 @@ mod tests {
         let cases = golden("sanitize");
         assert!(cases.len() > 40);
         for (input, expected) in cases {
-            assert_eq!(super::summary(&input), expected, "input: {input:?}");
+            let got = super::summary(&input);
+            // A word that may hold a credential prints as the placeholder before Go's
+            // rules run (owner ruling Settled 60), so those inputs no longer match Go.
+            if ck_wire::redact::urls_in(&input) == input {
+                assert_eq!(got, expected, "input: {input:?}");
+            } else {
+                assert_eq!(ck_wire::redact::urls_in(&got), got, "input: {input:?}");
+            }
+        }
+    }
+
+    /// URLs in an upstream summary are redacted before Go's own rules run.
+    #[test]
+    fn summary_urls_are_redacted_first() {
+        for (input, want) in [
+            (
+                r#"Post "http://127.0.0.1/v1?beta=sk-review-secret": dial tcp 127.0.0.1:1: i/o timeout"#,
+                r#"Post "<redacted url>": dial tcp 127.0.0.1:1: i/o timeout"#,
+            ),
+            (
+                r#"Post "http://127.0.0.1/v1#sk-review-secret": EOF"#,
+                r#"Post "<redacted url>": EOF"#,
+            ),
+        ] {
+            assert_eq!(crate::inference::dispatch::upstream_summary(input), want);
         }
     }
 

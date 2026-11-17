@@ -7,12 +7,15 @@ use std::time::Duration;
 
 use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
 use bytes::{Bytes, BytesMut};
-use ck_core::exec::{ExecError, ExecResponse, ExecStream, FailureScope, ResponseBody};
+use ck_core::credential::Credential;
+use ck_core::exec::{CaptureEvent, ExecError, ExecResponse, ExecStream, FailureScope, ResponseBody, UsageSink};
 use ck_translate::sse::Framer;
 use futures_util::{Stream, StreamExt};
 use http::HeaderMap;
 use tokio::io::{AsyncBufRead, AsyncReadExt, BufReader};
 use tokio_util::io::{ReaderStream, StreamReader};
+
+use crate::types::Body;
 
 /// Largest upstream error body read; the rest is never pulled off the socket.
 pub(crate) const MAX_ERROR_BODY: usize = 64 * 1024;
@@ -21,6 +24,42 @@ pub(crate) fn transport_error(e: wreq::Error) -> ExecError {
     // wreq errors may include a URL with credential-bearing query parameters.
     let _ = e;
     ExecError::local(502, FailureScope::Transport, "upstream request failed")
+}
+
+/// `error` and its sources as text for errors and logs. wreq's own text names the
+/// request URI, which can carry credentials, so each wreq error in the chain prints its
+/// kind and the URI as [`ck_wire::redact::url`] renders it, and any other URL in a source
+/// is rendered the same way.
+pub fn transport_text(error: &wreq::Error) -> String {
+    let mut parts = Vec::new();
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = next {
+        parts.push(match e.downcast_ref::<wreq::Error>() {
+            Some(e) => wreq_kind(e),
+            None => ck_wire::redact::urls_in(&e.to_string()).into_owned(),
+        });
+        next = e.source();
+    }
+    parts.join(": ")
+}
+
+/// wreq's text for `e` without its URI and source: `<kind> for uri (<uri>): <source>`.
+fn wreq_kind(e: &wreq::Error) -> String {
+    let full = e.to_string();
+    let mut kind = full.as_str();
+    if let Some(source) = std::error::Error::source(e) {
+        kind = kind.strip_suffix(&format!(": {source}")).unwrap_or_default();
+    }
+    if let Some(uri) = e.uri() {
+        kind = kind.strip_suffix(&format!(" for uri ({uri})")).unwrap_or_default();
+    }
+    if kind.is_empty() {
+        return "transport error".to_owned();
+    }
+    match e.uri() {
+        Some(uri) => format!("{kind} for uri ({})", ck_wire::redact::url(&uri.to_string())),
+        None => kind.to_owned(),
+    }
 }
 
 /// A response whose body went through Go's Claude `decodeResponseBody`. `body` is
@@ -77,6 +116,7 @@ pub(crate) async fn into_response(res: wreq::Response) -> Result<ExecResponse, E
             body,
             direct: false,
             addon: None,
+            upstream: true,
         });
     }
     let is_sse = headers
@@ -313,6 +353,50 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     crate::quota::retry_after(headers.get(http::header::RETRY_AFTER)?.to_str().ok()?, now)?
         .duration_since(now)
         .ok()
+}
+
+/// The record of one upstream call before it is sent: the request capture, whose observer
+/// masks the credentials, and for a generation the round-trip start (contract §3, G4).
+pub(crate) fn record_send(
+    usage: &UsageSink,
+    generation: bool,
+    credential: &Credential,
+    provider: &str,
+    url: &str,
+    (headers, body): (&[(String, String)], &Bytes),
+) {
+    crate::gemini::capture_request(usage.capture(), credential, provider, url, headers, body);
+    if generation {
+        usage.round_trip_started();
+    }
+}
+
+/// A send that failed before any answer, as the capture records it.
+pub(crate) fn record_failure(usage: &UsageSink, error: &ExecError) {
+    if usage.capture().enabled() {
+        let text = std::str::from_utf8(&error.body).unwrap_or_default();
+        usage.capture().record(CaptureEvent::ResponseError(text));
+    }
+}
+
+/// The answer's metadata capture, then its body with every chunk captured and, for a
+/// generation, the first non-empty one marked as the first byte.
+pub(crate) fn record_answer(usage: &UsageSink, generation: bool, status: u16, headers: &HeaderMap, body: Body) -> Body {
+    crate::gemini::capture_metadata(usage.capture(), status, headers);
+    let usage = usage.clone();
+    let mut marked = !generation;
+    body.inspect(move |chunk| {
+        if let Ok(chunk) = chunk
+            && !chunk.is_empty()
+        {
+            if !marked {
+                marked = true;
+                usage.first_byte();
+            }
+            usage.capture().record(CaptureEvent::ResponseChunk(chunk));
+        }
+    })
+    .boxed()
 }
 
 #[cfg(test)]

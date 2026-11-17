@@ -7,6 +7,7 @@ Read `docs/STATE-AND-CONCURRENCY.md` for changes to ownership, persistence, publ
 
 Current crate responsibilities:
 
+- `crates/ck-stream`: shared mmap pool, positions, publication, reader leases and cache retention. No workspace dependencies or transport/provider work.
 - `crates/ck-core`: legacy config import, runtime projection and credential formats. No networking.
 - `crates/ck-wire`: provider-neutral, Go-exact helpers shared by translators and executors.
 - `crates/ck-translate`: format translation between the Anthropic, OpenAI and Gemini APIs.
@@ -16,12 +17,16 @@ Current crate responsibilities:
 
 A workspace reorganization updates this list in the same PR.
 
+S1 freezes the responsibility boundary in `docs/INTERNAL-STREAM.md`, §2.1. `ck-stream` owns storage and position-backed views; it owns no HTTP, credentials, provider dispatch or durable state. `ck-core` keeps configuration, credential and model types; `ck-wire` keeps boundary helpers. Codecs and capability validation belong in `ck-translate`; execution envelopes and provider transports belong in `ck-exec`. Client boundaries, scheduling, resume authorization and runtime-owned producers belong in `ck-server`; `cooker` remains bootstrap.
+
+Phase B installs `ck-stream` without production callers. Later cutover phases add each consuming crate's allowed dependency together with its actual use. Add it to the binary's allowed dependencies only if the binary uses it directly. Keep the existing table parser and exact-membership checks.
+
 ### APIs and modularity
 
 - Keep API abstractions and responsibility boundaries clear. URLs, paths, configuration, upstream fees, limits and rules are data rather than hardcoded policy. Keep endpoints working.
-- Inside the router, every transport protocol is represented as one SSE event stream in an internal format that extends OpenAI Chat Completions chunks with extra attributes, carried in reserved `x_ck` JSON fields and named `event:` events under one versioned grammar. Unknown fields and events are kept and passed to egress. Convert to it only at ingress and from it only at egress, including for same-protocol requests; no raw-byte passthrough path. Internal stages process the unbounded stream incrementally and never wait for a complete body.
-- The internal stream is stored in memory-mapped files, never in heap buffers. Like operating-system paging, the files are divided into fixed-size blocks, so a position is a block number and an offset; stages hold only the key positions of a stream, not copies of its data or a pointer per block. Stream files hold request content, so they are private to the process user and removed when the request ends.
-- Non-SSE payloads (images, audio, video, realtime) travel in the same stream as custom data in fixed chunks of at most 50 KB, flushed within 100 ms.
+- Inside the router, every transport protocol is represented as one SSE event stream in an internal format that extends OpenAI Chat Completions chunks with extra attributes, carried in reserved `x_ck` JSON fields and named `event:` events under one versioned grammar. Unknown fields and events are kept and passed to egress. Convert to it only at ingress and from it only at egress, including for same-protocol requests; no raw-byte passthrough path. Two exceptions: an Anthropic request the Claude OAuth cloak or Claude Code identity shapes, which is prepared from the client's own bytes (`docs/EXECUTION-CONTRACT.md`, G5); and live-session messages (Realtime, Live, WebRTC), which are forwarded as received while only their metadata projection enters the stream (Settled 55). Internal stages process the unbounded stream incrementally and never wait for a complete body.
+- The internal stream is stored in one process-owned mmap pool, never in heap buffers. Fixed-size frames hold the bytes; a position is a frame number and offset scoped by stream generation. Stages hold positions, not body copies or retained raw pointers. The pool is private to the process user and closes only after owned work and leases end. A document stream's response stays cached across completion and disconnect until expiry or eviction under `docs/INTERNAL-STREAM.md`, §6; a client disconnect closes a live session and cancels an in-flight Responses WebSocket turn, and live-session streams are never resumable (Settled 55, 56); request/scratch ranges may release after their last dependent reader.
+- Non-SSE payloads of document streams (images, audio files, video) travel in the same stream as custom data in chunks of at most 50 KB, published within 100 ms. Live-session messages (Realtime, Live, WebRTC) are forwarded as received; only their metadata enters the stream.
 - A rewrite replaces the old code in the same change. Do not keep old and new paths side by side, adapters to the old form or unreachable legacy code.
 - Case mapping and case-insensitive comparison use `ck_core::gostr::GoStr`: `go_lower`, `go_upper`, `go_eq_fold`, matching Go's `strings.ToLower`, `strings.ToUpper` and `strings.EqualFold`. `clippy.toml` disallows Rust's full `str::to_lowercase` and `str::to_uppercase` mappings. Use `eq_ignore_ascii_case` only for ASCII-defined inputs such as headers and protocol tokens, or explicitly ASCII comparisons. An ASCII literal alone is insufficient: Go folding also matches `ſ` with `s` and the Kelvin sign with `k`.
 
@@ -106,11 +111,12 @@ Money clauses apply only where billing or a ledger exists.
 
    | Crate | May depend on |
    | --- | --- |
+   | `ck-stream` | none |
    | `ck-core` | none |
    | `ck-wire` | `ck-core` |
-   | `ck-translate` | `ck-core`, `ck-wire` |
-   | `ck-exec` | `ck-core`, `ck-wire`, `ck-translate` |
-   | `ck-server` | `ck-core`, `ck-wire`, `ck-translate`, `ck-exec` |
+   | `ck-translate` | `ck-core`, `ck-wire`, `ck-stream` |
+   | `ck-exec` | `ck-core`, `ck-wire`, `ck-stream`, `ck-translate` |
+   | `ck-server` | `ck-core`, `ck-wire`, `ck-stream`, `ck-translate`, `ck-exec` |
    | `cooker` | `ck-core`, `ck-wire`, `ck-translate`, `ck-exec`, `ck-server` |
 
 6. Keep unit tests beside modules and crate integration tests in `crates/<name>/tests/`. Keep Go recordings and fixtures excluded from published packages with `exclude = ["tests/"]`.

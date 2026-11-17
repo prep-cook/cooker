@@ -21,11 +21,7 @@ use crate::runtime::state::Runtime;
 pub async fn require_client_key(State(rt): State<Arc<Runtime>>, mut req: Request, next: Next) -> Response {
     let caller = match client_caller(&rt, req.headers(), req.uri().query().unwrap_or_default()) {
         Ok(caller) => caller,
-        // gin `AbortWithStatusJSON(401, gin.H{"error": msg})`.
-        Err(message) => {
-            let body = crate::http::gojson::Obj::new().str("error", message).finish();
-            return crate::http::respond::gin_json(401, body);
-        }
+        Err(message) => return crate::http::errors::local(&req, 401, message),
     };
     req.extensions_mut().insert(caller);
     next.run(req).await

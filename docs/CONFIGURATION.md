@@ -168,7 +168,7 @@ observability:
 | `host` | The listen address. `"127.0.0.1"` accepts connections from this computer only; `""` listens on every interface. |
 | `port` | The listen port. The default is `8317`. |
 | `tls.enable`, `tls.cert`, `tls.key` | Serve HTTPS on the same port with the given certificate and key file. |
-| `max-request-body-bytes` | The largest request body accepted, in bytes. `0` (the default) or a negative value sets no limit. On the client routes and the Management API, a body whose declared `Content-Length` is over the limit receives `413` before it is read. A body without a declared length receives `413` when the reader passes the limit; as in Go, a JSON value or multipart form that ends before the limit is processed from the bytes before it. Changes apply to the next request. The client routes also stop at 64 MiB regardless of this setting. |
+| `max-request-body-bytes` | An explicit request-body limit in bytes; `0` (the default) or a negative value adds no deployment limit. Changes apply to the next request. Anthropic Messages and token counting accept at most 128 MB (128,000,000 bytes), or this setting when smaller; other client routes retain their 64 MiB ceiling. Oversized inference bodies return HTTP 413 in the client's protocol. Management JSON and multipart readers may handle a complete value before the limit. |
 | `github-token` | A GitHub token. cooker keeps the setting for import and runtime projection but does not send it on release checks; its dashboard is built in. Treat it as a secret: ordinary administration reads and exports redact it. The older top-level `github-token` import spelling also works; the one under `server` wins. |
 | `trusted-proxies` | Addresses of reverse proxies or tunnels whose `X-Forwarded-For` header is trusted. Set it when a tunnel on the same machine forwards requests, for example `[127.0.0.1, "::1"]`. See [running it safely](GETTING-STARTED.md#running-it-safely). |
 
@@ -191,6 +191,7 @@ observability:
 | Setting | What it does |
 |---|---|
 | `providers.codex.signin-with-chatgpt-identifier` | The agent name sent when binding Sign in with ChatGPT tokens to a Codex credential (`POST /v8/management/oauth/siwc/bind`); the value is `CLIProxyAPI` when empty. Legacy spelling: `codex.signin-with-chatgpt-identifier`. Go also uses it as the SIWC request User-Agent prefix; cooker does not send SIWC requests yet. |
+| `providers.aistudio.relay-keys` | The keys that may register an AI Studio browser relay at `/v1/ws`, sent like a client key (`Authorization: Bearer <key>`, `x-api-key`, `x-goog-api-key`, `?key=` or `?auth_token=`). Client keys from `access.api-keys` do not register a relay. When this list is empty or unset, or `access.api-keys` is empty, every registration is refused with 403. A registered browser serves requests for every client. Changing the list, or removing the last client key, ends every connected relay session; browsers then register again with a listed key. Ordinary admin reads and exports mask the keys. |
 | `providers.codex.chatgpt-keep-alive` | `false` by default. `true` keeps up to 2 idle connections to `chatgpt.com` per proxy for 90 seconds, so Codex HTTP requests skip the TCP and TLS handshake. When off, every Codex request opens its own connection. A published change applies from the next request, without a restart. |
 
 The private `<canonical-db-path>.credentials` directory is a materialized credential cache and refresh-lock domain. It is not a supported edit or import source, and it is not an independent durable authority. Do not edit or share it: credential state loads from SQLite, and cache edits are not imported. Before a provider writer merges existing settings, the affected files are restored from SQLite under the storage transaction; writes, token refreshes and startup can replace cache bytes. The server does not watch files or poll the database. Configuration and credential changes take effect when the owning service commits them, from the dashboard, `/admin/v1` or a `--management-base-url` command; an offline command cannot write a database that a running service owns. The service loads the database once at startup and opens SQLite again only to save a commit. Keep the directory private, alongside SQLite. Credential tables are excluded from config export, history and restore; only a full database backup includes them.
@@ -203,12 +204,14 @@ Provider settings that account sign-ins and provider API keys share. Settings le
 
 | Setting | What it does |
 |---|---|
-| `codex.disable-codex-cloaking`, `codex.stream-bootstrap-buffering`, `codex.stream-bootstrap-timeout`, `codex.orphan-delegation-compatibility`, `codex.model-level-cooling`, `codex.response-steering` | Codex request shaping, stream start-up, cooldown scope and full-duplex WebSocket steering. |
+| `codex.disable-codex-cloaking`, `codex.stream-bootstrap-buffering`, `codex.stream-bootstrap-timeout`, `codex.orphan-delegation-compatibility`, `codex.model-level-cooling`, `codex.response-steering` | Codex request shaping, stream start-up and cooldown scope. `response-steering` is accepted and has no effect: Responses WebSocket turns do not steer yet. |
 | `claude.model-level-cooling`, `claude.disable-cloaking-model-list`, `claude.disable-claude-cloak-mode`, `claude.header-defaults.*` | Claude cooldown scope, cloaking and the fallback request headers (`user-agent`, `package-version`, `runtime-version`, `os`, `arch`, `timeout`, `timezone`, `stabilize-device-profile`). |
 | `claude.tool-search` | `false` by default. `true` turns Codex client `tool_search` on Responses requests to Claude into Anthropic native tool search (`defer_loading` tools and `tool_reference` results) on credentials that support it: Anthropic's own API, or a Claude API key with `native-tool-search: true`. Other credentials and models that predate tool search receive the request without `tool_search`. The Codex model catalog then advertises the search tool for a Claude model only when every credential serving it supports native tool search. |
 | `xai.inject-x-search` | Adds the `x_search` tool to xAI requests. |
 
 cooker rejects the flat `codex`, `claude`, `claude-code`, `disable-claude-cloak-mode`, `claude-header-defaults` and `xai` keys, and `oauth.providers.claude` and `oauth.providers.xai`, as unknown settings. OAuth-only settings keep their scope instead of being broadened to API-key credentials. New configuration edits use `/admin/v1` resources, not the removed v8 setting paths.
+
+xAI generation uses the Responses API, including for Chat clients. `safety_identifier`, explicit `parallel_tool_calls: false` and `search_parameters` reach xAI. Search parameters are isolated from other providers on the canonical execution path. Requests keep up to 1,000 tools after shaping and optional X Search injection; a larger list fails before sending instead of being truncated. Both execution paths refuse multiple choices, seed, stop sequences, presence/frequency penalties, logit bias, requested log probabilities, `response_format: {"type":"json_object"}` and unsupported search options before sending. Gemini controls are checked in both snake_case and camelCase. Native reasoning-text events and X Search traces retain their types and indices for Responses clients. Anthropic, Chat and Gemini projections drop hosted search traces; a custom call with a client-declared name stays a client tool unless its call ID starts with `xs_call`. Chat output retains xAI's cost and search-usage extensions. Gemini streaming retains both reasoning-text and reasoning-summary deltas.
 
 With `upstream.codex.stream-bootstrap-buffering: true`, HTTP/SSE and non-steering WebSocket attempts hold their initial handshake frames within the existing 48-frame / 1 MiB bounds and the optional `stream-bootstrap-timeout`. A retryable disconnect or upstream rejection before those frames are released can move an unpinned request to the next eligible credential through normal selection. Invalid client requests and request-scoped empty-incomplete failures still stop. Once output is released, the router does not replay it on another credential. Stateful continuations remain pinned: a lost upstream session needs client replay, not an in-place credential switch.
 
@@ -230,7 +233,7 @@ api-keys:
           alias: "kimi-k2"
 ```
 
-A `vertex` key with `interactions: true` sends Interactions clients (`/v1beta/interactions`) to Vertex's native Interactions API (`/v1beta1/interactions`) instead of translating their requests to `generateContent`. A Vertex service-account file opts in the same way with `"interactions": true` or `"native_interactions": true` at the top level. When the credential names a project (a service account's `project_id`, or a file's `project_id` next to its `access_token`), the path is `/v1beta1/projects/<project>/locations/global/interactions`. The credential's `location` is ignored, and the host is the configured `base-url` or `https://aiplatform.googleapis.com`.
+`/v1beta/interactions` currently answers 501, so the following Interactions settings have no effect. A `vertex` key with `interactions: true` sends Interactions clients (`/v1beta/interactions`) to Vertex's native Interactions API (`/v1beta1/interactions`) instead of translating their requests to `generateContent`. A Vertex service-account file opts in the same way with `"interactions": true` or `"native_interactions": true` at the top level. When the credential names a project (a service account's `project_id`, or a file's `project_id` next to its `access_token`), the path is `/v1beta1/projects/<project>/locations/global/interactions`. The credential's `location` is ignored, and the host is the configured `base-url` or `https://aiplatform.googleapis.com`.
 
 Vertex partner and open models (MaaS) are named `<publisher>/<model>`, such as `deepseek-ai/deepseek-v4.1-flash-maas`, or `publishers/<publisher>/models/<model>`. They go to Vertex's OpenAI-compatible `endpoints/openapi` route as Chat Completions requests, for every client format and before the Interactions opt-in; the upstream model is `<publisher>/<model>`. Two setups reach the route:
 
@@ -278,9 +281,13 @@ routing:
 
 `X-Ck-Routed-Provider` names the serving credential's selector. cooker sends it only when `routing.providers` sets `exclude` or `order`, or when a model router served the request.
 
+### Settings that do not apply to Chat, Anthropic, Gemini and Responses routes
+
+`/v1/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, the Gemini `/v1beta/models/...` routes, `POST /v1/responses` and `/v1/responses/compact` (with their `/backend-api/codex/` paths) and `/v1/responses/input_tokens` send nothing before the first byte of the answer, so `requests.streaming.keepalive-seconds` has no effect on them. A failure before that byte fails over to the next candidate instead.
+
 ### Optional preset: fail over only on 429
 
-This commented preset keeps 429 cooldown and failover for Claude and Codex OAuth accounts. For the listed non-429 statuses it stops ordinary failover after a failed attempt without adding a cooldown. Credential-preparation failures and an enabled `requests.streaming.bootstrap-retries` can still cause another attempt. Unlisted statuses keep normal handling. The preset applies only to OAuth accounts and leaves plan limits and provider checks unchanged. A credential's own `request_scoped_errors` rules take precedence.
+This commented preset keeps 429 cooldown and failover for Claude and Codex OAuth accounts. For the listed non-429 statuses it stops ordinary failover after a failed attempt without adding a cooldown. Credential-preparation failures can still cause another attempt. Unlisted statuses keep normal handling. The preset applies only to OAuth accounts and leaves plan limits and provider checks unchanged. A credential's own `request_scoped_errors` rules take precedence.
 
 Uncomment the block to use it. `(?s).*` matches any body, including an empty one. Rules need a body matcher; status alone does not match.
 
@@ -308,6 +315,11 @@ Uncomment the block to use it. `(?s).*` matches any body, including an empty one
 |---|---|
 | `proxy-url` | An outbound proxy for every upstream request, such as `socks5://127.0.0.1:1080` or `http://proxy:3128`. A single account can use its own proxy instead; see [per-account proxies](MULTI-ACCOUNT.md#per-account-proxies-and-request-shaping). |
 | `tls-handshake-timeout-seconds` | The seconds a new connection to `api.anthropic.com` (Claude) or `chatgpt.com` (Codex) may take to become ready. A server that accepts the connection but never answers the TLS handshake then fails the attempt, and request retry can engage. The default `0` waits indefinitely. The setting never limits a request once connected. In cooker it also covers the DNS lookup, the TCP connect and a proxy's CONNECT, which Go leaves unbounded. |
+| `upstream-timeouts.header-seconds` | Seconds one upstream attempt may wait for the response headers, counted from the attempt's start; default 600. A non-streaming answer arrives with its headers, so this also bounds a whole non-streaming generation; Anthropic directs requests expected to run past 10 minutes to streaming. |
+| `upstream-timeouts.idle-seconds` | Seconds an upstream response body may go without sending a chunk; default 300, Codex CLI's own stream idle timeout. A reasoning model that streams nothing while it thinks must answer within it. |
+| `upstream-timeouts.total-seconds` | Seconds one upstream attempt may take from its start to the end of its body; default 3600. It ends an upstream that keeps sending without finishing. |
+
+The three deadlines apply to every upstream attempt on the Chat, Anthropic, Gemini, Responses and media routes, including token counts and `responses/compact`. Attempts that still run on a provider's older execution path are not bounded yet: Devin and AI Studio accounts, and model aliases with `force-mapping`. A deadline that expires before the client has received any output fails the attempt as a connection fault: the request moves to the next account and the expired account does not cool down. After output has started, the client gets the protocol's error event, the attempt's usage is recorded once and the request is not retried. A Responses WebSocket turn that Codex or xAI serves over its own upstream WebSocket, and Realtime, Live and WebRTC sessions, keep their own liveness rules under `realtime`. Each value must be a whole number greater than 0; a change applies to attempts that start after it.
 
 Claude accounts ignore `HTTPS_PROXY` and `HTTP_PROXY`; without an explicit proxy, they connect directly. Set `requests.proxy-url` or the account's `proxy_url` when you need a proxy. Claude API keys pointed at a custom, non-Anthropic base URL use the standard transport, which can inherit environment proxies.
 
@@ -332,11 +344,55 @@ Listener changes allow five seconds for active requests to finish. On timeout, c
 |---|---|
 | `catalog`, `codex-catalog`, `devin-catalog` | Where the model catalog (`models.json`), the Codex client catalog and the Devin catalog come from: an absolute local path or an `http`/`https` URL. An empty value keeps the default. Any other value, such as a relative path, `~/models.json` or a `file://` URL, refuses the config, as in CLIProxyAPI v8.0.35. cooker checks and keeps these settings but does not use them yet; see [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md). |
 
+When a model lists supported reasoning levels, an unsupported standard level snaps to the nearest supported level in this order: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Ties choose the lower level. Requests below or above the supported range use its lowest or highest level. This applies within a provider family and across families; `none`, `auto`, budgets and models without a level list keep their existing handling. Unknown level strings are not snapped.
+
+## model-catalog
+
+`model-catalog` sets per-model values by glob over the upstream model name, without a thinking suffix. Only one value exists today: `default-max-tokens`, the `max_tokens` cooker sends to Anthropic Messages for a request that carries no limit (a Chat, Responses or Gemini client may omit it; an Anthropic client must send its own).
+
+```yaml
+model-catalog:
+  - match: "claude-*"
+    overrides: {default-max-tokens: 8192}
+  - match: "claude-haiku-*"
+    overrides: {default-max-tokens: 4096}
+  - match: "claude-opus-*"
+    overrides: {default-max-tokens: null}
+```
+
+| Field | What it does |
+|---|---|
+| `match` | A glob over the model name, case-sensitive. `*` matches within one `/`-separated segment, `**` also matches `/`; every other character is literal. |
+| `overrides.default-max-tokens` | A positive integer, or `null` to remove a value an earlier entry set. An entry without the key leaves the value alone. |
+
+Every matching entry applies in file order, and a later one replaces an earlier one (an RFC 7396 merge patch). The value for a model is the first of:
+
+1. the `model-catalog` override;
+2. the `max_completion_tokens` of the model in the registry;
+3. none. The destination refuses a request without a limit, the router skips that candidate, logs `candidate skipped` with `missing_setting=model-catalog default-max-tokens` at info level, and another candidate can still serve. When every candidate refuses, the client gets a 400 saying `max_tokens` is required. cooker never invents a value such as 1024.
+
+A limit the client sends is never changed, and token counts need none. A config change applies from the next request. A zero, negative or non-numeric value, or an empty `match`, refuses the config; a fractional number is truncated, as for every integer setting.
+
 ## worker-threads
 
 `worker-threads: 4` at the top level sets the number of threads that serve requests. Without it, cooker uses the smaller of the CPU count and two. That default suffices for one person: a coding-agent request with a 300 KB prompt costs about 20 to 30 ms of CPU, a small chat request about 1 ms, and most of a request's time is spent waiting on the provider. Each extra thread can keep its own pool of freed memory, so more threads mean a larger resident size. The `TOKIO_WORKER_THREADS` environment variable overrides the setting.
 
 cooker reads the setting from SQLite before the request runtime starts. Changing it requires a restart; `TOKIO_WORKER_THREADS` overrides it. YAML edits after import have no effect. Remote-store environment settings do not provide an alternate source of thread configuration or runtime configuration.
+
+## realtime
+
+| Setting | What it does |
+|---|---|
+| `realtime.ping-interval-seconds` | Seconds between the WebSocket pings the gateway sends to a realtime client; default 30. Must be less than `realtime.read-timeout-seconds`. Deploy-only; restart required. |
+| `realtime.read-timeout-seconds` | Seconds a realtime client connection may go without a pong before the gateway closes it; default 60. Only a pong extends it. Deploy-only; restart required. |
+| `realtime.write-timeout-seconds` | Seconds one write to a realtime client may block before the gateway closes the session; default 10. Deploy-only; restart required. |
+| `realtime.max-sockets-per-key` | Concurrent realtime sockets per client key; default 0, no limit. Deploy-only; restart required. |
+
+## responses
+
+| Setting | What it does |
+|---|---|
+| `responses.ignore-client-store-false` | Stores every Responses turn for continuation with `previous_response_id`, including one the client sent with `store: false`; the response then shows `store: true`. Codex clients always send `store: false`, so this lets a Codex client that reconnects continue its conversation. Default false: a `store: false` turn continues only on the WebSocket that produced it, and never over HTTP. |
 
 ## model-routers
 
