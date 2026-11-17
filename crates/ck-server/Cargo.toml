@@ -50,7 +50,7 @@ getrandom = "0.3"
 sha2 = "0.10"
 subtle = "2.6"
 wreq.workspace = true
-# The live call body reports whether it reached the connection (realtime/http.rs).
+# The live call body reports whether it reached the connection (realtime/api/http.rs).
 http-body = "1"
 # Codex Live WebRTC media relay (codex.live-media-relay), a pion port; ring crypto keeps
 # a second BoringSSL out of the binary. Off by default.
@@ -61,7 +61,7 @@ async-trait = { version = "0.1", optional = true }
 rusqlite = { version = "0.41", features = ["bundled"] }
 
 # libc: listener socket options, pprof and runtime on Unix; windows-sys: the Codex
-# credential file lock on Windows (management/siwc.rs).
+# credential file lock on Windows (management/api/siwc.rs).
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 # CPU sampling is never linked into default builds or published release binaries.

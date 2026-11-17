@@ -147,7 +147,18 @@ try {
   await page.keyboard.press("Enter");
   const dialog = page.getByRole("dialog", { name: "Add client key" });
   await appears(dialog, "the Add client key dialog");
-  await appears(dialog.locator(":focus"), "focus inside the Add client key dialog");
+  // The title can take focus between the field's initial focus and the dialog's next frame.
+  await page.waitForFunction(
+    async (input) => {
+      if (document.activeElement !== input) return false;
+      await new Promise(requestAnimationFrame);
+      if (document.activeElement !== input) return false;
+      await new Promise(requestAnimationFrame);
+      return document.activeElement === input;
+    },
+    await dialog.locator("input").elementHandle(),
+    { polling: "raf", timeout: 15_000 },
+  );
   await page.keyboard.type(key);
   await page.keyboard.press("Enter");
   await dialog.waitFor({ state: "detached" });

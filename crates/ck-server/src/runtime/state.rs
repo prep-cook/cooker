@@ -4122,6 +4122,16 @@ async fn read_locked_codex_file(
     }
 }
 
+/// [`read_locked_codex_file`] for tests outside this module.
+#[cfg(test)]
+pub(crate) async fn test_read_locked_codex_file(
+    path: &Path,
+    shutdown: &tokio_util::sync::CancellationToken,
+    backend: Arc<crate::store::credential_store::CredentialDb>,
+) -> Result<LockedFile, String> {
+    read_locked_codex_file(path, shutdown, backend).await
+}
+
 /// Go `CredentialsChanged`: the tokens or API key differ.
 pub(crate) fn credentials_changed(a: &Credential, b: &Credential) -> bool {
     let text = |c: &Credential, keys: &[&str]| {

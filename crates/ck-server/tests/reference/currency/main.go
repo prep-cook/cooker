@@ -1,5 +1,5 @@
 // Prints the three-letter codes golang.org/x/text/currency.ParseISO accepts, at the
-// version CLIProxyAPI 6fecc6e uses, as the Rust table src/management/iso_currency.rs.
+// version CLIProxyAPI 6fecc6e uses, as the Rust table src/management/api/iso_currency.rs.
 //
 // Usage: gen.sh /absolute/path/to/CLIProxyAPI
 package main

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Regenerates ../../../src/management/iso_currency.rs from Go's currency.ParseISO.
+# Regenerates ../../../src/management/api/iso_currency.rs from Go's currency.ParseISO.
 # Usage: gen.sh /absolute/path/to/CLIProxyAPI   (checkout at 6fecc6e; not modified)
 set -eu
 export GOTOOLCHAIN=local GOPROXY=off GONOPROXY=none GOPRIVATE= GOSUMDB=off
@@ -16,5 +16,5 @@ cp "$here"/*.go "$module/"
   go mod edit -replace=github.com/router-for-me/CLIProxyAPI/v8="$reference"
   cp "$reference/go.sum" .
   go mod tidy -e >/dev/null 2>&1
-  go run . "$crate/src/management/iso_currency.rs"
+  go run . "$crate/src/management/api/iso_currency.rs"
 )

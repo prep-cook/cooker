@@ -309,13 +309,32 @@ impl CredentialDb {
         }
     }
 
-    pub(crate) fn repair_cache(&self) -> anyhow::Result<()> {
+    /// Rewrites every document's cache file from the accepted state, unless a document's
+    /// lock is held: then nothing is written and that document's path is returned. Every
+    /// refresh takes a document's lock and only then restores the document through the
+    /// store writer, which this holds throughout; management holders write under `disk`,
+    /// which the caller holds. A lock found free here therefore means no refresh of that
+    /// document is in flight, and none can restore it before the repair ends, so each
+    /// probe releases its lock at once instead of keeping one descriptor per document.
+    pub(crate) fn repair_cache(&self) -> anyhow::Result<Option<PathBuf>> {
         let _writer = self.store.grant_writer()?;
         let current = self.store.current();
-        for name in current.documents.keys() {
-            self.restore_from(&current, &self.path(name)?)?;
+        let paths = current
+            .documents
+            .keys()
+            .map(|name| self.path(name))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for path in &paths {
+            let lock = ck_exec::codex_siwc_bind::open_lock_file(path).map_err(anyhow::Error::msg)?;
+            if !ck_exec::codex_siwc_bind::try_lock(&lock).map_err(anyhow::Error::msg)? {
+                return Ok(Some(path.clone()));
+            }
+            ck_exec::codex_siwc_bind::unlock(&lock).map_err(anyhow::Error::msg)?;
         }
-        Ok(())
+        for path in &paths {
+            self.restore_from(&current, path)?;
+        }
+        Ok(None)
     }
 
     /// Recreates documents and clears abandoned cache files. Each restoration

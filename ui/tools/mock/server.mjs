@@ -30,6 +30,7 @@ const N = Math.max(0, Number(opt.accounts));
 const CHURN = Number(opt.churn);
 const KEY = opt.key;
 const VERSION = "cooker-mock";
+const EXPOSED_HEADERS = "X-Ck-Trace-Id, X-Ck-Version, X-Ck-Commit, X-Ck-Build-Date, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, ETag, X-Request-Id, OpenAI-Request-Id";
 // Three days before start, so the dashboard shows a past build in every time zone.
 const BUILD_DATE = new Date(Date.now() - 3 * 86_400_000).toISOString();
 const BUCKET_MS = 600_000;
@@ -296,7 +297,6 @@ let config = {
     meta: [],
   },
   oauth: {
-    "auth-dir": "~/.cli-proxy-api",
     "model-alias": { claude: [{ name: "claude-sonnet-4-5", alias: "sonnet" }], codex: [] },
     "excluded-models": { claude: ["claude-3-*"], codex: [] },
   },
@@ -878,8 +878,9 @@ const server = http.createServer((req, res) => {
       if (url.pathname === "/healthz") return (status = 200), send(200, { "Content-Type": "application/json" }, '{"status":"ok"}');
       if (url.pathname === "/v1/models" && req.method === "GET") return (status = clientModels(req, send));
       if (![PREFIX, "/admin/v1"].some((prefix) => url.pathname.startsWith(prefix + "/") || url.pathname === prefix)) return send(404, {}, "");
-      const headers = { "X-Ck-Version": VERSION, "X-Ck-Commit": "0000000", "X-Ck-Build-Date": BUILD_DATE, "Cache-Control": "no-store", "X-Ck-Revision": String(configVersion), "X-Ck-Published-Revision": String(configVersion) };
-      if (req.method === "OPTIONS") return (status = 204), send(204, { ...headers, "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "Access-Control-Allow-Headers": "*" }, "");
+      const exposed = url.pathname.startsWith("/admin/v1/") && req.method !== "OPTIONS" ? [EXPOSED_HEADERS, "X-Ck-Revision, X-Ck-Published-Revision"] : EXPOSED_HEADERS;
+      const headers = { "X-Ck-Version": VERSION, "X-Ck-Commit": "0000000", "X-Ck-Build-Date": BUILD_DATE, "Cache-Control": "no-store", "X-Ck-Revision": String(configVersion), "X-Ck-Published-Revision": String(configVersion), "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS", "Access-Control-Allow-Headers": "*", "Access-Control-Expose-Headers": exposed };
+      if (req.method === "OPTIONS") return (status = 204), send(204, headers, "");
       const auth = req.headers.authorization || "";
       const given = /^bearer /i.test(auth) ? auth.slice(7) : "";
       // The dashboard session, as the server does it (crates/ck-server/src/management/api/session.rs):
