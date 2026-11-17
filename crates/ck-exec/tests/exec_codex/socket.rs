@@ -18,14 +18,12 @@ use crate::codex_socket::*;
 use crate::common::*;
 use crate::support::{Exchange, Streams};
 
-/// Every turn sends one `response.create` holding the request's expanded history, never a
-/// `previous_response_id`, on the connection's one socket; each turn's response reaches its
-/// own stream.
+/// Every turn sends its request once, holding the expanded history and never a
+/// `previous_response_id`: as one `response.create` on the connection's one socket or, when the
+/// upstream refuses the upgrade with 426, as one streamed HTTP request with no socket control
+/// (the official client's fallback). Each turn's response reaches its own stream.
 #[tokio::test]
-async fn every_turn_sends_its_expanded_history_as_one_create() {
-    let upstream = CodexSocket::start([act(answer("resp_1", 3)), act(answer("resp_2", 4))]).await;
-    let (streams, executor) = (Streams::new(), executor());
-    let exchange = Exchange::new(upstream.api_key(), MODEL, "/v1/responses");
+async fn every_turn_sends_its_expanded_history_once() {
     let assistant =
         json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]});
     let turns = [
@@ -36,28 +34,43 @@ async fn every_turn_sends_its_expanded_history_as_one_create() {
             vec!["first", "hello", "second"],
         ),
     ];
-    for (body, id, _) in &turns {
-        let (turn, response, _request) = start(&streams, &exchange, &executor, body).await;
-        let (upstream, _control) = turn.expect("the turn starts");
-        let (outcome, published) = produce(&streams, upstream, response).await;
-        outcome.unwrap();
-        assert_eq!(published.terminal, Some(Terminal::Done));
-        assert!(text(&published).contains(id), "{}", text(&published));
+    // (the upstream refuses upgrades, upgrades it sees)
+    for (refused, upgrades) in [(false, 1), (true, 2)] {
+        let upstream = CodexSocket::start([act(answer("resp_1", 3)), act(answer("resp_2", 4))]).await;
+        if refused {
+            upstream.refuse_upgrades();
+        }
+        let (streams, executor) = (Streams::new(), executor());
+        let exchange = Exchange::new(upstream.api_key(), MODEL, "/v1/responses");
+        for (body, id, _) in &turns {
+            let (turn, response, _request) = start(&streams, &exchange, &executor, body).await;
+            let (upstream, control) = turn.expect("the turn starts");
+            assert_eq!(control.is_none(), refused);
+            let (outcome, published) = produce(&streams, upstream, response).await;
+            outcome.unwrap();
+            assert_eq!(published.terminal, Some(Terminal::Done));
+            assert!(text(&published).contains(id), "{}", text(&published));
+        }
+        let (sent, other) = if refused {
+            (upstream.posted(), upstream.sent())
+        } else {
+            (upstream.sent(), upstream.posted())
+        };
+        assert_eq!(sent.len(), 2, "one request per turn, refused {refused}");
+        assert!(other.is_empty(), "{other:?}");
+        for (frame, (_, _, history)) in sent.iter().zip(&turns) {
+            assert_eq!(frame.get("type").is_none(), refused, "{frame}");
+            assert!(frame.get("previous_response_id").is_none(), "{frame}");
+            let texts: Vec<_> = frame["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["content"][0]["text"].as_str().unwrap_or_default())
+                .collect();
+            assert_eq!(&texts, history, "{frame}");
+        }
+        assert_eq!(upstream.upgrades().len(), upgrades, "refused {refused}");
     }
-    let sent = upstream.sent();
-    assert_eq!(sent.len(), 2, "one frame per turn");
-    for (frame, (_, _, history)) in sent.iter().zip(&turns) {
-        assert_eq!(frame["type"], "response.create", "{frame}");
-        assert!(frame.get("previous_response_id").is_none(), "{frame}");
-        let texts: Vec<_> = frame["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|item| item["content"][0]["text"].as_str().unwrap_or_default())
-            .collect();
-        assert_eq!(&texts, history, "{frame}");
-    }
-    assert_eq!(upstream.upgrades().len(), 1, "both turns share the connection's socket");
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -159,7 +172,9 @@ async fn steering_reaches_the_socket_and_each_response_is_its_own_stream() {
     let (streams, executor) = (Streams::new(), executor());
     let exchange = Exchange::new(upstream.api_key(), MODEL, "/v1/responses");
     let (turn, response, request) = start(&streams, &exchange, &executor, &request(json!([user("hi")]))).await;
-    let (body, control) = turn.unwrap();
+    let (body, Some(control)) = turn.unwrap() else {
+        panic!("the turn runs on the socket")
+    };
     control.steer(STEER.as_bytes()).await.unwrap();
     let (outcome, published) = produce(&streams, body, response).await;
     outcome.unwrap();
@@ -228,7 +243,9 @@ async fn control_frames_reach_the_socket_as_the_old_path_sends_them() {
         let mut exchange = Exchange::new(kind.of(&upstream), MODEL, "/v1/responses");
         exchange.cfg = ck_core::config::Config::parse(config).unwrap();
         let (turn, _response, _request) = start(&streams, &exchange, &executor, &request(json!([user("hi")]))).await;
-        let (mut body, control) = turn.unwrap();
+        let (mut body, Some(control)) = turn.unwrap() else {
+            panic!("the turn runs on the socket")
+        };
         tokio::time::timeout(WAIT, body.body.next())
             .await
             .unwrap()
@@ -265,7 +282,9 @@ async fn a_turn_reports_request_facts_quota_and_capture() {
         let observed = Arc::new(crate::usage::Observed::default());
         exchange.usage = UsageSink::new(observed.clone()).with_capture(CaptureSink::new(observed.clone()));
         let (turn, response, _request) = start(&streams, &exchange, &executor, &request(json!([user("hi")]))).await;
-        let (body, control) = turn.unwrap();
+        let (body, Some(control)) = turn.unwrap() else {
+            panic!("the turn runs on the socket")
+        };
         produce(&streams, body, response).await.0.unwrap();
         control.steer(IDLE_STEER.as_bytes()).await.unwrap();
         assert!(matches!(control.next().await, Some(Next::Event(_))));
@@ -382,7 +401,9 @@ async fn ending_a_turn_in_flight_closes_its_socket() {
         let exchange = Exchange::new(upstream.api_key(), MODEL, "/v1/responses");
         let body = request(json!([user("hi")]));
         let (turn, _response, _request) = start(&streams, &exchange, &executor, &body).await;
-        let (upstream_body, control) = turn.unwrap();
+        let (upstream_body, Some(control)) = turn.unwrap() else {
+            panic!("the turn runs on the socket")
+        };
         upstream.received(1).await;
         let mut frames = upstream_body.body;
         for _ in 0..read {
@@ -481,7 +502,9 @@ async fn cancel_interrupts_the_response_live_on_the_socket() {
         let (streams, executor) = (Streams::new(), executor());
         let exchange = Exchange::new(upstream.api_key(), MODEL, "/v1/responses");
         let (turn, _response, request) = start(&streams, &exchange, &executor, &request(json!([user("hi")]))).await;
-        let (upstream_body, control) = turn.unwrap();
+        let (upstream_body, Some(control)) = turn.unwrap() else {
+            panic!("the turn runs on the socket")
+        };
         upstream.synced(1).await;
         if steering {
             control.steer(STEER.as_bytes()).await.unwrap();

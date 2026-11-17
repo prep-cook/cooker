@@ -13,6 +13,9 @@
 //! - Failures. An `error` frame fails the attempt as `ws_error` classifies it
 //!   (`tests/fixtures/codex_ws_errors.json`); a lost socket fails it with transport scope. A
 //!   turn never dials or sends its request again; the next turn dials when the socket is gone.
+//!   An upgrade the upstream refuses with 426 sent nothing, so that turn's request goes over
+//!   HTTP (`CodexExecutor::generate_http`) with no socket control, as the official client
+//!   falls back (codex-rs `core/src/client.rs`).
 //! - Control. Steering and interrupt frames go to the turn's socket; frames outside any
 //!   response come back as received. Cancel interrupts the response in flight and closes the
 //!   socket, which never serves another turn while a response is in flight.
@@ -84,9 +87,21 @@ impl Turns for CodexExecutor {
         let guard = session.turn.clone().lock_owned().await;
         wire.ws_request(&target.url, &headers, frame.as_bytes());
         let cooling = settings.model_level_cooling;
-        let (conn, handshake) = self
+        let (conn, handshake) = match self
             .ensure(&session, &target, &headers, &shaped.base_model, cooling, Some(&wire))
-            .await?;
+            .await
+        {
+            Ok(dialed) => dialed,
+            // The official client's transport fallback: a refused upgrade sent nothing, so the
+            // turn's request, which carries the expanded history, goes over HTTP instead.
+            // ponytail: the next turn dials again, where the official client keeps HTTP for the
+            // rest of its session; record the refusal on `Session` if the extra handshake matters.
+            Err(error) if error.status == 426 => {
+                let upstream = self.generate_http(&shape, Call::Stream, scratch, ingress).await?;
+                return Ok(Turn { upstream, cancel: None });
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(handshake) = &handshake {
             wire.ws_handshake(101, handshake);
             self.quota()
@@ -122,7 +137,7 @@ impl Turns for CodexExecutor {
                 body: frames.body(scratch),
                 ingress,
             },
-            cancel: TurnControl { line },
+            cancel: Some(TurnControl { line }),
         })
     }
 }

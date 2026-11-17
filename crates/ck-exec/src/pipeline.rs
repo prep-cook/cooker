@@ -114,7 +114,7 @@ pub async fn start_turn<E: Turns>(
     request: &mut Request<'_>,
     upload: &mut Writer,
     mut response: Writer,
-) -> Result<(Started, E::Cancel), ExecError> {
+) -> Result<(Started, Option<E::Cancel>), ExecError> {
     let published = attach(attempt, &mut response)?;
     let streams = Streams {
         request: upload,

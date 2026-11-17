@@ -109,26 +109,7 @@ impl Execute for CodexExecutor {
         let call = if stream { Call::Stream } else { Call::NonStream };
         let scratch = streams.response.allocator();
         let ingress = generation(streams.response, attempt)?;
-        let (view, settings) = shaped.view();
-        let body = shaped.generate(&view, &settings, call, &self.replay)?;
-        let upstream = self
-            .post_shaped(&view, &settings, &body, call, request.client.usage)
-            .await?;
-        let replay = Some((self.replay.clone(), body.scope));
-        let rules = Events::new(
-            scratch,
-            body.optimized,
-            Backend::Codex {
-                model_level_cooling: settings.model_level_cooling,
-            },
-            replay,
-        );
-        Ok(Upstream {
-            status: upstream.status,
-            headers: upstream.headers,
-            body: events::body(upstream.body, rules),
-            ingress,
-        })
+        self.generate_http(&shaped, call, scratch, ingress).await
     }
 
     async fn count_tokens(
@@ -197,6 +178,37 @@ impl Execute for CodexExecutor {
 }
 
 impl CodexExecutor {
+    /// Generation over HTTP: `shape`'s body for `call`, posted, its events read through the
+    /// Codex rules into `ingress`.
+    pub(crate) async fn generate_http(
+        &self,
+        shape: &Shape<'_>,
+        call: Call,
+        scratch: Writer,
+        ingress: CodexIngress,
+    ) -> Result<Upstream<CodexIngress>, ExecError> {
+        let (view, settings) = shape.view();
+        let body = shape.generate(&view, &settings, call, &self.replay)?;
+        let upstream = self
+            .post_shaped(&view, &settings, &body, call, shape.request.client.usage)
+            .await?;
+        let replay = Some((self.replay.clone(), body.scope));
+        let rules = Events::new(
+            scratch,
+            body.optimized,
+            Backend::Codex {
+                model_level_cooling: settings.model_level_cooling,
+            },
+            replay,
+        );
+        Ok(Upstream {
+            status: upstream.status,
+            headers: upstream.headers,
+            body: events::body(upstream.body, rules),
+            ingress,
+        })
+    }
+
     /// Posts a shaped body with the old path's headers and transport. A non-2xx answer is
     /// the attempt's failure, classified as Go does. The request-side facts and the upstream
     /// exchange go to `usage` (contract G4); response usage is the canonical stream's.

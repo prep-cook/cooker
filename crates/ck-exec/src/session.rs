@@ -94,7 +94,8 @@ pub trait Turns: Execute {
 
 pub struct Turn<I, C> {
     pub upstream: Upstream<I>,
-    pub cancel: C,
+    /// `None` when the turn runs over HTTP instead; its response stream's cancel stops it.
+    pub cancel: Option<C>,
 }
 
 /// Cancels one in-flight turn when its client disconnects (Settled 56).
