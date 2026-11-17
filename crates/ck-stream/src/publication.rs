@@ -11,10 +11,12 @@ use parking_lot::Mutex;
 
 use crate::{Error, FRAME_BYTES, Limits, Position, Record, Terminal, cache::Retention, pool::Pool};
 
+mod final_room;
 mod reader;
 mod scratch;
 mod wakeup;
 mod writer;
+use final_room::FinalRoom;
 use reader::Pinned;
 pub use reader::{Lease, Read, Reader};
 pub use scratch::{MetadataPermit, ScratchLease, ScratchReservation};
@@ -22,20 +24,6 @@ use wakeup::Wakeup;
 pub use writer::{Reservation, Writer};
 
 pub(crate) const READER_BYTES: usize = std::mem::size_of::<Reader>();
-/// Table room a final record over `frames` frames takes: their frame entries and a run index
-/// entry.
-pub(crate) const fn final_metadata(frames: usize) -> usize {
-    frames * std::mem::size_of::<Frame>() + std::mem::size_of::<Index>()
-}
-
-/// Consecutive record frames held for the producer's final record (`Writer::reserve_final`),
-/// charged to the exchange quota with [`final_metadata`], and prefaulted for its first `len`
-/// bytes.
-pub(crate) struct FinalRoom {
-    pub(crate) frames: Box<[u32]>,
-    pub(crate) len: usize,
-}
-
 /// A stream's reference to a pool frame; readers' leases hold their own references.
 pub(crate) struct Frame {
     pool: Option<u32>,
@@ -516,26 +504,6 @@ impl Stream {
         drop(state);
         self.notify.wake();
         self.stopped.wake();
-    }
-
-    /// A charge failed: the stream ends with `StorageExhausted`, unless its producer holds
-    /// room for a final record and ends it itself.
-    pub(crate) fn exhausted(&self) {
-        if self.state.lock().final_room.is_none() {
-            self.finish(Terminal::StorageExhausted);
-        }
-    }
-
-    /// Returns the final room's frames to the pool and their charges to the exchange quota.
-    pub(crate) fn free_final(&self, state: &mut State) {
-        state.final_next = false;
-        if let Some(room) = state.final_room.take() {
-            for &frame in &room.frames {
-                self.pool.release(frame);
-            }
-            self.release_frames(room.frames.len());
-            self.release_metadata(final_metadata(room.frames.len()));
-        }
     }
 
     pub(crate) fn invalidate(&self) {

@@ -2,6 +2,7 @@
 
 use crate::FRAME_BYTES;
 use cold::ColdList;
+use states::FrameStates;
 use std::cell::Cell;
 use std::io;
 use std::ops::{Deref, DerefMut, Range};
@@ -12,13 +13,15 @@ use std::sync::{Mutex, MutexGuard};
 
 mod cold;
 mod os;
+mod states;
 #[cfg(test)]
 mod tests;
 
 /// Frames backed at open and per growth step: 1 MiB, close to the 21 × 50,000-byte extent
 /// it replaces (owner W0-1, 2026-11-16: initial frames 256).
 const EXTENT: u32 = 256;
-/// Most cold frames populated in one call for one reservation: 64 KiB, a 50,000-byte record.
+/// Most cold frames populated in one call for one reservation: 64 KiB, which covers a
+/// 50,000-byte data record from any offset (at most 14 frames).
 const COLD_RUN: u32 = 16;
 /// Idle free frames decay keeps per worker list: the 400,000-byte budget of 8 × 50,000-byte
 /// frames rounded up to whole 4,096-byte frames (INTERNAL-STREAM §6.5) until measured.
@@ -35,17 +38,6 @@ pub(crate) struct Header {
 
 #[repr(align(128))]
 struct Padded<T>(T);
-
-/// Per-frame counters, one cache line per frame. Leases on different threads update the
-/// counts of neighbouring frames; packed, every update moved a shared line between cores.
-#[repr(align(64))]
-struct FrameState {
-    /// References: the owner's plus one per reader lease. Zero means free.
-    refs: AtomicU32,
-    /// Bytes from the frame's start whose pages are populated, so writing them cannot
-    /// fault on tmpfs exhaustion. Only the frame's current owner changes it.
-    ready: AtomicU32,
-}
 
 struct FreeList {
     frames: Vec<u32>,
@@ -165,82 +157,6 @@ impl Mapping {
             }
         }
         Ok(mapping)
-    }
-}
-
-/// Per-frame states in private anonymous memory, which stays unbacked until a frame is
-/// first used; a heap allocation with this alignment would be written zero in full.
-struct FrameStates {
-    mapping: Mapping,
-    len: usize,
-}
-
-impl FrameStates {
-    /// States for `len` frames with the first `populated` marked wholly populated.
-    fn new(len: usize, populated: u32) -> io::Result<Self> {
-        let bytes = len.checked_mul(std::mem::size_of::<FrameState>()).ok_or_else(invalid)?;
-        // SAFETY: a fresh private anonymous mapping aliases nothing.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                bytes,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let states = Self {
-            mapping: Mapping {
-                base: NonNull::new(base.cast()).ok_or_else(invalid)?,
-                len: bytes,
-            },
-            len,
-        };
-        for state in &states[..populated as usize] {
-            state.ready.store(FRAME_BYTES as u32, Ordering::Relaxed);
-        }
-        Ok(states)
-    }
-}
-
-impl FrameStates {
-    /// Zero the states of frames `first..=last`, which are free and cold, by dropping the
-    /// whole pages that hold only them; the next touch maps a zero page. Without this, one
-    /// cache line per frame of a past burst stays resident.
-    fn discard(&self, first: u32, last: u32, page: usize) -> io::Result<()> {
-        let size = std::mem::size_of::<FrameState>();
-        let start = (first as usize * size).next_multiple_of(page);
-        let end = (last as usize + 1) * size / page * page;
-        if end <= start {
-            return Ok(());
-        }
-        // SAFETY: the page-aligned range lies inside this private anonymous mapping. Zero
-        // bytes are the state of a free, cold frame, which every frame in it already holds,
-        // and the decay pass calling this holds the cold list, so no other thread writes them.
-        let result = unsafe {
-            libc::madvise(
-                self.mapping.base.as_ptr().add(start).cast(),
-                end - start,
-                libc::MADV_DONTNEED,
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
-impl Deref for FrameStates {
-    type Target = [FrameState];
-    fn deref(&self) -> &[FrameState] {
-        // SAFETY: the page-aligned mapping holds `len` states for its whole life. Zero
-        // bytes are valid atomics, and all access goes through them.
-        unsafe { std::slice::from_raw_parts(self.mapping.base.as_ptr().cast(), self.len) }
     }
 }
 

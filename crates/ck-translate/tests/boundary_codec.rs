@@ -14,6 +14,7 @@ fn fragmented_source_packs_frames_without_losing_parser_positions() {
     let mut bytes = br#"{"payload":""#.to_vec();
     bytes.extend(std::iter::repeat_n(b'a', 80_003));
     bytes.extend_from_slice(br#"","tail":"\ud83d\ude80"}"#);
+    let frames = bytes.len().div_ceil(ck_stream::FRAME_BYTES);
     for width in [1, 7] {
         let mut mapped = Mapped::new();
         let mut scanner = json::Scanner::new(&mut mapped.writer, BUDGET as u64).unwrap();
@@ -22,18 +23,12 @@ fn fragmented_source_packs_frames_without_losing_parser_positions() {
             scanner.advance(&mapped.source).unwrap();
         }
         scanner.finish(&mapped.source).unwrap();
-        assert_eq!(
-            mapped.store.used_frames() as usize,
-            bytes.len().div_ceil(ck_stream::FRAME_BYTES)
-        );
+        assert_eq!(mapped.store.used_frames() as usize, frames);
         let output = encode::scratch(&mut mapped.writer, |e| e.json(&mapped.source, &scanner, 0)).unwrap();
         assert_eq!(scratch_bytes(&output), bytes);
         drop(output);
         mapped.source.release_before(ck_stream::FRAME_BYTES as u64).unwrap();
-        assert_eq!(
-            mapped.store.used_frames() as usize,
-            bytes.len().div_ceil(ck_stream::FRAME_BYTES) - 1
-        );
+        assert_eq!(mapped.store.used_frames() as usize, frames - 1);
         assert!(matches!(
             mapped
                 .source

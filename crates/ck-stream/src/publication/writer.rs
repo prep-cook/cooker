@@ -2,10 +2,11 @@ use std::sync::{Arc, atomic::Ordering};
 
 use parking_lot::MutexGuard;
 
-use super::{FinalRoom, Frame, Index, State, Stream, final_metadata, reserve_metadata};
+use super::{Frame, Index, State, Stream, reserve_metadata};
 use crate::{Error, FRAME_BYTES, Position, Record, Terminal, cache::Inner};
 
-/// Frames a reservation takes per release of the stream lock: a 50,000-byte record's worth.
+/// Frames a reservation takes per release of the stream lock: 64 KiB, which covers a
+/// 50,000-byte data record from any offset (at most 14 frames).
 const TAKE_BATCH: usize = 16;
 
 /// Exclusive stream producer. A disconnect must drop a reader, not this producer.
@@ -43,7 +44,7 @@ impl Writer {
         }
     }
 
-    fn publishes(&self) -> Result<(), Error> {
+    pub(super) fn publishes(&self) -> Result<(), Error> {
         if self.producer { Ok(()) } else { Err(Error::Closed) }
     }
     pub(crate) fn stream(&self) -> &Arc<Stream> {
@@ -99,69 +100,6 @@ impl Writer {
         }
     }
 
-    /// Holds room for one final record of at most `len` bytes: the pool frames it spans from a
-    /// frame boundary, prefaulted for `len` bytes, their frames of the exchange quota and the
-    /// table room of one record. While it is held, a failed charge on this stream returns
-    /// `StorageExhausted` without ending the stream, and other exchanges cannot take the frames.
-    /// The producer calls [`Self::release_final`] and writes its final record, which goes into
-    /// those frames, then finishes the stream with the terminal it chooses. Any terminal frees
-    /// an unused room.
-    pub fn reserve_final(&mut self, len: usize) -> Result<(), Error> {
-        self.publishes()?;
-        if len == 0 || len > self.inner.limits.max_event_bytes {
-            return Err(Error::InvalidRecord);
-        }
-        {
-            let state = self.stream.state.lock();
-            if state.terminal.is_some() {
-                return Err(Error::Closed);
-            }
-            if state.final_room.is_some() {
-                return Err(Error::InvalidRecord);
-            }
-        }
-        let count = len.div_ceil(FRAME_BYTES);
-        self.stream.charge_frames(count)?;
-        if let Err(error) = self.stream.charge_metadata(final_metadata(count)) {
-            self.stream.release_frames(count);
-            return Err(error);
-        }
-        let give_back = |frames: &[u32]| {
-            for &frame in frames {
-                self.inner.pool.release(frame);
-            }
-            self.stream.release_frames(count);
-            self.stream.release_metadata(final_metadata(count));
-        };
-        // Allocation may evict another stream; no stream lock is held across it.
-        let mut frames = Vec::with_capacity(count);
-        for taken in 0..count {
-            let needed = (len - taken * FRAME_BYTES).min(FRAME_BYTES);
-            match self.inner.allocate(self.id(), count - taken, needed) {
-                Ok(frame) => frames.push(frame),
-                Err(error) => {
-                    give_back(&frames);
-                    return Err(error);
-                }
-            }
-        }
-        let mut state = self.stream.state.lock();
-        if self.stream.invalidated.load(Ordering::Acquire) || state.terminal.is_some() {
-            drop(state);
-            give_back(&frames);
-            return Err(Error::Closed);
-        }
-        state.final_room = Some(FinalRoom {
-            frames: frames.into_boxed_slice(),
-            len,
-        });
-        Ok(())
-    }
-
-    /// The next record is the final one. Unless it fits in place at the end of the last frame,
-    /// it starts at a frame boundary in the room [`Self::reserve_final`] holds, so no allocation
-    /// can refuse it. A record longer than the room frees the room and is reserved like any
-    /// other.
     /// Keeps the stream out of eviction and expiry until it is invalidated, so its records
     /// outlive allocations by other exchanges and idle time: a live session's metadata stays
     /// readable for its accounting after the session ends. Allocations that would need its
@@ -169,13 +107,6 @@ impl Writer {
     /// once its readers are done, which removes it from the cache; until then it stays.
     pub fn keep_cached(&self) {
         self.stream.kept.store(true, Ordering::Release);
-    }
-
-    pub fn release_final(&mut self) {
-        let mut state = self.stream.state.lock();
-        if state.final_room.is_some() {
-            state.final_next = true;
-        }
     }
 
     /// Client egress demand. Resolves with a new count once a client egress reader
@@ -281,23 +212,12 @@ impl Writer {
         };
         let extends = state.records.back().is_some_and(|last| last.extends(&index));
         let records = state.records.len() + usize::from(!extends);
-        let mut pinned: Box<[u32]> = if into_room {
-            state.final_next = false;
-            state.final_room.take().map_or_else(Box::default, |room| room.frames)
+        let pinned = if into_room {
+            self.take_final_room(&mut state, extra)
         } else {
             Box::default()
         };
-        // The room's frames are already charged; its table room returns for the tables to take.
-        if !pinned.is_empty() {
-            self.stream.release_metadata(final_metadata(pinned.len()));
-        }
-        // A final record shorter than its room leaves the room's last frames unused.
-        let held = pinned.len().min(extra);
-        for &frame in &pinned[held..] {
-            self.inner.pool.release(frame);
-        }
-        self.stream.release_frames(pinned.len() - held);
-        pinned = pinned[..held].into();
+        let held = pinned.len();
         let give_back = |frames: &[u32]| {
             for &frame in frames {
                 self.inner.pool.release(frame);

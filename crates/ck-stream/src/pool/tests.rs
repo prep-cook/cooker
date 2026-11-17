@@ -209,7 +209,7 @@ fn decay_drops_the_states_of_punched_frames() {
 fn pool_states_per_page() -> usize {
     // SAFETY: sysconf has no pointer arguments.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-    page / std::mem::size_of::<FrameState>()
+    page / std::mem::size_of::<states::FrameState>()
 }
 
 #[test]

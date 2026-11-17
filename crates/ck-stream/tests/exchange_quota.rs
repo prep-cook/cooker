@@ -100,8 +100,7 @@ fn an_allocation_failure_after_the_terminal_keeps_the_terminal() {
 
 /// With room held for a final record, records stop one frame early and a refused one leaves the
 /// stream running; the final record then fits even when another exchange holds the rest of the
-/// pool, and the producer picks the terminal. Without it, the refusal ends the stream. A
-/// terminal frees room the stream never used.
+/// pool, and the producer picks the terminal. Without it, the refusal ends the stream.
 #[test]
 fn room_held_for_a_final_record_survives_a_full_quota_and_pool() {
     // (room held in bytes, final record bytes, pool frames, frames another exchange pins,
@@ -154,8 +153,6 @@ fn room_held_for_a_final_record_survives_a_full_quota_and_pool() {
         // A room over two frames holds both, also against the other exchange.
         (Some(two), two, 16, 0, FRAME_BYTES / 2, 4, true, Terminal::Shutdown),
         (Some(two), two, 4, 2, FRAME_BYTES / 2, 0, true, Terminal::Shutdown),
-        // A final record shorter than its room returns the frame it does not use.
-        (Some(two), counters, 16, 0, FRAME_BYTES / 2, 4, true, Terminal::Shutdown),
     ];
     for (room, last_bytes, pool, pinned, bytes, records, stored, terminal) in cases {
         let label = format!("room={room:?} final={last_bytes} pool={pool} pinned={pinned} bytes={bytes}");
@@ -179,25 +176,57 @@ fn room_held_for_a_final_record_survives_a_full_quota_and_pool() {
         let final_record = vec![7; last_bytes];
         assert_eq!(producer.append(&final_record).is_ok(), stored, "{label}");
         producer.finish(Terminal::Shutdown);
-        let mut reader = store.reader(producer.id(), 0).unwrap();
-        let mut last = None;
-        let ended = loop {
-            match reader.try_next() {
-                Poll::Ready(Some(Read::Record(lease))) => {
-                    let mut bytes = Vec::new();
-                    lease.visit(|chunk| bytes.extend_from_slice(chunk)).unwrap();
-                    last = Some(bytes);
-                }
-                Poll::Ready(Some(Read::Terminal(terminal))) => break terminal,
-                other => panic!("{label}: no terminal: {}", other.is_pending()),
-            }
-        };
+        let (last, ended) = last_record_and_terminal(&store, producer.id(), &label);
         assert_eq!(last.as_deref() == Some(&final_record[..]), stored, "{label}");
         assert_eq!(ended, terminal, "{label}");
     }
+}
+
+/// The last record a new reader of stream `id` reads, and the terminal that ends it.
+fn last_record_and_terminal(store: &Store, id: u64, label: &str) -> (Option<Vec<u8>>, Terminal) {
+    let mut reader = store.reader(id, 0).unwrap();
+    let mut last = None;
+    loop {
+        match reader.try_next() {
+            Poll::Ready(Some(Read::Record(lease))) => {
+                let mut bytes = Vec::new();
+                lease.visit(|chunk| bytes.extend_from_slice(chunk)).unwrap();
+                last = Some(bytes);
+            }
+            Poll::Ready(Some(Read::Terminal(terminal))) => return (last, terminal),
+            other => panic!("{label}: no terminal: {}", other.is_pending()),
+        }
+    }
+}
+
+/// Room frames the final record does not use return to the pool: past a final record shorter
+/// than its room at once, and all of them at a terminal or with a dropped producer.
+#[test]
+fn unused_final_room_returns_to_the_pool() {
+    let (_dir, store) = store(16, 4);
+    let mut producer = store.create().unwrap();
+    producer.reserve_final(FRAME_BYTES + 1).unwrap();
+    for _ in 0..4 {
+        producer.append(&[1; FRAME_BYTES / 2]).unwrap();
+    }
+    assert!(matches!(
+        producer.append(&[1; FRAME_BYTES / 2]),
+        Err(Error::StorageExhausted)
+    ));
+    producer.release_final();
+    producer.append(b"counters").unwrap();
+    assert_eq!(
+        store.used_frames(),
+        3,
+        "two record frames and the room frame the final record uses"
+    );
+    producer.finish(Terminal::Shutdown);
+    let (last, ended) = last_record_and_terminal(&store, producer.id(), "shorter final record");
+    assert_eq!((last.as_deref(), ended), (Some(&b"counters"[..]), Terminal::Shutdown));
+    producer.finish(Terminal::Gone);
+    assert_eq!(store.used_frames(), 0, "the terminal frees every frame");
     // Room a stream never used returns to the pool at its terminal, including `Gone`, which
     // invalidates the stream.
-    let (_dir, store) = store(16, 4);
     for terminal in [Terminal::Shutdown, Terminal::Gone] {
         let mut producer = store.create().unwrap();
         producer.reserve_final(b"counters".len()).unwrap();
