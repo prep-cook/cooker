@@ -77,6 +77,8 @@ async fn every_client_protocol_goes_out_as_codex_and_comes_back() {
                 out.contains("hel") && out.contains("lo") && out.contains(done),
                 "{protocol}: {out}"
             );
+            // OpenAI's Responses stream has no `[DONE]` sentinel.
+            assert!(protocol == "chat" || !out.contains("[DONE]"), "{protocol}: {out}");
         }
     }
 }

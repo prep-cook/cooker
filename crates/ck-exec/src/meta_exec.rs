@@ -100,6 +100,7 @@ impl Execute for MetaExecutor {
         .map_err(encoding)?;
         // The Meta event rules (`codex_events`) classify its failure events.
         ingress.classified_failures();
+        ingress.done_sentinel();
         let url = format!("{}/responses", base.strip_suffix('/').unwrap_or(&base));
         let client = self.clients.get(&Proxy::effective(&enriched, attempt.cfg));
         let headers = meta::headers(

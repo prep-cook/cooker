@@ -109,7 +109,8 @@ The source protocol is provenance; internal routing, scheduling, accounting and 
 | `item_id`, `tool_call_id`, `media_id` | local ID? | Stable internal identities; never substitute one for another. |
 | `block_index` | uint? | Logical content/thinking/part index within an item; not a frame number. |
 | `tool_index` | uint? | Chat tool index within a choice; independent of content block index. |
-| `source` | object? | `{protocol, event?, ids?, sequence?, output_index?, content_index?, summary_index?, part_index?, timestamp?, sse?}`. |
+| `source` | object? | `{protocol, event?, ids?, sequence?, output_index?, content_index?, summary_index?, part_index?, timestamp?, sse?, sentinel?}`. |
+| `source.sentinel` | string? | On `done`: the data line the source protocol writes after its terminal event, e.g. `[DONE]` for xAI and Meta Responses streams. The source's egress writes it whether or not the upstream's own sentinel was read before the completion boundary. |
 | `source.ids` | object? | Original request/response/item/call/part/session IDs under their original field names. |
 | `native_finish_reason` | JSON value? | Exact source stop/status reason, including unknown reasons. |
 | `original` | array? | Unmapped field records `{protocol, pointer, value}`; pointer is RFC 6901 within its correlated source object. |
