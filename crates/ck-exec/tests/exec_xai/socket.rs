@@ -378,7 +378,9 @@ fn error_status(published: &Published) -> Option<u64> {
 }
 
 /// How a turn ends for each upstream ending. xAI's WebSocket `response.done` ends a turn
-/// like a completion. A lost socket (xAI's 59-minute connection end among them) is a
+/// like a completion, and `response.incomplete` ends it with or without the apply_patch
+/// bridge. A turn that completes records its usage once and leaves the socket for the next
+/// turn. A lost socket (xAI's 59-minute connection end among them) is a
 /// transport failure that may fail over before the client commit, and the request is never
 /// sent a second time; an apply_patch call it cuts off is the bridge's 502 for the client.
 #[tokio::test]
@@ -416,6 +418,12 @@ async fn upstream_endings_are_attempt_failures_without_a_second_send() {
         (
             "incomplete",
             &plain,
+            after_created(&incomplete),
+            Want::Done { usage: true },
+        ),
+        (
+            "incomplete with the apply_patch bridge",
+            &patching,
             after_created(&incomplete),
             Want::Done { usage: true },
         ),
@@ -468,7 +476,7 @@ async fn upstream_endings_are_attempt_failures_without_a_second_send() {
         ),
     ];
     for (name, body, act, want) in cases {
-        let upstream = XaiSocket::start([act]).await;
+        let upstream = XaiSocket::start([act, Act::send(answer("resp_2"))]).await;
         let streams = Streams::new();
         let exchange = Exchange::new(upstream.credential(), MODEL, "/v1/responses");
         let executor = XaiExecutor::with_client(wreq::Client::new());
@@ -481,7 +489,12 @@ async fn upstream_endings_are_attempt_failures_without_a_second_send() {
             Want::Done { usage } => {
                 outcome.unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 assert_eq!(published.terminal, Some(Terminal::Done), "{name}");
-                assert_eq!(usage_records > 0, usage, "{name}: {:?}", records(&published));
+                assert_eq!(usage_records, usize::from(usage), "{name}: {:?}", records(&published));
+                let (next, published, _) = turn(&streams, &exchange, &executor, &plain).await;
+                next.unwrap_or_else(|e| panic!("{name}, next turn: {e:?}"));
+                assert_eq!(published.terminal, Some(Terminal::Done), "{name}, next turn");
+                assert_eq!((upstream.dials(), upstream.frames().len()), (1, 2), "{name}");
+                continue;
             }
             Want::Failed { outcome: want, record } => {
                 let error = outcome.expect_err(name);
