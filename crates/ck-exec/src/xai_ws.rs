@@ -621,7 +621,7 @@ impl Turns for XaiExecutor {
                 body,
                 ingress: XaiIngress::Generate(Box::new(events)),
             },
-            cancel,
+            cancel: Some(cancel),
         })
     }
 }

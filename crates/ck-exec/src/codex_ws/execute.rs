@@ -82,7 +82,7 @@ impl CodexExecutor {
                     wire.upgrade_rejection(&target.url, request, status, &handshake, &body);
                 }
                 if status == 426 {
-                    // Go returns a plain statusErr for 426 on downstream WebSockets.
+                    // A plain status error: the turn falls back to HTTP on it (`codex_ws::turns`).
                     let text = String::from_utf8_lossy(&body).into_owned();
                     return Err(response::status_error_raw(status, &text, handshake, false));
                 }

@@ -301,8 +301,9 @@ impl Executors {
 impl Executors {
     /// [`Executors::start`] for one Responses WebSocket turn whose execution session is its
     /// connection. A Codex or xAI credential with `websockets` runs it on its upstream socket
-    /// ([`session::Turns`]) and returns that transport's cancel; any other runs it as an
-    /// ordinary attempt, which its response stream's cancel stops.
+    /// ([`session::Turns`]) and returns that transport's cancel; any other, or a Codex turn whose
+    /// upgrade the upstream refused with 426, runs it as an ordinary attempt, which its response
+    /// stream's cancel stops.
     pub async fn start_turn(
         &self,
         attempt: &types::Attempt<'_>,
@@ -314,12 +315,12 @@ impl Executors {
         match credential.provider.as_str() {
             "codex" if codex::CodexExecutor::upstream_websocket(credential) => {
                 let (started, cancel) = pipeline::start_turn(&self.codex, attempt, request, upload, response).await?;
-                Ok((started, Some(TurnCancel::Codex(cancel))))
+                Ok((started, cancel.map(TurnCancel::Codex)))
             }
             xai::PROVIDER if xai_ws::websockets_enabled(credential) => {
                 let (started, cancel) =
                     pipeline::start_turn(&self.openai.xai, attempt, request, upload, response).await?;
-                Ok((started, Some(TurnCancel::Xai(cancel))))
+                Ok((started, cancel.map(TurnCancel::Xai)))
             }
             _ => Ok((self.start(attempt, request, upload, response).await?, None)),
         }

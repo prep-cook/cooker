@@ -1,5 +1,6 @@
-//! A loopback Codex backend for Responses WebSocket turns: it answers every upgrade, records
-//! the handshakes and frames it receives, and answers each frame with a scripted act.
+//! A loopback Codex backend for Responses WebSocket turns: it answers every upgrade (or
+//! refuses each with 426), records the handshakes and frames it receives, and answers each
+//! frame, or HTTP request, with a scripted act.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -8,7 +9,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, State};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use ck_core::credential::Credential;
 use ck_core::exec::ExecError;
@@ -67,8 +68,12 @@ struct Script {
     acts: VecDeque<Act>,
     frames: Vec<String>,
     upgrades: Vec<http::HeaderMap>,
+    /// HTTP request bodies, each answered with the next act's frames as SSE.
+    posts: Vec<String>,
     /// Headers the loopback adds to its 101 answers.
     answer: Vec<(&'static str, &'static str)>,
+    /// Upgrades get 426, as from an upstream without WebSocket support.
+    refuse: bool,
 }
 
 #[derive(Clone)]
@@ -138,6 +143,17 @@ impl CodexSocket {
         self.shared.script.lock().unwrap().answer = headers;
     }
 
+    /// Answers every later upgrade with 426.
+    pub(crate) fn refuse_upgrades(&self) {
+        self.shared.script.lock().unwrap().refuse = true;
+    }
+
+    /// The HTTP request bodies received.
+    pub(crate) fn posted(&self) -> Vec<Value> {
+        let script = self.shared.script.lock().unwrap();
+        script.posts.iter().map(|p| serde_json::from_str(p).unwrap()).collect()
+    }
+
     pub(crate) fn frames(&self) -> Vec<String> {
         self.shared.script.lock().unwrap().frames.clone()
     }
@@ -184,12 +200,18 @@ impl Drop for CodexSocket {
 }
 
 async fn upgrade(State(shared): State<Shared>, request: axum::extract::Request) -> Response {
-    let (mut parts, _) = request.into_parts();
-    let answer = {
+    let (mut parts, body) = request.into_parts();
+    if !parts.headers.contains_key(http::header::UPGRADE) {
+        return post(&shared, body).await;
+    }
+    let (answer, refuse) = {
         let mut script = shared.script.lock().unwrap();
         script.upgrades.push(parts.headers.clone());
-        script.answer.clone()
+        (script.answer.clone(), script.refuse)
     };
+    if refuse {
+        return (http::StatusCode::UPGRADE_REQUIRED, "upgrade required").into_response();
+    }
     let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &()).await.unwrap();
     let mut response = upgrade.on_upgrade(move |socket| async move {
         serve(socket, &shared).await;
@@ -201,6 +223,26 @@ async fn upgrade(State(shared): State<Shared>, request: axum::extract::Request) 
             .insert(name, http::HeaderValue::from_static(value));
     }
     response
+}
+
+/// An HTTP generation: the next act's frames as one SSE event each.
+async fn post(shared: &Shared, body: axum::body::Body) -> Response {
+    let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let act = {
+        let mut script = shared.script.lock().unwrap();
+        script.posts.push(String::from_utf8(body.to_vec()).unwrap());
+        script.acts.pop_front().unwrap_or_default()
+    };
+    shared.received.send_modify(|n| *n += 1);
+    let events: String = act
+        .send
+        .iter()
+        .map(|frame| {
+            let kind = serde_json::from_str::<Value>(frame).unwrap()["type"].clone();
+            format!("event: {}\ndata: {frame}\n\n", kind.as_str().unwrap())
+        })
+        .collect();
+    ([(http::header::CONTENT_TYPE, "text/event-stream")], events).into_response()
 }
 
 async fn serve(mut socket: WebSocket, shared: &Shared) {
@@ -285,7 +327,11 @@ pub(crate) async fn start(
     exchange: &Exchange,
     executor: &CodexExecutor,
     body: &str,
-) -> (Result<(Upstream<CodexIngress>, TurnControl), ExecError>, Writer, Writer) {
+) -> (
+    Result<(Upstream<CodexIngress>, Option<TurnControl>), ExecError>,
+    Writer,
+    Writer,
+) {
     start_on(Some(SESSION), streams, exchange, executor, body).await
 }
 
@@ -296,7 +342,11 @@ pub(crate) async fn start_on(
     exchange: &Exchange,
     executor: &CodexExecutor,
     body: &str,
-) -> (Result<(Upstream<CodexIngress>, TurnControl), ExecError>, Writer, Writer) {
+) -> (
+    Result<(Upstream<CodexIngress>, Option<TurnControl>), ExecError>,
+    Writer,
+    Writer,
+) {
     let mut request = streams.request();
     let mut response = streams.response(&request);
     let (store, id) = (&streams.store, identity(Direction::Request));

@@ -228,7 +228,7 @@ async fn fenced<T>(
     (out, fenced.writer)
 }
 
-type Turned = Result<(Started, <XaiExecutor as Turns>::Cancel), ExecError>;
+type Turned = Result<(Started, Option<<XaiExecutor as Turns>::Cancel>), ExecError>;
 
 /// Starts one turn of `body` through the pipeline on the client connection's session.
 async fn start(streams: &Streams, exchange: &Exchange, executor: &XaiExecutor, body: &str) -> (Turned, Writer) {
@@ -562,7 +562,9 @@ async fn cancel_and_credential_removal_close_only_their_sockets() {
         let executors = executors();
         let executor = &executors.openai.xai;
         let (started, _request) = start(&streams, &exchange, executor, &request(json!([user("hi")]))).await;
-        let (started, cancel) = started.expect("the turn starts");
+        let (started, Some(cancel)) = started.expect("the turn starts") else {
+            panic!("the turn runs on the socket")
+        };
         match closer {
             Closer::CancelInFlight => {
                 cancel.cancel().await;

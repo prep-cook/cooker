@@ -54,6 +54,8 @@ struct Upstream {
     /// A held response's HTTP body was dropped, or its socket got `response.interrupt`, the
     /// transport's cancel command.
     cancelled: AtomicBool,
+    /// WebSocket upgrades get 426, as from an upstream without WebSocket support.
+    refuse_upgrades: AtomicBool,
 }
 
 impl Upstream {
@@ -102,6 +104,9 @@ async fn upstream(
         .trim_start_matches("Bearer ")
         .to_owned();
     if let Ok(ws) = ws {
+        if up.refuse_upgrades.load(Ordering::SeqCst) {
+            return (axum::http::StatusCode::UPGRADE_REQUIRED, "upgrade required").into_response();
+        }
         return ws
             .on_upgrade(move |socket| serve_socket(up, key, socket))
             .into_response();
@@ -347,6 +352,9 @@ enum Row {
     CloseCancels(bool),
     /// 8. A third `response.create` while one runs and one waits.
     Overload,
+    /// 9. The upstream refuses the WebSocket upgrade with 426: each turn, a continuation
+    ///    included, completes over HTTP on the same credential.
+    UpgradeRefused,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -362,6 +370,7 @@ async fn responses_websocket_turns() {
         Row::CloseCancels(false),
         Row::CloseCancels(true),
         Row::Overload,
+        Row::UpgradeRefused,
     ] {
         run(row).await;
     }
@@ -503,6 +512,24 @@ async fn run(row: Row) {
             );
             let sent = p.up.sent();
             assert_eq!(sent[0].1["type"] == "response.create", websockets, "{row:?}: {sent:?}");
+        }
+        Row::UpgradeRefused => {
+            let p = proxy(true, "").await;
+            p.up.refuse_upgrades.store(true, Ordering::SeqCst);
+            let mut client = Client::open(&p).await;
+            let id = completed(&client.turn(first).await);
+            completed(&client.turn(next(&id)).await);
+            let sent = p.up.sent();
+            let [(one, _), (two, request)] = sent.as_slice() else {
+                panic!("{row:?}: one HTTP request per turn: {sent:?}");
+            };
+            assert_eq!((one.as_str(), two.as_str()), ("x", "x"), "{row:?}");
+            let text = said(request);
+            for part in ["first question", "hi", "second"] {
+                assert!(text.contains(part), "{row:?}: {part} resent: {text}");
+            }
+            assert!(!text.contains("previous_response_id"), "{row:?}: {text}");
+            client.close().await;
         }
         Row::Overload => {
             let p = proxy(false, "").await;
