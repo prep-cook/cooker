@@ -326,6 +326,13 @@
               }
             }
           }
+        },
+        "upstream-timeouts": {
+          "fields": {
+            "header-seconds": "int",
+            "idle-seconds": "int",
+            "total-seconds": "int"
+          }
         }
       }
     },

@@ -399,6 +399,33 @@ enum Script {
     Held,
     /// The executor panics.
     Panics,
+    /// The upstream never sends its response headers.
+    NoHeaders,
+    /// A comment, then the body stalls before any content.
+    StallsSilent,
+    /// One content chunk, then the body stalls.
+    StallsAfterContent,
+    /// A comment every 300 ms, never any content or end.
+    TricklesSilent,
+    /// A content chunk every 300 ms, never an end.
+    TricklesContent,
+}
+
+impl Script {
+    /// The upstream deadlines the script runs under, unless the defaults.
+    fn timeouts(self) -> Option<&'static str> {
+        match self {
+            // The total cannot expire first, so only the header or idle deadline ends these.
+            Script::NoHeaders | Script::StallsSilent | Script::StallsAfterContent => {
+                Some("requests: {upstream-timeouts: {header-seconds: 2, idle-seconds: 2, total-seconds: 60}}")
+            }
+            // The chunks keep the idle deadline from expiring, so only the total ends these.
+            Script::TricklesSilent | Script::TricklesContent => {
+                Some("requests: {upstream-timeouts: {header-seconds: 2, idle-seconds: 2, total-seconds: 3}}")
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Log lines of one exchange.
@@ -625,6 +652,24 @@ impl Execute for Executor<'_> {
                     .boxed()
             }
             Script::Panics => panic!("the executor panics"),
+            Script::NoHeaders => std::future::pending().await,
+            Script::StallsSilent => stream::iter([Ok(Bytes::from_static(b": waiting\n\n"))])
+                .chain(stream::pending())
+                .boxed(),
+            Script::StallsAfterContent => stream::iter([Ok(content())]).chain(stream::pending()).boxed(),
+            Script::TricklesSilent | Script::TricklesContent => {
+                let silent = matches!(self.script, Script::TricklesSilent);
+                stream::unfold((), move |()| async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let chunk = if silent {
+                        Bytes::from_static(b": waiting\n\n")
+                    } else {
+                        content()
+                    };
+                    Some((Ok(chunk), ()))
+                })
+                .boxed()
+            }
             Script::Old | Script::Refence(_) => unreachable!("never started"),
         };
         Ok(Upstream {
@@ -1061,6 +1106,86 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
             withheld: 0,
         },
         Row {
+            case: "an upstream that sends no headers in time fails over",
+            history: None,
+            scripts: [Script::NoHeaders, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["a", "b"],
+            settled: &[0, 1],
+            failed: &[true, false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            responses: false,
+            withheld: 0,
+        },
+        Row {
+            case: "an upstream body idle before any content fails over",
+            history: None,
+            scripts: [Script::StallsSilent, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["a", "b"],
+            settled: &[0, 1],
+            failed: &[true, false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            responses: false,
+            withheld: 0,
+        },
+        Row {
+            case: "an upstream body trickling past the attempt's total before any content fails over",
+            history: None,
+            scripts: [Script::TricklesSilent, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: true },
+            started: &["a", "b"],
+            settled: &[0, 1],
+            failed: &[true, false],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            responses: false,
+            withheld: 0,
+        },
+        Row {
+            case: "an upstream body idle after commitment ends with an error and does not retry",
+            history: None,
+            scripts: [Script::StallsAfterContent, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: false },
+            started: &["a"],
+            settled: &[0],
+            failed: &[true],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            responses: false,
+            withheld: 0,
+        },
+        Row {
+            case: "an upstream body trickling past the attempt's total after commitment ends with an error",
+            history: None,
+            scripts: [Script::TricklesContent, Script::Answers],
+            request: None,
+            ends: Ends::Commits { clean: false },
+            started: &["a"],
+            settled: &[0],
+            failed: &[true],
+            input_tokens: None,
+            old: 0,
+            cooled: &[],
+            compact: false,
+            responses: false,
+            withheld: 0,
+        },
+        Row {
             case: "a failure after commitment does not retry",
             history: None,
             scripts: [Script::FailsAfterContent, Script::Answers],
@@ -1243,7 +1368,8 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
     let usage = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
     for row in rows {
         let case = row.case;
-        let fixture = Fixture::with_credentials(vec![credential("a"), credential("b")], &upstream);
+        let timeouts = row.scripts.iter().find_map(|script| script.timeouts()).unwrap_or("");
+        let fixture = Fixture::with_credentials_config(timeouts, vec![credential("a"), credential("b")], &upstream);
         fixture.rt.usage_queue().configure(true, &usage);
         let (release, released) = oneshot::channel();
         let fake = Fake {
@@ -1324,6 +1450,11 @@ async fn each_attempt_settles_and_is_discarded_before_the_next() {
                         assert!(
                             ended && text.contains("lo") && !text.contains("\"error\":{"),
                             "{case}: only the committed attempt reaches the client: {text}"
+                        );
+                    } else {
+                        assert!(
+                            text.contains("\"error\":{"),
+                            "{case}: the client reads the committed attempt's failure: {text}"
                         );
                     }
                 }

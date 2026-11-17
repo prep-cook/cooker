@@ -16,6 +16,12 @@
 //! the stream the same way. Nothing else ends a producer: cancel goes through the allocation
 //! handle in [`Started::stream`], never through task abort.
 //!
+//! [`start`] bounds every attempt by `requests.upstream-timeouts`: the executor must return
+//! the upstream's headers within the header deadline, and the producer's body must deliver a
+//! chunk within the idle deadline of the previous one and end within the attempt's total
+//! deadline. An expired deadline is a transport failure: before commitment the server fails
+//! over; after it the ingress publishes the upstream failure, as for a body error.
+//!
 //! The functions here are generic over one executor; the selector in `lib.rs` calls them
 //! with the provider's implementation.
 
@@ -30,6 +36,7 @@ use ck_translate::codec::{self, Capability, Operation, RequestFence, RequestView
 use futures_util::StreamExt;
 use http::HeaderMap;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::session::{Turn, Turns};
 use crate::types::{Attempt, Body, Counted, Execute, Request, Streams, Upstream};
@@ -80,24 +87,37 @@ pub async fn start<E: Execute>(
     mut response: Writer,
 ) -> Result<Started, ExecError> {
     let published = attach(attempt, &mut response)?;
+    let timeouts = attempt.cfg.upstream_timeouts();
+    let began = Instant::now();
+    let deadlines = Deadlines {
+        idle: timeouts.idle,
+        total: began + timeouts.total,
+    };
     let streams = Streams {
         request: upload,
         response: &mut response,
     };
-    let upstream = match request.validated().view().operation {
-        Operation::Generate | Operation::Media(_) | Operation::AlphaSearch => {
-            executor.execute(attempt, request, streams).await
+    let operation = request.validated().view().operation;
+    // Dropping the executor at the deadline cancels its request, as a client disconnect does.
+    let answered = tokio::time::timeout_at((began + timeouts.header).min(deadlines.total), async {
+        match operation {
+            Operation::Generate | Operation::Media(_) | Operation::AlphaSearch => {
+                executor.execute(attempt, request, streams).await.map(Answer::Upstream)
+            }
+            Operation::Compact => executor.compact(attempt, request, streams).await.map(Answer::Upstream),
+            Operation::CountTokens => match executor.count_tokens(attempt, request, streams).await {
+                Ok(Counted::Upstream(upstream)) => Ok(Answer::Upstream(upstream)),
+                Ok(Counted::Local { .. }) if request.upstream_count_only() => Err(local_count_refused()),
+                Ok(Counted::Local { input_tokens }) => Ok(Answer::Local(input_tokens)),
+                Err(error) => Err(error),
+            },
         }
-        Operation::Compact => executor.compact(attempt, request, streams).await,
-        Operation::CountTokens => match executor.count_tokens(attempt, request, streams).await {
-            Ok(Counted::Upstream(upstream)) => Ok(upstream),
-            Ok(Counted::Local { .. }) if request.upstream_count_only() => Err(local_count_refused()),
-            Ok(Counted::Local { input_tokens }) => return Ok(local_count(attempt, response, input_tokens)),
-            Err(error) => Err(error),
-        },
-    };
-    match upstream {
-        Ok(upstream) => Ok(spawn(upstream, response, published)),
+    })
+    .await
+    .unwrap_or_else(|_| Err(timed_out(Expired::Header)));
+    match answered {
+        Ok(Answer::Upstream(upstream)) => Ok(spawn(upstream, response, published, Some(deadlines))),
+        Ok(Answer::Local(input_tokens)) => Ok(local_count(attempt, response, input_tokens)),
         Err(error) => {
             response.finish(Terminal::UpstreamError);
             Err(error)
@@ -121,7 +141,8 @@ pub async fn start_turn<E: Turns>(
         response: &mut response,
     };
     match executor.turn(attempt, request, streams).await {
-        Ok(Turn { upstream, cancel }) => Ok((spawn(upstream, response, published), cancel)),
+        // A Responses WebSocket turn keeps its socket's own liveness rules.
+        Ok(Turn { upstream, cancel }) => Ok((spawn(upstream, response, published, None), cancel)),
         Err(error) => {
             response.finish(Terminal::UpstreamError);
             Err(error)
@@ -144,17 +165,65 @@ fn attach(attempt: &Attempt<'_>, response: &mut Writer) -> Result<Published, Exe
     }
 }
 
+/// What an executor answered within the header deadline.
+enum Answer<I> {
+    Upstream(Upstream<I>),
+    /// A local token count.
+    Local(u64),
+}
+
+/// The body deadlines of one attempt.
+#[derive(Clone, Copy)]
+struct Deadlines {
+    /// Between two body chunks.
+    idle: Duration,
+    /// When the attempt's total time runs out.
+    total: Instant,
+}
+
+impl Deadlines {
+    /// When the body expires if its last chunk came at `last`, and which deadline that is.
+    fn next(self, last: Instant) -> (Instant, Expired) {
+        let idle = last + self.idle;
+        if idle < self.total {
+            (idle, Expired::Idle)
+        } else {
+            (self.total, Expired::Total)
+        }
+    }
+}
+
+/// Which upstream deadline expired.
+#[derive(Clone, Copy, Debug)]
+enum Expired {
+    Header,
+    Idle,
+    Total,
+}
+
+/// An expired deadline: a transport fault, which fails over before commitment and cools no
+/// credential.
+fn timed_out(expired: Expired) -> ExecError {
+    let message = match expired {
+        Expired::Header => "upstream sent no response headers in time",
+        Expired::Idle => "upstream stream idle timeout",
+        Expired::Total => "upstream attempt exceeded its time limit",
+    };
+    ExecError::local(504, FailureScope::Transport, message)
+}
+
 /// Starts the producer of an upstream that answered.
 fn spawn<I: ResponseIngress + Send + 'static>(
     upstream: Upstream<I>,
     response: Writer,
     published: Published,
+    deadlines: Option<Deadlines>,
 ) -> Started {
     Started {
         status: upstream.status,
         headers: upstream.headers,
         stream: response.allocator(),
-        producer: tokio::spawn(produce(upstream.body, upstream.ingress, response, published)),
+        producer: tokio::spawn(produce(upstream.body, upstream.ingress, response, published, deadlines)),
     }
 }
 
@@ -183,14 +252,16 @@ fn local_count(attempt: &Attempt<'_>, writer: Writer, input_tokens: u64) -> Star
 
 /// Feeds `body` into `ingress` until the ingress publishes a terminal record or the stream
 /// stops. A due flush deadline is served before any wait, so a ready body cannot postpone
-/// it; a stopped stream goes before the body.
+/// it; a stopped stream goes before the body, and so does an expired upstream deadline.
 async fn produce<I: ResponseIngress>(
     mut body: Body,
     mut ingress: I,
     mut writer: Writer,
     mut published: Published,
+    deadlines: Option<Deadlines>,
 ) -> Result<(), ExecError> {
     let mut stopped = pin!(writer.cancelled());
+    let mut last = Instant::now();
     loop {
         let flush = match ingress.flush_deadline() {
             Some(deadline) if deadline <= writer.now() => {
@@ -205,9 +276,15 @@ async fn produce<I: ResponseIngress>(
         let (step, ended) = tokio::select! {
             biased;
             terminal = &mut stopped => return stopped_outcome(terminal),
+            expired = expiry(deadlines.map(|deadlines| deadlines.next(last))) => {
+                return cut(ingress, writer, timed_out(expired)).await;
+            }
             () = until(flush) => (ingress.flush(&mut writer), false),
             chunk = body.next() => match chunk {
-                Some(Ok(bytes)) => (ingress.advance(&mut writer, &bytes), false),
+                Some(Ok(bytes)) => {
+                    last = Instant::now();
+                    (ingress.advance(&mut writer, &bytes), false)
+                }
                 // Settling after every call returns at `done`, so the response is incomplete.
                 Some(Err(error)) => return cut(ingress, writer, error).await,
                 None => (ingress.finish(&mut writer), true),
@@ -229,6 +306,17 @@ async fn cut<I: ResponseIngress>(mut ingress: I, mut writer: Writer, error: Exec
         }
         Err(codec::Error::Storage(failure)) => storage(&mut writer, failure).await,
         Err(_) => Err(defect(&mut writer)),
+    }
+}
+
+/// Sleeps until the body deadline `next` and names it; pending without one.
+async fn expiry(next: Option<(Instant, Expired)>) -> Expired {
+    match next {
+        Some((at, expired)) => {
+            tokio::time::sleep_until(at).await;
+            expired
+        }
+        None => std::future::pending().await,
     }
 }
 

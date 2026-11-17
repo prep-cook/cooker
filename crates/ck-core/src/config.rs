@@ -19,6 +19,7 @@ mod realtime;
 mod schema;
 mod timestamp;
 mod trusted;
+mod upstream_timeouts;
 mod validate;
 pub use document::ConfigDocument;
 pub use realtime::Realtime;
@@ -26,6 +27,7 @@ pub use schema::ValidationPath;
 pub use schema::validate as validate_config_fields;
 pub use schema::{coerce_typed_scalars, go_bool, go_int};
 pub use timestamp::{AsJson, TAG as TIMESTAMP_TAG};
+pub use upstream_timeouts::UpstreamTimeouts;
 
 /// `text` parsed as serde_yaml_ng does, except for plain scalars it reads otherwise
 /// than yaml.v3: an integer beyond int64 and uint64, which serde_yaml_ng refuses when
@@ -628,6 +630,7 @@ impl Config {
         trusted::validate(&trusted_proxies)?;
         validate::go_custom(document.value())?;
         realtime::Realtime::read(document.value().get("realtime"))?;
+        upstream_timeouts::UpstreamTimeouts::read(document.value())?;
         let oauth_only = schema::oauth_only_paths(&Value::Mapping(root.clone()));
         Ok(Config {
             host,
