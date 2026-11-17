@@ -96,7 +96,7 @@ impl Execute for XaiExecutor {
         let body = call.rules(Format::Codex, &upload, std::mem::take(&mut prepared.body));
         let headers = call.headers(&prepared, true, true);
         let url = xai::endpoint(&xai::chat_base_url(attempt.credential), "/responses");
-        let ingress = Ingress::new(
+        let mut ingress = Ingress::new(
             streams.response,
             attempt.identity,
             Operation::Generate,
@@ -104,6 +104,7 @@ impl Execute for XaiExecutor {
             MAX_LINE as u64,
         )
         .map_err(encoding)?;
+        ingress.done_sentinel();
         let events = Events::new(ingress, prepared, self.replay.clone(), &upload);
         let upstream = self.send(&call, url, headers, body).await?;
         Ok(Upstream {

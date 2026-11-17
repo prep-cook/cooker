@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use ck_core::exec::{CaptureEvent, CaptureObserver, CaptureSink, FailureScope, UsageObserver, UsageSink};
 use ck_core::format::Format;
 use ck_stream::Terminal;
-use ck_translate::codec::Operation;
+use ck_translate::codec::{BodyMode, Operation};
 
 use crate::common::*;
 use crate::support::Streams;
@@ -106,10 +106,11 @@ async fn a_failure_event_fails_with_the_meta_classification() {
             "{records:?}"
         );
         assert!(records.iter().any(|r| r.contains("hel")), "{records:?}");
+        // A failed stream ends without the sentinel a completed Meta stream gets.
         assert!(
             !records
                 .iter()
-                .any(|r| r.contains("vendor.invalid") || r.contains("private")),
+                .any(|r| r.contains("vendor.invalid") || r.contains("private") || r.contains("[DONE]")),
             "{records:?}"
         );
         let usage_record = records.iter().position(|r| r.contains("event: x_ck.usage"));
@@ -200,21 +201,32 @@ async fn a_line_past_the_scanner_limit_fails() {
     assert_eq!(errors(&records), 1);
 }
 
-/// The canonical stream does not depend on how the upstream body was split.
+/// The canonical stream does not depend on how the upstream body was split, and a streamed
+/// Responses client gets Meta's terminal event, then `data: [DONE]` once, whether the sentinel
+/// came with the terminal event, in its own chunk or byte by byte.
 #[tokio::test]
 async fn any_split_gives_the_same_response() {
+    let body = sse() + "data: [DONE]\n\n";
     let mut seen = Vec::new();
     for reply in [
-        Reply::sse(sse()),
-        Reply::sse(sse()).byte_at_a_time(),
-        Reply::sse(sse().replace('\n', "\r\n")).byte_at_a_time(),
+        Reply::sse(body.clone()),
+        Reply::sse(body.clone()).throttle(sse().len(), std::time::Duration::ZERO),
+        Reply::sse(body.clone()).byte_at_a_time(),
+        Reply::sse(body.replace('\n', "\r\n")).byte_at_a_time(),
     ] {
         let upstream = StreamUpstream::start([reply]).await;
         let (streams, exchange) = (Streams::new(), exchange(&upstream));
         let (started, id, _request) = run(&streams, &exchange, "chat", Operation::Generate, CHAT, 1).await;
-        let (outcome, published, _stream) = finish(&streams, started.unwrap(), id).await;
+        let (outcome, published, mut stream) = finish(&streams, started.unwrap(), id).await;
         outcome.unwrap();
         seen.push(records(&published));
+        let out = egress(&streams, "responses", &mut stream, id, BodyMode::Streaming).await;
+        let tail = out.rsplit("event: ").next().unwrap();
+        assert!(
+            tail.starts_with("response.completed\n") && tail.ends_with("}\n\ndata: [DONE]\n\n"),
+            "{out}"
+        );
+        assert_eq!(out.matches("[DONE]").count(), 1, "{out}");
     }
     assert!(seen.iter().all(|records| *records == seen[0]), "{seen:#?}");
 }

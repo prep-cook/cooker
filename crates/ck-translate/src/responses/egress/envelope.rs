@@ -141,10 +141,12 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         Ok(())
     }
 
-    /// Closes the response: buffered mode writes the body, streaming the terminal event.
+    /// Closes the response: buffered mode writes the body, streaming the terminal event and,
+    /// when the source's contract ends its stream with one, the `data: [DONE]` sentinel.
     pub(super) fn done(
         &mut self,
         owner: &mut Writer,
+        sentinel: bool,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         if self.images.iter().any(|image| !image.closed) || self.audio.iter().any(|audio| !audio.closed) {
@@ -175,7 +177,11 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 write_lease(&response, e)
             },
             output,
-        )
+        )?;
+        if sentinel {
+            output(encode::scratch(owner, |e| e.bytes(b"data: [DONE]\n\n"))?)?;
+        }
+        Ok(())
     }
 
     /// Restores native response fields, or writes or drops an unknown event.

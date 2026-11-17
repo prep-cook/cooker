@@ -64,8 +64,19 @@ impl State {
             },
             |_| Ok(()),
         )?;
-        self.emitter
-            .emit(owner, Kind::Done, Scope::default(), |_| Ok(()), |_| Ok(()))?;
+        let sentinel = self.sentinel;
+        self.emitter.emit(
+            owner,
+            Kind::Done,
+            Scope::default(),
+            |_| Ok(()),
+            |e| {
+                if sentinel {
+                    e.bytes(b",\"source\":{\"protocol\":\"responses\",\"sentinel\":\"[DONE]\"}")?;
+                }
+                Ok(())
+            },
+        )?;
         self.terminal = true;
         Ok(())
     }

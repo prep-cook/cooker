@@ -155,7 +155,15 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             Kind::Heartbeat => return Ok(()),
             Kind::Error | Kind::Cancelled => return self.failed(owner, kind, incoming, output),
             Kind::ResponseStart => return self.response_start(incoming),
-            Kind::Done => return self.done(owner, output),
+            Kind::Done => {
+                let sentinel = match incoming.member(x, "source")? {
+                    Some(source) => {
+                        is(&incoming, source, "protocol", "responses")? && is(&incoming, source, "sentinel", "[DONE]")?
+                    }
+                    None => false,
+                };
+                return self.done(owner, sentinel, output);
+            }
             Kind::Opaque => return self.opaque(owner, incoming, output),
             Kind::Usage | Kind::Chunk => {}
             _ => self.created(owner, output)?,

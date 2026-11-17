@@ -325,6 +325,8 @@ async fn responses_stream_reaches_every_client_egress() {
         assert_eq!(published.terminal, Some(Terminal::Done));
         let out = egress(&streams, client, &mut stream, id, BodyMode::Streaming).await;
         assert!(out.contains("hello"), "{client}: {out}");
+        // Kimi's Responses stream has no `[DONE]` sentinel.
+        assert!(client == "chat" || !out.contains("[DONE]"), "{client}: {out}");
         let sent = &upstream.captured()[0];
         assert_eq!(sent.path, "/coding/v1/responses");
         assert_eq!(sent.header("accept"), Some("text/event-stream"));

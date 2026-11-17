@@ -256,20 +256,36 @@ fn assert_every_egress(streams: &Streams, owner: &mut Writer, mode: BodyMode) {
 }
 
 /// The canonical stream does not depend on how the body was split, a completion whose
-/// `output` is empty included.
+/// `output` is empty included, and a streamed Responses client gets xAI's terminal event, then
+/// `data: [DONE]` once, whether the sentinel came with the terminal event, in its own chunk or
+/// byte by byte.
 #[tokio::test]
 async fn any_split_gives_the_same_records() {
-    for body in [sse(), sse_with(json!([]))] {
+    for terminal in [sse(), sse_with(json!([]))] {
+        let body = terminal.clone() + "data: [DONE]\n\n";
         let mut seen = Vec::new();
-        for reply in [Reply::sse(body.clone()), Reply::sse(body.clone()).byte_at_a_time()] {
+        for reply in [
+            Reply::sse(body.clone()),
+            Reply::sse(body.clone()).throttle(terminal.len(), std::time::Duration::ZERO),
+            Reply::sse(body.clone()).byte_at_a_time(),
+        ] {
             let streams = Streams::new();
             let upstream = StreamUpstream::start([reply]).await;
             let run = run(&streams, &upstream, Client::Responses, RESPONSES, 64).await;
-            let (outcome, published, _) = produce(&streams, run.started.unwrap()).await;
+            let (outcome, published, mut owner) = produce(&streams, run.started.unwrap()).await;
             outcome.unwrap();
             seen.push(records(&published));
+            let mut egress =
+                crate::support::responses_egress(&mut owner, Operation::Generate, BodyMode::Streaming).unwrap();
+            let out = deliver(&streams, &mut owner, &mut egress);
+            let tail = out.rsplit("event: ").next().unwrap();
+            assert!(
+                tail.starts_with("response.completed\n") && tail.ends_with("}\n\ndata: [DONE]\n\n"),
+                "{out}"
+            );
+            assert_eq!(out.matches("[DONE]").count(), 1, "{out}");
         }
-        assert_eq!(seen[0], seen[1]);
+        assert!(seen.iter().all(|records| *records == seen[0]), "{seen:#?}");
     }
 }
 

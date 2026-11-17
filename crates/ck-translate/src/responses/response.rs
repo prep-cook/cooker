@@ -77,6 +77,7 @@ impl Ingress {
                 client_declared_tools: 0,
                 classified: false,
                 held: false,
+                sentinel: false,
             },
             failed: false,
         })
@@ -92,6 +93,12 @@ impl Ingress {
     /// that ends instead gets the default 502.
     pub fn classified_failures(&mut self) {
         self.state.classified = true;
+    }
+    /// The upstream's contract (xAI, Meta) ends a successful stream with `data: [DONE]` after
+    /// the terminal event: the `done` record says so, so a streamed Responses client gets it
+    /// whether or not the upstream's sentinel was read before the completion boundary.
+    pub fn done_sentinel(&mut self) {
+        self.state.sentinel = true;
     }
     /// xAI's hosted X Search calls must not shadow tools declared by the client.
     pub fn xai(&mut self, request: &[u8]) {
@@ -245,6 +252,8 @@ struct State {
     classified: bool,
     /// A classified `response.failed` ended the response; its `error` record is not out yet.
     held: bool,
+    /// See [`Ingress::done_sentinel`].
+    sentinel: bool,
 }
 impl Item {
     fn scope(&self, block: Option<u64>) -> Scope {
