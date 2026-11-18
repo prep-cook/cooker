@@ -34,7 +34,7 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    /// `configure` adjusts the store's settings: a 768-frame pool and 16 header slots.
+    /// `configure` adjusts the store's settings: a 192-frame pool and 16 header slots.
     pub fn new(configure: impl FnOnce(&mut ck_stream::Config)) -> Self {
         Self::with_config("", configure)
     }
@@ -86,7 +86,7 @@ impl Fixture {
         };
         let rt = Arc::new(ck_server::testing::runtime(config, credentials, executors));
         let mut stream = ck_stream::Config::new(directory.join("pool"));
-        stream.pool_bytes = Some(768 * ck_stream::FRAME_BYTES);
+        stream.pool_bytes = Some(192 * ck_stream::FRAME_BYTES);
         stream.max_metadata_bytes = 4 * 1024 * 1024;
         stream.header_slots = 16;
         stream.workers = 1;

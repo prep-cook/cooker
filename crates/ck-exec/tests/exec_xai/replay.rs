@@ -165,7 +165,7 @@ async fn replay_takes_no_storage_from_delivery() {
     let body = format!("{blob}{completed}");
     let executors = executors();
     let mut completions = 0;
-    for frames in (192..=384).step_by(12) {
+    for frames in (48..=96).step_by(3) {
         let mut ends = Vec::new();
         for principal in ["", "sk-a"] {
             let streams = Streams::with_frames(frames);

@@ -54,14 +54,14 @@ fn completed(mapped: &Mapped) -> Option<Value> {
         .find(|event| event["status"] == "completed")
 }
 
-/// 500 audio deltas of 40 bytes each fit a 192-frame pool: they share data records instead of
+/// 500 audio deltas of 40 bytes each fit a 48-frame pool: they share data records instead of
 /// costing a frame-aligned record each. The store clock stands still, so no deadline passes.
 #[test]
 fn streamed_audio_deltas_share_data_records() {
     let raw = sample(500 * 40);
     let mut stream: String = raw.chunks(40).map(|piece| audio(&encode(piece))).collect();
     stream += &end();
-    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 192);
+    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 48);
     let mut ingress = streamed(&mut mapped);
     feed(&mut ingress, &mut mapped, &stream);
     ingress.finish(&mut mapped.writer).unwrap();
@@ -239,7 +239,7 @@ fn rejected_delta_adds_no_bytes_across_the_threshold() {
 /// A storage failure disarms the held audio's deadline; the failed ingress is not flushed.
 #[test]
 fn storage_failure_disarms_the_audio_deadline() {
-    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 192);
+    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 48);
     let mut ingress = streamed(&mut mapped);
     let content = json!({"choices":[{"index":1,"delta":{"content":"x".repeat(500_000)}}]});
     ingress

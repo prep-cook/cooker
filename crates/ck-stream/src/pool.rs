@@ -17,15 +17,15 @@ mod states;
 #[cfg(test)]
 mod tests;
 
-/// Frames backed at open and per growth step: 1 MiB, close to the 21 × 50,000-byte extent
-/// it replaces (owner W0-1, 2026-11-16: initial frames 256).
-const EXTENT: u32 = 256;
-/// Most cold frames populated in one call for one reservation: 64 KiB, which covers a
-/// 50,000-byte data record from any offset (at most 14 frames).
-const COLD_RUN: u32 = 16;
+/// Frames backed at open and per growth step: 1 MiB, the size owner W0-1 ruled on
+/// 2026-11-16 (then 256 frames of 4,096 bytes).
+const EXTENT: u32 = 64;
+/// Most cold frames populated in one call for one reservation: 80 KiB, which covers a
+/// 50,000-byte data record from any offset (at most 5 frames).
+const COLD_RUN: u32 = 5;
 /// Idle free frames decay keeps per worker list: the 400,000-byte budget of 8 × 50,000-byte
-/// frames rounded up to whole 4,096-byte frames (INTERNAL-STREAM §6.5) until measured.
-const WARM: usize = 98;
+/// frames rounded up to whole 16,384-byte frames (INTERNAL-STREAM §6.5) until measured.
+const WARM: usize = 25;
 static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static THREAD_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
@@ -390,7 +390,8 @@ impl Pool {
             return Ok(());
         }
         assert!(frame < self.backed_frames() && needed <= FRAME_BYTES);
-        // A frame is at most one page, so this populates it whole in one call.
+        // This populates only through the page holding `needed`, so a frame filled by small
+        // records costs one call per page: up to four on 4 KiB-page hosts.
         self.populate(frame, ready, needed)
     }
 

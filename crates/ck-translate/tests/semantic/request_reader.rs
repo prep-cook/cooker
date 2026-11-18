@@ -188,7 +188,7 @@ fn plain_base64_file_data_carries_a_supplied_mime() {
 fn rebuilt_with(input: &Json, transform: impl Fn(codec::event::Kind, &mut Document)) -> codec::Result<()> {
     use codec::RequestIngress;
     use std::task::Poll;
-    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 3072);
+    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 768);
     let mut ingress = super::Ingress::new(
         &mut mapped.writer,
         &mapped.store,

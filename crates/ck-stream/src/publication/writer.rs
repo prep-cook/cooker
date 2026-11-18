@@ -5,8 +5,8 @@ use parking_lot::MutexGuard;
 use super::{Frame, Index, State, Stream, reserve_metadata};
 use crate::{Error, FRAME_BYTES, Position, Record, Terminal, cache::Inner};
 
-/// Frames a reservation takes per release of the stream lock: 64 KiB, which covers a
-/// 50,000-byte data record from any offset (at most 14 frames).
+/// Most frames a reservation takes per release of the stream lock, which bounds one batch
+/// at 256 KiB.
 const TAKE_BATCH: usize = 16;
 
 /// Exclusive stream producer. A disconnect must drop a reader, not this producer.

@@ -6,8 +6,8 @@ use codec::{BodyMode, ResponseIngress, event::Direction};
 fn snapshot_under_budget(budget: usize) -> (Option<(usize, codec::Error)>, usize) {
     let directory = std::env::temp_dir().join(format!("ck-budget-{}", uuid::Uuid::new_v4()));
     let mut config = ck_stream::Config::new(directory.clone());
-    config.pool_bytes = Some(768 * ck_stream::FRAME_BYTES);
-    config.max_event_bytes = 192 * ck_stream::FRAME_BYTES;
+    config.pool_bytes = Some(192 * ck_stream::FRAME_BYTES);
+    config.max_event_bytes = 48 * ck_stream::FRAME_BYTES;
     config.max_metadata_bytes = budget;
     config.header_slots = 8;
     config.workers = 1;

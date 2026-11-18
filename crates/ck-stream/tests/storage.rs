@@ -497,7 +497,7 @@ fn positions_from_another_pool_are_rejected() {
 
 #[test]
 fn one_mib_of_small_records_replays_with_default_metadata_budget() {
-    let (_dir, store, _) = store(260);
+    let (_dir, store, _) = store((1 << 20) / FRAME_BYTES + 4);
     let mut writer = store.create().unwrap();
     for sequence in 0..16_384u32 {
         let payload = [sequence as u8; 64];

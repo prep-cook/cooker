@@ -618,11 +618,11 @@ class StreamLimitChecks(unittest.TestCase):
                 self.attempt(cutoff, charged_frames=frames)
 
     def test_non_integer_frame_count_is_rejected(self):
-        for frames in (65536.0, True, "65536"):
+        for frames in (16384.0, True, "16384"):
             with self.subTest(frames=frames):
                 self.assertIn("integer counter", driver.limit_position_failure(frames))
         with self.assertRaisesRegex(AssertionError, "integer counter"):
-            self.attempt(143, charged_frames=65536.0)
+            self.attempt(143, charged_frames=16384.0)
 
     def test_unreported_position_fails_closed(self):
         with self.assertRaisesRegex(AssertionError, "position unverified"):

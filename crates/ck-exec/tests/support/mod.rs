@@ -37,26 +37,26 @@ pub struct Streams {
 
 impl Streams {
     pub fn new() -> Self {
-        Self::with_frames(768)
+        Self::with_frames(192)
     }
 
     /// A pool of `frames` frames, for storage-exhaustion cases.
     pub fn with_frames(frames: usize) -> Self {
-        Self::with_all_limits(frames, 4 * 1024 * 1024, 192 * ck_stream::FRAME_BYTES)
+        Self::with_all_limits(frames, 4 * 1024 * 1024, 48 * ck_stream::FRAME_BYTES)
     }
 
     /// An exchange metadata quota of `bytes`, for metadata-exhaustion cases.
     pub fn with_metadata(bytes: usize) -> Self {
-        Self::with_all_limits(768, bytes, 192 * ck_stream::FRAME_BYTES)
+        Self::with_all_limits(192, bytes, 48 * ck_stream::FRAME_BYTES)
     }
 
     pub fn with_limits(frames: usize, metadata: usize) -> Self {
-        Self::with_all_limits(frames, metadata, 192 * ck_stream::FRAME_BYTES)
+        Self::with_all_limits(frames, metadata, 48 * ck_stream::FRAME_BYTES)
     }
 
     /// A per-event limit of `bytes`, for a record the stream cannot hold.
     pub fn with_event_bytes(bytes: usize) -> Self {
-        Self::with_all_limits(768, 4 * 1024 * 1024, bytes)
+        Self::with_all_limits(192, 4 * 1024 * 1024, bytes)
     }
 
     fn with_all_limits(frames: usize, metadata: usize, event: usize) -> Self {

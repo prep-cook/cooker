@@ -6,7 +6,7 @@ mod tests;
 
 use anyhow::{Context, Result, bail, ensure};
 use backend::Backend;
-use ck_stream::{FRAME_BYTES, Read, Terminal};
+use ck_stream::{FRAME_BYTES, MAX_POOL_BYTES, MAX_STREAM_FRAMES, Read, Terminal};
 use payload::{Check, pattern};
 use serde_json::{Value, json};
 use std::{
@@ -303,7 +303,8 @@ fn totalcap(backend: &Backend) -> Result<Value> {
         bail!("totalcap requires pool");
     };
     ensure!(
-        store.limits().pool_frames == 1_048_576 && store.limits().max_frames == 65_536,
+        store.limits().pool_frames as usize == MAX_POOL_BYTES / FRAME_BYTES
+            && store.limits().max_frames == MAX_STREAM_FRAMES,
         "host startup cap lowered pool: {}",
         backend.counters()
     );
@@ -336,9 +337,9 @@ fn totalcap(backend: &Backend) -> Result<Value> {
             "unexpected cap error {error}"
         );
         terminal_error(&mut reader)?;
-        // 16 × 65,536 = 1,048,576: stream 17 finds no frame left.
+        // 16 × 16,384 = 262,144: stream 17 finds no frame left.
         ensure!(
-            count == if stream < 16 { 65_536 } else { 0 },
+            count == if stream < 16 { MAX_STREAM_FRAMES } else { 0 },
             "stream {} stopped at {count} frames",
             stream + 1
         );
@@ -346,7 +347,10 @@ fn totalcap(backend: &Backend) -> Result<Value> {
         errors.push(error.to_string());
         held.push((writer, reader, leases));
     }
-    ensure!(store.used_frames() >= 85888, "pinned frames unexpectedly released");
+    ensure!(
+        store.used_frames() >= 16 * MAX_STREAM_FRAMES,
+        "pinned frames unexpectedly released"
+    );
     Ok(json!({"stream_frames":counts,"errors":errors,"survived":true,"counters":backend.counters()}))
 }
 fn enospc(backend: &Backend, directory: &Path) -> Result<Value> {

@@ -29,8 +29,8 @@ ARGUMENTS = '{"path":"src/測試.rs","line":17}'
 MEDIA = bytes(range(256)) * 32768  # 8 MiB, including invalid textual UTF-8.
 TIMEOUT = 12
 # §6.4: one exchange's request, response, scratch and replay frames share
-# max_frames = 65,536; the allocation of the 65,537th frame fails (§9.1 Bounds).
-STREAM_MAX_FRAMES = 65536
+# max_frames = 16,384; the allocation of the 16,385th frame fails (§9.1 Bounds).
+STREAM_MAX_FRAMES = 16384
 BULK_CONTENT = 40966  # f"{i:05d}:" plus 40,960 bytes per bulk record
 DIAGNOSTIC = "diagnostic, not acceptance"
 # §9.2 flow-limit metrics and how scenario values combine. The gateway exposes
@@ -743,10 +743,10 @@ def check_stream_limit(gateway, response):
 
 
 def limit_position_failure(charged_frames):
-    """The error must fire exactly when the exchange holds all 65,536 frames (§6.4, §9.1 Bounds)."""
+    """The error must fire exactly when the exchange holds all 16,384 frames (§6.4, §9.1 Bounds)."""
     if charged_frames is None:
         return ("storage error position unverified: the gateway reports no frames charged to the "
-                "failed exchange, so the 65,537th-frame failure cannot be checked to one frame")
+                "failed exchange, so the 16,385th-frame failure cannot be checked to one frame")
     if type(charged_frames) is not int:
         return f"frames charged must be an integer counter, not {charged_frames!r}"
     if charged_frames != STREAM_MAX_FRAMES:

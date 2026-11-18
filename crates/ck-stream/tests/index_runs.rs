@@ -86,9 +86,10 @@ fn appends_continue_runs_across_pages_frames_and_other_runs() {
     let mut expected = Vec::new();
     // Equal appends fill the first frame exactly and, after one shorter reserved record,
     // straddle every later frame boundary; each run stays exact.
-    for step in 0..120 {
+    let per_frame = FRAME_BYTES / 256;
+    for step in 0..per_frame * 15 / 2 {
         let byte = expected.len() as u8;
-        let record = if step == 20 {
+        let record = if step == per_frame + 4 {
             append(&mut writer, &[byte; 255], 0, 0)
         } else {
             writer.append(&[byte; 256]).unwrap()
@@ -96,7 +97,7 @@ fn appends_continue_runs_across_pages_frames_and_other_runs() {
         assert_eq!(record.sequence, expected.len() as u64);
         expected.push((record, byte));
     }
-    let end = expected[15].0.end;
+    let end = expected[per_frame - 1].0.end;
     assert_eq!((end.frame, end.offset), (1, 0));
     assert!(
         expected

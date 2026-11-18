@@ -43,7 +43,7 @@ fn growth_reuse_and_exact_cap() {
     let capacity = EXTENT + 24;
     let pool = Pool::open(&directory.0, capacity, 3, 2, 0).unwrap();
     assert_eq!(pool.capacity(), capacity);
-    // Owner W0-1 (2026-11-16): a pool opens with 256 frames, 1 MiB, backed.
+    // Owner W0-1 (2026-11-16): a pool opens with 1 MiB backed.
     assert_eq!(pool.backed_frames() as usize * FRAME_BYTES, 1 << 20);
     let mut allocated = Vec::new();
     for n in 0..capacity {
@@ -166,8 +166,8 @@ fn the_warm_budget_is_pool_wide() {
     pool.decay().unwrap();
     pool.decay().unwrap();
     let kept: usize = pool.shards.iter().map(|shard| shard.0.lock().frames.len()).sum();
-    // 98 frames (401,408 bytes) per free list, the 400,000-byte budget in whole frames.
-    assert_eq!(kept * FRAME_BYTES, 2 * 401_408);
+    // Each free list keeps the 400,000-byte budget in whole frames.
+    assert_eq!(kept, 2 * 400_000usize.div_ceil(FRAME_BYTES));
 }
 
 /// Resident pages of the per-frame state mapping.
@@ -212,7 +212,7 @@ fn frame_states_stay_in_base_pages() {
     // A states mapping of two huge pages, of which only the initial extent is written.
     let frames = (4 << 20) / std::mem::size_of::<states::FrameState>();
     let pool = Pool::open(&directory.0, frames as u32, 1, 1, 0).unwrap();
-    let written = EXTENT as usize / pool_states_per_page();
+    let written = (EXTENT as usize).div_ceil(pool_states_per_page());
     let resident = resident_state_pages(&pool);
     assert!(
         resident <= written,
@@ -257,7 +257,7 @@ fn cold_frames_prefault_only_the_pages_a_record_needs() {
 #[test]
 fn a_reservation_populates_its_cold_frames_in_one_call() {
     // (frames the reservation takes, cold frames populated): its own frames, at most COLD_RUN.
-    for (run, warmed) in [(1, 1), (13, 13), (40, COLD_RUN as usize)] {
+    for (run, warmed) in [(1, 1), (4, 4), (40, COLD_RUN as usize)] {
         let directory = Directory::new();
         let pool = Pool::open(&directory.0, EXTENT, 1, 1, 0).unwrap();
         pool.decay().unwrap();

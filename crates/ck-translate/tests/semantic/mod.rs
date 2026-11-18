@@ -19,14 +19,14 @@ impl Mapped {
     }
 
     pub fn with_clock(clock: std::sync::Arc<ck_stream::ManualClock>) -> Self {
-        Self::configured(clock, 768)
+        Self::configured(clock, 192)
     }
 
     pub fn configured(clock: std::sync::Arc<ck_stream::ManualClock>, frames: usize) -> Self {
         let directory = std::env::temp_dir().join(format!("ck-codec-{}", uuid::Uuid::new_v4()));
         let mut config = Config::new(directory.clone());
         config.pool_bytes = Some(frames * ck_stream::FRAME_BYTES);
-        config.max_event_bytes = 192 * ck_stream::FRAME_BYTES;
+        config.max_event_bytes = 48 * ck_stream::FRAME_BYTES;
         config.max_metadata_bytes = 4 * 1024 * 1024;
         config.header_slots = 8;
         config.workers = 1;

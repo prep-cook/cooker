@@ -17,7 +17,7 @@ use tokio::sync::Notify;
 
 const MAX_FRAMES: usize = ck_stream::MAX_STREAM_FRAMES as usize;
 const MAX_EVENT: usize = 1024 * 1024;
-/// Frames one record can touch: a 1 MiB event spans at most 257.
+/// Frames one record can touch: a 1 MiB event spans at most 65.
 const MAX_SPAN: usize = MAX_EVENT.div_ceil(FRAME_BYTES) + 1;
 
 #[derive(Default)]

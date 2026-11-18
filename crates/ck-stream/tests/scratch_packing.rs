@@ -97,7 +97,14 @@ fn a_shared_frame_returns_to_the_pool_only_after_its_last_lease_drops() {
 /// Leases taken in order: small ones pack, big ones keep whole frames.
 fn mixed(writer: &mut Writer) -> Vec<(ScratchLease, Vec<u8>)> {
     let mut leases = Vec::new();
-    for (len, byte) in [(100, 1), (FRAME_BYTES + 1, 2), (100, 3), (3_700, 4), (300, 5), (150, 6)] {
+    for (len, byte) in [
+        (100, 1),
+        (FRAME_BYTES + 1, 2),
+        (100, 3),
+        (FRAME_BYTES - 396, 4),
+        (300, 5),
+        (150, 6),
+    ] {
         let bytes = vec![byte; len];
         leases.push((lease(writer, &bytes).unwrap(), bytes));
     }
@@ -108,7 +115,8 @@ fn mixed(writer: &mut Writer) -> Vec<(ScratchLease, Vec<u8>)> {
 fn mixed_leases_fail_at_the_frame_cap_and_roll_back() {
     let (_dir, store) = store(6, 4);
     let mut writer = store.create().unwrap();
-    // 100 + 100 + 3,700 B share one frame, the big lease takes two, 300 + 150 B a fourth.
+    // 100 B, 100 B and a frame less 396 B share one frame, the big lease takes two, and
+    // 300 + 150 B, too big for the 196 B left, take a fourth.
     let leases = mixed(&mut writer);
     assert_eq!(store.used_frames(), 4);
     drop(leases);

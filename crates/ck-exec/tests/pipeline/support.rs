@@ -262,7 +262,7 @@ impl Fixture {
     pub fn new(max_metadata_bytes: usize) -> Self {
         let directory = std::env::temp_dir().join(format!("ck-pipeline-{}", uuid::Uuid::new_v4()));
         let mut config = ck_stream::Config::new(directory.clone());
-        config.pool_bytes = Some(768 * ck_stream::FRAME_BYTES);
+        config.pool_bytes = Some(192 * ck_stream::FRAME_BYTES);
         config.max_metadata_bytes = max_metadata_bytes;
         config.header_slots = 8;
         config.workers = 1;

@@ -17,11 +17,11 @@ pub use position::{Position, Record};
 pub use publication::{Lease, MetadataPermit, Read, Reader, Reservation, ScratchLease, ScratchReservation, Writer};
 pub use request::RequestFieldView;
 
-/// Logical frame size (Settled 57). It equals one OS page only on 4 KiB-page hosts.
-// ponytail: on 16 KiB or 64 KiB-page hosts a frame is sub-page; the pool maps, backs and
-// punches by the host page, so decay reclaims only whole pages of free frames. Upgrade path:
-// size frames from the host page at startup if those hosts matter.
-pub const FRAME_BYTES: usize = 4_096;
+/// Logical frame size (Settled 81): four pages on 4 KiB-page hosts, one on 16 KiB-page hosts.
+// ponytail: on 64 KiB-page hosts a frame is sub-page; the pool maps, backs and punches by
+// the host page, so decay reclaims only whole pages of free frames. Upgrade path: size
+// frames from the host page at startup if those hosts matter.
+pub const FRAME_BYTES: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Terminal {

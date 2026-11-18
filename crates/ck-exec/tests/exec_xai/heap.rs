@@ -59,7 +59,7 @@ static ALLOCATOR: Counting = Counting;
 /// `principal` (none turns replay off). The producer runs on this test's thread.
 async fn allocated(principal: &str, body: &str) -> usize {
     // Room for a 9.6 MB event and what the ingress makes of it.
-    let streams = Streams::with_frames(12_288);
+    let streams = Streams::with_frames(3_072);
     let upstream = StreamUpstream::start([Reply::sse(body.to_owned()).throttle(CHUNK, Duration::ZERO)]).await;
     let mut exchange = exchange(&upstream);
     exchange.caller.principal = principal.into();

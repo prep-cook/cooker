@@ -7,7 +7,7 @@ use crate::{
 
 pub const MAX_POOL_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// 256 MiB per exchange (Settled 41).
-pub const MAX_STREAM_FRAMES: u32 = 65_536;
+pub const MAX_STREAM_FRAMES: u32 = 16_384;
 const HEAP_HEADROOM: usize = 64 * 1024 * 1024;
 
 /// Deploy-only settings. `None` selects the capped default, not an unlimited pool.
@@ -82,7 +82,7 @@ impl Config {
             .pool_bytes
             .is_some_and(|n| n == 0 || n % FRAME_BYTES != 0 || n > MAX_POOL_BYTES)
         {
-            return Err(invalid("pool_bytes must be a nonzero frame multiple at most 4 GiB"));
+            return Err(invalid("pool_bytes must be a nonzero multiple of 16384 at most 4 GiB"));
         }
         let bytes = self
             .pool_bytes
@@ -98,7 +98,7 @@ impl Config {
         let startup_reserve_frames = reserve_bytes.div_ceil(FRAME_BYTES) as u32;
         let max_frames = self.max_frames.unwrap_or(MAX_STREAM_FRAMES.min(pool_frames));
         if !(4..=MAX_STREAM_FRAMES).contains(&max_frames) || max_frames > pool_frames {
-            return Err(invalid("max_frames must be between 4 and min(65536, pool_frames)"));
+            return Err(invalid("max_frames must be between 4 and min(16384, pool_frames)"));
         }
         if self.max_event_bytes == 0
             || self.max_event_bytes > max_frames as usize * FRAME_BYTES
@@ -201,14 +201,14 @@ mod tests {
     #[test]
     fn stream_limits_are_exact_frame_multiples() {
         // (bytes, frames): the per-stream limit and the pool ceiling are whole frames.
-        for (bytes, frames) in [(256 << 20, 65_536), (MAX_POOL_BYTES, 1_048_576)] {
+        for (bytes, frames) in [(256 << 20, 16_384), (MAX_POOL_BYTES, 262_144)] {
             assert_eq!(bytes % F, 0, "{bytes}");
             assert_eq!(bytes / F, frames);
         }
-        assert_eq!(MAX_STREAM_FRAMES as usize, 65_536);
+        assert_eq!(MAX_STREAM_FRAMES as usize, 16_384);
         let config = Config::new(PathBuf::from("/unused"));
         let limits = config.resolve_caps(MAX_POOL_BYTES, None).unwrap();
-        assert_eq!((limits.pool_frames, limits.max_frames), (1_048_576, MAX_STREAM_FRAMES));
+        assert_eq!((limits.pool_frames, limits.max_frames), (262_144, MAX_STREAM_FRAMES));
         let mut config = config;
         config.max_frames = Some(4);
         config.max_event_bytes = F;
