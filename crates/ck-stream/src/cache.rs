@@ -449,6 +449,9 @@ impl Store {
                 return Err(Error::StorageExhausted);
             }
         };
+        // Allocate before taking the cache lock, which every admission and lookup waits on:
+        // a stream's 128-byte-aligned allocation is slow under contention.
+        let mut storage = Arc::<Stream>::new_uninit();
         let mut cache = self.inner.cache.lock();
         let id = if self.inner.closed.load(Ordering::Acquire) {
             Err(Error::Closed)
@@ -459,15 +462,19 @@ impl Store {
         .and_then(|id| request.map_or(Ok(id), |request| request.depend(&request.state.lock()).map(|()| id)))
         .inspect_err(|_| self.inner.pool.release_slot(slot))?;
         let now = self.inner.retention.clock.now();
-        let stream = Arc::new(Stream::new(
-            id,
-            slot,
-            self.inner.pool.clone(),
-            self.inner.retention.clone(),
-            self.inner.limits,
-            now,
-            request.cloned(),
-        ));
+        Arc::get_mut(&mut storage)
+            .expect("unshared allocation")
+            .write(Stream::new(
+                id,
+                slot,
+                self.inner.pool.clone(),
+                self.inner.retention.clone(),
+                self.inner.limits,
+                now,
+                request.cloned(),
+            ));
+        // SAFETY: the stream was written into this unshared allocation just above.
+        let stream = unsafe { storage.assume_init() };
         cache.insert(stream.clone());
         Ok(Writer::new(self.inner.clone(), stream))
     }
