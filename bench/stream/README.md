@@ -14,7 +14,7 @@ bench/stream-gate.sh "$TMPFS" "$OUT"
 
 The script builds offline with the checked-in lockfile in release mode, respects `CARGO_TARGET_DIR` (default `target/stream`) and defaults to two build jobs. Cached dependencies are required. No production quotas are increased. The total-cap row requires the derived default to be 262,144 frames (4 GiB); a smaller startup cap fails the row rather than being overridden. A tmpfs of at least 8 GiB and sufficient free tmpfs/cgroup memory are needed to reach that default.
 
-The gate returns nonzero for build failures, missing samples, nonzero workload exits, missing metrics, timeouts, namespace failures and regressions. It attempts all rows after individual workload failures. A build/preflight failure writes every row as failed without claiming a measurement.
+The gate returns nonzero for build failures, missing samples, nonzero workload exits, missing metrics, timeouts, namespace failures and failed memory-allowance, total-cap or ENOSPC checks. A pool loss against heap is listed under `heap_regressions` in `medians.json` and in `RESULTS.md` but does not fail the gate: since decision 80 the merge bar is master's pool on the same host (`docs/INTERNAL-STREAM.md`, §9.3). It attempts all rows after individual workload failures. A build/preflight failure writes every row as failed without claiming a measurement.
 
 Output files:
 
@@ -94,4 +94,4 @@ CARGO_TARGET_DIR=/scratch/ssd/s1b-target cargo build --release --locked --offlin
 /scratch/ssd/s1b-target/release/ck-stream-bench heap smoke "$TMPFS"
 ```
 
-The self-test plants a regression, the stricter P25 failure, failed subprocess evidence, missing samples/metrics, samples without warmup, a short stream 17 in the total-cap row and repository or nonempty output directories. `cargo test --release --manifest-path bench/stream/Cargo.toml` proves the payload check rejects stale, shifted and cross-stream bytes and that the heap comparator delivers every record byte, including to four readers polling while the writer publishes and grows the frame table. These checks do not establish production performance. Run the full gate only after integration and without competing compilation.
+The self-test plants a heap regression and the stricter P25 miss, which must be reported without failing, and failed subprocess evidence, missing samples/metrics, samples without warmup, a short stream 17 in the total-cap row and repository or nonempty output directories. `cargo test --release --manifest-path bench/stream/Cargo.toml` proves the payload check rejects stale, shifted and cross-stream bytes and that the heap comparator delivers every record byte, including to four readers polling while the writer publishes and grows the frame table. These checks do not establish production performance. Run the full gate only after integration and without competing compilation.

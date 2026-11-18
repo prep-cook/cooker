@@ -26,7 +26,7 @@ The maintainer defaults B1-B9, C2, D1, D3 and F, and the pool-lifetime reading o
 | G6 | Settled | No application encryption; protection comes from OS disk and memory encryption. File 0600, directory 0700 (§6.3). | Owner ruling 2026-11-13 |
 | G7 | Settled | Out of pool space or over a limit returns an error; no heap fallback (§6.4). | Owner ruling 2026-11-13 |
 | G8 | Settled | Per-stream limit 256 MiB (16,384 frames); pool total at most 4 GiB (262,144 frames), lowered only by the startup caps in §6.4. | Owner ruling 2026-11-14 (Settled 41) |
-| G9 | Settled | Performance tests mount the storage directory on tmpfs; no regression against heap buffering is accepted (§9.3). | Owner ruling 2026-11-13 |
+| G9 | Settled | Performance tests mount the storage directory on tmpfs (§9.3). A pool change is measured against master's pool; the heap comparison is reported but does not block (decision 80). | Owner ruling 2026-11-13; decision 80, 2026-11-17 |
 | Exhaustion/platform | Settled | Visible failure, no degradation; Linux server only. | Settled; §6.4, §10 |
 | B1 | Settled (default accepted 2026-11-14) | Claude signatures remain bound to their thinking block. | Q |
 | B2 | Settled (default accepted 2026-11-14) | Redacted thinking has its own opaque event. | Q |
@@ -960,10 +960,10 @@ Zero old values require zero new values; use absolute values, not division by ze
 
 ### 9.3 Storage regression gate (S1)
 
-Owner ruling (G9): performance tests mount the storage directory on tmpfs, and no regression against heap buffering is accepted. S1 may not merge the pool until every row below holds.
+Owner ruling (G9, 2026-11-13): performance tests mount the storage directory on tmpfs. Until decision 80 the ruling also accepted no regression against heap buffering, so S1 could not merge the pool until every row below held against heap.
 **Merge bar since 2026-11-17 (decision 80):** a later pool change is measured against master's pool on one host with pinned, interleaved runs, and each row below is optimized as far as possible toward master's level. A row still worse than master merges only after an owner accepts it with those numbers. The pool-against-heap result is still reported but no longer blocks. The comparison is the chosen pool backend (per-thread LIFO lists, 128-byte alignment, decay reclaim) against heap frames of the same size and layout, on the same host, with `stream.pool_directory` on tmpfs. The per-request-file backend was rejected (§6.1) and is not measured here.
 Measured results in this table come from S0 with 50,000-byte frames; keep them as history and re-run every row with 16,384-byte frames.
-**S1 choice:** use at least 7 alternating runs per row and compare medians. A row regresses when the pool's median is worse than heap's and falls outside heap's own min..max range. The open row below uses a stricter rule.
+**S1 choice:** use at least 7 alternating runs per row and compare medians. `bench/stream/gate.py` reports a heap regression when the pool's median is worse than heap's and falls outside heap's own min..max range; the open row below uses a stricter rule. Under decision 80 a heap regression is reported and does not fail the gate.
 
 | Row | Workload | Measured | Pool must be |
 | --- | --- | --- | --- |
@@ -979,7 +979,7 @@ The 4 MiB memory margin sits just above the 1-3 MiB the S0 run reported with 50,
 
 For an explicit startup reserve, the maintainer's 2026-11-14 interpretation of option B adds `startup_reserve_bytes` to the memory comparison budgets: RSS/tmpfs must stay within the pre-open baseline plus the configured reserve plus the existing allowance; the RSS comparison against heap also includes that fixed resident budget. Report raw charges without subtracting the reserve, and do not punch its protected frames. Reserve zero leaves every original threshold unchanged. The ordinary gate uses that zero default; explicit-reserve diagnostics must record both the raw charges and the reserve-inclusive limits.
 
-One row is open: 4 readers, 64 B appends, 1 MiB streams. It does not pass by default. S0 results over 101 repetitions: the decay pool's median was +0.4% and -2.9% in two runs, the fixed pool without reclaim -4.1% and -3.7%, and heap's own runs spread from 254 to 1320 MB/s. The harness could not attribute or remove the possible few-percent loss. S1 runs this row for the pool and for heap, 101 alternating runs each, and reports both medians and the difference. Heap's run-to-run spread is the interquartile range of its 101 runs (P25..P75). The row passes only when the pool's median is not below heap's P25; a median below it blocks the merge until fixed or until an owner accepts the loss.
+One row is open: 4 readers, 64 B appends, 1 MiB streams. It does not pass by default. S0 results over 101 repetitions: the decay pool's median was +0.4% and -2.9% in two runs, the fixed pool without reclaim -4.1% and -3.7%, and heap's own runs spread from 254 to 1320 MB/s. The harness could not attribute or remove the possible few-percent loss. S1 runs this row for the pool and for heap, 101 alternating runs each, and reports both medians and the difference. Heap's run-to-run spread is the interquartile range of its 101 runs (P25..P75). The gate reports a heap regression when the pool's median is below heap's P25; under decision 80 the report does not block the merge.
 The S0 prototype `s0-bench` (outside this repository) produced the numbers, with 50,000-byte frames; they are history. S1 ports these workloads into `bench/` and keeps the gate there. Commands used, from the prototype directory with `$TMPFS` an existing tmpfs directory (the S0 `rss` rows ran the `pool-fixed+reclaim` backend, which is the chosen decay pool; a rerun must first change the prototype to 16,384-byte frames, and `totalcap` to give each stream 16,384 frames):
 
 ```sh

@@ -43,10 +43,13 @@ def distribution(values):
 
 
 def evaluate(row, runs, expected):
-    result = {"row": row, "status": "pass", "failures": [], "metrics": {}}
+    result = {"row": row, "status": "pass", "failures": [], "heap_regressions": [], "metrics": {}}
     def fail(reason):
         result["status"] = "fail"
         result["failures"].append(reason)
+    # Decision 80: the merge bar is master's pool; a loss against heap is reported, not failed.
+    def heap_regression(reason):
+        result["heap_regressions"].append(reason)
     kinds = ("pool",) if row in ("enospc", "totalcap") else ("pool", "heap")
     samples = {}
     for kind in kinds:
@@ -73,10 +76,10 @@ def evaluate(row, runs, expected):
             pool, heap = values["pool"], values["heap"]
             worse = pool["median"] < heap["min"] if metric in HIGHER else pool["median"] > heap["max"]
             if worse:
-                fail(f"{metric}: pool median outside heap min/max in regression direction")
+                heap_regression(f"{metric}: pool median outside heap min/max in regression direction")
             if row == "throughput-4-64-1":
                 if pool["median"] < heap["p25"]:
-                    fail("pool median below heap P25")
+                    heap_regression("pool median below heap P25")
                 values["pool_vs_heap_median_pct"] = (pool["median"]/heap["median"]-1)*100
             result["metrics"][metric] = values
         if group in METRICS and all(samples[kind] for kind in kinds):
@@ -101,7 +104,7 @@ def evaluate(row, runs, expected):
                     metric: {kind: distribution([run["metrics"][phase][metric] for run in samples[kind]]) for kind in kinds}
                     for metric in ("VmRSS", "RssAnon", "RssShmem", "RssFile", "tmpfs_used", "cgroup_current", "cgroup_anon", "cgroup_shmem")}
             if result["metrics"]["after"]["VmRSS"]["pool"]["median"] > result["metrics"]["after"]["VmRSS"]["heap"]["median"]:
-                fail("post-decay pool VmRSS median exceeds heap")
+                heap_regression("post-decay pool VmRSS median exceeds heap")
         if row == "totalcap":
             metrics = samples["pool"][0]["metrics"]
             counts = metrics["stream_frames"]
@@ -177,17 +180,20 @@ def self_test():
     assert evaluate(row, good[:1], 1)["metrics"]["mb_s"]["heap"]["median"] == 100
     assert evaluate(row, [dict(run, warmup=False) for run in good], 1)["status"] == "fail"
     assert evaluate(row, [{k: v for k, v in run.items() if k != "warmup"} for run in good], 1)["status"] == "fail"
+    assert evaluate(row, good, 1)["heap_regressions"] == []
     bad = [dict(run, metrics={"mb_s": 99, "minor_faults": 0}) if run["backend"] == "pool" else run for run in good]
-    assert evaluate(row, bad, 1)["status"] == "fail"
+    reported = evaluate(row, bad, 1)
+    assert reported["status"] == "pass" and reported["heap_regressions"]
     assert evaluate(row, [dict(run, status="error") for run in good], 1)["status"] == "fail"
     assert evaluate(row, [dict(run, metrics={}) for run in good], 1)["status"] == "fail"
     good_latency = [{"backend": k, "status": "ok", "warmup": True, "metrics": {"wall_ns": v, "ttfb_p99_ns": v, "minor_faults": 0}}
                     for k, v in (("heap", 100), ("pool", 101))]
-    assert evaluate("concurrent-256",good_latency,1)["status"] == "fail"
+    reported = evaluate("concurrent-256", good_latency, 1)
+    assert reported["status"] == "pass" and len(reported["heap_regressions"]) == 2
     spread = [{"backend": k, "status": "ok", "warmup": True, "metrics": {"mb_s": v, "minor_faults": 0}}
               for k, values in (("heap", [50, 100, 110, 120]), ("pool", [80]*4)) for v in values]
     strict = evaluate(row, spread, 4)
-    assert "pool median below heap P25" in strict["failures"]
+    assert strict["status"] == "pass" and "pool median below heap P25" in strict["heap_regressions"]
     cap = {"stream_frames": [16384]*16+[0], "survived": True, "errors": ["cap"]*17}
     assert evaluate("totalcap", [{"backend": "pool", "status": "ok", "metrics": cap}], 1)["status"] == "pass"
     for counts in ([16384]*16+[1], [16383]+[16384]*15+[0]):
@@ -210,7 +216,7 @@ def self_test():
             raise AssertionError("nonempty OUT accepted")
         except ValueError:
             pass
-    print("gate self-test: planted regressions, failed runs and missing evidence rejected")
+    print("gate self-test: planted heap regressions reported; failed runs and missing evidence rejected")
 
 
 def main():
@@ -247,7 +253,7 @@ def main():
             samples = []
             if preflight:
                 raw.write(json.dumps({"row": row, "status": "error", "error": preflight, "measured": False})+"\n")
-                summaries.append({"row":row,"status":"fail","failures":[preflight],"metrics":{}})
+                summaries.append({"row":row,"status":"fail","failures":[preflight],"heap_regressions":[],"metrics":{}})
                 continue
             kinds = ("pool",) if row in ("enospc", "totalcap") else ("pool", "heap")
             for repetition in range(repetitions):
@@ -278,8 +284,9 @@ def main():
             print(f"{row}: {summary['status']}",flush=True)
     report = {"status":"pass" if summaries and all(s["status"]=="pass" for s in summaries) and len(summaries)==len(ROWS) else "fail", "rows":summaries,"required_rows":len(ROWS)}
     (out/"medians.json").write_text(json.dumps(report,indent=2)+"\n")
-    lines = ["# Storage gate results", "", f"Status: {report['status']}", "", "| Row | Result | Failure |", "| --- | --- | --- |"]
-    lines += [f"| {s['row']} | {s['status']} | {'; '.join(s['failures'])} |" for s in summaries]
+    lines = ["# Storage gate results", "", f"Status: {report['status']}", "",
+             "| Row | Result | Failure | Heap regression (reported, decision 80) |", "| --- | --- | --- | --- |"]
+    lines += [f"| {s['row']} | {s['status']} | {'; '.join(s['failures'])} | {'; '.join(s['heap_regressions'])} |" for s in summaries]
     lines += ["", "Raw samples: raw.jsonl. Distributions, medians and IQR: medians.json. Host, source and build provenance: provenance.json.", ""]
     (out/"RESULTS.md").write_text("\n".join(lines))
     return 0 if report["status"] == "pass" else 1
