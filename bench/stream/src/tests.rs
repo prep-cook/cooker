@@ -21,14 +21,13 @@ fn heap_delivers_every_record_byte_exactly() {
     let mut writer = store.create();
     let id = writer.id();
     let mut reader = store.reader(id).unwrap();
-    // Packed records cross frame boundaries, a length change starts a new run,
-    // and aligned records skip the frame tail.
+    // Records cross frame boundaries and a length change starts a new run.
     let mut sizes = vec![64; 2000];
     sizes.extend([100, 64, 64]);
     sizes.extend([49152; 3]);
     let mut written = 0;
     for &size in &sizes {
-        writer.append(pattern(id, written, size), size == 49152).unwrap();
+        writer.append(pattern(id, written, size)).unwrap();
         written += size;
     }
     writer.finish();
@@ -49,7 +48,7 @@ fn heap_readers_follow_concurrent_publication_and_frame_growth() {
     let mut writer = store.create();
     let id = writer.id();
     let readers: Vec<_> = (0..4).map(|_| store.reader(id).unwrap()).collect();
-    // Aligned records add a frame each; packed ones cross frame boundaries and change runs.
+    // Records span several frames, cross frame boundaries and change runs.
     let sizes: Vec<usize> = (0..3000)
         .map(|i| match i % 7 {
             0 => 49152,
@@ -82,7 +81,7 @@ fn heap_readers_follow_concurrent_publication_and_frame_growth() {
             .collect();
         let mut written = 0;
         for &size in &sizes {
-            writer.append(pattern(id, written, size), size == 49152).unwrap();
+            writer.append(pattern(id, written, size)).unwrap();
             written += size;
         }
         writer.finish();

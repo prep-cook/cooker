@@ -320,8 +320,8 @@ mod tests {
     fn unfinished_request_retires_raw_positions_before_completion() {
         let directory = std::env::temp_dir().join(format!("ck-request-retirement-{}", uuid::Uuid::new_v4()));
         let mut config = ck_stream::Config::new(directory.clone());
-        config.pool_bytes = Some(48 * ck_stream::FRAME_BYTES);
-        config.max_event_bytes = 16 * ck_stream::FRAME_BYTES;
+        config.pool_bytes = Some(144 * ck_stream::FRAME_BYTES);
+        config.max_event_bytes = 48 * ck_stream::FRAME_BYTES;
         config.max_metadata_bytes = 4 * 1024 * 1024;
         config.header_slots = 8;
         config.workers = 1;
@@ -373,7 +373,7 @@ mod tests {
     fn filled_string_records_retire_their_input() {
         let directory = std::env::temp_dir().join(format!("ck-request-filled-{}", uuid::Uuid::new_v4()));
         let mut config = ck_stream::Config::new(directory.clone());
-        config.pool_bytes = Some(48 * ck_stream::FRAME_BYTES);
+        config.pool_bytes = Some(144 * ck_stream::FRAME_BYTES);
         config.workers = 1;
         let mut store =
             ck_stream::Store::with_clock(config, std::sync::Arc::new(ck_stream::ManualClock::default())).unwrap();
@@ -406,7 +406,7 @@ mod tests {
     fn published_fields_share_one_records_source() {
         let directory = std::env::temp_dir().join(format!("ck-request-records-{}", uuid::Uuid::new_v4()));
         let mut config = ck_stream::Config::new(directory.clone());
-        config.pool_bytes = Some(48 * ck_stream::FRAME_BYTES);
+        config.pool_bytes = Some(144 * ck_stream::FRAME_BYTES);
         config.workers = 1;
         let mut store =
             ck_stream::Store::with_clock(config, std::sync::Arc::new(ck_stream::ManualClock::default())).unwrap();

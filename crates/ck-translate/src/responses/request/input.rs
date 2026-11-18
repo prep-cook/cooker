@@ -258,7 +258,7 @@ impl Input {
                     end: wire.validated_end,
                 },
             )?;
-            let mut chunk = [0; 36_864];
+            let mut chunk = [0; crate::codec::DATA_CHUNK_BYTES];
             let mut used = 0;
             while let Some(c) = chars.next_scalar()? {
                 active.decoder.push(c, |bytes| {

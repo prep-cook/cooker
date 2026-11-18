@@ -6,7 +6,7 @@ mod tests;
 
 use anyhow::{Context, Result, bail, ensure};
 use backend::Backend;
-use ck_stream::{FRAME_BYTES, Read, Terminal};
+use ck_stream::{FRAME_BYTES, MAX_POOL_BYTES, MAX_STREAM_FRAMES, Read, Terminal};
 use payload::{Check, pattern};
 use serde_json::{Value, json};
 use std::{
@@ -57,7 +57,7 @@ async fn stream(
     while written < total {
         let n = chunk.min(total - written);
         writer
-            .append(pattern(id, written, n), chunk == 49152)
+            .append(pattern(id, written, n))
             .with_context(|| format!("append at {written}/{total} bytes; {}", backend.counters()))?;
         written += n;
         if written >= next_yield {
@@ -112,7 +112,7 @@ async fn small(backend: Arc<Backend>, tasks: usize, requests: usize) -> Result<V
                     let id = writer.id();
                     let mut reader = backend.reader(id)?;
                     for record in 0..32 {
-                        writer.append(pattern(id, record * 64, 64), false)?;
+                        writer.append(pattern(id, record * 64, 64))?;
                     }
                     writer.finish();
                     let mut check = Check::new(id);
@@ -180,7 +180,7 @@ async fn latency(backend: Arc<Backend>, readers: usize, records: usize) -> Resul
     for _ in 0..records {
         let mut bytes = [85; 64];
         bytes[..8].copy_from_slice(&(base.elapsed().as_nanos() as u64).to_le_bytes());
-        writer.append(&bytes, false)?;
+        writer.append(&bytes)?;
         let deadline = Instant::now() + Duration::from_micros(20);
         while Instant::now() < deadline {
             tokio::task::yield_now().await;
@@ -253,7 +253,7 @@ async fn memory(backend: Arc<Backend>, directory: &Path, baseline: Value, count:
                 let mut written = 0;
                 while written < size {
                     let n = payload.len().min(size - written);
-                    writer.append(&payload[..n], true)?;
+                    writer.append(&payload[..n])?;
                     written += n;
                 }
                 writer.finish();
@@ -303,7 +303,8 @@ fn totalcap(backend: &Backend) -> Result<Value> {
         bail!("totalcap requires pool");
     };
     ensure!(
-        store.limits().pool_frames == 85899 && store.limits().max_frames == 5368,
+        store.limits().pool_frames as usize == MAX_POOL_BYTES / FRAME_BYTES
+            && store.limits().max_frames == MAX_STREAM_FRAMES,
         "host startup cap lowered pool: {}",
         backend.counters()
     );
@@ -336,9 +337,9 @@ fn totalcap(backend: &Backend) -> Result<Value> {
             "unexpected cap error {error}"
         );
         terminal_error(&mut reader)?;
-        // 85,899 − 16 × 5,368 = 11: stream 17 takes exactly the remaining frames.
+        // 16 × 16,384 = 262,144: stream 17 finds no frame left.
         ensure!(
-            count == if stream < 16 { 5368 } else { 11 },
+            count == if stream < 16 { MAX_STREAM_FRAMES } else { 0 },
             "stream {} stopped at {count} frames",
             stream + 1
         );
@@ -346,7 +347,10 @@ fn totalcap(backend: &Backend) -> Result<Value> {
         errors.push(error.to_string());
         held.push((writer, reader, leases));
     }
-    ensure!(store.used_frames() >= 85888, "pinned frames unexpectedly released");
+    ensure!(
+        store.used_frames() >= 16 * MAX_STREAM_FRAMES,
+        "pinned frames unexpectedly released"
+    );
     Ok(json!({"stream_frames":counts,"errors":errors,"survived":true,"counters":backend.counters()}))
 }
 fn enospc(backend: &Backend, directory: &Path) -> Result<Value> {

@@ -148,7 +148,7 @@ fn malformed_request_advance_publishes_only_error_terminal() {
 
 #[test]
 fn completed_request_fields_and_messages_publish_before_the_body_ends() {
-    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 256);
+    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 768);
     let mut ingress = Ingress::new(
         &mut mapped.writer,
         &mapped.store,

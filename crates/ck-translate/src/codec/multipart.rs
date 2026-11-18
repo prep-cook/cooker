@@ -21,7 +21,6 @@ use super::{
 const HEADER_LINE: usize = 4096;
 const MAX_HEADERS: usize = 32;
 const INPUT_STEP: usize = 8192;
-const DATA_BYTES: usize = 36_864;
 const FLUSH_DELAY: Duration = Duration::from_millis(100);
 
 /// Client admission limits, independent of the store's shared frame/metadata quotas.
@@ -528,10 +527,10 @@ impl State {
                 return Err(Error::Position);
             }
             self.deadline.get_or_insert(owner.now() + FLUSH_DELAY);
-            let take = (DATA_BYTES as u64 - held.len()).min(span.len());
+            let take = (super::DATA_CHUNK_BYTES as u64 - held.len()).min(span.len());
             held.end += take;
             span.start += take;
-            if held.len() == DATA_BYTES as u64 {
+            if held.len() == super::DATA_CHUNK_BYTES as u64 {
                 self.flush(owner)?;
             }
         }
@@ -543,7 +542,7 @@ impl State {
             return Ok(());
         };
         self.deadline = None;
-        let mut copied = [0; DATA_BYTES];
+        let mut copied = [0; super::DATA_CHUNK_BYTES];
         let bytes = match self.input.slice(span)? {
             Some(bytes) => bytes,
             None => {

@@ -7,6 +7,7 @@ import os
 import math
 from pathlib import Path
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -42,10 +43,13 @@ def distribution(values):
 
 
 def evaluate(row, runs, expected):
-    result = {"row": row, "status": "pass", "failures": [], "metrics": {}}
+    result = {"row": row, "status": "pass", "failures": [], "heap_regressions": [], "metrics": {}}
     def fail(reason):
         result["status"] = "fail"
         result["failures"].append(reason)
+    # Decision 80: the merge bar is master's pool; a loss against heap is reported, not failed.
+    def heap_regression(reason):
+        result["heap_regressions"].append(reason)
     kinds = ("pool",) if row in ("enospc", "totalcap") else ("pool", "heap")
     samples = {}
     for kind in kinds:
@@ -72,10 +76,10 @@ def evaluate(row, runs, expected):
             pool, heap = values["pool"], values["heap"]
             worse = pool["median"] < heap["min"] if metric in HIGHER else pool["median"] > heap["max"]
             if worse:
-                fail(f"{metric}: pool median outside heap min/max in regression direction")
+                heap_regression(f"{metric}: pool median outside heap min/max in regression direction")
             if row == "throughput-4-64-1":
                 if pool["median"] < heap["p25"]:
-                    fail("pool median below heap P25")
+                    heap_regression("pool median below heap P25")
                 values["pool_vs_heap_median_pct"] = (pool["median"]/heap["median"]-1)*100
             result["metrics"][metric] = values
         if group in METRICS and all(samples[kind] for kind in kinds):
@@ -92,18 +96,19 @@ def evaluate(row, runs, expected):
                         fail(f"{kind}: invalid worker count or decay timing")
                     if kind == "pool":
                         for metric in ("VmRSS", "tmpfs_used"):
-                            if metrics["after"][metric] > metrics["baseline"][metric]+4*1024*1024+3_200_000:
+                            # 4 MiB plus the warm budget: 25 free 16,384-byte frames for each of the 8 lists (§6.5).
+                            if metrics["after"][metric] > metrics["baseline"][metric]+4*1024*1024+8*25*16384:
                                 fail(f"pool {metric}: post-decay baseline allowance exceeded")
             for phase in ("baseline", "held", "after"):
                 result["metrics"][phase] = {
                     metric: {kind: distribution([run["metrics"][phase][metric] for run in samples[kind]]) for kind in kinds}
                     for metric in ("VmRSS", "RssAnon", "RssShmem", "RssFile", "tmpfs_used", "cgroup_current", "cgroup_anon", "cgroup_shmem")}
             if result["metrics"]["after"]["VmRSS"]["pool"]["median"] > result["metrics"]["after"]["VmRSS"]["heap"]["median"]:
-                fail("post-decay pool VmRSS median exceeds heap")
+                heap_regression("post-decay pool VmRSS median exceeds heap")
         if row == "totalcap":
             metrics = samples["pool"][0]["metrics"]
             counts = metrics["stream_frames"]
-            if len(counts) != 17 or counts != [5368]*16+[11] or not metrics["survived"] or len(metrics["errors"]) != 17:
+            if len(counts) != 17 or counts != [16384]*16+[0] or not metrics["survived"] or len(metrics["errors"]) != 17:
                 fail("invalid total-cap evidence")
             result["metrics"] = metrics
         if row == "enospc":
@@ -124,13 +129,23 @@ def command_output(command):
         return {"command": command, "error": str(error)}
 
 
+def frame_bytes(root):
+    """The frame size the measured source declares; its hash is recorded with the others."""
+    source = (root/"crates/ck-stream/src/lib.rs").read_text()
+    found = re.search(r"pub const FRAME_BYTES: usize = ([0-9_]+);", source)
+    if not found:
+        raise ValueError("FRAME_BYTES not found in crates/ck-stream/src/lib.rs")
+    return int(found.group(1).replace("_", ""))
+
+
 def provenance(root, tmpfs, binary):
+    frame = frame_bytes(root)
     paths = list((root/"bench/stream").rglob("*.rs"))+list((root/"crates/ck-stream").rglob("*.rs"))
     paths += [root/"bench/stream/Cargo.toml", root/"bench/stream/Cargo.lock", root/"bench/stream/gate.py", root/"bench/stream-gate.sh", binary]
     return {"timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "host": platform.node(), "kernel": platform.platform(), "architecture": platform.machine(),
             "page_size": os.sysconf("SC_PAGE_SIZE"), "affinity": sorted(os.sched_getaffinity(0)),
-            "load": os.getloadavg(), "workers": 8, "frame_bytes": 50000,
+            "load": os.getloadavg(), "workers": 8, "frame_bytes": frame,
             "rustflags": os.environ.get("RUSTFLAGS", ""), "cargo_target_dir": os.environ.get("CARGO_TARGET_DIR"),
             "build": "cargo build --release --locked --offline --manifest-path bench/stream/Cargo.toml; thin LTO; codegen-units=1; default features",
             "revision": command_output(["git", "-C", str(root), "rev-parse", "HEAD"]),
@@ -140,8 +155,8 @@ def provenance(root, tmpfs, binary):
             "hashes": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths if path.is_file()},
             "notes": ["Fresh process per sample; alternating backend order on successive pairs.",
                       "Small requests expire in untimed batches of at most 2048; response delivery never releases bytes.",
-                      "49152-byte records are frame-aligned in both backends; other appends are packed.",
-                      "Heap: S0 shape; uninitialised 50000-byte frames from the system allocator, lock-free committed reads (Release/Acquire record count), locks only for frame-table growth, run-index updates and pointer lookup; Notify wakeups; payloads retained until expiry.",
+                      f"Every append is packed at the published end in both backends; a 49152-byte record spans {-(-49152 // frame)} or {-(-49152 // frame) + 1} {frame}-byte frames.",
+                      f"Heap: S0 shape; uninitialised {frame}-byte frames from the system allocator, lock-free committed reads (Release/Acquire record count), locks only for frame-table growth, run-index updates and pointer lookup; Notify wakeups; payloads retained until expiry.",
                       "Comparison rows run one identical untimed warmup pass and expiry in the same process for both backends; minor_faults counts the measured pass.",
                       "Payload bytes follow a per-stream, per-offset pattern; every reader compares every byte.",
                       "No production event, metadata, stream, header or pool quota is increased.",
@@ -165,21 +180,24 @@ def self_test():
     assert evaluate(row, good[:1], 1)["metrics"]["mb_s"]["heap"]["median"] == 100
     assert evaluate(row, [dict(run, warmup=False) for run in good], 1)["status"] == "fail"
     assert evaluate(row, [{k: v for k, v in run.items() if k != "warmup"} for run in good], 1)["status"] == "fail"
+    assert evaluate(row, good, 1)["heap_regressions"] == []
     bad = [dict(run, metrics={"mb_s": 99, "minor_faults": 0}) if run["backend"] == "pool" else run for run in good]
-    assert evaluate(row, bad, 1)["status"] == "fail"
+    reported = evaluate(row, bad, 1)
+    assert reported["status"] == "pass" and reported["heap_regressions"]
     assert evaluate(row, [dict(run, status="error") for run in good], 1)["status"] == "fail"
     assert evaluate(row, [dict(run, metrics={}) for run in good], 1)["status"] == "fail"
     good_latency = [{"backend": k, "status": "ok", "warmup": True, "metrics": {"wall_ns": v, "ttfb_p99_ns": v, "minor_faults": 0}}
                     for k, v in (("heap", 100), ("pool", 101))]
-    assert evaluate("concurrent-256",good_latency,1)["status"] == "fail"
+    reported = evaluate("concurrent-256", good_latency, 1)
+    assert reported["status"] == "pass" and len(reported["heap_regressions"]) == 2
     spread = [{"backend": k, "status": "ok", "warmup": True, "metrics": {"mb_s": v, "minor_faults": 0}}
               for k, values in (("heap", [50, 100, 110, 120]), ("pool", [80]*4)) for v in values]
     strict = evaluate(row, spread, 4)
-    assert "pool median below heap P25" in strict["failures"]
-    cap = {"stream_frames": [5368]*16+[11], "survived": True, "errors": ["cap"]*17}
+    assert strict["status"] == "pass" and "pool median below heap P25" in strict["heap_regressions"]
+    cap = {"stream_frames": [16384]*16+[0], "survived": True, "errors": ["cap"]*17}
     assert evaluate("totalcap", [{"backend": "pool", "status": "ok", "metrics": cap}], 1)["status"] == "pass"
-    for short in (0, 10):
-        leaked = dict(cap, stream_frames=[5368]*16+[short])
+    for counts in ([16384]*16+[1], [16383]+[16384]*15+[0]):
+        leaked = dict(cap, stream_frames=counts)
         assert evaluate("totalcap", [{"backend": "pool", "status": "ok", "metrics": leaked}], 1)["status"] == "fail"
     root = Path(__file__).resolve().parents[2]
     for bad_out in (root, root/"bench/out"):
@@ -198,7 +216,7 @@ def self_test():
             raise AssertionError("nonempty OUT accepted")
         except ValueError:
             pass
-    print("gate self-test: planted regressions, failed runs and missing evidence rejected")
+    print("gate self-test: planted heap regressions reported; failed runs and missing evidence rejected")
 
 
 def main():
@@ -235,7 +253,7 @@ def main():
             samples = []
             if preflight:
                 raw.write(json.dumps({"row": row, "status": "error", "error": preflight, "measured": False})+"\n")
-                summaries.append({"row":row,"status":"fail","failures":[preflight],"metrics":{}})
+                summaries.append({"row":row,"status":"fail","failures":[preflight],"heap_regressions":[],"metrics":{}})
                 continue
             kinds = ("pool",) if row in ("enospc", "totalcap") else ("pool", "heap")
             for repetition in range(repetitions):
@@ -266,8 +284,9 @@ def main():
             print(f"{row}: {summary['status']}",flush=True)
     report = {"status":"pass" if summaries and all(s["status"]=="pass" for s in summaries) and len(summaries)==len(ROWS) else "fail", "rows":summaries,"required_rows":len(ROWS)}
     (out/"medians.json").write_text(json.dumps(report,indent=2)+"\n")
-    lines = ["# Storage gate results", "", f"Status: {report['status']}", "", "| Row | Result | Failure |", "| --- | --- | --- |"]
-    lines += [f"| {s['row']} | {s['status']} | {'; '.join(s['failures'])} |" for s in summaries]
+    lines = ["# Storage gate results", "", f"Status: {report['status']}", "",
+             "| Row | Result | Failure | Heap regression (reported, decision 80) |", "| --- | --- | --- | --- |"]
+    lines += [f"| {s['row']} | {s['status']} | {'; '.join(s['failures'])} | {'; '.join(s['heap_regressions'])} |" for s in summaries]
     lines += ["", "Raw samples: raw.jsonl. Distributions, medians and IQR: medians.json. Host, source and build provenance: provenance.json.", ""]
     (out/"RESULTS.md").write_text("\n".join(lines))
     return 0 if report["status"] == "pass" else 1

@@ -182,7 +182,7 @@ impl Ingress {
                 end: scanned.validated_end,
             },
         )?;
-        let mut chunk = [0; 36_864];
+        let mut chunk = [0; crate::codec::DATA_CHUNK_BYTES];
         let mut used = 0;
         while let Some(c) = chars.next_scalar()? {
             pending.decoder.push(c, |bytes| {
@@ -276,7 +276,17 @@ impl StringState {
         reader: &mut ck_stream::Reader,
     ) -> Result<()> {
         if let Some(buffer) = self.buffer.take() {
-            self.publisher.append(buffer.chunk(0)?, emitter, owner)?;
+            let held = self.buffered;
+            // The held scratch may span frames; each of its chunks ends at a frame boundary.
+            self.publisher.collect(emitter, owner, |emit| {
+                let mut copied = 0;
+                while copied < held {
+                    let chunk = buffer.chunk(copied)?;
+                    emit(chunk)?;
+                    copied += chunk.len();
+                }
+                Ok(())
+            })?;
             registry.retain_record(doc, self.media, owner, reader)?;
         }
         self.buffered = 0;

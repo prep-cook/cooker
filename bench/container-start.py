@@ -22,8 +22,10 @@ RUNTIME = "/run/cooker-runtime"
 SIGNAL_PREFIX = "shutdown signal received: "
 SIGNAL_LINE = SIGNAL_PREFIX + "SIGTERM"
 TMPFS = f"{RUNTIME}:rw,noexec,nosuid,size=512m,mode=0700,uid=10001,gid=10001"
-POOL_BYTES = 6_400_000
-POOL_FRAMES = POOL_BYTES // 50_000
+# A small pool of whole 16,384-byte frames (ck_stream::FRAME_BYTES); stream.pool_bytes must be
+# a frame multiple.
+POOL_FRAMES = 391
+POOL_BYTES = POOL_FRAMES * 16_384
 SCENARIOS = ("default", "missing-xdg", "unsafe-directory", "explicit-directory",
              "small-derived-pool", "invalid-max-frames")
 

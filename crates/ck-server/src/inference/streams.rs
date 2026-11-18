@@ -458,7 +458,7 @@ mod tests {
     fn registration_sweeps_out_handles_of_invalidated_streams() {
         let directory = std::env::temp_dir().join(format!("ck-registry-{}", uuid::Uuid::new_v4()));
         let mut config = ck_stream::Config::new(directory.clone());
-        config.pool_bytes = Some(64 * ck_stream::FRAME_BYTES);
+        config.pool_bytes = Some(192 * ck_stream::FRAME_BYTES);
         config.workers = 1;
         let registry = Registry::default();
         assert!(registry.install(Store::open(config).unwrap()).is_ok());

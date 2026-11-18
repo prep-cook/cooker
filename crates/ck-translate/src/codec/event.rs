@@ -338,7 +338,7 @@ impl Emitter {
             )
         })?;
         let available = 50_000usize.checked_sub(framing).ok_or(Error::EventTooLarge)?;
-        let decoded = (available / 4 * 3).min(36_864);
+        let decoded = (available / 4 * 3).min(super::DATA_CHUNK_BYTES);
         if decoded == 0 {
             return Err(Error::EventTooLarge);
         }

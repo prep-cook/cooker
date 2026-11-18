@@ -1,4 +1,4 @@
-//! Benchmark-only heap comparator in the S0 shape: uninitialised 50,000-byte
+//! Benchmark-only heap comparator in the S0 shape: uninitialised `FRAME_BYTES`
 //! frames from the global allocator, lock-free copies of committed bytes and a
 //! run-length record index. Locks cover only the frame-table growth, index
 //! updates and pointer lookups, never a payload copy or a reader's visitor.
@@ -15,9 +15,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
-const MAX_FRAMES: usize = 5368;
+const MAX_FRAMES: usize = ck_stream::MAX_STREAM_FRAMES as usize;
 const MAX_EVENT: usize = 1024 * 1024;
-/// Frames one record can touch: an unaligned 1 MiB event spans at most 22.
+/// Frames one record can touch: a 1 MiB event spans at most 65.
 const MAX_SPAN: usize = MAX_EVENT.div_ceil(FRAME_BYTES) + 1;
 
 #[derive(Default)]
@@ -145,18 +145,14 @@ impl Writer {
     pub fn id(&self) -> u64 {
         self.id
     }
-    pub fn append(&mut self, bytes: &[u8], aligned: bool) -> Result<()> {
+    pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
         if self.finished {
             bail!("heap stream terminal");
         }
-        if bytes.is_empty() || bytes.len() > MAX_EVENT || (aligned && bytes.len() > FRAME_BYTES) {
+        if bytes.is_empty() || bytes.len() > MAX_EVENT {
             bail!("heap event limit");
         }
-        let start = if aligned {
-            self.end.div_ceil(FRAME_BYTES) * FRAME_BYTES
-        } else {
-            self.end
-        };
+        let start = self.end;
         let end = start + bytes.len();
         if end.div_ceil(FRAME_BYTES) > MAX_FRAMES {
             bail!("heap stream.storage_exhausted");

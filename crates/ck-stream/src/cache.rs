@@ -293,7 +293,7 @@ impl Inner {
         }
         let mut evicted_for_tmpfs = false;
         loop {
-            match self.pool.allocate(needed) {
+            match self.pool.allocate_run(needed, remaining) {
                 Ok(frame) => return Ok(frame),
                 Err(error) if error.kind() == io::ErrorKind::OutOfMemory && error.raw_os_error().is_none() => {
                     if !self.evict(Some(exclude), remaining, Stream::reclaimable) {
@@ -449,6 +449,9 @@ impl Store {
                 return Err(Error::StorageExhausted);
             }
         };
+        // Allocate before taking the cache lock, which every admission and lookup waits on:
+        // a stream's 128-byte-aligned allocation is slow under contention.
+        let mut storage = Arc::<Stream>::new_uninit();
         let mut cache = self.inner.cache.lock();
         let id = if self.inner.closed.load(Ordering::Acquire) {
             Err(Error::Closed)
@@ -459,15 +462,19 @@ impl Store {
         .and_then(|id| request.map_or(Ok(id), |request| request.depend(&request.state.lock()).map(|()| id)))
         .inspect_err(|_| self.inner.pool.release_slot(slot))?;
         let now = self.inner.retention.clock.now();
-        let stream = Arc::new(Stream::new(
-            id,
-            slot,
-            self.inner.pool.clone(),
-            self.inner.retention.clone(),
-            self.inner.limits,
-            now,
-            request.cloned(),
-        ));
+        Arc::get_mut(&mut storage)
+            .expect("unshared allocation")
+            .write(Stream::new(
+                id,
+                slot,
+                self.inner.pool.clone(),
+                self.inner.retention.clone(),
+                self.inner.limits,
+                now,
+                request.cloned(),
+            ));
+        // SAFETY: the stream was written into this unshared allocation just above.
+        let stream = unsafe { storage.assume_init() };
         cache.insert(stream.clone());
         Ok(Writer::new(self.inner.clone(), stream))
     }
@@ -475,7 +482,15 @@ impl Store {
     /// Attach at the number of complete records already consumed. Authorization belongs to the caller.
     pub fn reader(&self, id: u64, after: u64) -> Result<Reader, Error> {
         let stream = self.inner.cache.lock().get(id).ok_or(Error::Gone)?;
-        Reader::new(stream, after)
+        Reader::new(stream, after, false)
+    }
+
+    /// A [`reader`](Self::reader) that delivers the stream to a client: while it waits at the
+    /// published end, [`Writer::demand`](crate::Writer::demand) asks the producer to publish
+    /// the complete prefix it holds rather than wait for its batch timer.
+    pub fn egress_reader(&self, id: u64, after: u64) -> Result<Reader, Error> {
+        let stream = self.inner.cache.lock().get(id).ok_or(Error::Gone)?;
+        Reader::new(stream, after, true)
     }
 
     /// Expire with the injected clock and perform one decay pass; errors remain visible.

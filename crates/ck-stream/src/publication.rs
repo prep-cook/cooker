@@ -11,10 +11,12 @@ use parking_lot::Mutex;
 
 use crate::{Error, FRAME_BYTES, Limits, Position, Record, Terminal, cache::Retention, pool::Pool};
 
+mod final_room;
 mod reader;
 mod scratch;
 mod wakeup;
 mod writer;
+use final_room::FinalRoom;
 use reader::Pinned;
 pub use reader::{Lease, Read, Reader};
 pub use scratch::{MetadataPermit, ScratchLease, ScratchReservation};
@@ -22,30 +24,18 @@ use wakeup::Wakeup;
 pub use writer::{Reservation, Writer};
 
 pub(crate) const READER_BYTES: usize = std::mem::size_of::<Reader>();
-/// Table room the final record takes: a frame entry and a run index entry.
-pub(crate) const FINAL_METADATA: usize = std::mem::size_of::<Frame>() + std::mem::size_of::<Index>();
-
-/// A pool frame held for the producer's final record (`Writer::reserve_final`), charged to the
-/// exchange quota with [`FINAL_METADATA`], and prefaulted for its first `len` bytes.
-#[derive(Clone, Copy)]
-pub(crate) struct FinalRoom {
-    pub(crate) frame: u32,
-    pub(crate) len: usize,
-}
-
 /// A stream's reference to a pool frame; readers' leases hold their own references.
 pub(crate) struct Frame {
     pool: Option<u32>,
 }
 
-// A run represents exact record boundaries, not a byte range including padding.
+/// A run of consecutive records of one length, kind and correlation, laid end to end.
 #[derive(Clone, Copy)]
 pub(crate) struct Index {
     start: u64,
     sequence: u64,
     next_sequence: u64,
     len: u64,
-    stride: u64,
     kind: u32,
     correlation: u32,
 }
@@ -54,11 +44,10 @@ impl Index {
     fn extends(&self, next: &Self) -> bool {
         self.next_sequence == next.sequence
             && self.len == next.len
-            && self.stride == next.stride
             && self.kind == next.kind
             && self.correlation == next.correlation
             && (self.next_sequence - self.sequence)
-                .checked_mul(self.stride)
+                .checked_mul(self.len)
                 .and_then(|offset| self.start.checked_add(offset))
                 == Some(next.start)
     }
@@ -68,7 +57,7 @@ impl Index {
             return None;
         }
         let start = (sequence - self.sequence)
-            .checked_mul(self.stride)?
+            .checked_mul(self.len)?
             .checked_add(self.start)?;
         let end = start.checked_add(self.len)?;
         Some(Record {
@@ -225,6 +214,11 @@ pub(crate) struct Stream {
     detached: AtomicU64,
     notify: Wakeup,
     stopped: Wakeup,
+    /// Client egress readers waiting at the published end, and how many such waits began.
+    /// Only these readers ask the producer to publish what it holds early (`Writer::demand`).
+    egress_waiting: AtomicUsize,
+    egress_waits: AtomicU64,
+    demand: tokio::sync::Notify,
     /// Dependent streams holding this one: while nonzero it neither expires nor is evicted
     /// on its own; evicting its last holders frees it with them.
     held: AtomicUsize,
@@ -250,6 +244,9 @@ impl Stream {
             limits,
             notify: Wakeup::new(),
             stopped: Wakeup::new(),
+            egress_waiting: AtomicUsize::new(0),
+            egress_waits: AtomicU64::new(0),
+            demand: tokio::sync::Notify::new(),
             invalidated: AtomicBool::new(false),
             kept: AtomicBool::new(false),
             last_read: AtomicU64::new(millis(now)),
@@ -352,6 +349,14 @@ impl Stream {
         owned as u64 + self.detached.load(Ordering::Acquire)
     }
 
+    /// Record that a client egress reader waits at the published end until the guard drops.
+    fn egress_wait(&self) -> EgressWait<'_> {
+        self.egress_waiting.fetch_add(1, Ordering::SeqCst);
+        self.egress_waits.fetch_add(1, Ordering::SeqCst);
+        self.demand.notify_waiters();
+        EgressWait(&self.egress_waiting)
+    }
+
     pub(crate) fn last_read(&self) -> Duration {
         Duration::from_millis(self.last_read.load(Ordering::Relaxed))
     }
@@ -388,14 +393,6 @@ impl Stream {
     fn pin(&self, state: &mut State, record: Record) -> Result<Pinned, Terminal> {
         let first = (record.start.frame - state.base_frame) as usize;
         let last = (last_frame(record) - state.base_frame) as usize;
-        if first == last {
-            let index = state.frames[first].pool.ok_or(Terminal::Gone)?;
-            if self.pool.saturated(index) {
-                return Err(Terminal::StorageExhausted);
-            }
-            self.pool.retain(index);
-            return Ok(Pinned::One(index));
-        }
         let frames = (first..=last).map(|index| state.frames[index].pool);
         for frame in frames.clone() {
             match frame {
@@ -404,12 +401,24 @@ impl Stream {
                 Some(_) => {}
             }
         }
-        // The lease's frame list outlives its reader, so it is charged until the lease frees it.
+        // The stream's own references keep every frame allocated while these are added.
+        let (low, high) = (state.frames[first].pool, state.frames[last].pool);
+        if let (Some(low), Some(high)) = (low, high)
+            && low.abs_diff(high) as usize == last - first
+            && frames
+                .clone()
+                .flatten()
+                .zip(Pinned::Run { first: low, last: high }.iter())
+                .all(|(a, b)| a == b)
+        {
+            frames.flatten().for_each(|index| self.pool.retain(index));
+            return Ok(Pinned::Run { first: low, last: high });
+        }
+        // A scattered list outlives its reader, so it is charged until the lease frees it.
         let bytes = (last - first + 1) * std::mem::size_of::<u32>();
         if self.charge_metadata(bytes).is_err() {
             return Err(Terminal::StorageExhausted);
         }
-        // The stream's own references keep every frame allocated while these are added.
         let frames: Box<[u32]> = frames.flatten().collect();
         frames.iter().for_each(|&index| self.pool.retain(index));
         state.external_metadata += bytes;
@@ -497,24 +506,6 @@ impl Stream {
         self.stopped.wake();
     }
 
-    /// A charge failed: the stream ends with `StorageExhausted`, unless its producer holds
-    /// room for a final record and ends it itself.
-    pub(crate) fn exhausted(&self) {
-        if self.state.lock().final_room.is_none() {
-            self.finish(Terminal::StorageExhausted);
-        }
-    }
-
-    /// Returns the final room's frame to the pool and its charges to the exchange quota.
-    pub(crate) fn free_final(&self, state: &mut State) {
-        state.final_next = false;
-        if let Some(room) = state.final_room.take() {
-            self.pool.release(room.frame);
-            self.release_frames(1);
-            self.release_metadata(FINAL_METADATA);
-        }
-    }
-
     pub(crate) fn invalidate(&self) {
         let (mut state, _fence) = self.retention.lock_stable(self);
         self.invalidate_locked(&mut state);
@@ -571,6 +562,14 @@ impl Drop for Stream {
                 "exchange metadata leaked"
             );
         }
+    }
+}
+
+struct EgressWait<'a>(&'a AtomicUsize);
+
+impl Drop for EgressWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

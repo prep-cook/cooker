@@ -18,7 +18,8 @@ fn store() -> (tempfile::TempDir, Store) {
 fn a_panicking_tick_is_counted_and_the_next_tick_expires_and_decays() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::new(dir.path().join("pool"));
-    config.pool_bytes = Some(64 * FRAME_BYTES);
+    // More frames than decay keeps warm, so the tick has some to punch.
+    config.pool_bytes = Some(256 * FRAME_BYTES);
     config.max_event_bytes = FRAME_BYTES;
     config.header_slots = 4;
     config.workers = 1;
@@ -91,7 +92,7 @@ fn interleave(transition: Transition) {
             };
             match transition {
                 Transition::Rollback => {
-                    let reservation = victim.begin_record(2 * FRAME_BYTES, false, 0, 0).unwrap();
+                    let reservation = victim.begin_record(2 * FRAME_BYTES, 0, 0).unwrap();
                     wait();
                     drop(reservation);
                 }

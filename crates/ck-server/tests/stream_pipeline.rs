@@ -4,6 +4,8 @@
 //! The attempt loop around it (D2-PLAN §3.2, §5.2) settles and discards each failed attempt
 //! before the next one starts.
 
+#[path = "stream_pipeline/producer.rs"]
+mod producer;
 mod stream_fixture;
 
 use std::path::Path;
@@ -328,47 +330,6 @@ async fn an_attempt_that_ends_before_its_first_byte_leaves_the_exchange() {
             .expect("the next attempt depends on the request stream")
             .finish(Terminal::Gone);
         live.stopped().await;
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_committed_response_never_holds_back_the_producer() {
-    #[derive(Clone, Copy, Debug)]
-    enum Client {
-        /// Reads nothing more after commitment.
-        Throttled,
-        /// The first write fails: the connection is gone.
-        Disconnected,
-    }
-    let fixture = Fixture::new(|_| {});
-    let app = fixture.app();
-    for client in [Client::Throttled, Client::Disconnected] {
-        let (result, mut live, _) = delivered(&fixture, output(Protocol::Chat, Framing::Sse), async |live, _| {
-            live.send(chunk(r#"{"role":"assistant","content":"hel"}"#, "null"));
-        })
-        .await;
-        let Ok(response) = result else {
-            panic!("{client:?}: the attempt did not commit");
-        };
-        live.id = StreamId::parse(response.headers()["x-ck-stream-id"].as_bytes()).unwrap();
-        let held = match client {
-            Client::Throttled => Some(response),
-            Client::Disconnected => None,
-        };
-        answer_rest(&mut live);
-        assert_eq!(
-            live.stopped().await,
-            Terminal::Done,
-            "{client:?}: the upstream finishes"
-        );
-        let (text, clean) = body(resume(&app, &live, "v1.e.0").await).await;
-        assert!(
-            clean && text.contains("lo") && text.contains("[DONE]"),
-            "{client:?}: {text}"
-        );
-        if let Some(response) = held {
-            assert_eq!(body(response).await, (text, true), "{client:?}");
-        }
     }
 }
 

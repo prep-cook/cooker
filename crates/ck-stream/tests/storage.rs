@@ -34,7 +34,7 @@ fn incomplete_record_is_invisible_and_abandoned_frames_are_reusable() {
     let mut writer = store.create().unwrap();
     let mut reader = store.reader(writer.id(), 0).unwrap();
     {
-        let mut record = writer.begin_record(FRAME_BYTES + 8, false, 1, 2).unwrap();
+        let mut record = writer.begin_record(FRAME_BYTES + 8, 1, 2).unwrap();
         record.write(b"data: ").unwrap();
         assert!(matches!(reader.try_next(), Poll::Pending));
         assert!(matches!(record.commit(), Err(Error::IncompleteRecord)));
@@ -52,7 +52,7 @@ fn incomplete_commit_keeps_the_reservation_writable() {
     let (_dir, store, _) = store(4);
     let mut writer = store.create().unwrap();
     let mut reader = store.reader(writer.id(), 0).unwrap();
-    let mut record = writer.begin_record(12, false, 0, 0).unwrap();
+    let mut record = writer.begin_record(12, 0, 0).unwrap();
     record.write(b"data: ").unwrap();
     assert!(matches!(record.commit(), Err(Error::IncompleteRecord)));
     record.write(b"done\n\n").unwrap();
@@ -66,32 +66,108 @@ fn incomplete_commit_keeps_the_reservation_writable() {
     assert!(matches!(reader.try_next(), Poll::Pending));
 }
 
+/// Stands for the kind of custom `data` records; kinds are opaque to the store, and 1 stands
+/// for text events.
+const DATA: u32 = 10;
+
+/// Which pool frames a record takes.
+#[derive(Clone, Copy, Debug)]
+enum Taken {
+    Fresh,
+    /// Frames a scratch lease just released in rising order, which come back falling.
+    Released,
+    /// Not neighbours: another stream took the frame after the record's first.
+    Interleaved,
+}
+
 #[test]
-fn cross_frame_record_and_aligned_padding_are_not_mixed() {
-    let (_dir, store, _) = store(8);
-    let mut writer = store.create().unwrap();
-    writer.append(&vec![b'a'; FRAME_BYTES - 3]).unwrap();
-    let mut record = writer.begin_record(9, false, 4, 7).unwrap();
-    record.write(b"abc").unwrap();
-    record.write(b"defghi").unwrap();
-    record.commit().unwrap();
-    drop(record);
-    let mut reservation = writer.begin_record(4, true, 5, 8).unwrap();
-    reservation.write(b"last").unwrap();
-    let aligned = reservation.commit().unwrap();
-    drop(reservation);
-    assert_eq!(aligned.start.offset, 0);
-    let mut reader = store.reader(writer.id(), 1).unwrap();
-    let read = lease(&mut reader);
-    let mut bytes = Vec::new();
-    read.visit(|span| bytes.extend_from_slice(span)).unwrap();
-    assert_eq!(bytes, b"abcdefghi");
-    assert_eq!(read.record().kind, 4);
-    let last = lease(&mut reader);
-    assert_eq!(last.chunk(last.record().start).unwrap(), b"last");
-    let mut stale = last.record().start;
-    stale.generation += 1;
-    assert!(matches!(last.chunk(stale), Err(Error::InvalidPosition)));
+fn records_span_frames() {
+    // (bytes before the record, record length, kind, frames taken): text and data records
+    // start at the published end, whatever frame offset that is, and read back byte for byte
+    // from whichever pool frames hold them.
+    let rows = [
+        (FRAME_BYTES - 3, 9, 1, Taken::Fresh),
+        (FRAME_BYTES - 3, 9, DATA, Taken::Fresh),
+        (FRAME_BYTES - 1, 2 * FRAME_BYTES + 5, DATA, Taken::Fresh),
+        (FRAME_BYTES, FRAME_BYTES, DATA, Taken::Fresh),
+        (17, 3 * FRAME_BYTES, 1, Taken::Fresh),
+        (FRAME_BYTES, 3 * FRAME_BYTES, DATA, Taken::Released),
+        (17, 2 * FRAME_BYTES, DATA, Taken::Interleaved),
+    ];
+    for (before, len, kind, taken) in rows {
+        let (_dir, store, _) = store(8);
+        let mut writer = store.create().unwrap();
+        writer.append(&vec![b'a'; before]).unwrap();
+        let mut other = store.create().unwrap();
+        match taken {
+            Taken::Fresh => {}
+            Taken::Released => {
+                let mut scratch = writer.begin_scratch(3 * FRAME_BYTES).unwrap();
+                scratch.write(&[b'c'; 3 * FRAME_BYTES]).unwrap();
+                drop(scratch.complete().unwrap());
+            }
+            Taken::Interleaved => drop(other.append(b"b").unwrap()),
+        }
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut record = writer.begin_record(len, kind, 7).unwrap();
+        let (head, tail) = bytes.split_at(len / 3);
+        record.write(head).unwrap();
+        record.write(tail).unwrap();
+        let committed = record.commit().unwrap();
+        drop(record);
+        let start = committed.start;
+        assert_eq!(
+            (start.frame as usize, start.offset as usize),
+            (before / FRAME_BYTES, before % FRAME_BYTES),
+            "{before} {len} {kind} {taken:?}"
+        );
+        let mut reader = store.reader(writer.id(), 1).unwrap();
+        let read = lease(&mut reader);
+        let mut actual = Vec::new();
+        read.visit(|span| actual.extend_from_slice(span)).unwrap();
+        assert_eq!(actual, bytes, "{before} {len} {kind} {taken:?}");
+        let mut chunked = Vec::new();
+        let mut position = start;
+        while chunked.len() < len {
+            let chunk = read.chunk(position).unwrap();
+            chunked.extend_from_slice(chunk);
+            position.frame += 1;
+            position.offset = 0;
+        }
+        assert_eq!(chunked, bytes, "{before} {len} {kind} {taken:?}");
+        assert_eq!((read.record().kind, read.record().correlation), (kind, 7));
+        let mut stale = read.record().start;
+        stale.generation += 1;
+        assert!(matches!(read.chunk(stale), Err(Error::InvalidPosition)));
+    }
+}
+
+#[test]
+fn short_data_records_share_frames() {
+    // (records, length): N consecutive data records occupy at most their total length plus
+    // one frame, whatever the published end was when they began.
+    for (count, len) in [
+        (64, 7),
+        (300, 61),
+        (20, 1_000),
+        (5, FRAME_BYTES - 1),
+        (3, FRAME_BYTES + 1),
+    ] {
+        let (_dir, store, _) = store(16);
+        let mut writer = store.create().unwrap();
+        writer.append(&[b't'; 5]).unwrap();
+        let before = store.used_frames() as usize;
+        for index in 0..count {
+            let mut record = writer.begin_record(len, DATA, index as u32).unwrap();
+            record.write(&vec![b'd'; len]).unwrap();
+            record.commit().unwrap();
+        }
+        let frames = store.used_frames() as usize - before;
+        assert!(
+            frames * FRAME_BYTES <= count * len + FRAME_BYTES,
+            "{count} × {len} bytes took {frames} new frames"
+        );
+    }
 }
 
 #[test]
@@ -323,6 +399,33 @@ async fn notification_registration_cannot_lose_publication_or_cancellation() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn only_a_waiting_client_egress_reader_demands_publication() {
+    // (client egress reader, demand resolves): a runtime reader, such as a usage reader,
+    // waits at the published end without asking the producer to publish early.
+    for (egress, demanded) in [(true, true), (false, false)] {
+        let (_dir, store, _) = store(4);
+        let mut writer = store.create().unwrap();
+        writer.append(b"first").unwrap();
+        let attach: fn(&Store, u64, u64) -> Result<ck_stream::Reader, Error> =
+            if egress { Store::egress_reader } else { Store::reader };
+        let mut reader = attach(&store, writer.id(), 0).unwrap();
+        // A reader with a record to take is not waiting.
+        assert!(matches!(reader.next().await, Some(Read::Record(_))));
+        let quiet = Duration::from_millis(50);
+        assert!(tokio::time::timeout(quiet, writer.demand(0)).await.is_err());
+        let waiting = tokio::spawn(async move { matches!(reader.next().await, Some(Read::Record(_))) });
+        let demand = tokio::time::timeout(Duration::from_millis(500), writer.demand(0)).await;
+        assert_eq!(demand.is_ok(), demanded, "egress {egress}");
+        if let Ok(served) = demand {
+            // The same wait is served once: publishing nothing does not demand again.
+            assert!(tokio::time::timeout(quiet, writer.demand(served)).await.is_err());
+        }
+        writer.append(b"second").unwrap();
+        assert!(waiting.await.unwrap());
+    }
+}
+
 #[test]
 fn shutdown_preserves_mapping_until_last_borrow_and_refuses_admission() {
     let (_dir, mut store, _) = store(8);
@@ -394,11 +497,11 @@ fn positions_from_another_pool_are_rejected() {
 
 #[test]
 fn one_mib_of_small_records_replays_with_default_metadata_budget() {
-    let (_dir, store, _) = store(32);
+    let (_dir, store, _) = store((1 << 20) / FRAME_BYTES + 4);
     let mut writer = store.create().unwrap();
     for sequence in 0..16_384u32 {
         let payload = [sequence as u8; 64];
-        let mut record = writer.begin_record(64, false, sequence % 7, sequence).unwrap();
+        let mut record = writer.begin_record(64, sequence % 7, sequence).unwrap();
         record.write(&payload).unwrap();
         record.commit().unwrap();
     }
@@ -427,11 +530,8 @@ fn invalid_record_parameters_do_not_terminate_a_valid_prefix() {
     writer.append(b"prefix").unwrap();
     let mut reader = store.reader(writer.id(), 0).unwrap();
     drop(lease(&mut reader));
-    for (length, aligned) in [(0, false), (4 * FRAME_BYTES + 1, false), (FRAME_BYTES + 1, true)] {
-        assert!(matches!(
-            writer.begin_record(length, aligned, 0, 0),
-            Err(Error::InvalidRecord)
-        ));
+    for length in [0, 4 * FRAME_BYTES + 1] {
+        assert!(matches!(writer.begin_record(length, 0, 0), Err(Error::InvalidRecord)));
         assert!(matches!(reader.try_next(), Poll::Pending));
     }
     writer.append(b"suffix").unwrap();

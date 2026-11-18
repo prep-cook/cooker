@@ -2,8 +2,12 @@ use std::sync::{Arc, atomic::Ordering};
 
 use parking_lot::MutexGuard;
 
-use super::{FINAL_METADATA, FinalRoom, Frame, Index, State, Stream, reserve_metadata};
+use super::{Frame, Index, State, Stream, reserve_metadata};
 use crate::{Error, FRAME_BYTES, Position, Record, Terminal, cache::Inner};
+
+/// Most frames a reservation takes per release of the stream lock, which bounds one batch
+/// at 256 KiB.
+const TAKE_BATCH: usize = 16;
 
 /// Exclusive stream producer. A disconnect must drop a reader, not this producer.
 /// Dropping it before a terminal publishes `ProducerLost`.
@@ -40,7 +44,7 @@ impl Writer {
         }
     }
 
-    fn publishes(&self) -> Result<(), Error> {
+    pub(super) fn publishes(&self) -> Result<(), Error> {
         if self.producer { Ok(()) } else { Err(Error::Closed) }
     }
     pub(crate) fn stream(&self) -> &Arc<Stream> {
@@ -96,56 +100,6 @@ impl Writer {
         }
     }
 
-    /// Holds room for one final record of at most `len` bytes, at most one frame: a pool frame
-    /// prefaulted for `len` bytes, a frame of the exchange quota and the table room of one
-    /// record. While it is held, a failed charge on this stream returns `StorageExhausted`
-    /// without ending the stream, and other exchanges cannot take the frame. The producer calls
-    /// [`Self::release_final`] and writes its final record, which goes into that frame, then
-    /// finishes the stream with the terminal it chooses. Any terminal frees an unused room.
-    pub fn reserve_final(&mut self, len: usize) -> Result<(), Error> {
-        self.publishes()?;
-        if len == 0 || len > FRAME_BYTES || len > self.inner.limits.max_event_bytes {
-            return Err(Error::InvalidRecord);
-        }
-        {
-            let state = self.stream.state.lock();
-            if state.terminal.is_some() {
-                return Err(Error::Closed);
-            }
-            if state.final_room.is_some() {
-                return Err(Error::InvalidRecord);
-            }
-        }
-        self.stream.charge_frames(1)?;
-        if let Err(error) = self.stream.charge_metadata(FINAL_METADATA) {
-            self.stream.release_frames(1);
-            return Err(error);
-        }
-        // Allocation may evict another stream; no stream lock is held across it.
-        let frame = match self.inner.allocate(self.id(), 1, len) {
-            Ok(frame) => frame,
-            Err(error) => {
-                self.stream.release_frames(1);
-                self.stream.release_metadata(FINAL_METADATA);
-                return Err(error);
-            }
-        };
-        let mut state = self.stream.state.lock();
-        if self.stream.invalidated.load(Ordering::Acquire) || state.terminal.is_some() {
-            drop(state);
-            self.inner.pool.release(frame);
-            self.stream.release_frames(1);
-            self.stream.release_metadata(FINAL_METADATA);
-            return Err(Error::Closed);
-        }
-        state.final_room = Some(FinalRoom { frame, len });
-        Ok(())
-    }
-
-    /// The next record is the final one. Unless it fits in place at the end of the last frame,
-    /// it starts at a frame boundary in the room [`Self::reserve_final`] holds, so no allocation
-    /// can refuse it. A record longer than the room frees the room and is reserved like any
-    /// other.
     /// Keeps the stream out of eviction and expiry until it is invalidated, so its records
     /// outlive allocations by other exchanges and idle time: a live session's metadata stays
     /// readable for its accounting after the session ends. Allocations that would need its
@@ -155,25 +109,33 @@ impl Writer {
         self.stream.kept.store(true, Ordering::Release);
     }
 
-    pub fn release_final(&mut self) {
-        let mut state = self.stream.state.lock();
-        if state.final_room.is_some() {
-            state.final_next = true;
+    /// Client egress demand. Resolves with a new count once a client egress reader
+    /// ([`Store::egress_reader`](crate::Store::egress_reader)) waits at the published end and
+    /// has begun a wait since `served`, the count this producer last acted on (0 at first).
+    /// Publishing nothing new leaves that reader waiting without a new wait, so a producer
+    /// passing the count back is not woken again until a new wait. Owned and cancellation-safe.
+    pub fn demand(&self, served: u64) -> impl Future<Output = u64> + Send + 'static {
+        let stream = self.stream.clone();
+        async move {
+            loop {
+                let notified = stream.demand.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let waits = stream.egress_waits.load(Ordering::SeqCst);
+                if waits > served && stream.egress_waiting.load(Ordering::SeqCst) > 0 {
+                    return waits;
+                }
+                notified.await;
+            }
         }
     }
 
-    /// Reserve the whole record before writing. `aligned` excludes tail padding from the record.
-    /// The caller's codec must finish its framing before committing this reservation.
-    /// Invalid length/alignment is rejected without terminating the stream; storage failures are terminal.
-    pub fn begin_record(
-        &mut self,
-        len: usize,
-        aligned: bool,
-        kind: u32,
-        correlation: u32,
-    ) -> Result<Reservation<'_>, Error> {
+    /// Reserve the whole record before writing. It starts at the published end and may span
+    /// frames. The caller's codec must finish its framing before committing this reservation.
+    /// An invalid length is rejected without terminating the stream; storage failures are terminal.
+    pub fn begin_record(&mut self, len: usize, kind: u32, correlation: u32) -> Result<Reservation<'_>, Error> {
         self.publishes()?;
-        let (record, index, old_count, state) = self.reserve(len, aligned, kind, correlation)?;
+        let (record, index, old_count, state) = self.reserve(len, kind, correlation)?;
         drop(state);
         Ok(Reservation {
             writer: self,
@@ -188,11 +150,10 @@ impl Writer {
     fn reserve(
         &self,
         len: usize,
-        aligned: bool,
         kind: u32,
         correlation: u32,
     ) -> Result<(Record, Index, usize, MutexGuard<'_, State>), Error> {
-        let result = self.reserve_locked(len, aligned, kind, correlation);
+        let result = self.reserve_locked(len, kind, correlation);
         if matches!(result, Err(Error::StorageExhausted | Error::Io(_))) {
             self.stream.exhausted();
         }
@@ -202,11 +163,10 @@ impl Writer {
     fn reserve_locked(
         &self,
         len: usize,
-        aligned: bool,
         kind: u32,
         correlation: u32,
     ) -> Result<(Record, Index, usize, MutexGuard<'_, State>), Error> {
-        if len == 0 || len > self.inner.limits.max_event_bytes || (aligned && len > FRAME_BYTES) {
+        if len == 0 || len > self.inner.limits.max_event_bytes {
             return Err(Error::InvalidRecord);
         }
         let mut state = self.stream.state.lock();
@@ -217,12 +177,11 @@ impl Writer {
             return Err(Error::Closed);
         }
         // The final record goes into the room held for it, from a frame boundary.
-        let into_room = state.final_next && state.final_room.is_some_and(|room| len <= room.len);
+        let into_room = state.final_next && state.final_room.as_ref().is_some_and(|room| len <= room.len);
         if state.final_next && !into_room {
             self.stream.free_final(&mut state);
         }
-        let aligned = aligned || into_room;
-        let start = if aligned {
+        let start = if into_room {
             state
                 .end
                 .div_ceil(FRAME_BYTES as u64)
@@ -248,41 +207,35 @@ impl Writer {
             sequence: record.sequence,
             next_sequence: record.sequence.checked_add(1).ok_or(Error::StorageExhausted)?,
             len: len as u64,
-            stride: if aligned { FRAME_BYTES as u64 } else { len as u64 },
             kind,
             correlation,
         };
         let extends = state.records.back().is_some_and(|last| last.extends(&index));
         let records = state.records.len() + usize::from(!extends);
         let pinned = if into_room {
-            state.final_next = false;
-            state.final_room.take().map(|room| room.frame)
+            self.take_final_room(&mut state, extra)
         } else {
-            None
+            Box::default()
         };
-        // The room's frame is already charged; its table room returns for the tables to take.
-        let held = usize::from(pinned.is_some());
-        if held == 1 {
-            self.stream.release_metadata(FINAL_METADATA);
-        }
-        let give_back = |frame: Option<u32>| {
-            if let Some(frame) = frame {
+        let held = pinned.len();
+        let give_back = |frames: &[u32]| {
+            for &frame in frames {
                 self.inner.pool.release(frame);
-                self.stream.release_frames(1);
             }
+            self.stream.release_frames(frames.len());
         };
         // Charge every new frame before the lock is released to allocate them, so another
         // handle on the exchange cannot pass the quota meanwhile.
         if let Err(error) = self.stream.charge_frames(extra - held) {
-            give_back(pinned);
+            give_back(&pinned);
             return Err(error);
         }
         if let Err(error) = self.grow_tables(&mut state, needed, records) {
             self.stream.release_frames(extra - held);
-            give_back(pinned);
+            give_back(&pinned);
             return Err(error);
         }
-        let state = self.take_frames(state, old_count, extra, start, end, pinned)?;
+        let state = self.take_frames(state, old_count, extra, start, end, &pinned)?;
         Ok((record, index, old_count, state))
     }
 
@@ -300,7 +253,7 @@ impl Writer {
 
     /// Back the bytes `start..end` of a reservation: prefault the pages it reaches in the
     /// last frame and append `extra` frames after the `old_count` the table held, the first
-    /// of them `pinned` when the final room supplies it.
+    /// of them `pinned`, the frames the final room supplies.
     fn take_frames<'a>(
         &'a self,
         mut state: MutexGuard<'a, State>,
@@ -308,7 +261,7 @@ impl Writer {
         extra: usize,
         start: u64,
         end: u64,
-        pinned: Option<u32>,
+        pinned: &[u32],
     ) -> Result<MutexGuard<'a, State>, Error> {
         // A record continuing the last frame may reach pages that frame never needed yet.
         // The locked owner prefaults them; eviction cannot help, as it punches nothing.
@@ -324,42 +277,56 @@ impl Writer {
                     self.inner.pool.prefault(frame, needed as usize).map_err(Error::Io)
                 });
             if let Err(error) = prefaulted {
-                if let Some(frame) = pinned {
+                for &frame in pinned {
                     self.inner.pool.release(frame);
                 }
                 self.stream.release_frames(extra);
                 return Err(error);
             }
         }
-        for taken in 0..extra {
-            let frame = match pinned.filter(|_| taken == 0) {
-                // Prefaulted for the whole final record when it was reserved.
-                Some(frame) => frame,
-                None => {
+        // Allocation may evict another stream. Never enter cache ownership with metadata
+        // locked: take frames in batches with it released, then install each batch at once.
+        let mut pushed = 0;
+        while pushed < extra {
+            let mut batch = [0u32; TAKE_BATCH];
+            let count = (extra - pushed).min(TAKE_BATCH);
+            // The final record's room, prefaulted for the whole record when it was reserved.
+            let room = pinned.len().saturating_sub(pushed).min(count);
+            if room > 0 {
+                batch[..room].copy_from_slice(&pinned[pushed..pushed + room]);
+            }
+            if count > room {
+                drop(state);
+                for index in room..count {
+                    let taken = pushed + index;
                     let needed = (end - first_new - taken as u64 * FRAME_BYTES as u64).min(FRAME_BYTES as u64) as usize;
-                    // Allocation may evict another stream. Never enter cache ownership with
-                    // metadata locked.
-                    drop(state);
-                    let frame = match self.inner.allocate(self.id(), extra - taken, needed) {
-                        Ok(frame) => frame,
+                    match self.inner.allocate(self.id(), extra - taken, needed) {
+                        Ok(frame) => batch[index] = frame,
                         Err(error) => {
-                            self.stream.release_frames(extra - taken);
+                            for &frame in &batch[..index] {
+                                self.inner.pool.release(frame);
+                            }
+                            self.stream.release_frames(extra - pushed);
                             self.rollback(old_count);
                             return Err(error);
                         }
-                    };
-                    state = self.stream.state.lock();
-                    if self.stream.invalidated.load(Ordering::Acquire) || state.terminal.is_some() {
-                        self.inner.pool.release(frame);
-                        drop(state);
-                        self.stream.release_frames(extra - taken);
-                        self.rollback(old_count);
-                        return Err(Error::Gone);
                     }
-                    frame
                 }
-            };
-            state.frames.push_back(Frame { pool: Some(frame) });
+                state = self.stream.state.lock();
+                if self.stream.invalidated.load(Ordering::Acquire) || state.terminal.is_some() {
+                    for &frame in &batch[..count] {
+                        self.inner.pool.release(frame);
+                    }
+                    drop(state);
+                    self.stream.release_frames(extra - pushed);
+                    self.rollback(old_count);
+                    return Err(Error::Gone);
+                }
+            }
+            state
+                .frames
+                .extend(batch[..count].iter().map(|&frame| Frame { pool: Some(frame) }));
+            pushed += count;
         }
         Ok(state)
     }
@@ -385,7 +352,7 @@ impl Writer {
             return Ok(record);
         }
         drop(state);
-        let (record, index, old_count, mut state) = self.reserve(bytes.len(), false, 0, 0)?;
+        let (record, index, old_count, mut state) = self.reserve(bytes.len(), 0, 0)?;
         if let Err(error) = self.stream.write_reserved(&state, record.start, bytes) {
             drop(state);
             self.rollback(old_count);
@@ -425,7 +392,6 @@ impl Writer {
             sequence,
             next_sequence: sequence.checked_add(1)?,
             len,
-            stride: len,
             kind: 0,
             correlation: 0,
         };
@@ -466,13 +432,13 @@ impl Writer {
             if end < first_end {
                 break;
             }
-            let removed = ((end - first_end) / run.stride + 1).min(run.next_sequence - run.sequence);
+            let removed = ((end - first_end) / run.len + 1).min(run.next_sequence - run.sequence);
             if removed == run.next_sequence - run.sequence {
                 state.base_sequence = run.next_sequence;
                 state.records.pop_front();
             } else {
                 // Retained records were checked at append; this advances within that run.
-                run.start += removed * run.stride;
+                run.start += removed * run.len;
                 run.sequence += removed;
                 state.base_sequence = run.sequence;
                 break;

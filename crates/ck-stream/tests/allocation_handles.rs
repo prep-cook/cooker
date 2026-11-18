@@ -32,7 +32,7 @@ fn an_allocator_allocates_after_the_terminal_and_never_publishes() {
     let mut permit = allocator.reserve_metadata(8).unwrap();
     permit.resize(16).unwrap();
     assert!(matches!(allocator.append(b"x"), Err(Error::Closed)));
-    assert!(matches!(allocator.begin_record(1, false, 0, 0), Err(Error::Closed)));
+    assert!(matches!(allocator.begin_record(1, 0, 0), Err(Error::Closed)));
 
     // Invalidation still ends allocation.
     allocator.finish(Terminal::Gone);

@@ -36,9 +36,14 @@ fn assert_prefix(mapped: &Mapped) {
     assert!(values.iter().any(|event| event["bytes"].is_string()));
     assert!(!text.contains("event: x_ck.request.end\n"));
     assert!(!text.contains("event: x_ck.media.end\n"));
+    // Beyond the committed records: the scratch of one held data chunk and a few frames of
+    // unconsumed input; the raw payload itself is retired.
+    let held = ck_translate::codec::DATA_CHUNK_BYTES.div_ceil(ck_stream::FRAME_BYTES) as u64 + 3;
     assert!(
-        u64::from(mapped.store.used_frames()) <= mapped.writer.committed().frame + 3,
-        "raw payload remains charged"
+        u64::from(mapped.store.used_frames()) <= mapped.writer.committed().frame + held,
+        "raw payload remains charged: {} frames used, committed end {:?}",
+        mapped.store.used_frames(),
+        mapped.writer.committed()
     );
 }
 

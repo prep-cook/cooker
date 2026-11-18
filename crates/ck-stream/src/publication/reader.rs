@@ -18,10 +18,13 @@ pub struct Reader {
     available: u64,
     committed: u64,
     terminal_seen: bool,
+    /// A client egress reader: waiting in `next` at the published end is demand
+    /// (`Writer::demand`). Runtime readers, such as usage readers, wait without it.
+    egress: bool,
 }
 
 impl Reader {
-    pub(crate) fn new(stream: Arc<Stream>, after: u64) -> Result<Self, Error> {
+    pub(crate) fn new(stream: Arc<Stream>, after: u64, egress: bool) -> Result<Self, Error> {
         let result = stream.retention.reading(&stream, |state| {
             if stream.invalidated.load(Ordering::Acquire) || after < state.base_sequence {
                 return (Err(Error::Gone), false);
@@ -45,6 +48,7 @@ impl Reader {
             available: 0,
             committed: 0,
             terminal_seen: false,
+            egress,
         })
     }
 
@@ -124,6 +128,7 @@ impl Reader {
             if let Poll::Ready(value) = self.try_next() {
                 return value;
             }
+            let _demand = self.egress.then(|| stream.egress_wait());
             notified.await;
             if let Poll::Ready(value) = self.try_next() {
                 return value;
@@ -149,18 +154,36 @@ enum Step {
     Pending,
 }
 
-/// Pool frames a lease references, in record order. Most records fit one frame.
+/// Pool frames a lease references, in record order.
 pub(super) enum Pinned {
-    One(u32),
+    /// Consecutive pool frames from `first` to `last`, rising or falling, as a writer usually
+    /// takes them: no list to allocate, charge or free under the lock.
+    Run {
+        first: u32,
+        last: u32,
+    },
     Many(Box<[u32]>),
 }
 
 impl Pinned {
-    pub(super) fn frames(&self) -> &[u32] {
+    fn len(&self) -> usize {
         match self {
-            Self::One(frame) => std::slice::from_ref(frame),
-            Self::Many(frames) => frames,
+            Self::Run { first, last } => first.abs_diff(*last) as usize + 1,
+            Self::Many(frames) => frames.len(),
         }
+    }
+
+    /// The pool frame holding the record's `index`th frame; `index` is below `len`.
+    fn get(&self, index: usize) -> u32 {
+        match self {
+            Self::Run { first, last } if last >= first => first + index as u32,
+            Self::Run { first, .. } => first - index as u32,
+            Self::Many(frames) => frames[index],
+        }
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.len()).map(|index| self.get(index))
     }
 }
 
@@ -188,7 +211,7 @@ impl Lease {
         if self.stream.invalidated.load(Ordering::Acquire) {
             return Err(Error::Gone);
         }
-        let frame = self.pinned.frames()[(position.frame - self.record.start.frame) as usize];
+        let frame = self.pinned.get((position.frame - self.record.start.frame) as usize);
         let len = (end - byte).min((FRAME_BYTES - position.offset as usize) as u64) as usize;
         // SAFETY: this lease pins all record frames until Drop. Publication made this span
         // immutable before lease registration; the pool Arc outlives the returned borrow.
@@ -200,7 +223,7 @@ impl Lease {
         // directly; invalidation still ends the walk before each chunk, as `chunk` would.
         let mut offset = self.record.start.offset as usize;
         let mut remaining = self.record.len() as usize;
-        for &frame in self.pinned.frames() {
+        for frame in self.pinned.iter() {
             if self.stream.invalidated.load(Ordering::Acquire) {
                 return Err(Error::Gone);
             }
@@ -225,14 +248,14 @@ impl Drop for Lease {
         }
         // Releasing a reference only raises the stream's reclaimable count, so eviction's
         // counted gain stays valid without the state lock or the retention fence.
-        for &frame in self.pinned.frames() {
+        for frame in self.pinned.iter() {
             if self.stream.pool.release(frame) {
                 // The stream had detached this frame; its last lease freed it.
                 self.stream.detached.fetch_sub(1, Ordering::AcqRel);
                 self.stream.release_frames(1);
             }
         }
-        // Single-frame leases, the common case, own no list and take no lock.
+        // Runs, the common case, own no list and take no lock.
         if let Pinned::Many(frames) = &mut self.pinned {
             let bytes = std::mem::size_of_val::<[u32]>(frames);
             drop(std::mem::take(frames));

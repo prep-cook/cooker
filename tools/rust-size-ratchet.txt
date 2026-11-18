@@ -115,8 +115,8 @@ file crates/ck-server/tests/responses_state.rs 1177
 file crates/ck-server/tests/routes.rs 1715
 file crates/ck-server/tests/stream_duplex.rs 1077
 file crates/ck-server/tests/stream_media.rs 944
-file crates/ck-server/tests/stream_pipeline.rs 1754
-file crates/ck-stream/src/publication.rs 634
+file crates/ck-server/tests/stream_pipeline.rs 1715
+file crates/ck-stream/src/publication.rs 633
 file crates/ck-translate/src/anthropic/egress.rs 625
 file crates/ck-translate/src/anthropic/request.rs 621
 file crates/ck-translate/src/anthropic/request_encode.rs 612
@@ -132,7 +132,7 @@ file crates/ck-translate/src/claude_responses.rs 1864
 file crates/ck-translate/src/claude_responses_response.rs 1878
 file crates/ck-translate/src/claude_tool_args.rs 1152
 file crates/ck-translate/src/codec/media.rs 647
-file crates/ck-translate/src/codec/multipart.rs 605
+file crates/ck-translate/src/codec/multipart.rs 604
 file crates/ck-translate/src/codex_chat_response.rs 818
 file crates/ck-translate/src/codex_claude_response.rs 1021
 file crates/ck-translate/src/codex_interactions.rs 1152
@@ -159,7 +159,7 @@ file crates/ck-translate/src/responses_interactions.rs 1104
 file crates/ck-translate/src/responses_interactions_response.rs 2082
 file crates/ck-translate/src/responses_tools.rs 693
 file crates/ck-translate/src/stream.rs 786
-file crates/ck-translate/tests/boundary_codec.rs 860
+file crates/ck-translate/tests/boundary_codec.rs 858
 file crates/ck-translate/tests/golden.rs 936
 file crates/ck-translate/tests/images_codec.rs 1883
 file crates/ck-translate/tests/realtime_codec.rs 841
@@ -479,7 +479,6 @@ fn crates/ck-server/tests/stream_pipeline.rs::<Executor as Execute>::execute 100
 fn crates/ck-server/tests/stream_pipeline.rs::each_attempt_settles_and_is_discarded_before_the_next 757
 fn crates/ck-server/tests/stream_pipeline.rs::every_exit_keeps_the_committed_streams_and_discards_the_rest 192
 fn crates/ck-server/tests/usage_dimensions.rs::responses_billed_units_reach_accounting 101
-fn crates/ck-stream/src/publication/writer.rs::Writer::reserve_locked 86
 fn crates/ck-translate/src/antigravity_chat.rs::assistant 103
 fn crates/ck-translate/src/antigravity_chat.rs::convert 108
 fn crates/ck-translate/src/antigravity_claude.rs::convert 302

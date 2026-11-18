@@ -188,11 +188,11 @@ fn multipart_preserves_order_filenames_and_bytes_across_fragmentation() {
             r#"multipart/form-data; boundary="x\yz""#,
             r#"multipart/form-data; other="a\"b\\c"; boundary="\x\y\z""#,
         ] {
-            let whole = run(&input, content_type, LIMITS, input.len(), 64);
+            let whole = run(&input, content_type, LIMITS, input.len(), 192);
             assert_eq!((whole.0, whole.1, &whole.2), (200, 1, &expected));
             assert!(!String::from_utf8_lossy(&whole.3).contains("not-retained"));
             for chunk in [1, 2, 7, 83, 8192] {
-                assert_eq!(run(&input, content_type, LIMITS, chunk, 64), whole, "chunk={chunk}");
+                assert_eq!(run(&input, content_type, LIMITS, chunk, 192), whole, "chunk={chunk}");
             }
         }
     }
@@ -296,13 +296,13 @@ fn multipart_rejects_malformed_or_oversize_requests_before_sending() {
     }
     for (index, (input, content_type, limits, expected)) in cases.iter().enumerate() {
         for chunk in [1, 17, input.len()] {
-            let (status, sends, _, events) = run(input, content_type, *limits, chunk, 64);
+            let (status, sends, _, events) = run(input, content_type, *limits, chunk, 192);
             assert_eq!((status, sends), (*expected, 0), "case={index}, chunk={chunk}");
             assert!(!String::from_utf8_lossy(&events).contains("event: x_ck.request.end"));
         }
     }
     let body = form("Content-Disposition: form-data; name=f", &vec![0; 900_000]);
-    let (status, sends, _, _) = run(&body, CONTENT_TYPE, LIMITS, 8192, 24);
+    let (status, sends, _, _) = run(&body, CONTENT_TYPE, LIMITS, 8192, 72);
     assert_eq!((status, sends), (503, 0));
 }
 

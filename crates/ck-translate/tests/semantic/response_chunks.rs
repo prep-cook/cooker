@@ -48,13 +48,13 @@ fn image_body(encoded: &str) -> String {
     .to_string()
 }
 
-/// An 80 KB image read 13 bytes at a time fits a 16-frame pool: its reads share data records
+/// An 80 KB image read 13 bytes at a time fits a 48-frame pool: its reads share data records
 /// instead of costing a frame-aligned record each.
 #[test]
 fn buffered_image_in_small_reads_shares_data_records() {
     let raw: Vec<u8> = (0..80_000).map(|index| (index % 251) as u8).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
-    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 16);
+    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 48);
     let mut ingress = buffered(&mut mapped);
     for piece in image_body(&encoded).as_bytes().chunks(13) {
         ingress.advance(&mut mapped.writer, piece).unwrap();

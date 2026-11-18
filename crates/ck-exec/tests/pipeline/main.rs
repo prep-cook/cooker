@@ -11,6 +11,7 @@ use bytes::Bytes;
 use ck_core::exec::FailureScope;
 use ck_stream::Terminal;
 use ck_translate::codec::Operation;
+use ck_translate::codec::event::Kind;
 use support::{Answer, Fixture, Stub, WAIT, chunk, complete, cut, data, feed, finished};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -92,6 +93,55 @@ async fn a_flush_deadline_is_served_while_the_upstream_is_idle() {
     tokio::time::timeout(WAIT, stub.flushed.notified()).await.unwrap();
     assert!(!started.producer.is_finished());
     drop(upstream);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_client_egress_reader_is_served_before_the_flush_deadline() {
+    // (client egress reader, body pieces, each fed once the flushes it caused settled): the
+    // buffered Chat ingress holds decoded audio until a flush, and its deadline is an hour
+    // away, so only a client egress reader waiting at the published end flushes it. A piece that completes base64 an earlier flush could not publish reaches
+    // the reader still waiting from that flush.
+    let head = r#"{"id":"r","object":"chat.completion","model":"m","created":1,"choices":[{"index":0,"message":{"role":"assistant","audio":{"id":"a","data":""#;
+    let whole = format!("{head}AAAA");
+    let rows: [(bool, &[&str]); 3] = [(true, &[&whole]), (false, &[&whole]), (true, &[head, "A", "AAA"])];
+    for (egress, pieces) in rows {
+        let fixture = Fixture::new(4 * 1024 * 1024);
+        let (stub, upstream) = Stub::new(Answer::Buffered);
+        *stub.postpone.lock().unwrap() = Duration::from_secs(3600);
+        let (started, _upload, id) = fixture.launch(&stub, Operation::Generate).await;
+        let started = started.unwrap();
+        let mut reader = if egress {
+            fixture.store.egress_reader(id, 0)
+        } else {
+            fixture.store.reader(id, 0)
+        }
+        .unwrap();
+        let (data, mut published) = tokio::sync::mpsc::unbounded_channel();
+        let reading = tokio::spawn(async move {
+            while let Some(ck_stream::Read::Record(lease)) = reader.next().await {
+                if lease.record().kind == Kind::Data as u32 {
+                    data.send(()).unwrap();
+                }
+            }
+        });
+        let (last, earlier) = pieces.split_last().unwrap();
+        for piece in earlier {
+            upstream.send(Ok(Bytes::copy_from_slice(piece.as_bytes()))).unwrap();
+            // The reader has caught up and waits in one wait once no flush follows.
+            while tokio::time::timeout(Duration::from_millis(100), stub.flushed.notified())
+                .await
+                .is_ok()
+            {}
+        }
+        upstream.send(Ok(Bytes::copy_from_slice(last.as_bytes()))).unwrap();
+        let wait = if egress { WAIT } else { Duration::from_millis(300) };
+        let served = tokio::time::timeout(wait, published.recv()).await;
+        assert_eq!(served.is_ok(), egress, "egress {egress}, {} pieces", pieces.len());
+        assert!(!started.producer.is_finished());
+        drop(upstream);
+        finished(started).await.ok();
+        reading.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -231,7 +231,7 @@ pub(super) fn publish_record(
     if custom_data && length > 50_000 {
         return Err(Error::EventTooLarge);
     }
-    let mut reservation = output.begin_record(length, false, kind, correlation)?;
+    let mut reservation = output.begin_record(length, kind, correlation)?;
     {
         let mut encoder = Encoder {
             reservation: Some(&mut reservation),
