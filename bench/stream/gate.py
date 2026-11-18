@@ -96,7 +96,7 @@ def evaluate(row, runs, expected):
                         fail(f"{kind}: invalid worker count or decay timing")
                     if kind == "pool":
                         for metric in ("VmRSS", "tmpfs_used"):
-                            # 4 MiB plus the 25 free 16,384-byte frames that each of the 8 lists keeps (§6.5).
+                            # 4 MiB plus the warm budget: 25 free 16,384-byte frames for each of the 8 lists (§6.5).
                             if metrics["after"][metric] > metrics["baseline"][metric]+4*1024*1024+8*25*16384:
                                 fail(f"pool {metric}: post-decay baseline allowance exceeded")
             for phase in ("baseline", "held", "after"):

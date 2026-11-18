@@ -23,8 +23,9 @@ const EXTENT: u32 = 64;
 /// Most cold frames populated in one call for one reservation: 80 KiB, which covers a
 /// 50,000-byte data record from any offset (at most 5 frames).
 const COLD_RUN: u32 = 5;
-/// Idle free frames decay keeps per worker list: the 400,000-byte budget of 8 × 50,000-byte
-/// frames rounded up to whole 16,384-byte frames (INTERNAL-STREAM §6.5) until measured.
+/// Idle free frames decay keeps for each worker list, pooled into one budget of `WARM` × lists
+/// that any list may hold: the 400,000-byte budget of 8 × 50,000-byte frames rounded up to
+/// whole 16,384-byte frames (INTERNAL-STREAM §6.5) until measured.
 const WARM: usize = 25;
 static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
