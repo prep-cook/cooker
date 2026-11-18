@@ -960,7 +960,8 @@ Zero old values require zero new values; use absolute values, not division by ze
 
 ### 9.3 Storage regression gate (S1)
 
-Owner ruling (G9): performance tests mount the storage directory on tmpfs, and no regression against heap buffering is accepted. S1 may not merge the pool until every row below holds. The comparison is the chosen pool backend (per-thread LIFO lists, 128-byte alignment, decay reclaim) against heap frames of the same size and layout, on the same host, with `stream.pool_directory` on tmpfs. The per-request-file backend was rejected (§6.1) and is not measured here.
+Owner ruling (G9): performance tests mount the storage directory on tmpfs, and no regression against heap buffering is accepted. S1 may not merge the pool until every row below holds.
+**Merge bar since 2026-11-17 (decision 80):** a later pool change is measured against master's pool on one host with pinned, interleaved runs, and each row below is optimized as far as possible toward master's level. A row still worse than master merges only after an owner accepts it with those numbers. The pool-against-heap result is still reported but no longer blocks. The comparison is the chosen pool backend (per-thread LIFO lists, 128-byte alignment, decay reclaim) against heap frames of the same size and layout, on the same host, with `stream.pool_directory` on tmpfs. The per-request-file backend was rejected (§6.1) and is not measured here.
 Measured results in this table come from S0 with 50,000-byte frames; keep them as history and re-run every row with 4,096-byte frames.
 **S1 choice:** use at least 7 alternating runs per row and compare medians. A row regresses when the pool's median is worse than heap's and falls outside heap's own min..max range. The open row below uses a stricter rule.
 
