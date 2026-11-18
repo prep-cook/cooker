@@ -133,8 +133,9 @@ EOF
 # instead of sending anything. Nextest assigns each test to one of SHARDS shards by a hash
 # of its name (.config/nextest.toml sets the exclusive tests); the last
 # shard also runs the doc tests, the patched gjson in vendor/, which is outside the
-# workspace, and the cache replay script's tests, and the first the media relay and CPU
-# profiler tests. CK_TEST_NO_SKIP turns a skipped media relay IPv6 test into a failure.
+# workspace, the cache replay script's tests, the storage gate's self-test and the container
+# check's script tests (artifacts on tmpfs, outside the tree), and the first the media relay
+# and CPU profiler tests. CK_TEST_NO_SKIP turns a skipped media relay IPv6 test into a failure.
 # /home/builder/out holds the list and counts the test-report stage exports for
 # .github/scripts/test-counts.py. CI_COMMIT changes on every commit, so a cached run cannot
 # stand in for a new commit's. Nextest runs one test per CPU; on a large shared machine pass
@@ -156,6 +157,8 @@ if [ "$SHARD" = "$SHARDS" ]; then
   cargo test --workspace --doc --locked 2>&1 | tee -a "$out/test.log"
   cargo test --locked --manifest-path vendor/gjson/Cargo.toml --target-dir target 2>&1 | tee -a "$out/test.log"
   python3 bench/test-claude-cache-replay.py 2>&1 | tee -a "$out/test.log"
+  python3 -I bench/stream/gate.py --self-test 2>&1 | tee -a "$out/test.log"
+  python3 -I bench/container-test.py "$(mktemp -d -p /dev/shm)" 2>&1 | tee -a "$out/test.log"
 fi
 if [ "$SHARD" = 1 ]; then
   cargo nextest run -p ck-server --features media-relay,pprof --lib --locked --profile ci $threads
