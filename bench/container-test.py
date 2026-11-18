@@ -24,7 +24,7 @@ spec.loader.exec_module(gate)
 ARTIFACTS = None
 
 
-def probe(directory, mode="600", uid="10001", mapped=True, target=None, inode="55", size=6_400_000):
+def probe(directory, mode="600", uid="10001", mapped=True, target=None, inode="55", size=gate.POOL_BYTES):
     target = target or directory + "/#55 (deleted)"
     page = os.sysconf("SC_PAGE_SIZE")
     end = 0x1000 + ((size + page - 1) // page) * page
@@ -259,7 +259,7 @@ class PoolControls(unittest.TestCase):
     def test_duplicate_descriptors_of_same_inode_are_one_pool(self):
         text = probe(self.directory)
         descriptor = (f"FD\t/proc/1/fd/10\t{self.directory}/#55 (deleted)\n"
-                      "STAT 42 55 600 10001 10001 6400000 regular file\n")
+                      "STAT 42 55 600 10001 10001 6406144 regular file\n")
         errors, pools = gate.check_pool(text.replace("MAPS\n", descriptor + "MAPS\n"), self.directory)
         self.assertEqual(errors, [])
         self.assertEqual(len(pools), 1)
@@ -280,7 +280,7 @@ class PoolControls(unittest.TestCase):
         self.assertIn("0600 owned by 10001:10001", " ".join(errors))
 
     def test_small_pool_requires_exact_configured_backing_size(self):
-        for size in (gate.POOL_BYTES, gate.POOL_BYTES - 50_000, gate.POOL_BYTES + 50_000):
+        for size in (gate.POOL_BYTES, gate.POOL_BYTES - 16_384, gate.POOL_BYTES + 16_384):
             with self.subTest(size=size):
                 errors, _ = gate.check_pool(probe(self.directory, size=size), self.directory, gate.POOL_BYTES)
                 self.assertEqual(not errors, size == gate.POOL_BYTES)
@@ -307,14 +307,14 @@ class PoolControls(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="real-otmpfile-", dir=ARTIFACTS) as directory:
             fd = os.open(directory, os.O_TMPFILE | os.O_RDWR, 0o600)
             try:
-                os.ftruncate(fd, 50_000)
-                with mmap.mmap(fd, 50_000, access=mmap.ACCESS_WRITE) as mapping:
+                os.ftruncate(fd, 16_384)
+                with mmap.mmap(fd, 16_384, access=mmap.ACCESS_WRITE) as mapping:
                     mapping[0] = 42
                     stat = os.fstat(fd)
                     target = os.readlink(f"/proc/self/fd/{fd}")
                     text = probe(directory, target=target)
                     # Preserve the actual host ownership: this is parser proof, not uid-10001 image proof.
-                    text = text.replace("STAT 42 55 600 10001 10001 6400000 regular file",
+                    text = text.replace("STAT 42 55 600 10001 10001 6406144 regular file",
                                         f"STAT {stat.st_dev} {stat.st_ino} 600 {stat.st_uid} {stat.st_gid} {stat.st_size} regular file")
                     maps = Path("/proc/self/maps").read_text()
                     text = text.split("MAPS\n")[0] + "MAPS\n" + maps + "MOUNTS\n"
