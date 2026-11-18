@@ -42,14 +42,11 @@ impl FrameStates {
             return Err(io::Error::last_os_error());
         }
         // Decay drops the states of punched frames page by page. A transparent huge page
-        // would keep a whole 2 MiB of them resident, so the mapping uses base pages only.
+        // would keep a whole 2 MiB of them resident, so the mapping asks for base pages.
+        // The advice is best-effort: a kernel without transparent huge pages rejects it
+        // (EINVAL) and maps base pages anyway, and any refusal costs memory, not storage.
         // SAFETY: the range is the fresh mapping above; the advice only selects page size.
-        if unsafe { libc::madvise(base, bytes, libc::MADV_NOHUGEPAGE) } != 0 {
-            let error = io::Error::last_os_error();
-            // SAFETY: the mapping above is this function's alone and nothing refers to it.
-            unsafe { libc::munmap(base, bytes) };
-            return Err(error);
-        }
+        unsafe { libc::madvise(base, bytes, libc::MADV_NOHUGEPAGE) };
         let states = Self {
             mapping: Mapping {
                 base: NonNull::new(base.cast()).ok_or_else(invalid)?,
@@ -98,5 +95,64 @@ impl Deref for FrameStates {
         // SAFETY: the page-aligned mapping holds `len` states for its whole life. Zero
         // bytes are valid atomics, and all access goes through them.
         unsafe { std::slice::from_raw_parts(self.mapping.base.as_ptr().cast(), self.len) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Make this thread's `madvise(.., MADV_NOHUGEPAGE)` fail with EINVAL, as on a kernel
+    /// without transparent huge pages. Seccomp filters bind only the installing thread.
+    fn refuse_nohugepage() {
+        let stmt = |code, k| libc::sock_filter { code, jt: 0, jf: 0, k };
+        let jump = |k, jt, jf| libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt,
+            jf,
+            k,
+        };
+        let load = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+        let ret = (libc::BPF_RET | libc::BPF_K) as u16;
+        // seccomp_data: the syscall number at offset 0, the low half of args[2] at 32.
+        let mut program = [
+            stmt(load, 0),
+            jump(libc::SYS_madvise as u32, 0, 3),
+            stmt(load, 32),
+            jump(libc::MADV_NOHUGEPAGE as u32, 0, 1),
+            stmt(ret, libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32),
+            stmt(ret, libc::SECCOMP_RET_ALLOW),
+        ];
+        let filter = libc::sock_fprog {
+            len: program.len() as u16,
+            filter: program.as_mut_ptr(),
+        };
+        // SAFETY: both calls affect only this thread; the program outlives the second call.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &filter), 0);
+        }
+    }
+
+    #[test]
+    fn states_open_where_huge_page_advice_is_refused() {
+        std::thread::spawn(|| {
+            refuse_nohugepage();
+            let probe = FrameStates::new(1024, 0).map(|states| {
+                // SAFETY: advice on the live mapping; it changes no contents.
+                let refused = unsafe {
+                    libc::madvise(
+                        states.mapping.base.as_ptr().cast(),
+                        states.mapping.len,
+                        libc::MADV_NOHUGEPAGE,
+                    )
+                };
+                (refused, states[0].refs.load(Ordering::Relaxed))
+            });
+            // The filter refuses the advice, and the states open and read as free anyway.
+            assert_eq!(probe.unwrap(), (-1, 0));
+        })
+        .join()
+        .unwrap();
     }
 }
