@@ -255,6 +255,32 @@ fn cold_frames_prefault_only_the_pages_a_record_needs() {
 }
 
 #[test]
+fn prefault_doubles_the_populated_prefix() {
+    let directory = Directory::new();
+    let pool = Pool::open(&directory.0, EXTENT, 1, 1, 0).unwrap();
+    pool.decay().unwrap();
+    pool.decay().unwrap();
+    let warm: Vec<_> = (0..WARM).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
+    let frame = pool.allocate(100).unwrap();
+    let ready = || pool.states[frame as usize].ready.load(Ordering::Relaxed) as usize;
+    assert!(ready() <= pool.page);
+    // Record by record, a frame fills in a few populate calls rather than one per page.
+    let mut calls = 0;
+    while ready() < FRAME_BYTES {
+        pool.prefault(frame, ready() + 1).unwrap();
+        calls += 1;
+    }
+    let pages = (FRAME_BYTES / pool.page).max(1);
+    assert!(
+        calls <= pages.ilog2() as usize,
+        "{calls} populate calls for {pages} pages"
+    );
+    for frame in warm.into_iter().chain([frame]) {
+        pool.release(frame);
+    }
+}
+
+#[test]
 fn a_reservation_populates_its_cold_frames_in_one_call() {
     // (frames the reservation takes, cold frames populated): its own frames, at most COLD_RUN.
     for (run, warmed) in [(1, 1), (4, 4), (40, COLD_RUN as usize)] {
@@ -431,6 +457,41 @@ fn fill_available(path: &Path) -> File {
         0
     );
     file
+}
+
+#[test]
+#[ignore = "requires a disposable private 4 MiB tmpfs supplied as TMPDIR"]
+fn isolated_tmpfs_prefault_ahead_falls_back_to_the_needed_page() {
+    let _serial = isolated_tmpfs();
+    let directory = Directory::new();
+    let pool = Pool::open(&directory.0, EXTENT, 1, 1, 0).unwrap();
+    // Populating ahead differs from the needed page only when a frame spans four pages or more.
+    if FRAME_BYTES < 4 * pool.page {
+        return;
+    }
+    pool.decay().unwrap();
+    pool.decay().unwrap();
+    let warm: Vec<_> = (0..WARM).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
+    let frame = pool.allocate(FRAME_BYTES / 2).unwrap();
+    let ready = pool.states[frame as usize].ready.load(Ordering::Relaxed) as usize;
+    let filler_path = directory.0.join("filler");
+    let filler = fill_available(&filler_path);
+    // One free page: populating ahead is refused, the page the record needs is granted.
+    filler
+        .set_len(filler.metadata().unwrap().len() - pool.page as u64)
+        .unwrap();
+    pool.prefault(frame, ready + 1).unwrap();
+    let after = pool.states[frame as usize].ready.load(Ordering::Relaxed) as usize;
+    assert_eq!(after, ready + pool.page);
+    assert_eq!(
+        pool.prefault(frame, after + 1).unwrap_err().raw_os_error(),
+        Some(libc::EFAULT)
+    );
+    drop(filler);
+    fs::remove_file(&filler_path).unwrap();
+    for frame in warm.into_iter().chain([frame]) {
+        pool.release(frame);
+    }
 }
 
 #[test]

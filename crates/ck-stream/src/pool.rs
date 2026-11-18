@@ -390,8 +390,12 @@ impl Pool {
             return Ok(());
         }
         assert!(frame < self.backed_frames() && needed <= FRAME_BYTES);
-        // This populates only through the page holding `needed`, so a frame filled by small
-        // records costs one call per page: up to four on 4 KiB-page hosts.
+        // A frame written in small records grows its prefix by doubling, so filling it costs
+        // a few calls rather than one per page. Near exhaustion only `needed` must succeed.
+        let ahead = needed.max(ready * 2).min(FRAME_BYTES);
+        if ahead > needed && self.populate(frame, ready, ahead).is_ok() {
+            return Ok(());
+        }
         self.populate(frame, ready, needed)
     }
 
